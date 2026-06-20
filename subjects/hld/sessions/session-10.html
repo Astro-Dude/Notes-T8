@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 10 — NoSQL Internals — LSM Trees (Part 1)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 10</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 10 · NoSQL Internals — LSM Tree 1</span>
+      <h1>How write-heavy databases store data: LSM Trees</h1>
+      <p class="lead">
+        Ever wondered how databases that swallow millions of writes per second — Cassandra, RocksDB,
+        the engine behind your favourite chat app — actually pull it off? The secret is a clever
+        storage design called the <em>LSM tree</em>. In this session we build it up from absolute
+        zero: why a normal database struggles with heavy writes, the one trick that fixes it, and how
+        that trick turns into a real, working storage engine. No prior storage knowledge assumed.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 35 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why a different storage engine?</a></li>
+          <li><a href="#update-problem">The update problem in SQL</a></li>
+          <li><a href="#nosql-append">Why NoSQL is forced to append</a></li>
+          <li><a href="#append">Designing a write-optimized store</a></li>
+          <li><a href="#lsm">The LSM tree write path</a></li>
+          <li><a href="#tradeoffs">Trade-offs &amp; real systems</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why a different storage engine?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a library where every book is kept in perfect alphabetical order on the shelves.
+          Finding a book is super fast — you walk straight to the right spot. But every time a
+          <em>new</em> book arrives, the librarian has to shove all the other books along to make a
+          gap in exactly the right place. With one new book a day, fine. With a thousand new books a
+          minute, the poor librarian spends all day shoving and no time helping readers. We need a
+          smarter way to <strong>accept new books quickly</strong>.</p>
+        </div>
+
+        <p>Recall from <strong>Session 9</strong> (SQL vs NoSQL &amp; Sharding) that we split databases
+        into two camps. Traditional <span class="term">SQL</span> databases prize structure and
+        complex queries; many <span class="term">NoSQL</span> systems are built to scale out and
+        absorb enormous write volumes. That difference isn't just in the query language — it goes all
+        the way down to the <span class="term">storage engine</span>, the part of a database that
+        actually decides how bytes are laid out on disk and how reads and writes touch them.</p>
+
+        <h3>The read-optimized world: B-trees</h3>
+        <p>Most classic relational databases (PostgreSQL, MySQL/InnoDB, Oracle) store their data and
+        indexes in a structure called a <span class="term">B-tree</span> (more precisely a B+ tree).
+        Picture our alphabetised library: a B-tree keeps keys <strong>sorted in place</strong> in
+        fixed-size blocks called <span class="term">pages</span> (often 4&nbsp;KB or 8&nbsp;KB). To find any
+        key, you start at the top and follow a few pointers down to the right page — only a handful of
+        page reads even in a huge table. That makes reads wonderfully fast and predictable.</p>
+
+        <p>The catch is <em>writing</em>. A B-tree does <span class="term">in-place updates</span>: to
+        insert or change a row, it finds the exact page that key belongs in and rewrites that page
+        right where it lives on disk. Each write therefore means: locate the page, read it, modify it,
+        write it back — and if the page is full, <strong>split</strong> it into two and fix up the
+        parents. Those writes land at scattered, random locations on the disk.</p>
+
+        <div class="callout note">
+          <span class="c-title">Random vs sequential disk access</span>
+          <p>Disks (and even SSDs) love <strong>sequential</strong> work — writing a long stream to one
+          place — and dislike <strong>random</strong> work — jumping around to tiny scattered spots. On
+          a spinning hard disk a random write means physically moving the read/write head, which is
+          glacially slow compared to streaming. Even SSDs pay a penalty for lots of small random
+          writes. A B-tree's in-place updates are exactly this scattered, random pattern.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A B-tree is <strong>read-optimized</strong>: sorted, in-place, few page reads per lookup —
+          great for queries, but every write is a relatively expensive, random, in-place page update.
+          For a workload that is overwhelmingly <strong>writes</strong> (logging, metrics, event
+          streams, time-series, social feeds), that's the wrong trade.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: a sensor firehose</span>
+          <p>Suppose you run 100,000 IoT sensors, each sending a reading every second — that's
+          <strong>100,000 writes per second</strong>, almost no reads, and the readings arrive in no
+          particular key order. In a B-tree, each reading forces a near-random page somewhere on disk to
+          be read, modified, and written back, plus the occasional page split. The disk head thrashes,
+          throughput collapses, and you can't keep up. The same hardware running a write-optimized
+          engine can comfortably absorb the firehose. The data structure — not the disk — is the
+          bottleneck.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">We'll meet B-trees properly elsewhere</span>
+          <p>We're treating B-trees here only as a <em>contrast</em> — just enough to see why a
+          write-heavy system wants something different. The full internals of B-trees and B+ trees
+          (page splits, fan-out, clustered indexes) are covered in the <strong>DBMS subject</strong>, so
+          we won't repeat them here.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The storage engine decides how bytes hit the disk. B-trees keep keys sorted and update them
+          <strong>in place</strong>, which makes reads cheap but turns every write into a random,
+          page-rewriting operation. Write-heavy NoSQL workloads need a storage engine designed for the
+          opposite priority — fast writes — which is what the rest of this session builds.
+        </div>
+      </section>
+
+      <!-- ===================== 2. THE UPDATE PROBLEM ===================== -->
+      <section id="update-problem">
+        <h2><span class="sec-num">2</span> The update problem in SQL</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a row of labelled boxes on a shelf, each box just big enough for the toy inside.
+          Now you want to swap a small toy for a slightly bigger one. If the new toy doesn't fit, you
+          can't just cram it in — it would spill into the neighbour's box! So changing what's in a box
+          turns out to be trickier than it sounds. A database has the exact same headache when you
+          <strong>update</strong> a value, and it has a whole machine to handle it safely.</p>
+        </div>
+
+        <p>Before we can appreciate why NoSQL engines append, we need to see how a classic
+        <span class="term">SQL</span> database handles an <strong>update</strong> — because that machinery
+        is exactly what NoSQL gives up. Let's follow a simple <code class="inl">UPDATE</code> all the way
+        down to the disk.</p>
+
+        <h3>SQL has a strong, explicit schema</h3>
+        <p>In SQL, data lives in tables and every table has a fixed <span class="term">schema</span>
+        declared up front:</p>
+<pre><span class="kw">CREATE TABLE</span> users (
+    id   <span class="kw">integer PRIMARY KEY</span>,
+    name <span class="kw">varchar</span>(20),
+    age  <span class="kw">smallint</span>
+);</pre>
+        <p>The schema tells the database four things: <strong>what tables exist</strong>, <strong>what
+        columns</strong> each has, <strong>what type</strong> each column is, and <strong>what
+        constraints</strong> apply. For our table:</p>
+<pre>id   -&gt; integer
+name -&gt; varchar(20)
+age  -&gt; smallint</pre>
+        <p>This is called <span class="term">schema-on-write</span>: every time data is inserted or
+        updated, the database checks the new data against the schema. For
+        <code class="inl">INSERT INTO users (id, name, age) VALUES (1, 'Abdur', 20);</code> it verifies:
+        is <code class="inl">id</code> an integer? is <code class="inl">name</code> within 20 characters?
+        is <code class="inl">age</code> a valid smallint? is <code class="inl">id</code> unique?</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common misconception: data type ≠ fixed-size storage</span>
+          <p><code class="inl">varchar(20)</code> does <strong>not</strong> mean 20 bytes are reserved in
+          every row. <code class="inl">varchar(20)</code> is a <strong>constraint on allowed values</strong>,
+          not a promise of preallocated space. Variable-length types (varchar, text, varbinary) store only
+          the actual value plus a little metadata; only some types (integer, smallint) are fixed-size.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Value in <code class="inl">name</code></th><th>Fits varchar(20)?</th><th>Storage implication</th></tr></thead>
+            <tbody>
+              <tr><td>Abdur</td><td>Yes</td><td>Short value; variable-length storage keeps only the actual value plus metadata.</td></tr>
+              <tr><td>Abdur Rehman</td><td>Yes</td><td>Larger than "Abdur" but still within the varchar(20) constraint.</td></tr>
+              <tr><td>Abdur Rehman Ibne Munir Bin Abdul Aziz</td><td>No</td><td>Too long for varchar(20); the database usually rejects the insert/update.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>So two valid rows can occupy <em>different</em> amounts of physical storage even though they
+        follow the same schema:</p>
+<pre>1 | Abdur        | 20
+2 | Abdur Rehman | 21</pre>
+        <p>And the real physical row size is <em>not</em> just the sum of declared column sizes — databases
+        also store row metadata, null markers, transaction information, alignment padding, page headers,
+        and index references.</p>
+
+        <h3>How an update really works</h3>
+        <p>Run <code class="inl">UPDATE users SET name = 'Abdur Rehman' WHERE id = 1;</code> and the
+        database must: <strong>find the row</strong>, <strong>check the new value against the schema</strong>,
+        <strong>modify the row or create a new version</strong>, <strong>update relevant indexes</strong>,
+        <strong>make the change durable</strong>, and <strong>stay recoverable if a crash happens</strong>.
+        This is far more than "go to disk and overwrite the old value." Modern SQL engines combine a buffer
+        pool, pages, indexes, a write-ahead log, transaction metadata, and background flushing.</p>
+
+        <h3>Rows live inside pages</h3>
+        <p>Databases don't usually read/write individual rows from disk — data is stored in fixed-size
+        blocks called <span class="term">pages</span>:</p>
+<pre>Page 1
+  |-- row: id=1, name='Abdur',        age=20
+  |-- row: id=2, name='Abdur Rehman', age=21
+  |-- free space</pre>
+        <p>To update a row, the database loads the <em>whole page</em> into memory, modifies the row in
+        memory, then marks the page as a <span class="term">dirty page</span>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Dirty page</span>
+          <p>A <strong>dirty page</strong> is a page that has changed in memory but whose modified version
+          may not yet have been written back to the table or index file on disk.</p>
+        </div>
+
+        <h3>Write-Ahead Log: the key idea</h3>
+        <p>Before the database safely writes the modified page back to the table/index file, it first
+        records the change in a special append-only log called the
+        <span class="term">Write-Ahead Log (WAL)</span>.</p>
+
+        <div class="callout key">
+          <span class="c-title">The WAL rule</span>
+          <p>The log record must reach durable storage <strong>before</strong> the modified data page is
+          considered safely written. The log is written <em>ahead</em> of the actual data page.</p>
+        </div>
+
+        <p>In B-tree-based storage engines, data and index pages are updated <strong>in place</strong>. If
+        a crash happens while only some pages have been written, the structure could become inconsistent.
+        WAL prevents this by giving the database enough information to recover safely after a crash.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the full update flow with WAL</span>
+          <p>A simplified update flow for our <code class="inl">UPDATE … SET name = 'Abdur Rehman'</code>:</p>
+          <ol>
+            <li>User runs the <code class="inl">UPDATE</code> statement.</li>
+            <li>Database finds the relevant row and page, often using an index.</li>
+            <li>The page is loaded into memory if not already in the buffer pool.</li>
+            <li>Schema constraints are checked: "Abdur Rehman" fits inside varchar(20).</li>
+            <li>The page is modified in memory and marked dirty.</li>
+            <li>A WAL record describing the change is written.</li>
+            <li>The WAL is <strong>flushed to disk before the transaction commits</strong>.</li>
+            <li>The transaction commits.</li>
+            <li>The actual table/index pages are flushed later by background processes.</li>
+          </ol>
+          <div class="flow">
+            <div class="step"><div class="s-ico">📝</div><div class="s-t">UPDATE issued</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">🔍</div><div class="s-t">Find row/page</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">🧠</div><div class="s-t">Modify page in memory</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">✍️</div><div class="s-t">Write WAL record</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">💾</div><div class="s-t">Flush WAL before commit</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">✅</div><div class="s-t">Commit transaction</div></div>
+            <div class="arrow">↓</div>
+            <div class="step"><div class="s-ico">🧹</div><div class="s-t">Flush dirty pages later</div></div>
+          </div>
+        </div>
+
+        <h3>Why WAL is needed</h3>
+        <p>A single update may touch <em>multiple</em> physical structures: the table page with the row,
+        the primary-key index page, one or more secondary-index pages, and transaction metadata. If the
+        database overwrote these in place and crashed halfway, it could be left inconsistent — e.g. the
+        table row updated but the index not, or a B-tree page split done without updating its parent. With
+        WAL, the database first records enough information to <strong>redo / recover</strong> the operation;
+        after a crash it replays WAL records and brings the table and index files back to a consistent
+        state.</p>
+
+        <div class="callout note">
+          <span class="c-title">WAL is not the main table storage</span>
+          <p>The WAL is <em>not</em> the final home of the row — the row still belongs in the table and
+          index files. The WAL answers one question: <em>if the database crashes before all changed pages
+          are written, how do we reconstruct the committed changes?</em></p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Structure</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td>Table / index files</td><td>Main database storage</td></tr>
+                <tr><td>WAL file</td><td>Recovery log used to reconstruct committed changes after a crash</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Are updates applied in batches later?</span>
+          <p>Yes, with nuance. The update is applied to the page <strong>in memory immediately</strong>,
+          but the modified (dirty) page may be written to disk later — triggered by checkpointing, the
+          background writer, buffer-pool eviction, memory pressure, or shutdown. The core safety guarantee
+          is simply: <strong>before a transaction commits, its WAL records must be durable.</strong></p>
+        </div>
+
+        <h3>What if the new value is too large?</h3>
+        <p>Run <code class="inl">UPDATE users SET name = 'Abdur Rehman Ibne Munir Bin Abdul Aziz' WHERE id = 1;</code>.
+        That value violates <code class="inl">varchar(20)</code>. The database does <strong>not</strong>
+        overflow into the next row — it usually <strong>rejects</strong> the update because the value is
+        too large for the declared limit. Remember: varchar(20) is a constraint on allowed values, not a
+        promise of 20 preallocated bytes.</p>
+
+        <h3>Variable-length updates</h3>
+        <p>What about changing <code class="inl">Abdur</code> → <code class="inl">Abdur Rehman</code>? It's
+        larger but still fits varchar(20). Since varchar is variable-length, the new value may need more
+        physical storage, and the engine has several tactics:</p>
+        <ul>
+          <li>use free space on the same page;</li>
+          <li>create a new row version elsewhere;</li>
+          <li>move large values out-of-line;</li>
+          <li>update pointers or indexes;</li>
+          <li>leave old row versions for later cleanup;</li>
+          <li>split or reorganize pages.</li>
+        </ul>
+        <p>So updates aren't manageable because space was fully preallocated — they're manageable because
+        the storage engine knows how to <strong>modify pages safely, maintain indexes, and recover using
+        WAL</strong>.</p>
+
+        <h3>Schema changes (ALTER TABLE)</h3>
+        <p>Adding a column changes the table conceptually from <code class="inl">id | name | age</code> to
+        <code class="inl">id | name | age | gender</code>:</p>
+<pre><span class="kw">ALTER TABLE</span> users <span class="kw">ADD COLUMN</span> gender smallint;</pre>
+        <p>Physically, the database may <em>not</em> rewrite every row. Adding a <strong>nullable</strong>
+        column can be fast: existing rows are treated as if the new column is NULL, recorded in metadata.
+        Same idea with a default value:</p>
+<pre><span class="kw">ALTER TABLE</span> users <span class="kw">ADD COLUMN</span> country text <span class="kw">DEFAULT</span> 'India';</pre>
+        <p>Older systems might rewrite every row; modern databases may store the default in metadata and
+        return it when old rows are read. But some changes <em>do</em> require rewriting many or all rows,
+        e.g.:</p>
+<pre><span class="kw">ALTER TABLE</span> users <span class="kw">ALTER COLUMN</span> age <span class="kw">TYPE</span> bigint;
+<span class="kw">ALTER TABLE</span> users <span class="kw">ADD COLUMN</span> created_at timestamp <span class="kw">DEFAULT</span> clock_timestamp();</pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The correct statement is <em>not</em> "adding/deleting a column always rewrites the table."
+          It is: <strong>some schema changes are metadata-only and fast; some require rewriting the table
+          and are slow</strong> — it depends on the database and the exact <code class="inl">ALTER TABLE</code>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SQL is <strong>schema-on-write</strong>: every write is checked against a declared schema, and
+          a type like varchar(20) is a constraint, not preallocated space. An update is not a raw overwrite
+          — the engine loads the page, modifies it in memory (a <strong>dirty page</strong>), writes a
+          <strong>WAL</strong> record <em>before</em> commit for crash recovery, and flushes dirty
+          table/index pages later. Oversized values are rejected; variable-length growth and ALTER TABLE
+          are handled with page/metadata tricks. This whole apparatus is what makes <em>in-place</em>
+          updates safe.
+        </div>
+      </section>
+
+      <!-- ===================== 3. NOSQL MUST APPEND ===================== -->
+      <section id="nosql-append">
+        <h2><span class="sec-num">3</span> Why NoSQL is forced to append</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>In SQL you said up front "this box holds at most a 20-letter name," so everyone knows the
+          rules. In NoSQL there's no such rule — a value could be a tiny number today and a giant JSON
+          blob tomorrow. You have no idea how big any box needs to be, and you definitely can't make
+          every box as big as the biggest <em>possible</em> value (that would waste a mountain of space).
+          So when a value grows, there's simply nowhere to put it without bumping into the neighbours.
+          The only safe move is to write the new version somewhere fresh — to <strong>append</strong>.</p>
+        </div>
+
+        <p>Most <span class="term">NoSQL</span> databases are <strong>schemaless</strong> (or
+        semi-structured / loose-schema). The crucial consequence: <strong>we don't know the size of any
+        particular entry.</strong></p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Value</th><th>Entry size</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">item</code></td><td><code class="inl">10</code></td><td>9 bytes (key: 4b, value: 4b, separator: 1b)</td></tr>
+              <tr><td><code class="inl">preferences</code></td><td><code class="inl">{ "theme": "dark", "autoSave": false }</code></td><td>62 bytes (key: 11b, value: 50b, separator: 1b)</td></tr>
+              <tr><td><code class="inl">contest:[id]:page[10]</code></td><td><code class="inl">[ {user_id, rank, submission_details}, … ]</code></td><td>2 KB maybe?</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>No preallocation — and no way to preallocate</h3>
+        <p>NoSQL databases do not pre-allocate max-space for an entry. More than that, they
+        <strong>cannot</strong>: the possible maximum is just too large. In Redis, the size limit for a
+        single string is <strong>500 MB</strong> — preallocating that for every key would be a massive
+        waste of space.</p>
+
+        <h3>The overflow problem on update</h3>
+        <p>When you update an entry in NoSQL, its size can change. So what happens if the new value is
+        <em>larger</em> than the space it currently occupies? It would <strong>overflow</strong> and
+        overwrite the adjacent entry. The two naive "fixes" are both terrible:</p>
+        <ul>
+          <li><span class="term">Truncate</span> — enforce that you can't update a value to a larger size.
+          A useless database; bad design.</li>
+          <li><span class="term">Shift</span> — push all subsequent entries to the right to make room.
+          Ridiculously slow.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why is truncation OK in SQL but not in NoSQL?</span>
+          <p>In SQL, the developer <em>chose</em> the schema and deliberately enforces the max size, so
+          truncation is expected behaviour. In NoSQL there's no such schema, so silently truncating a
+          value would be <strong>unexpected</strong> and surprising — unacceptable.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The forced conclusion</span>
+          <p>In a NoSQL database it is <strong>impossible to update a value on disk in the traditional
+          (in-place) manner</strong>. Any entry can only be <strong>appended</strong> — entries are
+          <strong>immutable</strong>. That immediately raises the challenge that drives the rest of this
+          session: <em>if you can only append, how do you perform updates and deletes?</em></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          NoSQL is schemaless, so entry sizes are unknown and unbounded (Redis strings can hit 500 MB),
+          making preallocation impossible. A larger update would overflow into neighbours, and the only
+          alternatives — truncate or shift — are unacceptable. Therefore NoSQL entries are
+          <strong>immutable and append-only</strong>, and updates/deletes must be expressed as new
+          appended records. That's exactly the design we build next.
+        </div>
+      </section>
+
+      <!-- ===================== 4. APPEND ===================== -->
+      <section id="append">
+        <h2><span class="sec-num">4</span> Designing a write-optimized store</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of shoving books into the perfect spot every time, imagine the librarian just
+          <strong>drops each new book on the top of a pile by the door</strong> as it arrives. Adding a
+          book is now instant — no shoving, no searching for the right gap. The pile isn't tidy, but
+          accepting books is lightning fast. Cleaning up the pile into neat shelves can happen later,
+          quietly, when nobody's rushing. That "drop it on the pile" idea is the heart of a
+          write-optimized store.</p>
+        </div>
+
+        <p>So how do we make writes fast? Flip the B-tree's rule on its head with one core principle:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p><strong>Never update data in place.</strong> Every write is just <em>appended</em> to the
+          end of a file. New value? Append it. Changed value? Append the new version. Even a delete?
+          Append a little note saying "this key is gone." We <strong>only ever add to the end</strong>,
+          never reach back and overwrite.</p>
+        </div>
+
+        <p>This style is called an <span class="term">append-only</span> design, and the simplest form
+        is a <span class="term">log</span> — literally a file you keep tacking records onto. Because
+        every write lands at the end of one file, the disk writes are <strong>sequential</strong>: one
+        smooth stream, the pattern disks are fastest at. No seeking, no page splits, no read-modify-write.
+        The write essentially becomes "remember where the end is, write the record there, move the end
+        pointer forward."</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the append-only log in action</span>
+          <p>We store <code class="inl">key → value</code> records by appending. Watch the file grow as
+          three commands come in for key <code class="inl">user:42</code>:</p>
+<pre><span class="cm"># command stream            # what gets appended to the file (end →)</span>
+SET user:42 = "Ann"          <span class="cm">→</span>  [ user:42 | "Ann"   ]
+SET user:42 = "Annie"        <span class="cm">→</span>  [ user:42 | "Ann"   ][ user:42 | "Annie" ]
+DELETE user:42               <span class="cm">→</span>  [ user:42 | "Ann"   ][ user:42 | "Annie" ][ user:42 | &lt;tombstone&gt; ]
+</pre>
+          <p>Notice we never went back and erased the old <code class="inl">"Ann"</code> record. The
+          newest record for a key always sits <strong>further right</strong> (later) in the file, so the
+          <em>last</em> one wins. The delete didn't remove anything either — it appended a special marker
+          called a <span class="term">tombstone</span> meaning "as of here, this key is dead." Old data
+          gets cleaned up later, not now.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">"To find the current value, read the latest record"</span>
+          <p>If the same key was written many times, its true current value is whichever copy was
+          appended <strong>most recently</strong>. So a naive read means scanning from the newest end
+          backwards until you hit that key — slow if the log is huge. Hold that thought: making reads
+          fast again is exactly the problem the full LSM design (Topic 3) and the indexes &amp; bloom
+          filters of <strong>Session 11</strong> solve. For now, celebrate that <em>writes</em> are
+          gloriously cheap.</p>
+        </div>
+
+        <h3>Why this is the right trade for write-heavy systems</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Concern</th><th>In-place (B-tree)</th><th>Append-only (log)</th></tr></thead>
+            <tbody>
+              <tr><td>Disk write pattern</td><td>Random, scattered page rewrites</td><td>Sequential, one stream to the end</td></tr>
+              <tr><td>Cost per write</td><td>Locate page, read, modify, write, maybe split</td><td>Append a record at the tail</td></tr>
+              <tr><td>Old data</td><td>Overwritten immediately</td><td>Left behind, cleaned up later</td></tr>
+              <tr><td>Best for</td><td>Read-heavy, complex queries</td><td>Write-heavy ingestion</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The obvious problem we're creating</span>
+          <p>An append-only log grows forever and stores stale copies and tombstones. Reads get slower
+          and disk fills up. That's the price of fast writes — and the entire job of an LSM tree is to
+          keep the writes this cheap <em>while</em> taming the read cost and the disk bloat. We'll see
+          exactly how next.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The write-optimized trick is: <strong>never update in place — always append</strong>. That
+          turns every write into a cheap, sequential tail-write (the pattern disks love), and treats
+          updates and deletes as new appended records (the latest wins; a delete is a tombstone). The
+          downside — a growing log full of stale data and slow reads — is what the LSM tree is built to
+          manage.
+        </div>
+      </section>
+
+      <!-- ===================== 5. LSM WRITE PATH ===================== -->
+      <section id="lsm">
+        <h2><span class="sec-num">5</span> The LSM tree write path</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back to the library. New books still arrive fast, but now the librarian is cleverer. She
+          keeps a small <strong>sorting table</strong> right by the door (in easy reach) and quickly
+          slots each new book into order there — it's tiny, so this is instant. When the table fills up,
+          she carries the whole neat stack to a shelf in the back and <em>seals it</em> as a finished
+          shelf she'll never rearrange. Over time there are many sealed shelves; every so often, during
+          quiet hours, she merges several sealed shelves into one bigger, even tidier shelf. Fast intake
+          at the door, tidy shelves in the back, cleanup in the background. That's an LSM tree.</p>
+        </div>
+
+        <p>An <span class="term">LSM tree</span> (Log-Structured Merge tree) is the storage engine that
+        turns the append-only idea into something practical. It keeps the cheap sequential writes but
+        adds a layered structure so reads stay manageable and old data gets cleaned. It has a few moving
+        parts — let's meet each one.</p>
+
+        <h3>The moving parts</h3>
+        <ul>
+          <li><span class="term">MemTable</span> — an <strong>in-memory</strong>, sorted structure
+          (typically a balanced tree or skip list) holding the most recent writes. Because it's in RAM
+          and self-sorting, inserting a key in order is fast. This is the "sorting table by the door."</li>
+          <li><span class="term">Write-Ahead Log (WAL)</span> — an append-only file on disk. RAM is
+          volatile: if the server crashes, everything in the MemTable vanishes. So <em>before</em> a
+          write goes into the MemTable, it's first appended to the WAL on disk. That's the durability
+          insurance — after a crash we replay the WAL to rebuild the lost MemTable.</li>
+          <li><span class="term">SSTable</span> (Sorted String Table) — when the MemTable gets big
+          enough, its contents are written out to disk as an <strong>immutable</strong>, sorted file.
+          "Immutable" means once written it is <em>never modified</em> — only read, or eventually thrown
+          away. These are the "sealed shelves."</li>
+          <li><span class="term">Compaction</span> — a background process that merges several SSTables
+          into fewer, larger ones, discarding overwritten values and applying tombstones. This is the
+          "quiet-hours tidy-up."</li>
+        </ul>
+
+        <h3>What a single write does, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">1. Append to WAL</div><div class="s-d">Durable on disk first</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">2. Insert into MemTable</div><div class="s-d">Sorted, in RAM</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">3. Ack write</div><div class="s-d">Tell client "done"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">4. Flush when full</div><div class="s-d">MemTable → SSTable on disk</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧹</div><div class="s-t">5. Compact later</div><div class="s-d">Merge SSTables in background</div></div>
+        </div>
+
+        <p>The beautiful part: from the client's point of view a write is just steps 1–3, and <em>both</em>
+        are sequential/in-memory operations — no random disk seeks. Steps 4 and 5 happen later, in the
+        background, off the critical path.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: pseudocode for a write</span>
+          <p>Here's the write path in plain pseudocode. Notice the WAL append comes <strong>before</strong>
+          the MemTable insert — that ordering is the whole point of "write-ahead."</p>
+<pre><span class="kw">def</span> put(key, value):
+    <span class="cm"># 1. Durability first: append to the write-ahead log on disk.</span>
+    <span class="cm">#    This is a sequential append — cheap and fast.</span>
+    wal.append(record(key, value))      <span class="cm"># survives a crash</span>
+    wal.fsync()                         <span class="cm"># force it to actually hit disk</span>
+
+    <span class="cm"># 2. Update the in-memory sorted structure (skip list / balanced tree).</span>
+    memtable.insert(key, value)         <span class="cm"># O(log n), all in RAM</span>
+
+    <span class="cm"># 3. We can now safely tell the client the write succeeded.</span>
+    <span class="kw">return</span> OK
+
+    <span class="cm"># --- background, NOT on the write's critical path ---</span>
+
+<span class="kw">def</span> maybe_flush():
+    <span class="kw">if</span> memtable.size_bytes &gt;= FLUSH_THRESHOLD:    <span class="cm"># e.g. 64 MB</span>
+        sstable = write_sorted_to_disk(memtable)   <span class="cm"># one sequential write</span>
+        sstables.add_newest(sstable)               <span class="cm"># immutable from now on</span>
+        wal.truncate()                             <span class="cm"># those writes are now safe on disk</span>
+        memtable = new_empty_memtable()            <span class="cm"># start fresh</span>
+
+<span class="kw">def</span> delete(key):
+    put(key, TOMBSTONE)                 <span class="cm"># a delete is just a special append</span>
+</pre>
+          <p>A <code class="inl">delete</code> is literally a <code class="inl">put</code> of a
+          <span class="term">tombstone</span> — exactly the append-only idea from Topic 2. Because the
+          MemTable is sorted, flushing it produces a sorted file (an SSTable) in a single sequential
+          pass.</p>
+        </div>
+
+        <h3>The WAL file in detail — quick persistence</h3>
+        <p>Any operation (insert / update / delete) must be <strong>durable</strong> — persisted on disk.
+        The <span class="term">WAL</span> is an append-only file on the hard disk: every new write is
+        simply appended as a new entry at the end. Because it's append-only, the writes are
+        <strong>sequential</strong>, so write throughput is high. The WAL acts as
+        <strong>temporary storage</strong>: data there is committed and durable, but it has not yet been
+        fully absorbed into the database's internal bookkeeping.</p>
+
+        <p>The WAL file has a <strong>max size (typically 100 MB)</strong>. Once it reaches that size, we
+        must <strong>dump it into an SSTable</strong>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Can we just read directly from the WAL file?</span>
+          <p>Bad idea. The WAL is append-only, contains <strong>duplicates</strong>, is <strong>not
+          sorted</strong>, and is <strong>large (100 MB)</strong>. To find the latest entry for a key you'd
+          have to scan the entire 100 MB. We need a fast index into the data instead — the MemTable.</p>
+        </div>
+
+        <h3>The MemTable in detail — the read cache</h3>
+        <p>The <span class="term">MemTable</span> is essentially a <strong>hashmap in RAM</strong> (often
+        also implemented as a balanced BST / sorted linked list). Writes must mandatorily go to disk (for
+        durability), but <em>reads</em> can be served from RAM for ultra-high throughput. The MemTable acts
+        as an in-memory cache over the data we just wrote.</p>
+        <ul>
+          <li><strong>Invalidation:</strong> it's a <strong>write-through cache</strong>, but super simple
+          — <em>no 2PC</em> needed, because the entire LSM tree lives within a single server. (If the DB is
+          sharded, each shard builds its own LSM tree.)</li>
+          <li><strong>Eviction:</strong> <span class="term">Least Recently Used (LRU)</span>.</li>
+          <li><strong>Size:</strong> bounded by the DB server's RAM — more RAM means a larger db-internal
+          cache. Typically the MemTable is kept <strong>larger than the WAL's max size</strong>, which
+          simplifies eviction and read queries.</li>
+        </ul>
+
+        <h3>Inside an SSTable, and why "sorted" matters</h3>
+        <p>An SSTable stores its key→value entries <strong>sorted by key</strong>. Sorting buys two
+        things. First, merging two sorted files is easy and sequential (like the merge step of merge
+        sort — walk both with two pointers). Second, you can build a small <span class="term">sparse
+        index</span> — "key <code class="inl">m</code> starts at byte offset 50,000" — so a read can jump
+        near the right spot instead of scanning the whole file. (We go deep on these read-side indexes,
+        plus <strong>bloom filters</strong>, in <strong>Session 11</strong>.)</p>
+
+        <p>Some hard rules about SSTables (long-term persistence). When the WAL fills up, we dump it into a
+        <strong>new</strong> SSTable. SSTables are <strong>immutable</strong>: once created they are
+        <em>never</em> updated. They can be <strong>deleted</strong> (during compaction) and new ones
+        created, but a table is never "edited". Inside a single SSTable, entries are <strong>sorted by
+        key</strong> and have <strong>no duplicates</strong> — we deduplicate the WAL data before dumping
+        it.</p>
+
+        <div class="callout note">
+          <span class="c-title">Q: Can there be duplicate entries in SSTables?</span>
+          <p>A <em>single</em> SSTable is deduplicated and sorted by key, so no duplicates there. However,
+          it <strong>is</strong> possible to have duplicate entries for the same key <strong>across
+          different SSTables</strong>. Any old entry of a key is "overridden" by the latest write, making
+          the old entries redundant — wasted space that compaction will later reclaim.</p>
+        </div>
+
+        <h3>Levels / tiers — organising the sealed shelves</h3>
+        <p>Flushing produces a stream of SSTables over time. Left alone they'd pile up, so LSM trees
+        organise them into <span class="term">levels</span> (sometimes called tiers): Level&nbsp;0 holds
+        the freshest, smallest SSTables straight from flushes; deeper levels (L1, L2, …) hold larger
+        SSTables that result from merging. Each level down is typically ~10× bigger than the one above.
+        Newer data lives shallow; older, consolidated data sinks deeper.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">MemTable</div><div class="s-d">RAM, sorted, mutable</div></div>
+          <div class="arrow">↓ flush</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Level 0</div><div class="s-d">Small, fresh SSTables</div></div>
+          <div class="arrow">↓ compact</div>
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">Level 1</div><div class="s-d">Merged, larger</div></div>
+          <div class="arrow">↓ compact</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Level 2+</div><div class="s-d">Largest, oldest</div></div>
+        </div>
+
+        <h3>Compaction — the background tidy-up</h3>
+        <p><span class="term">Compaction</span> takes several overlapping SSTables and merges them into
+        new, larger SSTables, throwing away garbage along the way. Because the inputs are each sorted,
+        the merge is a clean sequential pass. During the merge it resolves duplicates and deletes:</p>
+        <ul>
+          <li>If a key appears in multiple input SSTables, <strong>keep only the newest version</strong>
+          and drop the older copies (reclaiming the space wasted by updates).</li>
+          <li>If the newest version is a <strong>tombstone</strong>, drop the key entirely (this is when
+          a delete <em>finally</em> frees space).</li>
+          <li>Write the survivors out as fresh, immutable SSTables; once readers move over, delete the
+          old inputs.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: compacting two SSTables</span>
+          <p>We merge an older and a newer SSTable. Both are sorted by key; the newer one wins on
+          conflicts, and a tombstone removes the key:</p>
+<pre><span class="cm"># OLDER sstable (sorted)        # NEWER sstable (sorted)</span>
+  a → 1                           a → 9            <span class="cm"># a was updated</span>
+  b → 2                           c → &lt;tombstone&gt;  <span class="cm"># c was deleted</span>
+  c → 3                           d → 4            <span class="cm"># brand-new key</span>
+
+<span class="cm"># two-pointer merge, newest-wins, tombstones drop the key:</span>
+  a → 9        <span class="cm"># newer value beats older 1</span>
+  b → 2        <span class="cm"># only in older, kept</span>
+               <span class="cm"># c → deleted: newest version is a tombstone, so dropped</span>
+  d → 4        <span class="cm"># only in newer, kept</span>
+
+<span class="cm"># RESULT sstable (still sorted, smaller, garbage removed):</span>
+  a → 9
+  b → 2
+  d → 4
+</pre>
+          <p>Three goals achieved at once: stale duplicate (<code class="inl">a → 1</code>) gone,
+          deleted key (<code class="inl">c</code>) gone, and we ended up with <em>fewer</em> sorted files
+          to search on the next read.</p>
+        </div>
+
+        <h3>Why compaction, mechanically</h3>
+        <p>Two motivations. (1) Multiple SSTables can hold duplicate (redundant) entries for the same key,
+        wasting space — we want to remove the duplicates. (2) Reads must scan SSTables one by one, so we
+        don't want the count to grow large — compaction reduces the number of SSTables. The mechanism:
+        take <strong>2 consecutive SSTables</strong> and merge them into a single SSTable. Since each
+        SSTable is individually sorted by key, we use the <strong>merge step of merge sort</strong>; for
+        duplicate keys we keep only the <strong>latest</strong> entry (not both). After compaction the
+        original SSTables are deleted.</p>
+
+        <div class="callout note">
+          <span class="c-title">Q: When does compaction happen?</span>
+          <p>Compaction requires at least <strong>2 tables on the same level</strong> — then we can compact
+          them into the next level. It runs <strong>in the background</strong> during normal operations, so
+          there's <strong>no downtime</strong>. But it's <strong>expensive</strong> (reads, writes, and
+          deletes on disk), so we don't usually compact the instant two tables appear. Triggers can be:</p>
+          <ul>
+            <li>amount of tables (a <code class="inl">tableCountThreshold</code>);</li>
+            <li>time passed (e.g. compact every midnight);</li>
+            <li>low-load time (detect when load drops below a threshold, then compact);</li>
+            <li>… and others.</li>
+          </ul>
+          <p>You also <strong>don't have to read the whole file into RAM</strong> while compacting — because
+          the tables are sorted, it can be done in a <strong>streaming</strong> manner.</p>
+        </div>
+
+        <h3>Most common compaction strategies</h3>
+        <ul>
+          <li><span class="term">Levelling</span> — the moment you get 2 SSTables on a level, you trigger
+          compaction: <code class="inl">tableCountThreshold = 2</code>.</li>
+          <li><span class="term">Tiering</span> — you allow more than 2 SSTables on a level, keeping a
+          higher <code class="inl">tableCountThreshold &gt; 2</code> before compacting.</li>
+        </ul>
+        <p>The compaction strategy is decided <strong>differently for each level</strong>. Poorly tuned
+        compaction can make or break database performance, so the choice must be careful.</p>
+
+        <div class="callout note">
+          <span class="c-title">How this maps to real engines</span>
+          <p>Real engines build on these ideas. <strong>Size-tiered</strong> compaction merges several
+          SSTables of similar size into one bigger one (write-friendly, used heavily by Cassandra).
+          <strong>Leveled</strong> compaction keeps each level's SSTables non-overlapping and tightly
+          sized (read- and space-friendly, used by RocksDB/LevelDB). The choice trades write cost against
+          read and space cost — the very trade-offs we tackle next.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Q: Can we compact across levels?</span>
+          <p>No — that's not recommended, because across levels the file sizes differ significantly, so the
+          merge would be inefficient. The sizes grow geometrically because each level is built by compacting
+          two tables from the level above:</p>
+<pre>Typical WAL size                 = 100 MB
+size of SSTable on Level 1  &lt;= 100 MB   <span class="cm"># compacted from the WAL file</span>
+size of SSTable on Level 2  &lt;= 200 MB   <span class="cm"># compacted from 2 Level-1 SSTables</span>
+size of SSTable on Level 3  &lt;= 400 MB   <span class="cm"># compacted from 2 Level-2 SSTables</span>
+...</pre>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The LSM write path keeps writes cheap by doing only two fast things up front — append to the
+          <strong>WAL</strong> (durability) and insert into the in-RAM <strong>MemTable</strong> (sorted).
+          Everything expensive — turning memory into <strong>immutable SSTables</strong> via flush, and
+          cleaning garbage via <strong>compaction</strong> across <strong>levels</strong> — is shifted to
+          the background, off the path that the client waits on.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A write goes: <strong>WAL append → MemTable insert → ack</strong> (both cheap), and later, in
+          the background, the full MemTable is <strong>flushed</strong> to an immutable, sorted
+          <strong>SSTable</strong>, while <strong>compaction</strong> merges SSTables across
+          <strong>levels</strong>, keeping the newest value and dropping duplicates and tombstones. Fast
+          intake at the door, tidy shelves in the back, cleanup in quiet hours.
+        </div>
+      </section>
+
+      <!-- ===================== 6. TRADE-OFFS ===================== -->
+      <section id="tradeoffs">
+        <h2><span class="sec-num">6</span> Trade-offs &amp; the real systems that use LSM</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The clever librarian's system isn't free. To keep the shelves tidy she ends up
+          <strong>re-carrying</strong> the same books many times as she merges shelves (extra work). For a
+          while, old copies of books sit around taking up space before cleanup (wasted room). And when a
+          reader asks for one book, she might have to <strong>check several shelves</strong> because the
+          book could be on any of them (slower searching). Fast intake came at a cost — and engineers have
+          names for each cost.</p>
+        </div>
+
+        <p>LSM trees buy fast writes, but every engineering choice has a bill. There are three classic
+        costs to know, usually called the three "amplifications" plus the read penalty.</p>
+
+        <h3>The trade-offs</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Trade-off</th><th>What it means</th><th>Where it comes from</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Write amplification</span></td><td>One logical write ends up being physically written to disk <em>several</em> times.</td><td>A record is written by the flush, then re-written every time compaction moves it to a deeper level. 1 user write can become 10×+ bytes on disk over its lifetime.</td></tr>
+              <tr><td><span class="term">Space amplification</span></td><td>The data on disk is <em>bigger</em> than the logical data it represents.</td><td>Stale (overwritten) values and not-yet-applied tombstones linger until compaction reclaims them.</td></tr>
+              <tr><td><span class="term">Read amplification</span></td><td>One logical read may have to inspect <em>multiple</em> places to find the answer.</td><td>A key could be in the MemTable, or in any of several SSTables across levels — you may check several before you find it (or confirm it's absent).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the cost of a single read</span>
+          <p>A read for key <code class="inl">k</code> walks from newest to oldest and stops at the first
+          hit (newest wins):</p>
+<pre><span class="kw">def</span> get(key):
+    <span class="kw">if</span> key <span class="kw">in</span> memtable:                 <span class="cm"># 1. check RAM first (newest)</span>
+        <span class="kw">return</span> resolve(memtable[key])    <span class="cm"># could be a tombstone → "not found"</span>
+
+    <span class="kw">for</span> sstable <span class="kw">in</span> newest_to_oldest(sstables):   <span class="cm"># 2. then disk files</span>
+        <span class="kw">if</span> sstable.maybe_contains(key):          <span class="cm"># (Session 11: bloom filter!)</span>
+            v = sstable.lookup(key)               <span class="cm"># binary search via sparse index</span>
+            <span class="kw">if</span> v <span class="kw">is not</span> <span class="nm">None</span>:
+                <span class="kw">return</span> resolve(v)               <span class="cm"># first (newest) hit wins</span>
+
+    <span class="kw">return</span> NOT_FOUND                <span class="cm"># worst case: checked everything</span>
+</pre>
+          <p>The painful case is a key that <strong>doesn't exist</strong>: with no shortcut, you'd touch
+          <em>every</em> SSTable before concluding "not found." That is exactly why Session 11 introduces
+          two read-savers — a per-SSTable <strong>index</strong> (so a hit is a quick binary search, not a
+          scan) and a <strong>bloom filter</strong> (a tiny structure that says "this key is
+          <em>definitely not</em> in this SSTable" so you skip it entirely). The
+          <code class="inl">maybe_contains(key)</code> call above is the bloom-filter hook.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The central tension</span>
+          <p>Compaction is a balancing act. Compact <strong>more aggressively</strong> → fewer SSTables to
+          search (less read amplification) and less stale data (less space amplification), but more
+          re-writing (more write amplification) and more background CPU/disk pressure. Compact
+          <strong>less</strong> → cheaper writes but slower reads and more wasted space. There's no free
+          lunch; you tune compaction to your workload. (This is the RUM conjecture: you can optimise
+          <strong>R</strong>ead, <strong>U</strong>pdate, or <strong>M</strong>emory cost, but improving
+          one tends to hurt another.)</p>
+        </div>
+
+        <h3>Compared to the B-tree we started with</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Dimension</th><th>B-tree (read-optimized)</th><th>LSM tree (write-optimized)</th></tr></thead>
+            <tbody>
+              <tr><td>Writes</td><td>Slower — random in-place page updates</td><td>Faster — sequential appends</td></tr>
+              <tr><td>Reads</td><td>Faster — one path down the tree</td><td>Slower — may check MemTable + several SSTables</td></tr>
+              <tr><td>Disk pattern</td><td>Random</td><td>Sequential</td></tr>
+              <tr><td>Main extra cost</td><td>Random-write penalty, fragmentation</td><td>Write/space amplification from compaction</td></tr>
+              <tr><td>Sweet spot</td><td>Read-heavy, transactional, complex queries</td><td>Write-heavy ingestion, time-series, logs</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Real systems built on LSM trees</h3>
+        <ul>
+          <li><span class="term">LevelDB</span> — Google's compact embedded key-value library; the
+          original popular open-source LSM implementation (and the source of the SSTable terminology
+          we've used).</li>
+          <li><span class="term">RocksDB</span> — Facebook/Meta's fork of LevelDB, heavily tuned;
+          embedded inside countless systems (it's a storage engine, not a server). Uses leveled
+          compaction by default.</li>
+          <li><span class="term">Apache Cassandra</span> — a distributed wide-column NoSQL database
+          (recall sharding from Session 9); its on-disk format is MemTable + commit log (WAL) + SSTables
+          with size-tiered or leveled compaction.</li>
+          <li><span class="term">ScyllaDB</span> — a C++ rewrite of Cassandra focused on raw performance;
+          same LSM design, different implementation.</li>
+          <li>Also common: HBase, Bigtable (the original inspiration), and time-series stores — all lean
+          on LSM-style storage for write throughput.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why this matters for system design</span>
+          <p>When you pick a database in an HLD interview or a real project, you're implicitly picking a
+          storage engine. "Heavy writes, simple key lookups, time-ordered data" should make you reach for
+          an LSM-backed store (Cassandra, RocksDB) and explain <em>why</em> with the write-path reasoning
+          from this session. "Complex joins, strong transactions, read-heavy" leans back toward a
+          B-tree-backed relational database.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          LSM trees trade away read speed and disk efficiency for write speed. The costs are
+          <strong>write amplification</strong> (re-writing data during compaction),
+          <strong>space amplification</strong> (stale data before cleanup), and
+          <strong>read amplification</strong> (checking the MemTable plus multiple SSTables). The
+          read cost is what Session 11's indexes and bloom filters attack. Real users include LevelDB,
+          RocksDB, Cassandra, and ScyllaDB.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how write-heavy databases actually store data. Here's the one-paragraph story
+        that connects all four topics:</p>
+        <div class="bigidea">
+          <p>Classic databases use <strong>B-trees</strong>, which keep data sorted and update it
+          <strong>in place</strong> — wonderful for reads, but every write is a random, page-rewriting
+          operation that buckles under heavy write loads. So write-optimized engines flip the rule:
+          <strong>never update in place — always append</strong>, turning writes into cheap sequential
+          tail-writes (updates become new records, deletes become <strong>tombstones</strong>). The
+          <strong>LSM tree</strong> makes that practical: each write is appended to the
+          <strong>WAL</strong> for durability and inserted into the in-RAM, sorted <strong>MemTable</strong>;
+          when the MemTable fills, it's <strong>flushed</strong> to an immutable, sorted
+          <strong>SSTable</strong>; and a background <strong>compaction</strong> merges SSTables across
+          <strong>levels</strong>, keeping newest values and dropping duplicates and tombstones. The bill
+          is <strong>write, space, and read amplification</strong> — and that read cost (checking many
+          SSTables) is exactly what <strong>Session 11</strong> tackles with indexes and bloom filters. This
+          design powers LevelDB, RocksDB, Cassandra, and ScyllaDB.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Does <code class="inl">varchar(20)</code> mean the database reserves 20 bytes per row?</summary>
+          <p class="ans">No. varchar(20) is a <strong>constraint on allowed values</strong> (reject values
+          longer than 20 chars), not a promise of preallocated space. varchar is variable-length and stores
+          only the actual value plus metadata, so two valid rows can occupy different physical sizes.</p>
+        </details>
+        <details class="quiz">
+          <summary>In SQL, why must the WAL record be flushed before a transaction commits?</summary>
+          <p class="ans">B-tree data/index pages are updated in place, so a crash mid-write could leave the
+          structure inconsistent (e.g. row updated but index not). Writing the WAL record durably first
+          means recovery can replay it to redo the operation and restore a consistent state. The data
+          pages themselves are flushed later by background processes.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't NoSQL update values in place the way SQL does?</summary>
+          <p class="ans">NoSQL is schemaless, so entry sizes are unknown and unbounded (a Redis string can
+          be up to 500 MB), making preallocation impossible. A larger update would overflow into adjacent
+          entries; the only alternatives — truncate (useless DB) or shift everything right (ridiculously
+          slow) — are unacceptable. So entries are immutable and updates/deletes are appended.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why not just read directly from the WAL file?</summary>
+          <p class="ans">It's append-only, has duplicates, isn't sorted, and is large (~100 MB), so finding
+          the latest entry for a key would require scanning the whole file. The MemTable (an in-RAM
+          hashmap/BBST) provides fast indexed access instead.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between levelling and tiering compaction?</summary>
+          <p class="ans">Levelling triggers compaction as soon as there are 2 SSTables on a level
+          (tableCountThreshold = 2). Tiering allows more than 2 SSTables per level before compacting
+          (tableCountThreshold &gt; 2). The strategy is chosen per level, and compaction across levels is
+          avoided because level file sizes differ too much (100 MB, 200 MB, 400 MB, …).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why are B-trees considered read-optimized but a poor fit for write-heavy workloads?</summary>
+          <p class="ans">They keep keys sorted and update them in place, so a read follows just a few
+          pointers down the tree (fast), but every write must locate, read, modify, and rewrite a
+          specific page — a random, scattered disk operation, plus occasional page splits. Under heavy
+          writes the disk thrashes.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the single core principle behind a write-optimized store?</summary>
+          <p class="ans">Never update data in place — always append. Writes go to the end of a file as
+          new records, which makes them cheap sequential writes. Updates append a newer version (latest
+          wins) and deletes append a tombstone.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does the WAL append happen before the MemTable insert?</summary>
+          <p class="ans">The MemTable lives in RAM, which is lost on a crash. Writing to the on-disk
+          write-ahead log first means a crash can be recovered by replaying the WAL to rebuild the
+          MemTable. Durability before acknowledging the write.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does compaction actually do, and what does it clean up?</summary>
+          <p class="ans">It merges several sorted SSTables into fewer, larger ones in a sequential pass.
+          Along the way it keeps only the newest version of each key (discarding stale duplicates) and
+          drops keys whose newest version is a tombstone — reclaiming space and reducing the number of
+          files reads must check.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name the three "amplifications" and which one Session 11 most directly addresses.</summary>
+          <p class="ans">Write amplification (data re-written during compaction), space amplification
+          (stale data lingering before cleanup), and read amplification (checking the MemTable plus
+          multiple SSTables). Session 11's indexes and bloom filters most directly attack read
+          amplification.</p>
+        </details>
+        <details class="quiz">
+          <summary>Give two real databases or engines that use an LSM tree, and one workload they suit.</summary>
+          <p class="ans">Examples: RocksDB, LevelDB, Apache Cassandra, ScyllaDB. They suit write-heavy
+          workloads such as time-series data, event logs, metrics, and high-ingest feeds with simple
+          key-based lookups.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1fJMHZAqAUKQVuZUkqp9t7-KIGvh6ZbT1gtOwUK9AUhg/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] NoSQL Internals - LSM Tree</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li>📄 <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf" target="_blank" rel="noopener">O'Neil et al. — "The Log-Structured Merge-Tree (LSM-Tree)" (1996)</a> — the original paper that introduced the LSM tree.</li>
+    <li>📄 <a href="https://github.com/facebook/rocksdb/wiki" target="_blank" rel="noopener">RocksDB Wiki (Meta)</a> — a production LSM storage engine: MemTables, SSTables, flush and compaction explained.</li>
+    <li>📄 <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/storage_engine.html" target="_blank" rel="noopener">Apache Cassandra — Storage Engine docs</a> — commit log (WAL), MemTables, and SSTables in a real wide-column database.</li>
+    <li>📘 <a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications (Kleppmann), Ch. 3</a> — B-trees vs LSM-trees and storage-engine trade-offs.</li>
+  </ul>
+  <h4>Optional resources (from the handout)</h4>
+  <ul>
+    <li>🎬 <a href="https://nan01ab.github.io/2024/06/LSM-Tree-Compaction.html" target="_blank" rel="noopener">LSM-Tree Compaction Visualization</a> — watch compaction across levels animate.</li>
+    <li>📄 <a href="https://www.alibabacloud.com/blog/" target="_blank" rel="noopener">An In-depth Discussion on the LSM Compaction Mechanism — Alibaba Cloud Community</a>.</li>
+    <li>📄 Raphael Carvalho — <em>Building state-of-art LSM-tree compaction in ScyllaDB</em>.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-9.html"><div class="dir">← Previous</div><div class="ttl">Session 9: SQL vs NoSQL &amp; Sharding</div></a>
+        <a class="next" href="session-11.html"><div class="dir">Next →</div><div class="ttl">Session 11: NoSQL Internals — LSM Tree 2</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 10 — NoSQL Internals — LSM Trees (Part 1) · Fast writes, tidy shelves 🗄️</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

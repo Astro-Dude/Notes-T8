@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 5 — Loss Functions &amp; Optimization</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 5</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 05 · Loss Functions &amp; Optimization</span>
+      <h1>How a neural net measures its mistakes — and fixes them</h1>
+      <p class="lead">
+        In Session 4 we learned how <em>backpropagation</em> figures out which way each weight should move.
+        But move toward <em>what</em>? This session answers that. First we'll meet the <strong>loss function</strong> —
+        the single number that says "how wrong are you right now?" Then we'll watch the network chase that
+        number downhill using <strong>gradient descent</strong>, and meet the clever <strong>optimizers</strong> and
+        <strong>learning-rate schedules</strong> that make the trip faster and smoother. We assume you've studied
+        <em>none</em> of this — every idea starts with a tiny story before any math.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what-loss">What a loss function is</a></li>
+          <li><a href="#common-losses">Common losses: MSE &amp; cross-entropy</a></li>
+          <li><a href="#gd-variants">Gradient descent variants</a></li>
+          <li><a href="#optimizers">Advanced optimizers</a></li>
+          <li><a href="#schedules">Learning-rate schedules</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHAT A LOSS FUNCTION IS ===================== -->
+      <section id="what-loss">
+        <h2><span class="sec-num">1</span> What a loss function is</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're learning to throw a ball into a basket. Each throw, a friend tells you a single
+          number: <em>"You missed by 2 metres."</em> A big number means a bad throw, a small number means a
+          good one, and <strong>zero</strong> means you scored. You don't need to know <em>everything</em> about
+          the throw — that one "how far off were you" number is enough to know which way to adjust. A
+          <strong>loss function</strong> is exactly that friend: it watches the network's answer, compares it to
+          the right answer, and shouts back one number — "here's how wrong you were."</p>
+        </div>
+
+        <p>A <span class="term">loss function</span> (also called a <span class="term">cost function</span> or
+        <span class="term">objective</span>) is a formula that takes the network's <strong>prediction</strong> and the
+        <strong>true answer</strong> and returns a single number: the <strong>loss</strong>. The bigger the number, the
+        more wrong the network is. Training has exactly one goal — <strong>make this number as small as possible</strong>.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>A neural network doesn't "want" anything on its own. We give it a purpose by writing down a loss
+          function. <strong>Everything the network learns is just a side effect of pushing that one number down.</strong>
+          Choose a different loss and you get a different network — the loss <em>is</em> the goal.</p>
+        </div>
+
+        <h3>Why a single number?</h3>
+        <p>Recall from Session 4 that backpropagation needs a starting point to compute gradients — a quantity it
+        can differentiate. The loss <strong>L</strong> is that quantity. Because it's one number, we can ask the
+        crisp question "if I nudge this weight a tiny bit, does L go up or down?" That answer is the
+        <span class="term">gradient</span>, and the whole training machine runs on it.</p>
+
+        <h3>Loss vs. cost vs. objective — same family</h3>
+        <ul>
+          <li><strong>Loss</strong> — usually the error on <em>one</em> training example.</li>
+          <li><strong>Cost</strong> — usually the <em>average</em> loss over a batch or the whole dataset.</li>
+          <li><strong>Objective</strong> — the thing we optimize overall (often the cost, sometimes plus extra
+          penalty terms like the regularization we'll meet in Session 6).</li>
+        </ul>
+        <p>People use these words loosely and often interchangeably. Don't lose sleep over it — they all mean
+        "the number we're trying to shrink."</p>
+
+        <h3>What makes a <em>good</em> loss function?</h3>
+        <ul>
+          <li><strong>Small when right, large when wrong</strong> — so minimizing it actually improves predictions.</li>
+          <li><strong>Differentiable</strong> (smooth) — backprop needs a slope at every point. A loss with no
+          gradient gives the network no direction to move.</li>
+          <li><strong>Matched to the task</strong> — a loss for predicting house prices looks different from a loss
+          for sorting photos into "cat / dog / bird." We unpack that in Topic 2.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">A tiny worked example</span>
+          <p>Your network predicts a house will sell for <code class="inl">$300k</code>. It actually sold for
+          <code class="inl">$250k</code>. A simple loss is the <strong>squared error</strong>:</p>
+          <pre><span class="cm"># prediction and truth, in thousands of dollars</span>
+y_pred = <span class="nm">300</span>
+y_true = <span class="nm">250</span>
+
+error   = y_pred - y_true        <span class="cm"># 50</span>
+loss    = error ** <span class="nm">2</span>          <span class="cm"># 2500</span>
+</pre>
+          <p>If the next prediction is <code class="inl">$260k</code>, the error is 10 and the loss is 100 —
+          <strong>much</strong> smaller. The network "knows" it improved purely because that number dropped. (Why
+          <em>square</em> it? See Topic 2 — squaring keeps the number positive and punishes big misses extra hard.)</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A picture worth keeping</span>
+          <p>Imagine the loss as the <strong>height of a hilly landscape</strong>, where your position is the
+          network's weights. Training is just walking <em>downhill</em> to the lowest valley. We'll lean on this
+          "landscape" picture constantly — gradient descent (Topic 3) is literally how you walk down it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A loss function turns "how wrong is the network?" into one differentiable number. Training = pushing
+          that number down. It must be small-when-right, smooth enough to differentiate, and matched to the task.
+          Picture it as a landscape; the rest of this session is about walking downhill efficiently.
+        </div>
+      </section>
+
+      <!-- ===================== 2. COMMON LOSSES ===================== -->
+      <section id="common-losses">
+        <h2><span class="sec-num">2</span> Common losses: MSE &amp; cross-entropy</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>There are two big kinds of questions. <strong>"How much?"</strong> questions — like guessing someone's
+          height — where being off by a little is okay and being off by a lot is bad. And
+          <strong>"which one?"</strong> questions — like "is this a cat or a dog?" — where you're not guessing a
+          number, you're pointing at the right box. These two kinds of questions need two different "how wrong"
+          rulers. The height ruler is called <strong>MSE</strong>; the picking-the-right-box ruler is called
+          <strong>cross-entropy</strong>.</p>
+        </div>
+
+        <p>The two questions are the two great families of machine-learning tasks:</p>
+        <ul>
+          <li><span class="term">Regression</span> — predict a continuous number (price, temperature, age). Use
+          <strong>Mean Squared Error</strong>.</li>
+          <li><span class="term">Classification</span> — pick a category from a fixed set (cat/dog/bird, spam/not-spam).
+          Use <strong>Cross-Entropy</strong>.</li>
+        </ul>
+
+        <h3>Mean Squared Error (MSE) — for regression</h3>
+        <p><span class="term">Mean Squared Error</span> averages the squared difference between each prediction and
+        its true value. For <em>n</em> examples:</p>
+        <pre><span class="cm"># MSE formula</span>
+MSE = (<span class="nm">1</span>/n) * Σ (y_pred_i - y_true_i)²
+</pre>
+        <p>Two design choices make it work:</p>
+        <ul>
+          <li><strong>Squaring</strong> makes every error positive (so +5 and −5 don't cancel out) and punishes
+          large errors disproportionately — a miss of 10 costs 100, a miss of 20 costs 400.</li>
+          <li><strong>Averaging</strong> (the <code class="inl">1/n</code>) makes the loss comparable whether you have
+          10 examples or 10,000.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Numeric example — MSE</span>
+          <p>Three house-price predictions (in $k) vs. truth:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Predicted</th><th>True</th><th>Error</th><th>Error²</th></tr></thead>
+              <tbody>
+                <tr><td>300</td><td>250</td><td>50</td><td>2500</td></tr>
+                <tr><td>180</td><td>200</td><td>−20</td><td>400</td></tr>
+                <tr><td>410</td><td>400</td><td>10</td><td>100</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <pre><span class="cm"># average of the squared errors</span>
+MSE = (<span class="nm">2500</span> + <span class="nm">400</span> + <span class="nm">100</span>) / <span class="nm">3</span> = <span class="nm">1000</span>
+</pre>
+          <p>Notice the single big miss (2500) dominates the result — that's the squaring at work, telling the
+          network "fix the large errors first."</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A cousin: MAE</span>
+          <p><span class="term">Mean Absolute Error (MAE)</span> averages the <em>absolute</em> errors instead of the
+          squared ones. It cares less about huge outliers (no squaring), so it's more <strong>robust</strong> when your
+          data has a few wild values. Rule of thumb: MSE when big errors are truly bad; MAE when a few outliers
+          shouldn't dominate.</p>
+        </div>
+
+        <h3>Cross-Entropy (log loss) — for classification</h3>
+        <p>For classification the network outputs <strong>probabilities</strong> — e.g. "I'm 70% sure it's a cat,
+        20% dog, 10% bird." <span class="term">Cross-entropy</span> (also called <span class="term">log loss</span>)
+        measures how far those predicted probabilities are from the truth. The truth is a
+        <span class="term">one-hot</span> vector: 1 for the correct class, 0 for the rest (e.g. cat = <code class="inl">[1, 0, 0]</code>).</p>
+        <pre><span class="cm"># Cross-entropy for one example, C classes</span>
+CE = - Σ  y_true_c * log(y_pred_c)
+
+<span class="cm"># Because y_true is one-hot, only the correct class survives:</span>
+CE = - log(y_pred[correct_class])
+</pre>
+        <p>So cross-entropy boils down to: <strong>take the probability the network assigned to the right answer,
+        and penalise it with −log</strong>. Predict 1.0 (perfectly confident and correct) → loss is
+        <code class="inl">−log(1) = 0</code>. Predict 0.01 for the right class (confidently wrong) → loss is
+        <code class="inl">−log(0.01) ≈ 4.6</code>, a big penalty. The −log shape <strong>punishes confident mistakes
+        savagely</strong>, which is exactly what we want.</p>
+
+        <h4>Softmax — turning scores into probabilities</h4>
+        <p>The network's raw outputs are <span class="term">logits</span> — arbitrary numbers, possibly negative.
+        <span class="term">Softmax</span> squashes them into a valid probability distribution (all positive, summing
+        to 1) before cross-entropy looks at them:</p>
+        <pre><span class="cm"># softmax over logits z</span>
+softmax(z_i) = exp(z_i) / Σ_j exp(z_j)
+</pre>
+        <p>In practice the two are glued together (e.g. PyTorch's <code class="inl">CrossEntropyLoss</code> applies
+        softmax internally) because computing them jointly is more numerically stable.</p>
+
+        <div class="callout example">
+          <span class="c-title">Numeric example — softmax + cross-entropy</span>
+          <p>A 3-class network (cat / dog / bird) outputs logits <code class="inl">[2.0, 1.0, 0.1]</code> and the
+          true class is <strong>cat</strong>.</p>
+          <pre><span class="cm"># 1) softmax the logits</span>
+exp([<span class="nm">2.0</span>, <span class="nm">1.0</span>, <span class="nm">0.1</span>]) = [<span class="nm">7.39</span>, <span class="nm">2.72</span>, <span class="nm">1.11</span>]
+sum                       = <span class="nm">11.22</span>
+probs = [<span class="nm">0.659</span>, <span class="nm">0.242</span>, <span class="nm">0.099</span>]   <span class="cm"># cat=66%, dog=24%, bird=10%</span>
+
+<span class="cm"># 2) cross-entropy = -log(prob of correct class = cat)</span>
+CE = -log(<span class="nm">0.659</span>) = <span class="nm">0.417</span>
+</pre>
+          <p>If the network had instead been confident the answer was bird (say cat prob = 0.05), the loss would
+          be <code class="inl">−log(0.05) ≈ 3.0</code> — over 7× larger. Cross-entropy rewards confident, correct
+          probabilities and hammers confident, wrong ones.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">In code (PyTorch)</span>
+          <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+<span class="cm"># regression</span>
+mse = nn.MSELoss()
+loss_r = mse(pred, target)            <span class="cm"># pred, target are floats</span>
+
+<span class="cm"># classification (softmax applied INSIDE the loss)</span>
+ce = nn.CrossEntropyLoss()
+logits = torch.tensor([[<span class="nm">2.0</span>, <span class="nm">1.0</span>, <span class="nm">0.1</span>]])
+target = torch.tensor([<span class="nm">0</span>])   <span class="cm"># class index 0 = cat</span>
+loss_c = ce(logits, target)           <span class="cm"># ≈ 0.417</span>
+</pre>
+        </div>
+
+        <h3>When to use which</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Task</th><th>Output layer</th><th>Loss</th></tr></thead>
+            <tbody>
+              <tr><td>Regression (predict a number)</td><td>Linear (no activation)</td><td>MSE (or MAE if outliers)</td></tr>
+              <tr><td>Binary classification (yes/no)</td><td>Sigmoid → 1 probability</td><td>Binary cross-entropy</td></tr>
+              <tr><td>Multi-class (pick 1 of C)</td><td>Softmax → C probabilities</td><td>Categorical cross-entropy</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common beginner mistake</span>
+          <p>Using MSE on a classification problem. It technically runs, but it trains slowly and badly — squared
+          error gives weak gradients when the network is confidently wrong, while cross-entropy gives strong ones.
+          <strong>Match the loss to the task.</strong></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>MSE</strong> = average squared error, for regression — squaring punishes big misses. <strong>Cross-entropy</strong>
+          = −log(probability of the correct class), for classification — it punishes confident mistakes hard, and
+          pairs with <strong>softmax</strong> to turn logits into probabilities. Pick the loss that fits the task.
+        </div>
+      </section>
+
+      <!-- ===================== 3. GRADIENT DESCENT VARIANTS ===================== -->
+      <section id="gd-variants">
+        <h2><span class="sec-num">3</span> Gradient descent variants</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You're standing on a foggy hill and want to reach the bottom. You can't see far, but you can feel
+          which way the ground slopes under your feet, so you take a small step downhill, feel again, step again.
+          That's <strong>gradient descent</strong>. The only real questions are: <em>how big a step do you take</em>
+          (the learning rate), and <em>how often do you stop to re-check the slope</em> — after looking at all the
+          ground (batch), after a single patch (stochastic), or after a handful of patches (mini-batch)?</p>
+        </div>
+
+        <p>From Topic 1, the loss is a landscape and we want the lowest valley. The <span class="term">gradient</span>
+        points in the direction of <em>steepest uphill</em>, so we step the <em>opposite</em> way. That's the core
+        update rule, repeated thousands of times:</p>
+        <pre><span class="cm"># the heart of all training</span>
+w = w - learning_rate * gradient_of_loss_wrt_w
+</pre>
+        <p>The <span class="term">learning rate</span> (often written <code class="inl">η</code>, "eta") is the step
+        size. The three variants differ only in <strong>how much data they look at before each step</strong>.</p>
+
+        <h3>The three variants</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🗺️</div><div class="s-t">Batch GD</div><div class="s-d">Look at ALL data, then 1 step</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">SGD</div><div class="s-d">Look at 1 example, step</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Mini-batch</div><div class="s-d">Look at ~32–256, step</div></div>
+        </div>
+
+        <h4>Batch gradient descent</h4>
+        <p><span class="term">Batch gradient descent</span> computes the gradient over the <strong>entire training
+        set</strong> before taking one step. Every step points in the true "average downhill" direction, so the
+        path is smooth and stable. The catch: one step requires processing all your data — painfully slow and
+        memory-hungry for large datasets (millions of examples → one tiny step).</p>
+
+        <h4>Stochastic gradient descent (SGD)</h4>
+        <p><span class="term">Stochastic gradient descent (SGD)</span> goes to the other extreme: it estimates the
+        gradient from a <strong>single random example</strong> and steps immediately. ("Stochastic" just means
+        "random.") Steps are lightning-fast and you make many of them, but each step is <strong>noisy</strong> — one
+        example is a rough guess of the true slope, so the path zig-zags. Surprisingly, that noise is often
+        <em>helpful</em>: the jitter can bounce the network out of shallow bad valleys.</p>
+
+        <h4>Mini-batch gradient descent</h4>
+        <p><span class="term">Mini-batch gradient descent</span> is the practical sweet spot used by virtually all
+        modern deep learning. It computes the gradient over a small <strong>batch</strong> of examples (commonly
+        32, 64, 128, or 256) before stepping. You get most of the stability of batch GD <em>and</em> most of the
+        speed of SGD, plus it maps perfectly onto GPUs, which love crunching a batch of numbers in parallel.</p>
+
+        <div class="callout note">
+          <span class="c-title">Vocabulary: epoch, batch, iteration</span>
+          <p>One <span class="term">epoch</span> = one full pass over the training data. One
+          <span class="term">iteration</span> = one weight update (one batch). So with 10,000 examples and a
+          batch size of 100, one epoch = 100 iterations. Confusingly, people often say "SGD" to mean
+          "mini-batch SGD" — in practice almost nobody uses true one-example-at-a-time SGD.</p>
+        </div>
+
+        <h3>The speed / noise trade-off</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Variant</th><th>Data per step</th><th>Step speed</th><th>Path</th><th>In practice</th></tr></thead>
+            <tbody>
+              <tr><td>Batch</td><td>All N examples</td><td>Slow (rare steps)</td><td>Smooth, stable</td><td>Tiny datasets only</td></tr>
+              <tr><td>SGD (pure)</td><td>1 example</td><td>Very fast, very noisy</td><td>Zig-zags wildly</td><td>Rarely used as-is</td></tr>
+              <tr><td>Mini-batch</td><td>~32–256</td><td>Fast, mild noise</td><td>Mostly smooth</td><td><strong>The standard</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a mini-batch loop in code</span>
+          <pre><span class="kw">for</span> epoch <span class="kw">in</span> range(num_epochs):
+    <span class="kw">for</span> x_batch, y_batch <span class="kw">in</span> dataloader:   <span class="cm"># yields batches of, say, 64</span>
+        preds = model(x_batch)
+        loss  = loss_fn(preds, y_batch)
+
+        optimizer.zero_grad()             <span class="cm"># clear old gradients</span>
+        loss.backward()                   <span class="cm"># backprop (Session 4): fill .grad</span>
+        optimizer.step()                  <span class="cm"># w = w - lr * grad</span>
+</pre>
+          <p>Each <code class="inl">optimizer.step()</code> is one mini-batch update. Notice backprop (Session 4)
+          and the loss (Topics 1–2) are both right here, working together.</p>
+        </div>
+
+        <h3>Learning-rate intuition — too big vs. too small</h3>
+        <p>The learning rate is the single most important knob in all of training. Get it wrong and nothing else
+        matters.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Learning rate</th><th>What happens</th><th>Hill analogy</th></tr></thead>
+            <tbody>
+              <tr><td>Too small</td><td>Loss creeps down agonisingly slowly; may never finish or get stuck.</td><td>Baby steps — takes forever to reach the valley.</td></tr>
+              <tr><td>Just right</td><td>Loss drops steadily and settles near the minimum.</td><td>Confident strides straight downhill.</td></tr>
+              <tr><td>Too big</td><td>Loss bounces around or <strong>explodes to infinity (diverges)</strong>.</td><td>Giant leaps that overshoot the valley and fly up the far side.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out: diverging loss</span>
+          <p>If your loss shoots <strong>up</strong> or becomes <code class="inl">NaN</code>, the number-one suspect is
+          a learning rate that's too high. Cut it by 10× and try again. A typical starting point is
+          <code class="inl">0.001</code> for Adam (Topic 4) or <code class="inl">0.01–0.1</code> for plain SGD — but
+          you always tune it. Topic 5 shows how to <em>change</em> it during training for the best of both worlds.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Gradient descent steps downhill: <code class="inl">w = w − η·gradient</code>. <strong>Batch</strong> uses all
+          data (smooth but slow), <strong>SGD</strong> uses one example (fast but noisy), <strong>mini-batch</strong>
+          (~32–256) is the practical winner. The <strong>learning rate</strong> sets step size: too small = crawling,
+          too big = diverging, just right = steady descent.
+        </div>
+      </section>
+
+      <!-- ===================== 4. ADVANCED OPTIMIZERS ===================== -->
+      <section id="optimizers">
+        <h2><span class="sec-num">4</span> Advanced optimizers</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Plain gradient descent is like walking downhill one careful step at a time, forgetting every step the
+          moment you take it. But think about a <strong>ball rolling down a hill</strong>: it builds up speed, rolls
+          smoothly through little bumps, and doesn't get stuck in every tiny dip. The fancy optimizers in this
+          topic add exactly that kind of "memory" and "smarts" — momentum so the ball keeps rolling, and automatic
+          step-size tuning so it slows down on tricky terrain. <strong>Adam</strong> combines both and is the one
+          you'll reach for most.</p>
+        </div>
+
+        <p>Plain SGD has two weaknesses: it can crawl through long shallow valleys, and it uses the
+        <em>same</em> learning rate for every weight. These optimizers each fix a specific problem. They're all
+        drop-in replacements for the <code class="inl">optimizer</code> in our training loop.</p>
+
+        <h3>Momentum — keep rolling</h3>
+        <p><span class="term">Momentum</span> keeps a running average of past gradients (a "velocity") and steps in
+        that accumulated direction. Like a heavy ball, it powers through small bumps and flat patches and dampens
+        the zig-zag of SGD.</p>
+        <pre><span class="cm"># Momentum (β ≈ 0.9)</span>
+v = β * v + gradient
+w = w - η * v
+</pre>
+        <p><strong>Fixes:</strong> slow progress in long valleys and noisy zig-zagging — old gradients in the same
+        direction reinforce; conflicting ones cancel out.</p>
+
+        <h3>Nesterov momentum — look before you leap</h3>
+        <p><span class="term">Nesterov accelerated gradient</span> is a smarter momentum: it first jumps ahead in
+        the direction of the existing velocity, <em>then</em> measures the gradient <strong>at that lookahead
+        point</strong>. By "peeking" where it's about to land, it corrects course earlier and overshoots less.</p>
+        <pre><span class="cm"># Nesterov: gradient evaluated at the lookahead position (w + β·v)</span>
+v = β * v + gradient_at(w + β * v)
+w = w - η * v
+</pre>
+        <p><strong>Fixes:</strong> momentum's tendency to overshoot the bottom of a valley — the lookahead acts like
+        an early brake.</p>
+
+        <h3>RMSProp — a custom step size per weight</h3>
+        <p><span class="term">RMSProp</span> keeps a running average of the <em>squared</em> gradients for each
+        weight, then divides the step by the square root of that. Weights with consistently big gradients get
+        <strong>smaller</strong> steps; weights with tiny gradients get <strong>bigger</strong> ones. Every parameter
+        gets its own <span class="term">adaptive learning rate</span>.</p>
+        <pre><span class="cm"># RMSProp (β ≈ 0.9, ε tiny, e.g. 1e-8)</span>
+s = β * s + (<span class="nm">1</span> - β) * gradient²
+w = w - η * gradient / (sqrt(s) + ε)
+</pre>
+        <p><strong>Fixes:</strong> one global learning rate being wrong for differently-scaled weights; great on the
+        noisy, non-stationary objectives common in deep nets.</p>
+
+        <h3>Adam — momentum + RMSProp together</h3>
+        <p><span class="term">Adam</span> (Adaptive Moment Estimation) combines momentum (a running average of
+        gradients, the "first moment") <em>and</em> RMSProp (a running average of squared gradients, the "second
+        moment"). It's the <strong>default optimizer</strong> for most deep learning today because it just works with
+        little tuning.</p>
+        <p><strong>Fixes:</strong> essentially everything above at once — directional smoothing <em>and</em> per-weight
+        step sizes — plus a <span class="term">bias correction</span> step so the early updates (when the running
+        averages start at zero) aren't artificially tiny.</p>
+
+        <div class="callout example">
+          <span class="c-title">Pseudocode — the Adam update</span>
+          <pre><span class="cm"># Defaults: lr=0.001, β1=0.9, β2=0.999, ε=1e-8</span>
+m = <span class="nm">0</span>;  v = <span class="nm">0</span>;  t = <span class="nm">0</span>          <span class="cm"># m: momentum, v: RMS term</span>
+
+<span class="kw">for</span> each batch:
+    t = t + <span class="nm">1</span>
+    g = gradient_of_loss
+
+    m = β1 * m + (<span class="nm">1</span> - β1) * g       <span class="cm"># 1st moment (mean of grads)</span>
+    v = β2 * v + (<span class="nm">1</span> - β2) * g * g   <span class="cm"># 2nd moment (mean of squared grads)</span>
+
+    m_hat = m / (<span class="nm">1</span> - β1 ** t)       <span class="cm"># bias correction</span>
+    v_hat = v / (<span class="nm">1</span> - β2 ** t)
+
+    w = w - lr * m_hat / (sqrt(v_hat) + ε)
+</pre>
+          <p>The <code class="inl">m_hat / sqrt(v_hat)</code> shape is the whole trick: numerator = "which way" (momentum),
+          denominator = "how big a step is safe" (RMSProp). In PyTorch this entire algorithm is just
+          <code class="inl">optimizer = torch.optim.Adam(model.parameters(), lr=0.001)</code>.</p>
+        </div>
+
+        <h3>Comparison table</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Optimizer</th><th>Key idea</th><th>Problem it fixes</th><th>Adaptive LR?</th></tr></thead>
+            <tbody>
+              <tr><td>SGD</td><td>Step opposite the gradient</td><td>(baseline)</td><td>No</td></tr>
+              <tr><td>Momentum</td><td>Accumulate past gradients</td><td>Slow valleys, zig-zag</td><td>No</td></tr>
+              <tr><td>Nesterov</td><td>Momentum with a lookahead</td><td>Overshooting the minimum</td><td>No</td></tr>
+              <tr><td>RMSProp</td><td>Scale step by recent grad size</td><td>Wrong global step size</td><td>Yes (per-weight)</td></tr>
+              <tr><td><strong>Adam</strong></td><td>Momentum + RMSProp + bias fix</td><td>All of the above</td><td>Yes (per-weight)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>If you're unsure what to use, start with <strong>Adam at lr = 0.001</strong> — it's the robust default
+          and rarely embarrasses you. Well-tuned <strong>SGD + momentum</strong> can sometimes <em>generalise</em>
+          slightly better (especially in computer vision), which is why it's still popular for state-of-the-art
+          image models. Both are excellent; Adam is just more forgiving.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">You'll hear: AdamW</span>
+          <p><span class="term">AdamW</span> is a small but important fix to how Adam handles
+          <em>weight decay</em> (a regularization trick from Session 6). It's now the standard choice for training
+          large models like Transformers. Same Adam machinery, cleaner weight-decay handling.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Momentum</strong> rolls like a ball through bumps; <strong>Nesterov</strong> adds a lookahead to brake
+          early; <strong>RMSProp</strong> gives every weight its own step size; <strong>Adam</strong> combines momentum
+          + RMSProp + bias correction and is the go-to default (lr ≈ 0.001). Each fixes a specific weakness of plain SGD.
+        </div>
+      </section>
+
+      <!-- ===================== 5. LEARNING-RATE SCHEDULES ===================== -->
+      <section id="schedules">
+        <h2><span class="sec-num">5</span> Learning-rate schedules</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When you're far from home you walk in big, fast strides. As you get close to your front door, you
+          slow down and take small, careful steps so you don't overshoot it and bonk into the wall. A
+          <strong>learning-rate schedule</strong> does the same for training: take <em>big</em> steps early when
+          you're far from the answer, then <em>shrink</em> the steps as you close in, so you settle gently into the
+          lowest point instead of bouncing around it.</p>
+        </div>
+
+        <p>From Topic 3 we know a fixed learning rate forces a compromise: big enough to make progress, small
+        enough not to diverge. A <span class="term">learning-rate schedule</span> escapes that compromise by
+        <strong>changing the learning rate over time</strong> — typically starting larger and decaying it.</p>
+
+        <div class="bigidea">
+          <span class="c-title">Why scheduling helps</span>
+          <p>Early in training you're far from the minimum, so a <strong>large</strong> learning rate makes fast
+          progress. Late in training you're circling the bottom of the valley, where a large rate just bounces you
+          around — a <strong>small</strong> rate lets you fine-tune into the minimum. A schedule gives you both: speed
+          early, precision late.</p>
+        </div>
+
+        <h3>Step decay</h3>
+        <p><span class="term">Step decay</span> cuts the learning rate by a fixed factor every so many epochs — e.g.
+        multiply by 0.1 every 30 epochs. Simple, classic, and easy to reason about (it shows up as clean "stairs"
+        in a learning-rate plot).</p>
+        <pre><span class="cm"># step decay: drop by 10× every 30 epochs</span>
+lr = initial_lr * (<span class="nm">0.1</span> ** (epoch // <span class="nm">30</span>))
+<span class="cm"># epoch 0–29  -> 0.1</span>
+<span class="cm"># epoch 30–59 -> 0.01</span>
+<span class="cm"># epoch 60+   -> 0.001</span>
+</pre>
+
+        <h3>Cosine annealing</h3>
+        <p><span class="term">Cosine annealing</span> smoothly lowers the learning rate following a cosine curve from
+        the initial value down toward zero over training — fast at first, gentle near the end. No abrupt jumps, and
+        it's a favourite for modern models.</p>
+        <pre><span class="cm"># cosine annealing from lr_max to ~0 over T total steps</span>
+lr = lr_max * <span class="nm">0.5</span> * (<span class="nm">1</span> + cos(π * step / T))
+</pre>
+
+        <h3>Warmup</h3>
+        <p><span class="term">Warmup</span> does the opposite at the very start: it <em>ramps the learning rate up</em>
+        from near zero over the first few hundred or thousand steps, <em>then</em> hands off to decay. Why? At the
+        very beginning the weights are random and gradients are erratic; a big step immediately can destabilise
+        training (especially with Adam, whose moment estimates haven't warmed up yet). Warmup eases in gently. It's
+        nearly universal when training Transformers, and often paired with cosine decay ("warmup + cosine").</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📈</div><div class="s-t">Warmup</div><div class="s-d">Ramp lr UP from ~0</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏔️</div><div class="s-t">Peak</div><div class="s-d">Largest lr, fast learning</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📉</div><div class="s-t">Decay</div><div class="s-d">Cosine/step down toward 0</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Small example — schedule in code (PyTorch)</span>
+          <pre><span class="kw">import</span> torch
+
+optimizer = torch.optim.Adam(model.parameters(), lr=<span class="nm">0.001</span>)
+
+<span class="cm"># cosine annealing over 100 epochs</span>
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=<span class="nm">100</span>)
+
+<span class="kw">for</span> epoch <span class="kw">in</span> range(<span class="nm">100</span>):
+    train_one_epoch(model, optimizer)
+    scheduler.step()                 <span class="cm"># nudge the lr along the cosine curve</span>
+    <span class="kw">print</span>(epoch, scheduler.get_last_lr())
+</pre>
+          <p>Swap one line for a different policy: <code class="inl">StepLR(optimizer, step_size=30, gamma=0.1)</code>
+          for step decay, or <code class="inl">LinearLR</code> for a warmup ramp — schedules are decoupled from the
+          optimizer, so you can mix and match.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>A schedule does <strong>not</strong> rescue a bad starting learning rate — if your <em>peak</em> rate is too
+          high you'll still diverge in epoch 1. Pick a sane base rate first (Topic 3), <em>then</em> add a schedule to
+          refine it. Tools like a "learning-rate range test" can help you find a good peak.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A learning-rate schedule changes the step size over time: big early for speed, small late for precision.
+          <strong>Step decay</strong> drops in stairs; <strong>cosine annealing</strong> glides smoothly to ~0;
+          <strong>warmup</strong> ramps up at the start to stabilise early training. Schedules refine a good base rate —
+          they don't fix a bad one.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>These five topics are the complete "learning engine" of a neural network. Here's the one-paragraph
+        story that connects them:</p>
+        <div class="bigidea">
+          <p>A network learns by shrinking a single number, its <strong>loss</strong> — <strong>MSE</strong> for
+          predicting numbers, <strong>cross-entropy</strong> (with <strong>softmax</strong>) for picking categories. The loss
+          defines a landscape, and <strong>gradient descent</strong> walks downhill using the gradients that
+          backpropagation (Session 4) computed: all the data at once (batch), one example (SGD), or — in practice —
+          a <strong>mini-batch</strong>. How big each step is comes down to the <strong>learning rate</strong>, and smarter
+          <strong>optimizers</strong> like <strong>Momentum</strong>, <strong>RMSProp</strong>, and the all-rounder
+          <strong>Adam</strong> add memory and per-weight step sizes to make the descent faster and steadier. Finally a
+          <strong>learning-rate schedule</strong> — step decay, cosine annealing, or warmup — takes big strides early and
+          tiny ones late, settling the network gently into a good minimum. In Session 6 we'll see how
+          <strong>regularization</strong> keeps that minimum from overfitting.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What is a loss function, in one sentence?</summary>
+          <p class="ans">A formula that turns "how wrong is the prediction vs. the truth?" into a single
+          differentiable number that training tries to minimize.</p>
+        </details>
+        <details class="quiz">
+          <summary>You're predicting tomorrow's temperature. MSE or cross-entropy?</summary>
+          <p class="ans">MSE — it's a regression task (predicting a continuous number). Cross-entropy is for
+          classification (picking a category).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is mini-batch gradient descent the practical standard over batch and pure SGD?</summary>
+          <p class="ans">It balances the trade-off: nearly the stability of batch GD with nearly the speed of SGD,
+          and a batch of ~32–256 examples maps efficiently onto GPUs.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your loss suddenly explodes to NaN. What's the most likely culprit?</summary>
+          <p class="ans">A learning rate that's too high (the steps overshoot and diverge). Cut it by about 10× and retry.</p>
+        </details>
+        <details class="quiz">
+          <summary>What two ideas does Adam combine?</summary>
+          <p class="ans">Momentum (a running average of gradients — the direction) and RMSProp (a running average
+          of squared gradients — a per-weight adaptive step size), plus bias correction for the early steps.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use a learning-rate schedule instead of a fixed rate?</summary>
+          <p class="ans">To get speed early and precision late: a large rate makes fast progress when you're far
+          from the minimum, while shrinking it later lets you settle gently into the valley instead of bouncing.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>Your course handout: <strong>"SST Deep Learning handout (Session 5)"</strong> — the notes that accompany
+          this session, available through your class at <a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">priyanshsaxena.com/sst-deep-learning-nn</a>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">Adam: A Method for Stochastic Optimization (Kingma &amp; Ba, 2014)</a> — the original Adam paper; surprisingly readable and the source of the pseudocode in Topic 4.</li>
+          <li><a href="https://www.ruder.io/optimizing-gradient-descent/" target="_blank" rel="noopener">An overview of gradient descent optimization algorithms (Sebastian Ruder)</a> — the single best tour of SGD, momentum, Nesterov, RMSProp, Adam and friends, with clear math and intuition.</li>
+          <li><a href="https://cs231n.github.io/optimization-1/" target="_blank" rel="noopener">CS231n — Optimization notes (Stanford)</a> — Stanford's classic course notes on loss landscapes and gradient descent; excellent visual intuition.</li>
+          <li><a href="https://www.deeplearningbook.org/contents/optimization.html" target="_blank" rel="noopener">Deep Learning Book — Ch. 8: Optimization (Goodfellow, Bengio, Courville)</a> — the authoritative textbook chapter on training deep models, free online.</li>
+          <li><a href="https://pytorch.org/docs/stable/optim.html" target="_blank" rel="noopener">PyTorch <code class="inl">torch.optim</code> documentation</a> — official reference for every optimizer and learning-rate scheduler used in this session's code.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-4.html"><div class="dir">← Previous</div><div class="ttl">Session 4: Backpropagation</div></a>
+        <a class="next" href="session-6.html"><div class="dir">Next →</div><div class="ttl">Session 6: Regularization</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 5 — Loss Functions &amp; Optimization · You taught the network how to learn 🎯</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

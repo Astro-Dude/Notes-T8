@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 3 — The Storage Engine: Heap Files &amp; Free Space</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 3</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 03 · Storage Engine — Heap Files</span>
+      <h1>The Storage Engine — Heap Files &amp; Free Space</h1>
+      <p class="lead">
+        Welcome back! In Session 2 we cracked open a single page and saw how rows are packed into it
+        with a slotted layout. Today we zoom out one level: how does the database glue thousands of
+        those pages together into a whole <em>table</em>, find a page with room to insert a new row,
+        handle records that grow too big to fit, and clean up the mess left behind when you delete or
+        update data? We assume you've studied <em>none</em> of this before. Every topic starts with a
+        tiny "explain like I'm 5" story, then we go deeper with real diagrams, examples, and code.
+        Take it slow — by the end you'll understand exactly where your rows physically live.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#heap">Heap file organization</a></li>
+          <li><a href="#freespace">Free space management</a></li>
+          <li><a href="#varlen">Variable-length records &amp; overflow</a></li>
+          <li><a href="#deletes">Deletes, updates &amp; vacuum</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. HEAP FILES ===================== -->
+      <section id="heap">
+        <h2><span class="sec-num">1</span> Heap file organization</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a big toy box. When you get a new toy, you don't carefully sort it — you just toss
+          it wherever there's space. The toys aren't in any order; they're just <strong>all in the box</strong>.
+          If your mum asks "is your red car in there?", the only way to be sure is to dump everything out
+          and look at every toy. A <strong>heap file</strong> is the database's toy box: it stores your rows
+          wherever there's room, in no particular order.</p>
+        </div>
+
+        <p>Recall from Session 2 that the database stores data in fixed-size <span class="term">pages</span>
+        (usually 4&nbsp;KB or 8&nbsp;KB), and that within a page, rows live in a slotted layout. But a table
+        like <code class="inl">users</code> has way more rows than fit in one page. So the database needs a
+        way to organize <em>many</em> pages into one logical table. The simplest and most common way is a
+        <span class="term">heap file</span>.</p>
+
+        <p>A <span class="term">heap file</span> is an <strong>unordered collection of pages</strong> where rows
+        (also called <span class="term">tuples</span>) are stored with no sorting and no relationship between
+        their physical position and their values. New rows simply go wherever there's free space. The name has
+        nothing to do with the "heap" data structure from algorithms class — here it just means "an unsorted
+        pile."</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A table is not one giant blob — it's a <strong>collection of fixed-size pages</strong>. The storage
+          engine's job is to track which pages belong to the table, where each one is, and which ones still have
+          room. A heap file is the bookkeeping that turns a pile of pages into a table.</p>
+        </div>
+
+        <h3>Two ways to organize the pages</h3>
+        <p>If a table is just "a set of pages," the engine still needs to <em>find</em> them on disk. There are
+        two classic designs, and real systems generally use the second.</p>
+
+        <h4>Option A — Linked list of pages</h4>
+        <p>The database keeps a special <span class="term">header page</span> with two pointers: one to the first
+        page that has free space, and one to the first full page. Every data page then stores a pointer to the
+        next page, forming a chain — like a treasure hunt where each clue points to the next.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📋</div><div class="s-t">Header page</div><div class="s-d">points to first page</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Page 1</div><div class="s-d">rows + next ptr</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Page 2</div><div class="s-d">rows + next ptr</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Page 3</div><div class="s-d">next = null</div></div>
+        </div>
+
+        <p>This works, but it's clumsy. To find a page with free space you might have to walk the whole chain,
+        following pointer after pointer — slow when a table has millions of pages.</p>
+
+        <h4>Option B — Page directory</h4>
+        <p>A smarter design keeps a <span class="term">page directory</span>: special directory pages that hold an
+        <em>array</em> of entries, one per data page. Each entry records the page's location (its
+        <span class="term">page number</span>) and how much free space it currently has. To find room for a new
+        row, the engine just scans this compact directory instead of every data page.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Directory entry</th><th>Page #</th><th>Free space</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>page 0</td><td>120 bytes</td></tr>
+              <tr><td>1</td><td>page 1</td><td>0 bytes (full)</td></tr>
+              <tr><td>2</td><td>page 2</td><td>3,900 bytes</td></tr>
+              <tr><td>3</td><td>page 3</td><td>512 bytes</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">What real systems do</span>
+          <p>PostgreSQL stores each table as one or more <span class="term">heap files</span> on disk (literally
+          files named by an object ID) and tracks free space in a separate structure we'll meet in Topic 2.
+          SQL Server, Oracle, and others use page-directory-style structures. The linked-list design is mostly a
+          teaching baseline — the directory wins in practice because it makes "find a page with room" fast.</p>
+        </div>
+
+        <h3>How a full-table scan works</h3>
+        <p>Because a heap is unordered, the only way to answer a query that <em>can't</em> use an index — say
+        <code class="inl">SELECT * FROM users WHERE age &gt; 30</code> with no index on <code class="inl">age</code>
+        — is a <span class="term">full-table scan</span> (also called a <span class="term">sequential scan</span>):
+        read <strong>every</strong> page, look at <strong>every</strong> row, and keep the ones that match. It's the
+        toy-box dump-and-look from our story.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: scanning the users table</span>
+          <p>Say <code class="inl">users</code> has 4 pages. Here's the pseudocode the engine effectively runs for
+          a sequential scan:</p>
+          <pre><span class="cm"># Full-table scan over a heap file</span>
+matches = []
+<span class="kw">for</span> page_id <span class="kw">in</span> heap.all_pages():        <span class="cm"># walk every page in the heap</span>
+    page = buffer_pool.fetch(page_id)    <span class="cm"># load it into memory (Session 4!)</span>
+    <span class="kw">for</span> slot <span class="kw">in</span> page.slots():           <span class="cm"># walk every slot in the page</span>
+        <span class="kw">if</span> slot.is_live():               <span class="cm"># skip deleted/empty slots</span>
+            row = page.read(slot)
+            <span class="kw">if</span> row.age &gt; <span class="nm">30</span>:             <span class="cm"># apply the WHERE filter</span>
+                matches.append(row)
+<span class="kw">return</span> matches</pre>
+          <p>Cost is roughly <strong>O(N)</strong> in the number of pages — read all of them, every time. For a
+          1-million-row table that's brutal. This is exactly the pain that <strong>indexes</strong> (a later
+          session) exist to solve: they let you jump to the right pages instead of reading them all.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A heap stores rows in <em>insertion-driven</em>, unordered fashion — great for fast inserts, but any
+          lookup with no index degenerates into reading the entire table. The page directory makes
+          <em>writes</em> fast (quickly find a page with room); it does nothing for <em>reads</em> that filter on
+          a column — those still scan everything.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A heap file is an unordered pile of fixed-size pages making up one table. The engine finds pages via a
+          linked list (simple, slow) or a page directory (an array of page → free-space entries, fast). Because
+          rows aren't sorted, an unindexed query becomes a full-table scan that reads every page — O(N).
+        </div>
+      </section>
+
+      <!-- ===================== 2. FREE SPACE ===================== -->
+      <section id="freespace">
+        <h2><span class="sec-num">2</span> Free space management</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a parking garage with hundreds of floors. You're driving in with a car and you want a spot
+          <em>fast</em> — you don't want to drive up every floor checking. So at the entrance there's a board:
+          "Floor 1: full. Floor 2: 3 spots. Floor 3: 1 spot." You glance at the board, pick a floor with room,
+          and go straight there. A database keeps a board exactly like this so it can instantly find a page with
+          enough room for your new row.</p>
+        </div>
+
+        <p>Every time you <code class="inl">INSERT</code> a row, the engine must answer one question: <strong>which
+        page has enough free space to hold it?</strong> Scanning every page to find out would be far too slow, so
+        databases keep a dedicated structure that tracks free space.</p>
+
+        <h3>The free space map</h3>
+        <p>A <span class="term">free space map (FSM)</span> is a compact index that records, for each page, roughly
+        how many bytes are free. It's the "parking board." The page directory from Topic 1 is one way to implement
+        it; PostgreSQL keeps a separate small file (the <code class="inl">_fsm</code> fork) shaped as a tree so it
+        can find a page with enough room in <strong>O(log&nbsp;N)</strong> instead of scanning.</p>
+
+        <div class="callout note">
+          <span class="c-title">PostgreSQL's FSM, concretely</span>
+          <p>Postgres stores free space as a number from 0–255 per page (a rounded "how many bytes free" value,
+          so the map stays tiny). The FSM is organized as a tree: upper nodes summarize the max free space below
+          them, so a search can prune whole branches. It's <em>approximate</em> on purpose — being slightly stale
+          is fine, because the engine re-checks the real page before writing.</p>
+        </div>
+
+        <h3>Finding a page to insert into</h3>
+        <p>Here's the decision the storage engine makes on every insert:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">1. Need room</div><div class="s-d">row is 200 bytes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗺️</div><div class="s-t">2. Ask the FSM</div><div class="s-d">page with ≥ 200 free?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">3a. Found</div><div class="s-d">insert into that page</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">3b. None</div><div class="s-d">append a brand-new page</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: inserting with an FSM</span>
+          <p>Suppose page size is 8,192 bytes and the FSM currently says:</p>
+          <pre><span class="cm"># Free space map snapshot (bytes free per page)</span>
+page 0 -&gt; <span class="nm">0</span>      <span class="cm"># full</span>
+page 1 -&gt; <span class="nm">40</span>     <span class="cm"># almost full</span>
+page 2 -&gt; <span class="nm">512</span>
+page 3 -&gt; <span class="nm">7000</span>
+
+<span class="cm"># INSERT a 200-byte row:</span>
+target = fsm.find_page(<span class="nm">200</span>)    <span class="cm"># first page with &gt;= 200 free</span>
+<span class="cm"># skips page 0 (0) and page 1 (40), picks page 2 (512)</span>
+page2.insert(row)                <span class="cm"># now ~312 bytes free</span>
+fsm.update(page=<span class="nm">2</span>, free=<span class="nm">312</span>)   <span class="cm"># keep the map current</span></pre>
+          <p>The engine never touched pages 0, 1, or 3 — it went straight to page 2. That's the whole point of the
+          map: turn "find room" from an O(N) scan into a quick lookup.</p>
+        </div>
+
+        <h3>Fragmentation — why pages get messy</h3>
+        <p>Over time, inserts, deletes, and updates leave pages with awkward gaps. There are two flavors of
+        wasted space:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>What it is</th><th>Picture</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Internal fragmentation</span></td><td>A page has free bytes scattered between live rows, but no single hole big enough for a new row.</td><td>[row][gap][row][gap] — 300 free total, but in 50-byte pieces.</td></tr>
+              <tr><td><span class="term">External fragmentation</span></td><td>Many pages are each only partly full, so the table spans more pages than its data really needs.</td><td>Lots of half-empty pages = wasted disk &amp; slower scans.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Recall the slotted-page layout from Session 2: rows are added from one end and the slot array grows from
+        the other. When a row is deleted, its bytes become a hole. The engine can <strong>compact</strong> a page —
+        slide the remaining rows together to merge the holes into one contiguous free region — so a new row can
+        fit. The slot array means it can do this without breaking any external pointers (more on that in Topic 4).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>The FSM is <strong>approximate and can be stale</strong>. If it claims a page has 200 bytes free but the
+          space is fragmented into tiny holes, the insert into that page fails and the engine has to try another.
+          Slightly-wrong-but-fast beats perfectly-accurate-but-slow here — correctness is rechecked at write time,
+          so a stale map only ever costs a retry, never a corrupted row.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A free space map tracks roughly how much room each page has, so an insert can find a home in O(log N)
+          instead of scanning. PostgreSQL uses an approximate tree-shaped FSM. Over time pages suffer internal
+          (holes within a page) and external (many half-empty pages) fragmentation; compaction slides rows together
+          to reclaim contiguous space.
+        </div>
+      </section>
+
+      <!-- ===================== 3. VARIABLE-LENGTH RECORDS ===================== -->
+      <section id="varlen">
+        <h2><span class="sec-num">3</span> Variable-length records &amp; overflow</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your school cubby is exactly big enough for your normal stuff. One day you bring a giant
+          poster that won't fit. You don't get a bigger cubby — instead you put a sticky note in your cubby that
+          says "my poster is in the big storage room, shelf 7," and the poster lives in the storage room. Your
+          cubby stays neat, and you can still find the poster from the note. Databases do the same with values too
+          big to fit on a page.</p>
+        </div>
+
+        <p>Many columns are <span class="term">variable-length</span>: a <code class="inl">VARCHAR</code>,
+        <code class="inl">TEXT</code>, <code class="inl">JSON</code>, or <code class="inl">BLOB</code> can be a few
+        bytes or a few megabytes. From Session 2 you know a slotted page handles variable-length rows by storing,
+        in each slot, an <em>offset</em> and <em>length</em> pointing at where the row's bytes live in the page.
+        That's fine — until a value is too big to fit on a single page at all.</p>
+
+        <h3>Records that grow and shrink</h3>
+        <p>When you <code class="inl">UPDATE</code> a row and a variable-length column gets <strong>longer</strong>,
+        the row may no longer fit in its current spot. Two things can happen:</p>
+        <ul>
+          <li><strong>It still fits in the page:</strong> the engine compacts the page to make a big-enough hole and
+          rewrites the row there, updating its slot's offset.</li>
+          <li><strong>It no longer fits in the page:</strong> the engine moves the row to a different page entirely
+          and leaves a <span class="term">forwarding pointer</span> behind — covered in detail in Topic 4.</li>
+        </ul>
+        <p>When a value <strong>shrinks</strong>, the freed bytes become a hole, recovered later by compaction.</p>
+
+        <h3>The hard case: values bigger than a page</h3>
+        <p>If a single column value is larger than a page (e.g. a 2&nbsp;MB document in a 8&nbsp;KB page), it
+        physically cannot live inline. Databases use <span class="term">overflow pages</span>: the big value is
+        stored on one or more extra pages, and the main row keeps only a small pointer to them.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Main page</div><div class="s-d">row: id, name, ptr→</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Overflow page 1</div><div class="s-d">first chunk + next ptr</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Overflow page 2</div><div class="s-d">remaining chunk</div></div>
+        </div>
+
+        <h3>TOAST — PostgreSQL's take</h3>
+        <p>PostgreSQL calls this mechanism <span class="term">TOAST</span> (<em>The Oversized-Attribute Storage
+        Technique</em>). Because a Postgres row must fit within a single 8&nbsp;KB page, when a row gets too big the
+        engine springs into action on the large variable-length columns, in this order:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Step</th><th>What TOAST does</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>1. Compress</td><td>Try to compress big values in place first.</td><td>Often shrinks the row enough to fit — cheapest fix.</td></tr>
+              <tr><td>2. Move out-of-line</td><td>If still too big, store the value in a separate hidden <em>TOAST table</em>, split into ~2&nbsp;KB chunks.</td><td>The main row keeps only a small pointer.</td></tr>
+              <tr><td>3. Repeat</td><td>Keep compressing/moving columns until the main row fits in the page.</td><td>Guarantees the row fits the 8&nbsp;KB limit.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a fat row goes on a diet</span>
+          <p>You insert a blog post:</p>
+          <pre><span class="kw">CREATE TABLE</span> posts (
+    id    <span class="kw">INT</span>,
+    title <span class="kw">VARCHAR</span>(<span class="nm">200</span>),
+    body  <span class="kw">TEXT</span>          <span class="cm">-- could be 1 MB!</span>
+);
+
+<span class="kw">INSERT INTO</span> posts <span class="kw">VALUES</span>
+    (<span class="nm">1</span>, <span class="st">'Hello'</span>, <span class="st">'... 1,000,000 chars of text ...'</span>);</pre>
+          <p>The 1&nbsp;MB <code class="inl">body</code> can't fit in an 8&nbsp;KB page. So PostgreSQL:</p>
+          <ul>
+            <li>Compresses <code class="inl">body</code> (say, down to 300&nbsp;KB).</li>
+            <li>Still too big → splits it into ~2&nbsp;KB chunks and writes them to the post table's TOAST table.</li>
+            <li>The main <code class="inl">posts</code> row now stores just <code class="inl">id</code>,
+            <code class="inl">title</code>, and a tiny <span class="term">TOAST pointer</span> (a few bytes) to the
+            chunks.</li>
+          </ul>
+          <p>The beautiful side effect: a query that only reads <code class="inl">id</code> and
+          <code class="inl">title</code> never touches the TOAST table at all — so it stays fast even though
+          <code class="inl">body</code> is huge. The big value is only fetched (and decompressed) when you
+          actually <code class="inl">SELECT body</code>.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Keep rows small and uniform on the main page; push oversized values out-of-line and leave a pointer.
+          This keeps scans fast (more rows per page, less to read) and lets the page layout stay simple. Overflow
+          pages and TOAST are the same idea: <em>"big things live elsewhere; the row holds a sticky note."</em></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Variable-length values are stored with offset+length in the slot. When a value grows past the page, it's
+          pushed to overflow pages with a pointer in the row. PostgreSQL's TOAST compresses big columns, then moves
+          them to a hidden TOAST table in ~2 KB chunks, keeping the main row under 8 KB — so queries that skip the
+          big column stay cheap.
+        </div>
+      </section>
+
+      <!-- ===================== 4. DELETES & UPDATES ===================== -->
+      <section id="deletes">
+        <h2><span class="sec-num">4</span> Deletes, updates &amp; vacuum</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When you "delete" a contact on your phone, the phone often doesn't truly erase it right away — it just
+          <strong>crosses it out</strong> so it won't show up, and actually wipes it later when it tidies up.
+          Crossing out is instant; truly erasing and re-packing everything is slow, so the phone batches that for
+          later. Databases delete rows the same lazy way — and then run a "tidy-up" job to reclaim the space.</p>
+        </div>
+
+        <h3>Logical vs physical deletion</h3>
+        <p>There are two very different meanings of "delete":</p>
+        <ul>
+          <li><span class="term">Logical deletion</span> — mark the row as dead but leave its bytes in place. Fast,
+          and safe for concurrent readers who might still need the old version.</li>
+          <li><span class="term">Physical deletion</span> — actually reclaim the bytes so the space can be reused.
+          Slower, done later.</li>
+        </ul>
+
+        <p>The marker left by a logical delete is called a <span class="term">tombstone</span>: a flag (often a
+        single bit, or in MVCC systems a transaction id) that says "this row is no longer live; skip it." Look back
+        at the scan pseudocode in Topic 1 — the <code class="inl">slot.is_live()</code> check is exactly what skips
+        tombstoned rows.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why not delete immediately? (MVCC)</span>
+          <p>In <span class="term">MVCC</span> (Multi-Version Concurrency Control — used by PostgreSQL, MySQL/InnoDB,
+          Oracle), a <code class="inl">DELETE</code> doesn't remove the row; it marks the version as expired as of
+          your transaction. Older transactions that started <em>before</em> your delete can still see the old
+          version — so the row's bytes must linger until no transaction needs them. We'll explore MVCC properly in
+          a later session; for now just know it's <em>why</em> deletes are lazy.</p>
+        </div>
+
+        <h3>Why we need vacuum / compaction</h3>
+        <p>All those tombstoned, dead rows are <span class="term">dead tuples</span> — bytes that are logically gone
+        but still physically occupying pages. Left alone they cause <span class="term">bloat</span>: the table grows
+        on disk and scans get slower because they wade through dead rows. The cleanup job is called
+        <span class="term">vacuum</span> (PostgreSQL's name) or, more generally, <span class="term">compaction</span>.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">VACUUM</code></td><td>Marks dead-tuple space as reusable for future inserts and updates the free space map. The file usually doesn't shrink — it's recycled in place.</td></tr>
+              <tr><td><code class="inl">VACUUM FULL</code></td><td>Rewrites the whole table compactly into a new file, actually returning disk space to the OS — but it locks the table, so it's heavyweight.</td></tr>
+              <tr><td>Autovacuum</td><td>A background daemon that runs VACUUM automatically when a table accumulates enough dead tuples, so you rarely run it by hand.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How an update can move a tuple</h3>
+        <p>An <code class="inl">UPDATE</code> is conceptually a delete-plus-insert. In MVCC systems it literally
+        writes a <strong>new version</strong> of the row and tombstones the old one. Two cases matter:</p>
+        <ul>
+          <li><strong>New version fits on the same page:</strong> great — it's written nearby, old version becomes a
+          dead tuple for vacuum to clean.</li>
+          <li><strong>New version doesn't fit (e.g. a column grew):</strong> the new version goes to a
+          <em>different</em> page, and the old slot is replaced with a <span class="term">forwarding pointer</span>
+          (PostgreSQL: a <em>redirect</em> in the page's item array) that says "the current row is over <em>there</em>."</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why forwarding pointers exist</span>
+          <p>Indexes (a later session) point at rows by a physical address — in PostgreSQL a
+          <span class="term">TID</span> = (page number, slot number). If an update physically moved the row, every
+          index pointing at it would break. The forwarding pointer lets the row move while the <em>old</em> address
+          still works: a lookup lands on the old slot, sees the redirect, and hops to the new location. (Postgres's
+          HOT — Heap-Only Tuple — optimization avoids even touching indexes when no indexed column changed.)</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: an update that moves a row</span>
+          <p>Start with a tiny <code class="inl">products</code> heap. Row for product 42 lives at TID (page 5,
+          slot 2):</p>
+          <pre><span class="cm"># Page 5, before:</span>
+slot 0 -&gt; (id=10, name=<span class="st">"Pen"</span>)
+slot 1 -&gt; (id=20, name=<span class="st">"Mug"</span>)
+slot 2 -&gt; (id=42, name=<span class="st">"Hat"</span>)        <span class="cm"># &lt;- we will update this</span>
+
+<span class="kw">UPDATE</span> products
+   <span class="kw">SET</span> name = <span class="st">'Wide-brim summer straw hat, limited edition'</span>
+ <span class="kw">WHERE</span> id = <span class="nm">42</span>;</pre>
+          <p>The new, longer name no longer fits in page 5's free space. The engine writes the new version to page
+          9, slot 0, and turns the old slot into a redirect:</p>
+          <pre><span class="cm"># Page 5, after:</span>
+slot 0 -&gt; (id=10, name=<span class="st">"Pen"</span>)
+slot 1 -&gt; (id=20, name=<span class="st">"Mug"</span>)
+slot 2 -&gt; REDIRECT to (page 9, slot 0)   <span class="cm"># forwarding pointer</span>
+
+<span class="cm"># Page 9, after:</span>
+slot 0 -&gt; (id=42, name=<span class="st">"Wide-brim summer straw hat, limited edition"</span>)</pre>
+          <p>An index entry pointing at (page 5, slot 2) still works: the reader lands there, sees the redirect, and
+          follows it to (page 9, slot 0). Later, <code class="inl">VACUUM</code> can clean up the chain. If too many
+          rows forward this way, lookups slow down (an extra hop each), which is one more reason vacuum and
+          occasional <code class="inl">VACUUM FULL</code> matter.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>A workload with heavy updates/deletes and <strong>no</strong> vacuuming leads to runaway
+          <em>bloat</em>: the table balloons with dead tuples and forwarding chains, queries crawl, and disk fills
+          up. This is a real production incident, not a theoretical worry — autovacuum tuning exists precisely to
+          prevent it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deletes are logical first (a tombstone marks the row dead) and physical later. MVCC keeps old versions
+          around for concurrent readers, creating dead tuples that vacuum/compaction reclaim (VACUUM recycles space;
+          VACUUM FULL shrinks the file). An update writes a new version and, if it no longer fits, moves the row,
+          leaving a forwarding pointer so existing index addresses still resolve.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a database turns a pile of pages into a living, breathing table. Here's the
+        one-paragraph story that connects all four topics:</p>
+        <div class="bigidea">
+          <p>A table is a <strong>heap file</strong> — an unordered collection of fixed-size pages, located via a
+          <strong>page directory</strong> (or a linked list). Because it's unordered, any unindexed query becomes a
+          <strong>full-table scan</strong> that reads every page. To insert quickly, the engine consults a
+          <strong>free space map</strong> to find a page with room in O(log N), fighting the
+          <strong>fragmentation</strong> that builds up over time. Values too big for a page are pushed to
+          <strong>overflow pages</strong> — PostgreSQL's <strong>TOAST</strong> compresses them and stores them
+          out-of-line in chunks, keeping the main row small. Deletes are <strong>logical</strong> (a
+          <strong>tombstone</strong>) before they're physical, leaving <strong>dead tuples</strong> that
+          <strong>vacuum/compaction</strong> reclaim; and an <strong>update</strong> that no longer fits moves the
+          row and leaves a <strong>forwarding pointer</strong> so index addresses still resolve. Next session we
+          stop assuming pages are "just there" and look at the <strong>buffer pool</strong> — how pages move between
+          disk and memory.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does an unindexed <code class="inl">WHERE</code> query on a heap require a full-table scan?</summary>
+          <p class="ans">Because a heap stores rows in no particular order, there's no shortcut to the matching
+          rows — the engine must read every page and check every live row. That's O(N) in the number of pages.</p>
+        </details>
+        <details class="quiz">
+          <summary>What problem does a free space map solve, and what's its rough complexity?</summary>
+          <p class="ans">It lets an insert quickly find a page with enough room without scanning every page.
+          PostgreSQL's tree-shaped FSM finds a suitable page in about O(log N). It's approximate, so a stale entry
+          only ever costs a retry.</p>
+        </details>
+        <details class="quiz">
+          <summary>A row has a 1 MB <code class="inl">TEXT</code> column but pages are 8 KB. What happens?</summary>
+          <p class="ans">It can't fit inline, so it goes out-of-line. PostgreSQL's TOAST compresses the value, then
+          (if still too big) splits it into ~2 KB chunks stored in a hidden TOAST table, leaving only a small
+          pointer in the main row. Queries that don't read that column never touch the TOAST table.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's a tombstone, and why don't databases delete rows immediately?</summary>
+          <p class="ans">A tombstone is a marker that flags a row as logically deleted without erasing its bytes.
+          Under MVCC, older transactions may still need the old version, so the bytes linger as a dead tuple until
+          no transaction needs them — then vacuum reclaims the space.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a database leave a forwarding pointer when an update moves a row to another page?</summary>
+          <p class="ans">Indexes reference rows by physical address (e.g. PostgreSQL's TID = page + slot). If the row
+          physically moved, those addresses would break. The forwarding pointer keeps the old address valid: a
+          lookup lands on the old slot, sees the redirect, and hops to the new location.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is bloat, and what fixes it?</summary>
+          <p class="ans">Bloat is accumulated dead tuples (and forwarding chains) that swell a table and slow scans.
+          VACUUM marks that space reusable and updates the FSM; VACUUM FULL rewrites the table to actually shrink it
+          on disk. Autovacuum runs VACUUM automatically.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 3 — Storage Engine 2 — the class handout that accompanies this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems</a> — Andy Pavlo's renowned course; the storage / heap-file / page-layout lectures are the gold-standard intro to everything in this session.</li>
+          <li><a href="https://www.postgresql.org/docs/current/storage-toast.html" target="_blank" rel="noopener">PostgreSQL docs — TOAST</a> — the official, authoritative description of how PostgreSQL compresses and stores oversized attributes out-of-line (Topic 3).</li>
+          <li><a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" target="_blank" rel="noopener">PostgreSQL docs — Routine Vacuuming</a> — explains dead tuples, bloat, VACUUM vs VACUUM FULL, and autovacuum (Topic 4).</li>
+          <li><a href="https://www.postgresql.org/docs/current/storage-page-layout.html" target="_blank" rel="noopener">PostgreSQL docs — Database Page Layout</a> — how a heap page, item pointers, and TIDs/redirects actually look on disk; ties Topic 1 and Topic 4 together.</li>
+          <li><a href="https://www.postgresql.org/docs/current/storage-fsm.html" target="_blank" rel="noopener">PostgreSQL docs — Free Space Map</a> — the precise design of the FSM fork behind Topic 2.</li>
+          <li><a href="https://www.databass.dev/" target="_blank" rel="noopener">Alex Petrov — "Database Internals"</a> — an excellent book whose storage-engine chapters cover heap files, slotted pages, and overflow in depth.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-2.html"><div class="dir">← Previous</div><div class="ttl">Session 2: Storage Engine</div></a>
+        <a class="next" href="session-4.html"><div class="dir">Next →</div><div class="ttl">Session 4: Buffer Pool</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 3 — The Storage Engine: Heap Files &amp; Free Space · You now know exactly where your rows live 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

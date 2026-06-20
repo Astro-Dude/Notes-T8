@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 12 — Transactions — ACID &amp; Isolation</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 12</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 12 · Transactions</span>
+      <h1>Transactions — how databases keep promises</h1>
+      <p class="lead">
+        Today we learn what happens when a database has to do several things that <em>all</em> have to
+        succeed together — like moving money between two accounts. We assume you've studied <em>none</em>
+        of this before. Each topic opens with a tiny "explain like I'm 5" story, then we go deeper with
+        real schedules, tables and SQL. By the end you'll understand <strong>ACID</strong>, the sneaky
+        bugs that appear when many users hit the database at once, the <strong>isolation levels</strong>
+        that tame them, and the theory (<strong>serializability</strong> and <strong>2PL</strong>) that
+        makes it all provably correct.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 18 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#acid">What a transaction is &amp; ACID</a></li>
+          <li><a href="#anomalies">Concurrency anomalies</a></li>
+          <li><a href="#isolation">Isolation levels</a></li>
+          <li><a href="#serial">Serializability &amp; 2PL</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. ACID ===================== -->
+      <section id="acid">
+        <h2><span class="sec-num">1</span> What a transaction is &amp; ACID</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you give your friend $10 by taking a $10 note out of your piggy bank and putting it
+          into theirs. There's a scary half-second where the note is <strong>in neither bank</strong> —
+          it's in your hand. If a magpie swooped down and stole it right then, $10 would just <em>vanish</em>.
+          A transaction is a magic rule that says: <strong>either the whole move happens, or none of it
+          does</strong> — there is no in-between where the money disappears. The database makes that promise
+          for you.</p>
+        </div>
+
+        <p>A <span class="term">transaction</span> is a group of database operations (reads and writes)
+        that the database treats as <strong>one single, indivisible unit of work</strong>. In SQL you mark
+        its boundaries explicitly:</p>
+
+        <pre><span class="kw">BEGIN</span>;                                   <span class="cm">-- start the transaction</span>
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="nm">10</span> <span class="kw">WHERE</span> id = <span class="st">'alice'</span>;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="nm">10</span> <span class="kw">WHERE</span> id = <span class="st">'bob'</span>;
+<span class="kw">COMMIT</span>;                                  <span class="cm">-- make it permanent (or ROLLBACK to undo everything)</span></pre>
+
+        <p>Everything between <code class="inl">BEGIN</code> and <code class="inl">COMMIT</code> succeeds
+        together or is thrown away together. To make this precise, databases promise four properties whose
+        initials spell <span class="term">ACID</span>.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Letter</th><th>Property</th><th>Promise in plain English</th></tr></thead>
+            <tbody>
+              <tr><td>A</td><td><span class="term">Atomicity</span></td><td>All-or-nothing. Every statement in the transaction happens, or none does. ("Atom" = indivisible.)</td></tr>
+              <tr><td>C</td><td><span class="term">Consistency</span></td><td>The transaction moves the database from one <em>valid</em> state to another — all rules (constraints, types, foreign keys) still hold afterwards.</td></tr>
+              <tr><td>I</td><td><span class="term">Isolation</span></td><td>Concurrent transactions don't step on each other. Each one behaves as if it ran alone.</td></tr>
+              <tr><td>D</td><td><span class="term">Durability</span></td><td>Once committed, the change survives — even a power cut a millisecond later won't lose it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Walking through ACID with the bank transfer</h3>
+        <p>Let's use Alice sending Bob $10 (the two UPDATEs above) to feel each letter:</p>
+        <ul>
+          <li><strong>Atomicity</strong> — if the database crashes <em>after</em> debiting Alice but
+          <em>before</em> crediting Bob, atomicity guarantees the debit is undone on restart. Money never
+          evaporates. The mechanism that allows undo/redo is the <span class="term">write-ahead log (WAL)</span>,
+          which we touch on again in the recovery session.</li>
+          <li><strong>Consistency</strong> — suppose there's a rule "total money in the system never changes."
+          The transfer removes $10 and adds $10, so the total is preserved. If a constraint would be violated
+          (e.g. Alice's balance can't go negative), the transaction is rejected and rolled back.</li>
+          <li><strong>Isolation</strong> — if Carol is reading the total balances at the same instant, she must
+          <em>not</em> see the moment where $10 has left Alice but not yet reached Bob. To her it should look
+          like the transfer either fully happened or hasn't started.</li>
+          <li><strong>Durability</strong> — once the bank's app says "Transfer complete," that money has moved
+          for good. Pulling the plug won't bring it back to Alice.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: why partial execution is dangerous</span>
+          <p>Without atomicity, picture the crash happening between the two UPDATEs:</p>
+          <pre><span class="cm">-- Step 1 runs and is saved:</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="nm">10</span> <span class="kw">WHERE</span> id = <span class="st">'alice'</span>;   <span class="cm">-- Alice: 100 -&gt; 90</span>
+
+<span class="cm">*** POWER FAILURE ***  (Bob's credit never runs)</span>
+
+<span class="cm">-- Bob still has his old balance:                            Bob:   50 (unchanged)</span></pre>
+          <p>Now $10 has simply <strong>disappeared</strong> from the system. Total money dropped from 150 to 140.
+          A transaction prevents exactly this: on restart the database reads its log, sees the transfer never
+          committed, and <strong>rolls back</strong> Alice's debit so she's back to 100. All-or-nothing saves the day.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A transaction bundles several operations into one unit so that partially-completed work can never
+          be observed or left behind. ACID is the four-part contract the database signs: <strong>A</strong>tomic
+          (all-or-nothing), <strong>C</strong>onsistent (rules always hold), <strong>I</strong>solated (as if
+          alone), <strong>D</strong>urable (survives crashes).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A transaction is one indivisible unit of work bounded by <code class="inl">BEGIN</code> …
+          <code class="inl">COMMIT</code>/<code class="inl">ROLLBACK</code>. ACID = Atomicity, Consistency,
+          Isolation, Durability. Atomicity is what stops the bank transfer from "losing" money when a crash
+          happens mid-way — the danger of partial execution.
+        </div>
+      </section>
+
+      <!-- ===================== 2. ANOMALIES ===================== -->
+      <section id="anomalies">
+        <h2><span class="sec-num">2</span> Concurrency anomalies</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two kids share one colouring book. If they both colour the same page at the same time without
+          taking turns, you get a mess: one paints over the other, or someone copies a half-finished drawing
+          and gets confused. <strong>Concurrency anomalies</strong> are exactly these "we didn't take turns
+          properly" messes — but in a database, where two users touch the same data at the same moment.</p>
+        </div>
+
+        <p>The <strong>I</strong> in ACID (isolation) is the hard one. When many transactions run at once,
+        the database <em>interleaves</em> their reads and writes to stay fast. A particular interleaving is
+        called a <span class="term">schedule</span>. Some schedules produce wrong results that could never
+        happen if the transactions ran one-at-a-time. Those wrong results are <span class="term">anomalies</span>.
+        Below, <strong>T1</strong> and <strong>T2</strong> are two transactions and time runs downward.</p>
+
+        <h3>Anomaly 1 — Dirty read</h3>
+        <p>A <span class="term">dirty read</span> happens when T2 reads a value that T1 wrote but has
+        <strong>not committed yet</strong> — and T1 later rolls back. T2 acted on data that never officially existed.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>T1</th><th>T2</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>UPDATE balance = 200 (was 100)</td><td>&nbsp;</td></tr>
+              <tr><td>2</td><td>&nbsp;</td><td>READ balance → sees <strong>200</strong> (uncommitted!)</td></tr>
+              <tr><td>3</td><td><strong>ROLLBACK</strong> (balance back to 100)</td><td>&nbsp;</td></tr>
+              <tr><td>4</td><td>&nbsp;</td><td>Acts on the bogus 200 — wrong!</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Anomaly 2 — Non-repeatable read</h3>
+        <p>A <span class="term">non-repeatable read</span> happens when T1 reads the same row twice and gets
+        <strong>two different values</strong>, because T2 changed and committed it in between. The same query,
+        the same row, two answers within one transaction.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>T1</th><th>T2</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>READ balance → <strong>100</strong></td><td>&nbsp;</td></tr>
+              <tr><td>2</td><td>&nbsp;</td><td>UPDATE balance = 100 → 150; <strong>COMMIT</strong></td></tr>
+              <tr><td>3</td><td>READ balance → <strong>150</strong> (changed under me!)</td><td>&nbsp;</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Anomaly 3 — Phantom read</h3>
+        <p>A <span class="term">phantom read</span> is the non-repeatable read's cousin, but for <em>sets of
+        rows</em>. T1 runs a query with a condition (e.g. "all accounts with balance &gt; 100"); T2 inserts a
+        <strong>new row</strong> matching that condition and commits; T1 re-runs the query and a "phantom" row
+        has appeared that wasn't there before.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>T1</th><th>T2</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>SELECT COUNT(*) WHERE balance &gt; 100 → <strong>3</strong></td><td>&nbsp;</td></tr>
+              <tr><td>2</td><td>&nbsp;</td><td>INSERT account (balance = 500); <strong>COMMIT</strong></td></tr>
+              <tr><td>3</td><td>SELECT COUNT(*) WHERE balance &gt; 100 → <strong>4</strong> (phantom!)</td><td>&nbsp;</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Non-repeatable read vs phantom — what's the difference?</span>
+          <p>A non-repeatable read is about an <em>existing row's value changing</em> (an UPDATE). A phantom is
+          about the <em>set of rows changing</em> — new rows appearing or disappearing (an INSERT/DELETE) for a
+          range query. They're prevented by different mechanisms, which is why the SQL standard lists them separately.</p>
+        </div>
+
+        <h3>Anomaly 4 — Lost update</h3>
+        <p>A <span class="term">lost update</span> happens when two transactions read the same value, both
+        compute a new value from it, and both write back — so one write silently <strong>clobbers</strong> the other.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>T1 (add $10)</th><th>T2 (add $20)</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>READ balance → 100</td><td>&nbsp;</td></tr>
+              <tr><td>2</td><td>&nbsp;</td><td>READ balance → 100</td></tr>
+              <tr><td>3</td><td>WRITE balance = 110; COMMIT</td><td>&nbsp;</td></tr>
+              <tr><td>4</td><td>&nbsp;</td><td>WRITE balance = 120; COMMIT</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Both deposits should leave 130, but the final balance is <strong>120</strong> — T1's +$10 was lost
+        because T2 overwrote it with a value computed from the stale 100.</p>
+
+        <h3>Anomaly 5 — Write skew</h3>
+        <p>A <span class="term">write skew</span> is subtler. Two transactions read an overlapping set of data,
+        each checks a rule that's currently satisfied, and each writes to a <em>different</em> row. Individually
+        each looks fine; together they break an invariant that spans both rows.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: the on-call doctors rule</span>
+          <p>Rule: <strong>at least one doctor must stay on call.</strong> Alice and Bob are both on call and
+          both want to go off call. Each transaction checks "is anyone <em>else</em> still on call?" — and at
+          this instant the answer is yes, so each thinks it's safe.</p>
+          <pre><span class="cm">-- Invariant: COUNT(on_call) &gt;= 1 must always hold (currently Alice &amp; Bob both on call)</span>
+
+<span class="cm">T1 (Alice):</span>  <span class="kw">SELECT</span> count(*) <span class="kw">FROM</span> shifts <span class="kw">WHERE</span> on_call = <span class="kw">true</span>;  <span class="cm">-- = 2, ok</span>
+<span class="cm">T2 (Bob):  </span>  <span class="kw">SELECT</span> count(*) <span class="kw">FROM</span> shifts <span class="kw">WHERE</span> on_call = <span class="kw">true</span>;  <span class="cm">-- = 2, ok</span>
+<span class="cm">T1 (Alice):</span>  <span class="kw">UPDATE</span> shifts <span class="kw">SET</span> on_call = <span class="kw">false</span> <span class="kw">WHERE</span> who = <span class="st">'alice'</span>;
+<span class="cm">T2 (Bob):  </span>  <span class="kw">UPDATE</span> shifts <span class="kw">SET</span> on_call = <span class="kw">false</span> <span class="kw">WHERE</span> who = <span class="st">'bob'</span>;
+<span class="cm">both COMMIT  -&gt;  now ZERO doctors on call. Invariant broken!</span></pre>
+          <p>Neither transaction wrote the row the other read, so no single value was overwritten (it's not a
+          lost update). Yet the combined effect violates a rule. Write skew is famous because it sneaks past the
+          popular "Snapshot Isolation" level — only <strong>Serializable</strong> reliably prevents it.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>These anomalies aren't theoretical — they cause real double-spends, overdrafts and broken invariants
+          in production. The whole point of the next topic (isolation levels) is to choose <em>which</em> of these
+          you're willing to risk in exchange for speed.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Bad interleavings produce anomalies: <strong>dirty read</strong> (reading uncommitted data),
+          <strong>non-repeatable read</strong> (a row's value changes mid-transaction), <strong>phantom read</strong>
+          (new rows appear for a range query), <strong>lost update</strong> (one write clobbers another), and
+          <strong>write skew</strong> (two safe-looking writes jointly break an invariant). Isolation exists to
+          stop these.
+        </div>
+      </section>
+
+      <!-- ===================== 3. ISOLATION LEVELS ===================== -->
+      <section id="isolation">
+        <h2><span class="sec-num">3</span> Isolation levels</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a sliding door between two rooms. You can leave it <strong>wide open</strong> (everyone sees
+          and bumps into everyone — fast but chaotic), <strong>slightly ajar</strong>, or <strong>locked shut</strong>
+          (total privacy, but you have to wait your turn — slow but tidy). Isolation levels are exactly these
+          settings: how much one transaction is allowed to notice what others are doing. More privacy = fewer
+          messes, but more waiting.</p>
+        </div>
+
+        <p>The SQL standard defines four <span class="term">isolation levels</span>. Each is a deal: a higher
+        level forbids more anomalies but costs more performance (more locking or version-keeping, more waiting,
+        more aborts). You pick the lowest level that's still safe for your task.</p>
+
+        <pre><span class="cm">-- you set the level per-transaction (PostgreSQL / standard SQL):</span>
+<span class="kw">SET TRANSACTION ISOLATION LEVEL</span> READ COMMITTED;
+<span class="cm">-- or: READ UNCOMMITTED | REPEATABLE READ | SERIALIZABLE</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Level</th><th>Idea</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Read Uncommitted</span></td><td>The loosest. A transaction may read other transactions' <em>uncommitted</em> writes. Almost no protection.</td></tr>
+              <tr><td><span class="term">Read Committed</span></td><td>You only ever read data that has been committed. The common default (e.g. PostgreSQL, Oracle).</td></tr>
+              <tr><td><span class="term">Repeatable Read</span></td><td>Once you read a row, re-reading it gives the same value for the whole transaction.</td></tr>
+              <tr><td><span class="term">Serializable</span></td><td>The strictest. The result is guaranteed identical to <em>some</em> order of running the transactions one at a time.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The standard "which anomaly does each prevent?" table</h3>
+        <p>This is <em>the</em> table to memorise. "Possible" means the level allows that anomaly;
+        "Prevented" means it forbids it. (Definitions from the ANSI/ISO SQL standard.)</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th></tr></thead>
+            <tbody>
+              <tr><td>Read Uncommitted</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+              <tr><td>Read Committed</td><td>Prevented</td><td>Possible</td><td>Possible</td></tr>
+              <tr><td>Repeatable Read</td><td>Prevented</td><td>Prevented</td><td>Possible</td></tr>
+              <tr><td>Serializable</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Reading the table — a concrete walk</span>
+          <p>Take the <strong>non-repeatable read</strong> from Topic 2 (T1 reads 100, T2 commits 150, T1 re-reads):</p>
+          <ul>
+            <li>Under <strong>Read Committed</strong>, T1's second read sees the freshly committed 150 → the anomaly
+            <em>still happens</em> (it's "Possible").</li>
+            <li>Under <strong>Repeatable Read</strong>, T1 is pinned to the value it first saw (100) for its whole
+            life → the anomaly is <em>prevented</em>.</li>
+          </ul>
+          <p>So if your report must see a stable snapshot, Read Committed isn't enough — step up to Repeatable Read.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Real systems are stricter than the standard requires</span>
+          <p>The standard says only what each level <em>must at least</em> forbid; engines may forbid more. For
+          example, PostgreSQL's "Repeatable Read" actually uses <span class="term">Snapshot Isolation</span> and
+          also blocks phantom reads — but, as we saw, snapshot isolation can still allow <strong>write skew</strong>,
+          which is why a truly Serializable level exists. Also, many engines implement "Read Uncommitted" as just
+          "Read Committed" because their design (MVCC) never exposes uncommitted data anyway.</p>
+        </div>
+
+        <h3>The performance trade-off</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🏎️</div><div class="s-t">Read Uncommitted</div><div class="s-d">Fastest, least safe</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚗</div><div class="s-t">Read Committed</div><div class="s-d">Good default</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚙</div><div class="s-t">Repeatable Read</div><div class="s-d">More locking/versions</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🐢</div><div class="s-t">Serializable</div><div class="s-d">Safest, slowest, more aborts</div></div>
+        </div>
+        <p>As you climb the levels the database holds locks longer (or tracks more versions and conflicts), so
+        transactions <strong>wait</strong> on each other more, throughput drops, and at Serializable you may even
+        get transactions <strong>aborted</strong> with a "serialization failure" that your app must retry. The art
+        is choosing the cheapest level that's still correct for the job.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Going up the ladder — Read Uncommitted → Read Committed → Repeatable Read → Serializable — each step
+          forbids one more class of anomaly (dirty → non-repeatable → phantom) and Serializable forbids them all,
+          including write skew. The cost is reduced concurrency: more waiting and more retries. Pick the lowest
+          level that is still <em>safe</em> for your workload.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Four levels trade safety for speed. Read Uncommitted allows everything; Read Committed kills dirty reads;
+          Repeatable Read also kills non-repeatable reads; Serializable kills phantoms too and is equivalent to
+          running serially. Higher = safer but slower (more locks/aborts). Memorise the three-column anomaly table.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SERIALIZABILITY & 2PL ===================== -->
+      <section id="serial">
+        <h2><span class="sec-num">4</span> Serializability &amp; 2PL theory</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two people want to use one bathroom. The <em>obviously safe</em> plan is "take turns" — one fully
+          finishes, then the other goes. That's a <strong>serial</strong> plan: slow but never a clash. But what
+          if they could each do little bits at the same time and the end result is <em>exactly</em> as if they'd
+          taken turns? That'd be just as safe but faster. Serializability theory is the rulebook for spotting
+          when an interleaved plan is "as good as taking turns," and <strong>2PL</strong> is a simple discipline
+          — grab all your keys first, only give them back later — that guarantees it.</p>
+        </div>
+
+        <h3>Serial vs serializable schedules</h3>
+        <p>Recall a <span class="term">schedule</span> is one specific interleaving of several transactions'
+        operations. Two kinds matter:</p>
+        <ul>
+          <li>A <span class="term">serial schedule</span> runs transactions one completely after another — T1
+          finishes, then T2 starts. It's always correct (no interleaving = no anomalies), but it wastes the
+          machine's ability to do work in parallel.</li>
+          <li>A <span class="term">serializable schedule</span> is an interleaved schedule whose final result is
+          <strong>equivalent to some serial schedule</strong>. It may run operations in a mixed-up order, but the
+          outcome is identical to <em>some</em> "take turns" order. This is the gold standard of correctness —
+          it's exactly what the <strong>Serializable</strong> isolation level promises.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">"Some" order, not "the same" order</span>
+          <p>Serializable does <em>not</em> mean the result equals running them in the order they arrived. It means
+          the result matches <em>at least one</em> valid serial order (either "T1 then T2" or "T2 then T1"). The
+          database is free to pick whichever it can achieve — it just has to match one of them.</p>
+        </div>
+
+        <h3>Conflict serializability — how we check it</h3>
+        <p>Checking "is this equivalent to a serial order?" in general is hard, so we use a practical, slightly
+        stricter test called <span class="term">conflict serializability</span>. Two operations <em>conflict</em>
+        if they are from <strong>different transactions</strong>, touch the <strong>same data item</strong>, and
+        <strong>at least one is a write</strong>. The three conflict types: write-write, write-read, read-write.</p>
+        <p>A schedule is conflict-serializable if you can reach a serial schedule purely by swapping
+        <em>adjacent non-conflicting</em> operations. The standard tool is the
+        <span class="term">precedence graph</span> (conflict graph):</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">⭕</div><div class="s-t">1. Node per Tx</div><div class="s-d">One node for each transaction</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➡️</div><div class="s-t">2. Edge per conflict</div><div class="s-d">Ti → Tj if Ti's op precedes a conflicting op of Tj</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">3. Check for cycle</div><div class="s-d">No cycle ⇒ conflict-serializable</div></div>
+        </div>
+        <div class="callout example">
+          <span class="c-title">Worked example: spotting a non-serializable schedule</span>
+          <p>Here <code class="inl">R</code> = read, <code class="inl">W</code> = write, <code class="inl">A</code>
+          is a data item. Time runs left to right:</p>
+          <pre><span class="cm">Schedule S:   R1(A)   W2(A)   W1(A)</span>
+
+<span class="cm">Conflicts on A:</span>
+  R1(A) before W2(A)   =&gt;  edge  T1 -&gt; T2   <span class="cm">(read-write conflict)</span>
+  W2(A) before W1(A)   =&gt;  edge  T2 -&gt; T1   <span class="cm">(write-write conflict)</span>
+
+<span class="cm">Precedence graph:  T1 -&gt; T2  and  T2 -&gt; T1   =&gt;  CYCLE</span>
+<span class="cm">A cycle exists  =&gt;  NOT conflict-serializable  =&gt;  this interleaving is unsafe.</span></pre>
+          <p>Because there's a cycle, no amount of swapping non-conflicting neighbours can untangle S into a serial
+          order. If instead the graph had been just <code class="inl">T1 → T2</code> with no back-edge, S would be
+          serializable and equivalent to running "T1 then T2."</p>
+        </div>
+
+        <h3>Two-Phase Locking (2PL) — a rule that guarantees serializability</h3>
+        <p>Checking precedence graphs after the fact is impractical at runtime. Instead the database enforces a
+        <em>discipline</em> that makes every schedule it produces conflict-serializable automatically. The classic
+        one is <span class="term">Two-Phase Locking (2PL)</span>. Each transaction takes
+        <span class="term">locks</span> on the items it uses (a <strong>shared</strong> lock to read, an
+        <strong>exclusive</strong> lock to write), and it must obey one rule about the <em>order</em> in which it
+        acquires and releases them:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📈</div><div class="s-t">Growing phase</div><div class="s-d">Acquire locks only. Never release.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔒</div><div class="s-t">Lock point</div><div class="s-d">The moment it holds its last lock</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📉</div><div class="s-t">Shrinking phase</div><div class="s-d">Release locks only. Never acquire.</div></div>
+        </div>
+        <p>The single rule: <strong>once a transaction releases any lock, it may never acquire another.</strong>
+        Acquiring all goes in the growing phase; releasing all goes in the shrinking phase — hence "two phase."</p>
+
+        <div class="callout example">
+          <span class="c-title">Why 2PL forces serializability (the intuition)</span>
+          <p>Every transaction has a single <strong>lock point</strong> — the instant it grabs its last lock,
+          just before it starts releasing. It turns out you can <em>order all transactions by their lock points</em>,
+          and the resulting order is a valid serial order equivalent to the actual run. The reason: if Ti and Tj
+          conflict on item A, one must hold A's lock first and only release it (entering its shrinking phase) before
+          the other can grab it. So Ti's lock point provably comes before Tj's. There's no way to create a cycle of
+          conflicts, so the precedence graph is always acyclic — i.e. conflict-serializable. <strong>That's the
+          guarantee: obey 2PL and every schedule is serializable, with zero runtime graph-checking.</strong></p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The catch: deadlocks (and a teaser)</span>
+          <p>Basic 2PL guarantees serializability but it can cause <span class="term">deadlocks</span> — T1 holds A
+          and wants B while T2 holds B and wants A, so both wait forever. The database detects this and aborts one.
+          Also, plain 2PL can still allow a transaction to read another's <em>uncommitted</em> data right before a
+          rollback (a cascading-abort problem). The fix — <span class="term">Strict 2PL</span>, where all locks are
+          held until <code class="inl">COMMIT</code>/<code class="inl">ROLLBACK</code> — plus deadlock handling and
+          the lock-free alternative (MVCC) are the heart of <strong>Session 13: Concurrency Control</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>serial</strong> schedule runs transactions one-at-a-time (always safe); a
+          <strong>serializable</strong> one interleaves but gives the same result as <em>some</em> serial order.
+          We test it with <strong>conflict serializability</strong>: build a precedence graph from read/write
+          conflicts and check for a cycle (cycle = not serializable). <strong>2PL</strong> — acquire all locks in a
+          growing phase, release all in a shrinking phase, never acquire after releasing — guarantees every schedule
+          is conflict-serializable. Strict 2PL and deadlocks come next session.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how databases stay correct when many users hit them at once. Here's the one-paragraph
+        story connecting all four topics:</p>
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A <strong>transaction</strong> bundles work into one unit that obeys <strong>ACID</strong> — and the
+          tricky letter is <strong>I</strong>solation, because running transactions concurrently can produce
+          <strong>anomalies</strong> (dirty reads, non-repeatable reads, phantoms, lost updates, write skew). To
+          control which anomalies you tolerate, you choose an <strong>isolation level</strong> — from loose Read
+          Uncommitted up to strict <strong>Serializable</strong>, trading speed for safety. "Serializable" is
+          defined by <strong>serializability theory</strong>: an interleaved <strong>schedule</strong> is safe when
+          it's equivalent to <em>some</em> serial order, which we verify via <strong>conflict serializability</strong>
+          and a precedence graph. And the database achieves that safety automatically with <strong>Two-Phase
+          Locking</strong> — grow your locks, then shrink them, never grabbing a lock after releasing one — whose
+          stricter cousin and deadlock handling we'll meet in Session 13.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Which ACID property stops a crash mid-transfer from "losing" money, and how?</summary>
+          <p class="ans">Atomicity. It's all-or-nothing: on restart the database uses its write-ahead log to roll
+          back the half-finished transfer, so the debit is undone and no money disappears.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between a non-repeatable read and a phantom read?</summary>
+          <p class="ans">A non-repeatable read is an <em>existing row's value</em> changing between two reads (an
+          UPDATE). A phantom is the <em>set of rows</em> matching a query changing — new rows appearing or vanishing
+          (an INSERT/DELETE) when you re-run a range query.</p>
+        </details>
+        <details class="quiz">
+          <summary>You read 100, re-read in the same transaction and get 150. Which isolation level were you on, and which would fix it?</summary>
+          <p class="ans">You were on Read Committed (which allows non-repeatable reads). Stepping up to Repeatable
+          Read pins the value to what you first saw, fixing it.</p>
+        </details>
+        <details class="quiz">
+          <summary>Which isolation level is needed to prevent write skew, and why don't lower ones suffice?</summary>
+          <p class="ans">Serializable. Write skew involves two transactions reading overlapping data then writing
+          <em>different</em> rows, so no single value is overwritten — snapshot/repeatable-read levels miss it. Only
+          a truly serializable guarantee catches the joint invariant violation.</p>
+        </details>
+        <details class="quiz">
+          <summary>How do you test whether a schedule is conflict-serializable?</summary>
+          <p class="ans">Build a precedence graph: a node per transaction, and an edge Ti → Tj whenever an operation
+          of Ti precedes a conflicting operation of Tj (same item, at least one write). If the graph has no cycle,
+          the schedule is conflict-serializable.</p>
+        </details>
+        <details class="quiz">
+          <summary>State the single rule of Two-Phase Locking and what it guarantees.</summary>
+          <p class="ans">Once a transaction releases any lock, it may never acquire another (growing phase then
+          shrinking phase). This guarantees every schedule it produces is conflict-serializable — provably no cycle
+          in the precedence graph.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 12 — Transactions"</strong> — the in-class slides and worked schedules for this session.</li>
+          <li>📝 Written assignment: <strong>compare 2PL vs MVCC</strong> — write up how lock-based Two-Phase Locking and multi-version concurrency control differ in handling conflicts, readers-vs-writers, and aborts.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems</a> — Andy Pavlo's free lectures on concurrency control and 2PL; the gold-standard course video set for this material.</li>
+          <li><a href="https://arxiv.org/abs/cs/0701157" target="_blank" rel="noopener">A Critique of ANSI SQL Isolation Levels (Berenson et al., 1995)</a> — the classic paper showing the standard's anomaly definitions are ambiguous; it introduces snapshot isolation and write skew.</li>
+          <li><a href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noopener">PostgreSQL — Transaction Isolation</a> — clear, practical official docs on what each level really does in a real engine (including Serializable Snapshot Isolation).</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Database System Concepts (Silberschatz, Korth, Sudarshan)</a> — the transactions chapter is the standard textbook treatment of ACID, serializability and locking.</li>
+          <li><a href="https://en.wikipedia.org/wiki/Two-phase_locking" target="_blank" rel="noopener">Two-Phase Locking (overview)</a> — a concise reference on growing/shrinking phases, strict 2PL, and how locking guarantees serializability.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-11.html"><div class="dir">← Previous</div><div class="ttl">Session 11: Query Optimization</div></a>
+        <a class="next" href="session-13.html"><div class="dir">Next →</div><div class="ttl">Session 13: Concurrency Control</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 12 — Transactions — ACID &amp; Isolation · You kept the database's promises 🤝</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 14 — Seq2Seq &amp; the Attention Mechanism</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 14</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 14 · Seq2Seq &amp; Attention</span>
+      <h1>Teaching a network to translate — and to look back</h1>
+      <p class="lead">
+        Last few sessions we built up RNNs, LSTMs and GRUs — networks that read sequences one step at a
+        time. Today we put them to real work: turning <em>one</em> sequence into <em>another</em> (English →
+        French, article → summary). We'll meet the elegant encoder–decoder idea, watch it choke on long
+        sentences, and then discover the single trick — <strong>attention</strong> — that fixed it and quietly
+        set the stage for the Transformer you'll meet next session. We assume you've studied none of this; every
+        topic starts with a tiny story before the real machinery.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 17 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#seq2seq">The sequence-to-sequence problem</a></li>
+          <li><a href="#bottleneck">The information bottleneck</a></li>
+          <li><a href="#attention">Attention: looking back</a></li>
+          <li><a href="#variants">Attention variants &amp; intuition</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. SEQ2SEQ ===================== -->
+      <section id="seq2seq">
+        <h2><span class="sec-num">1</span> The sequence-to-sequence problem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine two friends who don't speak the same language, with a translator sitting between them.
+          The first friend whispers a whole sentence to the translator. The translator <strong>listens to the
+          entire thing</strong>, nods, holds the idea in their head — and only <em>then</em> starts speaking it out
+          loud in the other language, one word at a time. Listen fully first, then speak. That "listen, then
+          speak" dance is exactly what today's network does.</p>
+        </div>
+
+        <p>So far our networks did things like "read a sentence, output one label" (is this review positive or
+        negative?) or "read numbers, predict the next number." But a huge family of real problems is different:
+        the input is a sequence <em>and</em> the output is a sequence — and the two can be <strong>different
+        lengths</strong>. This is the <span class="term">sequence-to-sequence</span> (often written
+        <span class="term">seq2seq</span>) problem.</p>
+
+        <h3>Where it shows up</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Task</th><th>Input sequence</th><th>Output sequence</th></tr></thead>
+            <tbody>
+              <tr><td>Machine translation</td><td>"I am hungry" (English)</td><td>"J'ai faim" (French)</td></tr>
+              <tr><td>Summarization</td><td>A 500-word article</td><td>A 2-sentence summary</td></tr>
+              <tr><td>Chatbot / dialogue</td><td>A user's message</td><td>The bot's reply</td></tr>
+              <tr><td>Speech-to-text</td><td>Audio frames</td><td>Words</td></tr>
+              <tr><td>Code generation</td><td>A description</td><td>Lines of code</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Notice the key wrinkle: "I am hungry" is 3 words but "J'ai faim" is 2. The input and output don't line
+        up one-to-one, and we don't know the output length in advance. A plain RNN that emits one output per input
+        step can't handle that. We need an architecture that <strong>reads the whole input first, then generates
+        an output of whatever length it needs</strong>.</p>
+
+        <h3>The encoder–decoder architecture</h3>
+        <p>The classic 2014 solution (Sutskever et al., and Cho et al.) splits the job into two RNNs:</p>
+        <ul>
+          <li>The <span class="term">encoder</span> — an RNN (in practice usually an LSTM or GRU, recall
+          Session 13) that reads the input sequence one token at a time and squeezes everything it understood
+          into a single fixed-size summary vector.</li>
+          <li>The <span class="term">context vector</span> — that final summary, often written
+          <code class="inl">c</code>. It's the encoder's <em>last hidden state</em>: a fixed-length list of numbers
+          that's supposed to capture the meaning of the <em>whole</em> input.</li>
+          <li>The <span class="term">decoder</span> — a second RNN that <em>starts</em> from that context vector
+          and generates the output sequence one token at a time, feeding each word it just produced back in as the
+          next input (just like the autoregressive loop you've seen for language models).</li>
+        </ul>
+
+        <h3>The flow, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">1. Encode</div><div class="s-d">RNN reads input word by word</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">2. Context</div><div class="s-d">Final hidden state = one vector c</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚀</div><div class="s-t">3. Init decoder</div><div class="s-d">c seeds the decoder's state</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗣️</div><div class="s-t">4. Decode</div><div class="s-d">Emit one word, feed it back</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛑</div><div class="s-t">5. Stop</div><div class="s-d">Until &lt;EOS&gt; token</div></div>
+        </div>
+
+        <p>Two special tokens make this work. <span class="term">&lt;EOS&gt;</span> ("end of sequence") tells the
+        encoder where the input ends, and is the signal the decoder emits when it's done. A start token, often
+        <span class="term">&lt;SOS&gt;</span> or <code class="inl">&lt;BOS&gt;</code>, is the decoder's very first
+        input to kick off generation.</p>
+
+        <p>Let's write the math compactly. The encoder runs its recurrence over input tokens
+        <code class="inl">x&#8321; … x&#8348;</code>, producing hidden states <code class="inl">h&#8321; … h&#8348;</code>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Step</th><th>Equation</th><th>In words</th></tr></thead>
+            <tbody>
+              <tr><td>Encoder</td><td><code class="inl">h&#7511; = f(h&#7511;&#8331;&#8321;, x&#7511;)</code></td><td>Update hidden state from previous state + current input word.</td></tr>
+              <tr><td>Context</td><td><code class="inl">c = h&#8348;</code></td><td>The context is just the <em>last</em> encoder state.</td></tr>
+              <tr><td>Decoder</td><td><code class="inl">s&#7510; = g(s&#7510;&#8331;&#8321;, y&#7510;&#8331;&#8321;, c)</code></td><td>New decoder state from previous state + previous output word + context.</td></tr>
+              <tr><td>Output</td><td><code class="inl">P(y&#7510;) = softmax(W·s&#7510;)</code></td><td>Turn the decoder state into a probability over the vocabulary.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: translating "I am hungry" → "J'ai faim"</span>
+          <p>Here's a tiny PyTorch-flavoured sketch of an encoder–decoder so you can see the two RNNs and the
+          single context hand-off concretely:</p>
+          <pre><span class="kw">class</span> Seq2Seq(nn.Module):
+    <span class="kw">def</span> __init__(self, vocab_in, vocab_out, emb, hid):
+        self.enc_emb = nn.Embedding(vocab_in, emb)
+        self.encoder = nn.LSTM(emb, hid)        <span class="cm"># reads the source</span>
+        self.dec_emb = nn.Embedding(vocab_out, emb)
+        self.decoder = nn.LSTM(emb, hid)        <span class="cm"># writes the target</span>
+        self.out = nn.Linear(hid, vocab_out)    <span class="cm"># hidden -> vocab scores</span>
+
+    <span class="kw">def</span> forward(self, src, tgt):
+        <span class="cm"># 1) ENCODE: read whole source, keep only final state</span>
+        _, (h, c) = self.encoder(self.enc_emb(src))
+        <span class="cm"># 'h' is THE context vector — the bottleneck (Topic 2)</span>
+
+        <span class="cm"># 2) DECODE: start decoder from the encoder's final state</span>
+        dec_in = self.dec_emb(tgt)              <span class="cm"># &lt;SOS&gt; J'ai faim ...</span>
+        dec_out, _ = self.decoder(dec_in, (h, c))
+        <span class="kw">return</span> self.out(dec_out)            <span class="cm"># scores for each output step</span>
+</pre>
+          <p>Walking through it: the encoder reads <code class="inl">I</code>, <code class="inl">am</code>,
+          <code class="inl">hungry</code>, <code class="inl">&lt;EOS&gt;</code> and its final hidden state
+          <code class="inl">h</code> becomes the context. The decoder, seeded with that <code class="inl">h</code>,
+          is fed <code class="inl">&lt;SOS&gt;</code> and predicts <code class="inl">J'ai</code>; that's fed back in
+          and it predicts <code class="inl">faim</code>; fed back in, it predicts <code class="inl">&lt;EOS&gt;</code>
+          and stops. Three input steps, three output steps — different content, free to differ in length.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Teacher forcing</span>
+          <p>During <em>training</em>, we usually feed the decoder the <strong>correct</strong> previous word
+          (from the real translation) rather than its own guess — this is called
+          <span class="term">teacher forcing</span>. It makes training faster and more stable. At
+          <em>inference</em> time there's no answer key, so the decoder must feed back its own predictions.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Seq2seq maps an input sequence to an output sequence of possibly different length (translation,
+          summarization, chat). The <strong>encoder–decoder</strong> architecture solves it: an encoder RNN reads
+          the whole input into one fixed <strong>context vector</strong>, and a decoder RNN generates the output
+          from it, one token at a time until <code class="inl">&lt;EOS&gt;</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 2. BOTTLENECK ===================== -->
+      <section id="bottleneck">
+        <h2><span class="sec-num">2</span> The information bottleneck</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have to read someone a whole storybook, but you're only allowed to write yourself
+          <strong>one tiny sticky note</strong> first — and then close the book forever and tell the story from
+          just that note. For a one-line story, easy. For a long fairy tale with lots of characters? That little
+          note can't possibly hold everything, and you'll forget the beginning. The single context vector is that
+          one sticky note.</p>
+        </div>
+
+        <p>Look back at the encoder–decoder. <strong>Everything</strong> the decoder ever sees about the input is
+        squeezed through that single fixed-length context vector <code class="inl">c</code>. Whether the input is
+        3 words or 300, it all has to fit into the same number of slots (say 512 numbers). This is the
+        <span class="term">information bottleneck</span>, and it's the core limitation of plain seq2seq.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A <strong>fixed-size</strong> vector cannot faithfully store an <strong>arbitrarily long</strong>
+          input. As sentences get longer, more meaning gets crushed into the same number of slots, so detail
+          inevitably leaks out — especially the words read earliest.</p>
+        </div>
+
+        <h3>Why long sequences suffer most</h3>
+        <ul>
+          <li><strong>Compression loss.</strong> 300 words of meaning forced into 512 numbers means the encoder
+          must throw information away. The decoder simply never receives it.</li>
+          <li><strong>Recency bias.</strong> Because the context is the <em>last</em> hidden state, the words read
+          most recently (the end of the input) are best represented; the beginning has been overwritten through
+          many recurrence steps — the classic vanishing-gradient / forgetting problem from Session 13, now hurting
+          us at the architecture level.</li>
+          <li><strong>No way to revisit.</strong> Once encoding is done, the original words are gone. If the
+          decoder, halfway through, really needs that one noun from the start of the sentence, it has no way to
+          go back and look — it only has the blurry summary.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the BLEU score cliff</span>
+          <p>Researchers measured translation quality (<span class="term">BLEU</span> score — higher is better)
+          against input sentence length for a fixed-context seq2seq model. The pattern was stark:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Sentence length</th><th>Translation quality</th><th>What's happening</th></tr></thead>
+              <tbody>
+                <tr><td>≤ 10 words</td><td>Good</td><td>The whole meaning fits in the context vector.</td></tr>
+                <tr><td>~20 words</td><td>Still okay</td><td>Getting tight; some early detail blurs.</td></tr>
+                <tr><td>30+ words</td><td>Drops sharply</td><td>The vector overflows; quality falls off a cliff.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Translate a 40-word legal sentence and the model often produces a fluent-sounding output that quietly
+          <strong>drops or scrambles</strong> the parts it couldn't fit — a date here, a clause there. The
+          decoder isn't lying on purpose; it genuinely never got that information.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A clever-but-limited patch</span>
+          <p>Sutskever et al. found that simply <strong>reversing the input</strong> (encoding "hungry am I"
+          instead of "I am hungry") improved results, because it put the start of the source closer to where
+          decoding begins. That this hack helped at all is a flashing warning sign: the bottleneck, not the
+          vocabulary, was the problem.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The trade-off to remember</span>
+          <p>You might think "just make the context vector huge!" — but a bigger vector means more parameters,
+          more compute, slower training, and easier overfitting, <em>and it still can't grow with the input</em>.
+          Any <strong>fixed</strong> size is eventually too small. We need a fundamentally different idea, not a
+          bigger note.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Cramming an entire input into one fixed-length context vector is an <strong>information
+          bottleneck</strong>. It works for short sequences but collapses on long ones — early words get
+          overwritten, detail is compressed away, and the decoder can never look back at the original. This single
+          weakness is exactly what attention was invented to fix.
+        </div>
+      </section>
+
+      <!-- ===================== 3. ATTENTION ===================== -->
+      <section id="attention">
+        <h2><span class="sec-num">3</span> Attention: letting the decoder look back</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back to our translator — but now they're allowed to <strong>keep the open book on the table</strong>.
+          As they say each word of the translation, they glance back at the parts of the original that matter
+          <em>for that word</em>. Saying the French word for "hungry"? They glance at "hungry" in the English.
+          They don't memorize the whole book into one note; they look back, on demand, at the bits they need
+          right now. That glancing-back is <strong>attention</strong>.</p>
+        </div>
+
+        <p>Bahdanau et al. (2014) asked: why throw away all the encoder's per-word hidden states and keep only the
+        last one? Instead, <strong>keep all of them</strong> — <code class="inl">h&#8321; … h&#8348;</code>, one per
+        input word — and let the decoder build a <em>fresh</em> context vector at <strong>every output step</strong>,
+        focusing on whichever input words are relevant for the word it's about to produce.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Don't summarize the input once. At each output step, let the decoder <strong>look at all encoder
+          states and take a weighted average of them</strong>, where the weights say "how much should I attend to
+          each input word right now?" The context becomes <em>dynamic</em> — different for every word produced.</p>
+        </div>
+
+        <h3>The three ingredients</h3>
+        <p>At decoder step <code class="inl">t</code>, with the decoder's current state
+        <code class="inl">s&#7510;&#8331;&#8321;</code>, attention does three things:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Step</th><th>Equation</th><th>What it means</th></tr></thead>
+            <tbody>
+              <tr><td>1. Score</td><td><code class="inl">e&#7510;&#7522; = score(s&#7510;&#8331;&#8321;, h&#7522;)</code></td><td>For each input word <code class="inl">i</code>, how relevant is it to what I'm producing now? These are the <span class="term">alignment scores</span>.</td></tr>
+              <tr><td>2. Normalize</td><td><code class="inl">&#945;&#7510;&#7522; = softmax(e&#7510;&#7522;)</code></td><td>Turn raw scores into <span class="term">attention weights</span> that are positive and sum to 1 (a probability distribution over input words).</td></tr>
+              <tr><td>3. Blend</td><td><code class="inl">c&#7510; = &#931;&#7522; &#945;&#7510;&#7522; · h&#7522;</code></td><td>Build a <span class="term">context vector</span> for this step as the weighted sum of encoder states.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>That step-specific <code class="inl">c&#7510;</code> is then combined with the decoder state to predict
+        the output word: <code class="inl">s&#7510; = g(s&#7510;&#8331;&#8321;, y&#7510;&#8331;&#8321;, c&#7510;)</code>, then
+        <code class="inl">P(y&#7510;) = softmax(W·[s&#7510;; c&#7510;])</code>. Crucially, because the weights
+        <code class="inl">&#945;&#7510;&#7522;</code> change every step, the decoder reads a <strong>different</strong>
+        mix of the source for every word it writes. The bottleneck is gone: there's no longer a single vector that
+        has to hold everything.</p>
+
+        <h3>The flow with attention</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">Keep all states</div><div class="s-d">h&#8321; … h&#8348;, not just the last</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📐</div><div class="s-t">Score</div><div class="s-d">Compare decoder state to each h&#7522;</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚖️</div><div class="s-t">Softmax</div><div class="s-d">Weights &#945;&#7522; sum to 1</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧪</div><div class="s-t">Weighted sum</div><div class="s-d">Build c&#7510; for this step</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗣️</div><div class="s-t">Predict word</div><div class="s-d">Use c&#7510; + decoder state</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: alignment in translation</span>
+          <p>Translating <em>"I am hungry"</em> → <em>"J'ai faim"</em>. Suppose the encoder produced one state per
+          English word: <code class="inl">h(I)</code>, <code class="inl">h(am)</code>,
+          <code class="inl">h(hungry)</code>. Watch the attention weights shift as the decoder writes each French
+          word:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Decoder is producing</th><th>&#945; on "I"</th><th>&#945; on "am"</th><th>&#945; on "hungry"</th></tr></thead>
+              <tbody>
+                <tr><td>"J'ai" (I have)</td><td><strong>0.7</strong></td><td>0.25</td><td>0.05</td></tr>
+                <tr><td>"faim" (hunger)</td><td>0.05</td><td>0.10</td><td><strong>0.85</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Each row sums to 1. When writing <code class="inl">J'ai</code> the model leans on "I"/"am"; when
+          writing <code class="inl">faim</code> it leans almost entirely on "hungry." That learned mapping between
+          output words and the input words they correspond to is called <span class="term">alignment</span> — and
+          here's the lovely part: <strong>nobody labelled it</strong>. The model discovered which words translate
+          to which, purely from the attention math.</p>
+          <p>A minimal forward pass for one step:</p>
+          <pre><span class="cm"># enc_states: (T, hid) — one row per input word</span>
+<span class="cm"># s_prev:    (hid,)   — decoder state from the last step</span>
+scores = enc_states @ W_a @ s_prev      <span class="cm"># e_{t,i}: relevance of each input word</span>
+alpha  = softmax(scores)                <span class="cm"># weights, sum to 1</span>
+c_t    = (alpha.unsqueeze(1) * enc_states).sum(0)   <span class="cm"># weighted blend</span>
+out    = predict(s_prev, y_prev, c_t)   <span class="cm"># produce this output word</span>
+</pre>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Attention replaces "compress everything once" with "look back, weighted, every step." The decoder
+          gets a <strong>direct line</strong> to every input word, so long-sequence quality stops falling off a
+          cliff — and as a bonus, the attention weights give us a window into <em>what the model is looking at</em>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Attention keeps <strong>all</strong> encoder states and, at each decoder step, computes
+          <strong>alignment scores</strong>, softmaxes them into <strong>attention weights</strong> that sum to 1,
+          and blends the encoder states into a fresh, step-specific <strong>context vector</strong>. This removes
+          the bottleneck and lets the model learn word alignments on its own.
+        </div>
+      </section>
+
+      <!-- ===================== 4. VARIANTS ===================== -->
+      <section id="variants">
+        <h2><span class="sec-num">4</span> Attention variants &amp; intuition</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>"How relevant is this word to me?" can be measured in different ways. One way is to hand both words to
+          a little helper who studies them and gives a relevance score (that's the <strong>additive</strong> way).
+          A faster way is to just see how much the two words "point in the same direction" — multiply them
+          together (the <strong>multiplicative</strong> way). Same goal, two recipes: one a bit smarter, one a lot
+          faster.</p>
+        </div>
+
+        <p>The key choice in attention is <em>how</em> you compute the alignment score
+        <code class="inl">e&#7510;&#7522; = score(s&#7510;&#8331;&#8321;, h&#7522;)</code>. Two famous families appeared
+        within a year of each other.</p>
+
+        <h3>Additive (Bahdanau) attention</h3>
+        <p><span class="term">Additive attention</span>, from Bahdanau et al. (2014), feeds the decoder state and
+        an encoder state through a tiny one-hidden-layer neural network and reads off a score:</p>
+        <pre><span class="nm">e_ti</span> = v&#7488; · tanh( W&#8321;·s_{t-1} + W&#8322;·h_i )</pre>
+        <p>It's called "additive" because the two inputs are <strong>added</strong> inside the
+        <code class="inl">tanh</code>. The learned vectors <code class="inl">W&#8321;, W&#8322;, v</code> let the model
+        figure out, flexibly, what "relevant" means. It's expressive and works even when the encoder and decoder
+        states have different sizes — but the little network makes it slower.</p>
+
+        <h3>Multiplicative (Luong) attention</h3>
+        <p><span class="term">Multiplicative attention</span> (also called <span class="term">dot-product
+        attention</span>), from Luong et al. (2015), scores relevance with a simple dot product — essentially asking
+        "how aligned are these two vectors?":</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Form</th><th>Score</th><th>Note</th></tr></thead>
+            <tbody>
+              <tr><td>Dot</td><td><code class="inl">e&#7510;&#7522; = s&#7510;&#8331;&#8321; · h&#7522;</code></td><td>Cheapest; needs matching sizes.</td></tr>
+              <tr><td>General</td><td><code class="inl">e&#7510;&#7522; = s&#7510;&#8331;&#8321;&#7488; · W · h&#7522;</code></td><td>A learned matrix W; handles different sizes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Because a dot product is just one big matrix multiply — and GPUs <em>love</em> matrix multiplies — this
+        is much faster than the additive recipe. That speed is precisely why the dot-product style won out and sits
+        at the heart of the Transformer.</p>
+
+        <h3>Side by side</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Additive (Bahdanau)</th><th>Multiplicative (Luong)</th></tr></thead>
+            <tbody>
+              <tr><td>Score function</td><td>Tiny feed-forward net with <code class="inl">tanh</code></td><td>Dot product (optionally with a learned <code class="inl">W</code>)</td></tr>
+              <tr><td>Speed</td><td>Slower (extra layer)</td><td>Faster (one matmul, GPU-friendly)</td></tr>
+              <tr><td>Different state sizes</td><td>Handles naturally</td><td>Needs <code class="inl">W</code> (the "general" form)</td></tr>
+              <tr><td>Year / paper</td><td>2014, "Jointly Learning to Align and Translate"</td><td>2015, "Effective Approaches…"</td></tr>
+              <tr><td>Legacy</td><td>Introduced attention</td><td>Led to scaled dot-product attention</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">One scaling detail</span>
+          <p>When vectors are long, plain dot products grow large, which pushes softmax into flat regions where
+          gradients vanish. The Transformer's fix (next session) is <span class="term">scaled dot-product
+          attention</span> — divide the score by <code class="inl">&#8730;d</code> (the square root of the vector
+          size) before softmax. Same multiplicative idea, just kept numerically calm.</p>
+        </div>
+
+        <h3>Reading the weights: attention as an X-ray</h3>
+        <p>Because the attention weights <code class="inl">&#945;&#7510;&#7522;</code> form a tidy grid (output words
+        down one side, input words across the top, each cell a number 0–1), you can plot them as a
+        <span class="term">heatmap</span> and literally <em>see</em> what the model looked at.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: an alignment heatmap</span>
+          <p>Translating <em>"the agreement was signed"</em> → French <em>"l'accord a été signé"</em>. Darker = more
+          attention (per-row weights, each row sums to ~1):</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>↓ output / input →</th><th>the</th><th>agreement</th><th>was</th><th>signed</th></tr></thead>
+              <tbody>
+                <tr><td>l'accord</td><td>0.30</td><td><strong>0.65</strong></td><td>0.03</td><td>0.02</td></tr>
+                <tr><td>a été</td><td>0.05</td><td>0.10</td><td><strong>0.80</strong></td><td>0.05</td></tr>
+                <tr><td>signé</td><td>0.02</td><td>0.03</td><td>0.05</td><td><strong>0.90</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>The bright diagonal-ish band shows the model aligning each French word to its English source — and
+          for languages that reorder words, this band <em>bends</em>, showing attention jumping around the sentence
+          to grab the right word out of order. This visual is both a debugging tool and a confidence check.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Additive and multiplicative attention are two recipes for the same "how relevant?" question.
+          Multiplicative (dot-product) won on speed, and once you realize attention is just "query × keys →
+          weights → weighted sum of values," you're one step from the <strong>Transformer</strong>, which throws
+          out the RNN entirely and uses attention <em>everywhere</em>. That's Session 15.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The score function is the dial. <strong>Additive (Bahdanau)</strong> uses a small <code class="inl">tanh</code>
+          network — expressive but slower; <strong>multiplicative (Luong)</strong> uses a dot product — faster and
+          GPU-friendly, leading to the <strong>scaled dot-product attention</strong> of the Transformer. Plotting
+          the weights as a heatmap reveals the learned word alignments and sets up next session perfectly.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Today's session is one tight story about reading and writing sequences — and the single idea that
+        unlocked modern NLP. Here's the whole arc in a paragraph:</p>
+        <div class="bigidea">
+          <p>The <strong>sequence-to-sequence</strong> problem maps one sequence to another of possibly different
+          length, and the <strong>encoder–decoder</strong> architecture solves it by encoding the input into a
+          single <strong>context vector</strong> and decoding from it. But cramming everything into one fixed
+          vector is an <strong>information bottleneck</strong> that breaks on long inputs. <strong>Attention</strong>
+          fixes this by keeping <em>all</em> encoder states and, at every output step, computing
+          <strong>alignment scores</strong>, softmaxing them into <strong>attention weights</strong>, and blending
+          the states into a fresh per-step context — letting the decoder look back at exactly the words it needs.
+          The score can be computed the <strong>additive (Bahdanau)</strong> way or the faster
+          <strong>multiplicative (Luong)</strong> way, and that dot-product recipe — once scaled — is the very heart
+          of the <strong>Transformer</strong> we'll build next session.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What makes a problem "sequence-to-sequence," and why can't a plain RNN do it?</summary>
+          <p class="ans">Both the input and output are sequences, often of <em>different</em> lengths (e.g. 3 input
+          words → 2 output words). A plain RNN emits one output per input step, so it can't produce an output of a
+          different, unknown length. The encoder–decoder design (read fully, then generate) handles it.</p>
+        </details>
+        <details class="quiz">
+          <summary>In one sentence, what is the information bottleneck?</summary>
+          <p class="ans">The entire input must be squeezed into a single fixed-size context vector, so long inputs
+          lose information — especially the earliest words — because a fixed vector can't hold an arbitrarily long
+          sequence.</p>
+        </details>
+        <details class="quiz">
+          <summary>What are the three steps attention performs at each decoder step?</summary>
+          <p class="ans">(1) Score each encoder state against the current decoder state (alignment scores), (2)
+          softmax the scores into attention weights that sum to 1, and (3) take a weighted sum of the encoder states
+          to form a fresh, step-specific context vector.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does the context vector with attention beat the single fixed context vector?</summary>
+          <p class="ans">It's <em>dynamic</em>: a different weighted blend is built for every output word, giving the
+          decoder a direct line to all input words rather than one blurry summary. So long-sequence quality no longer
+          collapses.</p>
+        </details>
+        <details class="quiz">
+          <summary>Additive vs multiplicative attention — what's the practical difference?</summary>
+          <p class="ans">Additive (Bahdanau) scores relevance with a small <code class="inl">tanh</code> network —
+          expressive but slower. Multiplicative (Luong) uses a dot product — faster and GPU-friendly. The
+          dot-product form, scaled by √d, became the Transformer's attention.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does an attention heatmap show you?</summary>
+          <p class="ans">The learned alignment between output and input words: each cell is how much an output word
+          attended to an input word. A bright band reveals word correspondences the model discovered on its own,
+          which is great for debugging and interpretability.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 14) — your course handout for this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning handout (online)</a> — the companion notes for this session's material.</li>
+          <li><a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">Sutskever, Vinyals &amp; Le — "Sequence to Sequence Learning with Neural Networks" (2014)</a> — the paper that introduced the LSTM encoder–decoder and the input-reversal trick.</li>
+          <li><a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Bahdanau, Cho &amp; Bengio — "Neural Machine Translation by Jointly Learning to Align and Translate" (2014)</a> — the original attention mechanism (additive); read it for where attention came from.</li>
+          <li><a href="https://arxiv.org/abs/1508.04025" target="_blank" rel="noopener">Luong, Pham &amp; Manning — "Effective Approaches to Attention-based NMT" (2015)</a> — introduces multiplicative / dot-product and global vs local attention.</li>
+          <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Vaswani et al. — "Attention Is All You Need" (2017)</a> — where attention goes next: the Transformer (preview of Session 15).</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-13.html"><div class="dir">← Previous</div><div class="ttl">Session 13: LSTMs, GRUs &amp; Gating</div></a>
+        <a class="next" href="session-15.html"><div class="dir">Next →</div><div class="ttl">Session 15: The Transformer</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 14 — Seq2Seq &amp; the Attention Mechanism · You taught a network to look back 👀</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

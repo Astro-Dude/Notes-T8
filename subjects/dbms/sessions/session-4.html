@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 4 — The Buffer Pool</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 4</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 04 · Buffer Pool</span>
+      <h1>Where the database keeps its pages while it works</h1>
+      <p class="lead">
+        Disks are slow and memory is fast — so a database keeps a private stash of recently
+        used disk pages in RAM and reuses them instead of fetching from disk every time. That
+        stash is the <em>buffer pool</em>. We assume you've studied <em>none</em> of this before.
+        Every topic starts with a tiny "explain like I'm 5" story, then we go deeper with real
+        examples and pseudocode. By the end you'll understand exactly how the database decides
+        what stays in memory and what gets thrown out.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why a buffer pool?</a></li>
+          <li><a href="#design">Buffer pool design</a></li>
+          <li><a href="#pin-dirty">Pin counts &amp; dirty flags</a></li>
+          <li><a href="#replacement">Replacement policy theory</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why a buffer pool?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your toys live in a huge warehouse far across town (that's the <strong>disk</strong>),
+          but you play on a tiny rug in your room (that's <strong>memory</strong>). Walking to the warehouse
+          every time you want a toy would take forever. So you keep the toys you've been playing with on
+          your rug. When the rug gets full, you carry the toy you haven't touched in ages back to the
+          warehouse to make space. That rug full of recently-used toys is the <strong>buffer pool</strong>.</p>
+        </div>
+
+        <p>In <a href="session-3.html">Session 3</a> we saw that a database stores its data on disk as
+        fixed-size <span class="term">pages</span> (often 4&nbsp;KB, 8&nbsp;KB, or 16&nbsp;KB blocks) inside
+        heap files. The problem: the engine can't run code <em>directly</em> on data sitting on disk. It has
+        to copy a page into <span class="term">memory (RAM)</span> first, work on it there, and (if it
+        changed) copy it back. The buffer pool is the piece of the DBMS that manages this copying.</p>
+
+        <h3>Just how big is the speed gap?</h3>
+        <p>This is the whole reason the buffer pool exists, so it's worth feeling the numbers. Memory and
+        disk are not "a bit different" in speed — they're different by <em>orders of magnitude</em>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Storage layer</th><th>Typical access time</th><th>Human-scale analogy</th></tr></thead>
+            <tbody>
+              <tr><td>CPU register / cache</td><td>~1 nanosecond</td><td>Grabbing something in your hand</td></tr>
+              <tr><td>Main memory (RAM)</td><td>~100 nanoseconds</td><td>Walking across the room</td></tr>
+              <tr><td>SSD (flash)</td><td>~100 microseconds (~1,000× slower than RAM)</td><td>Walking to the next town</td></tr>
+              <tr><td>Spinning hard disk</td><td>~10 milliseconds (~100,000× slower than RAM)</td><td>A multi-day road trip</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Reading a page from disk can be <strong>thousands to a hundred-thousand times slower</strong> than
+          reading it from memory. So if the database can serve a page from memory instead of going to disk,
+          it does — every single time. The buffer pool's whole job is to make "it's already in memory" the
+          common case.</p>
+        </div>
+
+        <h3>This is just caching — a universal idea</h3>
+        <p>A <span class="term">cache</span> is any small, fast store that holds copies of things from a big,
+        slow store, betting you'll want them again soon. You meet caches everywhere:</p>
+        <ul>
+          <li>Your <strong>browser</strong> caches images so a page loads instantly on a second visit.</li>
+          <li>Your <strong>CPU</strong> caches recently-used memory so it doesn't wait on RAM.</li>
+          <li>A <strong>CDN</strong> caches website files near you so they don't travel across the world.</li>
+        </ul>
+        <p>The buffer pool is exactly this pattern: a fast cache (RAM) in front of a slow store (disk). Two
+        bets make it pay off, and both are usually true for database workloads:</p>
+        <ul>
+          <li><span class="term">Temporal locality</span> — if a page was used recently, it's likely to be
+          used again soon (think a hot "users" page touched by every login).</li>
+          <li><span class="term">Spatial locality</span> — if you used a page, you'll probably use nearby
+          pages too (scanning a table reads page after page in order).</li>
+        </ul>
+
+        <h3>Why not just let the operating system do it?</h3>
+        <p>Here's a fair question. The OS <em>already</em> caches disk pages for every program (it's called
+        the <span class="term">OS page cache</span>). So why does a database build its <em>own</em> buffer pool
+        instead of leaning on the OS? Because the DBMS knows things the OS can't:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Decision</th><th>OS page cache</th><th>DBMS buffer pool</th></tr></thead>
+            <tbody>
+              <tr><td>Eviction order</td><td>Generic LRU — guesses blindly.</td><td>Knows query plans &amp; access patterns, so it evicts smarter.</td></tr>
+              <tr><td>Write timing</td><td>Flushes when <em>it</em> feels like it.</td><td>Must flush in a specific order for crash recovery (the <span class="term">write-ahead log</span> rule — a later session).</td></tr>
+              <tr><td>Pinning</td><td>Can't be told "don't evict this, I'm using it."</td><td>Can <span class="term">pin</span> a page in place (Topic 3).</td></tr>
+              <tr><td>Double copy</td><td>Data sits in OS cache <em>and</em> DBMS memory — wasteful.</td><td>One authoritative copy under DBMS control.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: the cost of not caching</span>
+          <p>Suppose a query reads the same 100-page index 50 times during a join. Without a buffer pool,
+          that's <code class="inl">100 × 50 = 5,000</code> disk reads. On a spinning disk at ~10&nbsp;ms each,
+          that's <strong>50 seconds</strong> just waiting on I/O. With a buffer pool, the 100 pages are read
+          from disk <em>once</em> (~1 second), and the other 4,900 accesses hit memory at ~100&nbsp;ns each —
+          essentially free. Same query, ~50× faster, purely from caching.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A vocabulary heads-up</span>
+          <p>The region of RAM the buffer pool manages is often called the <span class="term">buffer pool</span>
+          or <span class="term">page cache</span>; PostgreSQL calls it <code class="inl">shared_buffers</code>,
+          MySQL/InnoDB calls it the <code class="inl">innodb_buffer_pool</code>. Tuning its size is one of the
+          single biggest knobs in database performance.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Disk is thousands of times slower than RAM, so the DBMS keeps recently-used disk pages in a
+          memory cache called the buffer pool. It's the same caching idea used by browsers and CPUs, and it
+          pays off because database access has temporal and spatial locality. The DBMS manages its own cache
+          (rather than trusting the OS) because it knows access patterns and must control write ordering for
+          recovery.
+        </div>
+      </section>
+
+      <!-- ===================== 2. DESIGN ===================== -->
+      <section id="design">
+        <h2><span class="sec-num">2</span> Buffer pool design — frames &amp; the page table</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a wall of identical lockers (your memory). Each locker is exactly the right size to hold
+          one toy box from the warehouse. To find your toy fast, you keep a little notebook: "Red box → locker
+          7, Blue box → locker 2." When you want the red box, you check the notebook first. If it's listed,
+          you go straight to that locker. If it's not, you fetch it from the warehouse, put it in a free locker,
+          and write the new line in your notebook.</p>
+        </div>
+
+        <p>The buffer pool is a big chunk of memory the DBMS carves up into equal-sized slots. Each slot is
+        called a <span class="term">frame</span>, and each frame is exactly the size of one disk page — so any
+        page from disk fits perfectly into any frame. If the buffer pool is 1&nbsp;GB and pages are 8&nbsp;KB,
+        you get about <code class="inl">1 GB / 8 KB ≈ 131,000</code> frames.</p>
+
+        <h3>The page table — the "notebook"</h3>
+        <p>To find a page in memory quickly, the buffer pool keeps a <span class="term">page table</span>: an
+        in-memory lookup (a hash map) from a <span class="term">page id</span> (which page on disk) to the
+        <span class="term">frame</span> that currently holds it. A lookup is <code class="inl">O(1)</code> on
+        average — basically instant.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Don't confuse two "page tables"</span>
+          <p>The operating system also has a thing called a "page table" (for virtual memory). The DBMS buffer
+          pool's page table is a <em>different</em>, software structure that just maps database page ids to
+          buffer frames. Same name, unrelated job — a classic exam trap.</p>
+        </div>
+
+        <p>Alongside the page table, each frame carries a little bit of <span class="term">metadata</span> the
+        pool needs to manage it. We'll meet most of these in Topic 3, but here's the shape:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Per-frame field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>page_id</td><td>Which disk page lives here (or "empty").</td></tr>
+              <tr><td>pin_count</td><td>How many users are currently using this page (Topic 3).</td></tr>
+              <tr><td>is_dirty</td><td>Has this page been modified since it was read in? (Topic 3)</td></tr>
+              <tr><td>data</td><td>The actual page bytes copied from disk.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The fetch path: hit vs miss</h3>
+        <p>Every time some part of the database needs a page, it asks the buffer pool: <code class="inl">getPage(page_id)</code>.
+        Two things can happen — the two most important words in this whole session:</p>
+        <ul>
+          <li><span class="term">Cache hit</span> — the page is already in a frame. The pool finds it via the
+          page table and hands it back immediately. <strong>No disk I/O.</strong> Fast.</li>
+          <li><span class="term">Cache miss</span> — the page isn't in memory. The pool must find a free frame
+          (or <span class="term">evict</span> something — Topic 4) and read the page from disk into it.
+          <strong>Disk I/O happens.</strong> Slow.</li>
+        </ul>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🙋</div><div class="s-t">1. Request</div><div class="s-d">getPage(P) is called</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📒</div><div class="s-t">2. Look up</div><div class="s-d">Is P in the page table?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">3a. Hit</div><div class="s-d">Return the frame — no disk</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">3b. Miss</div><div class="s-d">Find a frame, read P from disk</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📌</div><div class="s-t">4. Pin &amp; return</div><div class="s-d">Hand the page to the caller</div></div>
+        </div>
+
+        <p>The <span class="term">hit rate</span> — the fraction of requests that are hits — is the headline
+        number for buffer pool health. A well-sized pool on a typical workload hits 95–99% of the time, so the
+        vast majority of page requests never touch the disk at all.</p>
+
+        <h3>Pseudocode: getPage</h3>
+        <p>Here is the core routine, with the eviction details deferred to Topic 4 and the pinning details to
+        Topic 3. Read it slowly — it's the heart of the buffer pool.</p>
+<pre><span class="cm"># Fetch a page into memory and return the frame holding it.</span>
+<span class="kw">function</span> getPage(page_id):
+    <span class="cm"># --- Cache HIT: already in memory? ---</span>
+    <span class="kw">if</span> page_id <span class="kw">in</span> page_table:
+        frame = page_table[page_id]
+        frame.pin_count = frame.pin_count + <span class="nm">1</span>   <span class="cm"># mark "in use" (Topic 3)</span>
+        <span class="kw">return</span> frame                            <span class="cm"># no disk I/O 🎉</span>
+
+    <span class="cm"># --- Cache MISS: must bring it in from disk ---</span>
+    frame = findFreeFrame()                      <span class="cm"># a truly empty frame, if any</span>
+    <span class="kw">if</span> frame <span class="kw">is</span> <span class="kw">None</span>:
+        frame = evictVictim()                    <span class="cm"># pick &amp; free a victim (Topic 4)</span>
+        <span class="kw">if</span> frame <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">throw</span> <span class="st">"buffer pool full: every page is pinned"</span>
+
+    <span class="cm"># 'frame' is now empty and ours to use</span>
+    frame.data    = disk.readPage(page_id)       <span class="cm"># the slow part</span>
+    frame.page_id = page_id
+    frame.is_dirty = <span class="kw">false</span>
+    frame.pin_count = <span class="nm">1</span>
+    page_table[page_id] = frame                  <span class="cm"># write the new notebook line</span>
+    <span class="kw">return</span> frame</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a hit and a miss</span>
+          <p>Pool with 3 frames, all empty. Page table starts empty <code class="inl">{}</code>.</p>
+          <ul>
+            <li><code class="inl">getPage(5)</code> → <strong>miss</strong>. Read page 5 from disk into frame 0.
+            Table is now <code class="inl">{5 → f0}</code>. (1 disk read)</li>
+            <li><code class="inl">getPage(8)</code> → <strong>miss</strong>. Read page 8 into frame 1.
+            Table <code class="inl">{5 → f0, 8 → f1}</code>. (2 disk reads)</li>
+            <li><code class="inl">getPage(5)</code> → <strong>hit!</strong> Page 5 is already in frame 0.
+            Return it instantly. (still 2 disk reads — this one was free)</li>
+          </ul>
+          <p>Three requests, only two disk reads. The repeated access to page 5 paid for the cache.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The buffer pool is memory split into page-sized <strong>frames</strong>. A <strong>page table</strong>
+          maps page-id → frame for instant lookup. On <code class="inl">getPage</code> a <strong>hit</strong>
+          returns the frame with no disk I/O; a <strong>miss</strong> finds a free (or evicted) frame and reads
+          the page from disk. The fraction of hits is the all-important hit rate.
+        </div>
+      </section>
+
+      <!-- ===================== 3. PIN COUNTS & DIRTY FLAGS ===================== -->
+      <section id="pin-dirty">
+        <h2><span class="sec-num">3</span> Pin counts &amp; dirty flags</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two sticky notes go on each toy box on your rug. The first is a tally: "3 people are playing with
+          this right now." While that number is above zero, nobody is allowed to put the box back in the
+          warehouse — someone's still using it! That tally is the <strong>pin count</strong>. The second note
+          says "DIRTY" if you scribbled on the toy. A dirty box must be re-saved to the warehouse before it
+          leaves, or your changes are lost. That's the <strong>dirty flag</strong>.</p>
+        </div>
+
+        <h3>Pin counts — "don't evict, I'm using it"</h3>
+        <p>When a part of the database asks for a page, it's going to read or write the bytes in that frame for
+        a while. It would be a disaster if the buffer pool evicted that frame mid-use and reused it for a
+        different page. So before handing a frame out, the pool <span class="term">pins</span> it: it increments
+        the frame's <span class="term">pin count</span> (also called the <em>reference count</em>). A frame with
+        <code class="inl">pin_count &gt; 0</code> is <strong>off-limits for eviction</strong>.</p>
+        <p>When the caller is done, it must <span class="term">unpin</span> the page (decrement the count). A
+        frame only becomes eligible for eviction once its pin count drops back to <strong>zero</strong> — meaning
+        nobody is using it anymore.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Pin/unpin must balance</span>
+          <p>Every <code class="inl">pin</code> needs a matching <code class="inl">unpin</code>, just like every
+          <code class="inl">malloc</code> needs a <code class="inl">free</code>. Forget to unpin and that frame
+          is stuck forever — a <span class="term">pin leak</span>. Leak enough frames and the pool can't evict
+          anything, and the whole database stalls with "buffer pool full." This is a real, common bug.</p>
+        </div>
+
+        <h3>The dirty flag — "this page changed in memory"</h3>
+        <p>When a transaction modifies a page (inserts a row, updates a value), it changes the <em>copy in the
+        frame</em> — not the disk yet. That frame is now out of sync with disk. The pool marks it with a
+        <span class="term">dirty flag</span> (<code class="inl">is_dirty = true</code>). A
+        <span class="term">dirty page</span> holds the only up-to-date version of that data; a
+        <span class="term">clean page</span> is identical to what's on disk.</p>
+
+        <div class="bigidea">
+          <span class="c-title">Why the dirty flag is so important</span>
+          <p>It tells the pool whether a page <strong>must be written back to disk before it's evicted</strong>.
+          A <em>clean</em> page can be dropped instantly — disk already has an identical copy, so we just
+          overwrite the frame. A <em>dirty</em> page must first be <span class="term">flushed</span> (written to
+          disk), or the changes vanish. So the dirty flag turns some evictions cheap and some expensive.</p>
+        </div>
+
+        <h3>When do dirty pages actually get written back?</h3>
+        <p>The DBMS deliberately delays writing dirty pages — it's called <span class="term">delayed writeback</span> —
+        so that many changes can be batched and a hot page can be modified repeatedly without paying for a disk
+        write each time. A dirty page is flushed when:</p>
+        <ul>
+          <li><strong>It's chosen as an eviction victim</strong> and is dirty — flush, then reuse the frame.</li>
+          <li><strong>A background writer / checkpointer runs</strong> — a thread that periodically flushes dirty
+          pages so evictions later are cheap and recovery after a crash is fast.</li>
+          <li><strong>A checkpoint forces it</strong> — recovery logic occasionally flushes everything to create a
+          known-good snapshot.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">The recovery rule (a peek ahead)</span>
+          <p>There's one ordering law a database must obey, called <span class="term">Write-Ahead Logging (WAL)</span>:
+          the <em>log record</em> describing a change must hit disk <strong>before</strong> the dirty data page it
+          describes. This is how the database survives a crash without losing or corrupting data. We cover WAL and
+          recovery in a later session — for now, just know it's <em>why</em> the buffer pool can't flush pages in
+          whatever order it likes.</p>
+        </div>
+
+        <h3>The latch/concurrency angle (briefly)</h3>
+        <p>Many threads hit the buffer pool at once, so its internal structures — the page table and each frame's
+        metadata — must be protected from races. Databases use <span class="term">latches</span> (lightweight,
+        short-held locks on in-memory structures, distinct from the higher-level transaction <em>locks</em> you'll
+        meet later) to guard them. Two levels show up:</p>
+        <ul>
+          <li>A latch on the <strong>page table</strong> so two threads don't insert the same page into two frames.</li>
+          <li>A latch on each <strong>frame</strong> so a reader doesn't see a page half-overwritten by a writer.</li>
+        </ul>
+        <p>A subtle point: the <strong>pin count itself</strong> is a coordination tool. It's how the buffer pool
+        layer says "this frame is in active use" without holding a heavy lock for the whole duration.</p>
+
+        <h3>Pseudocode: unpin, and an eviction that respects both flags</h3>
+<pre><span class="cm"># Caller is done with a page. dirtied = did I modify it?</span>
+<span class="kw">function</span> unpinPage(page_id, dirtied):
+    frame = page_table[page_id]
+    <span class="kw">if</span> dirtied:
+        frame.is_dirty = <span class="kw">true</span>          <span class="cm"># mark it; flush happens later</span>
+    frame.pin_count = frame.pin_count - <span class="nm">1</span>
+    <span class="cm"># pin_count == 0 → now eligible for eviction (Topic 4)</span>
+
+<span class="cm"># Free a frame for reuse, honouring pin &amp; dirty rules.</span>
+<span class="kw">function</span> freeFrame(frame):
+    <span class="kw">if</span> frame.pin_count &gt; <span class="nm">0</span>:
+        <span class="kw">throw</span> <span class="st">"cannot evict a pinned page"</span>   <span class="cm"># someone's using it</span>
+    <span class="kw">if</span> frame.is_dirty:
+        disk.writePage(frame.page_id, frame.data) <span class="cm"># flush BEFORE reuse</span>
+        frame.is_dirty = <span class="kw">false</span>
+    page_table.remove(frame.page_id)              <span class="cm"># erase the notebook line</span>
+    frame.page_id = <span class="kw">None</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: pinning protects a page</span>
+          <p>Frame 0 holds page 5. Two threads call <code class="inl">getPage(5)</code> → pin_count becomes 2.
+          Now the pool is full and wants a victim.</p>
+          <ul>
+            <li>Page 5 has <code class="inl">pin_count = 2</code> → <strong>skipped</strong>, can't be evicted.</li>
+            <li>Thread A finishes, calls <code class="inl">unpinPage(5, dirtied=true)</code> → pin_count = 1,
+            <code class="inl">is_dirty = true</code>.</li>
+            <li>Thread B finishes, <code class="inl">unpinPage(5, dirtied=false)</code> → pin_count = 0. Now
+            evictable — <em>but</em> it's dirty.</li>
+            <li>If page 5 is later chosen as victim, <code class="inl">freeFrame</code> first writes it to disk
+            (because it's dirty), <em>then</em> reuses the frame. Changes are safe.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The <strong>pin count</strong> says how many users hold a page; a page is evictable only when it hits
+          zero. The <strong>dirty flag</strong> says the in-memory copy was modified, so it must be flushed to
+          disk before eviction (clean pages are dropped for free). Dirty pages are written back lazily — on
+          eviction, by a background writer, or at a checkpoint — and the WAL rule constrains the order.
+          <strong>Latches</strong> protect the page table and frames from concurrent threads.
+        </div>
+      </section>
+
+      <!-- ===================== 4. REPLACEMENT POLICY ===================== -->
+      <section id="replacement">
+        <h2><span class="sec-num">4</span> Replacement policy theory</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Your rug only fits a few toy boxes. When it's full and you want a new one, you have to put an old
+          box back in the warehouse to make room. Which one do you pick? Probably the one you haven't touched in
+          the longest time — you'll most likely want the others again sooner. Deciding which box to send back is
+          the <strong>replacement policy</strong>, and "the one untouched longest" is the famous rule called
+          <strong>LRU</strong>.</p>
+        </div>
+
+        <p>Memory is finite, so the buffer pool fills up. When a miss happens and there's no free frame, the pool
+        must throw one page out to make room — this is <span class="term">eviction</span>. The rule it uses to
+        choose the victim is the <span class="term">replacement policy</span> (a.k.a. eviction policy). A good
+        policy keeps the hit rate high by evicting pages you're <em>least</em> likely to need again soon. (Only
+        pages with <code class="inl">pin_count = 0</code> are even candidates — pinned pages are untouchable,
+        from Topic 3.)</p>
+
+        <h3>The theoretical best, and why we can't have it</h3>
+        <p>The provably optimal policy, called <span class="term">Bélády's OPT</span>, evicts the page that won't
+        be needed for the longest time <em>in the future</em>. It's optimal — and impossible — because it
+        requires seeing the future. So real policies <em>guess</em> the future from the past. The two classics
+        you must know:</p>
+
+        <h3>Policy 1 — LRU (Least Recently Used)</h3>
+        <p><span class="term">LRU</span> evicts the page that was accessed the longest ago, betting (via temporal
+        locality, Topic 1) that the recently-used pages will be used again soon. Conceptually you keep pages in a
+        list ordered by last-use; on every access you move that page to the front; to evict, you drop the page at
+        the back.</p>
+        <ul>
+          <li><strong>Pro:</strong> simple, intuitive, and good for most workloads.</li>
+          <li><strong>Con:</strong> a precise LRU must update a shared, ordered list on <em>every single access</em> —
+          including hits. Under heavy concurrency, all threads fighting over that one list (and its latch) becomes
+          a bottleneck.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">LRU's classic weakness: sequential flooding</span>
+          <p>A big sequential scan (read every page of a giant table once) pulls in page after page that will
+          <em>never</em> be reused, and LRU dutifully evicts your genuinely-hot pages to cache this one-time junk.
+          The hit rate craters. This is exactly why smarter schemes like <span class="term">LRU-K</span> exist —
+          they track the last <em>K</em> accesses to tell "used once" apart from "used repeatedly." We dig into
+          LRU-K and other refinements in <a href="session-5.html">Session 5</a>.</p>
+        </div>
+
+        <h3>Policy 2 — Clock (a.k.a. Second-Chance)</h3>
+        <p><span class="term">Clock</span> is a cheap approximation of LRU that avoids the per-access list churn.
+        Picture all frames arranged in a circle with a single hand (like a clock), and each frame having one
+        <span class="term">reference bit</span>:</p>
+        <ul>
+          <li>On <strong>access</strong>, just set that frame's reference bit to 1. (Cheap — no list to reorder.)</li>
+          <li>On <strong>eviction</strong>, sweep the hand forward. At each frame: if its bit is 1, give it a
+          "second chance" — clear the bit to 0 and move on. If its bit is already 0 (and it's unpinned), evict it.</li>
+        </ul>
+        <p>The effect: a page touched since the hand last passed survives one more lap; a page nobody has touched
+        gets evicted. It approximates "least recently used" using just one bit per frame and no work on hits — which
+        is why real systems (and the OS) favour Clock-family policies.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🕐</div><div class="s-t">Hand at frame</div><div class="s-d">Check its ref bit</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">1️⃣</div><div class="s-t">Bit = 1</div><div class="s-d">Clear to 0, give 2nd chance</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">0️⃣</div><div class="s-t">Bit = 0</div><div class="s-d">Unpinned? Evict it!</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⏭️</div><div class="s-t">Advance</div><div class="s-d">Move hand to next frame</div></div>
+        </div>
+
+        <h3>How the policy interacts with pinning</h3>
+        <p>The replacement policy never gets to pick a pinned page. In Clock, when the hand lands on a frame with
+        <code class="inl">pin_count &gt; 0</code>, it simply skips it (leaving the bit alone) and keeps sweeping.
+        In LRU, pinned pages are excluded from the candidate list. So pinning and replacement work as a team: pin
+        count says "is this even allowed?", and the policy says "of the allowed ones, which is least valuable?"</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Policy</th><th>Work on a hit</th><th>Approximates LRU?</th><th>Main weakness</th></tr></thead>
+            <tbody>
+              <tr><td>OPT (Bélády)</td><td>—</td><td>It <em>is</em> optimal</td><td>Needs the future — impossible</td></tr>
+              <tr><td>LRU</td><td>Move page to front of list</td><td>Exact recency</td><td>List contention; sequential flooding</td></tr>
+              <tr><td>Clock</td><td>Set one bit (O(1))</td><td>Good approximation</td><td>Coarser than true LRU</td></tr>
+              <tr><td>FIFO</td><td>Nothing</td><td>No (ignores reuse)</td><td>Evicts hot pages; usually worst</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: LRU vs Clock on the same trace</span>
+          <p>Pool with <strong>3 frames</strong>. Access sequence of page ids:
+          <code class="inl">A, B, C, A, D, B</code> (all unpinned, none dirty for simplicity).</p>
+          <p><strong>LRU</strong> (front = most recent, back = eviction target):</p>
+          <ul>
+            <li><code class="inl">A</code> miss → [A]</li>
+            <li><code class="inl">B</code> miss → [B, A]</li>
+            <li><code class="inl">C</code> miss → [C, B, A] (full)</li>
+            <li><code class="inl">A</code> <strong>hit</strong> → move A front → [A, C, B]</li>
+            <li><code class="inl">D</code> miss, full → evict back = <strong>B</strong> → [D, A, C]</li>
+            <li><code class="inl">B</code> miss → evict back = <strong>C</strong> → [B, D, A]</li>
+          </ul>
+          <p>Result: 2 hits avoided… actually <strong>1 hit</strong> (the second A), 5 misses, and B/C were the
+          victims. Notice the recently-reused A was protected.</p>
+          <p><strong>Clock</strong> (frames in a ring f0,f1,f2; bit shown as page=bit; hand starts at f0):</p>
+          <ul>
+            <li><code class="inl">A</code> miss → f0=A(1). <code class="inl">B</code> miss → f1=B(1).
+            <code class="inl">C</code> miss → f2=C(1). Full; hand at f0.</li>
+            <li><code class="inl">A</code> <strong>hit</strong> → set f0 bit: A(1) (already 1).</li>
+            <li><code class="inl">D</code> miss → sweep: f0 A bit1→clear to 0, advance; f1 B bit1→clear to 0,
+            advance; f2 C bit1→clear to 0, advance; back to f0 A bit0→<strong>evict A</strong>, put D, f0=D(1).
+            Hand at f1.</li>
+            <li><code class="inl">B</code> <strong>hit</strong> → set f1 bit: B(1).</li>
+          </ul>
+          <p>Result: 2 hits (the A re-use and the final B), 4 misses. Here Clock happened to keep B and got an
+          extra hit — the two policies make different choices, and which "wins" depends on the exact trace.
+          The takeaway isn't that one is always better; it's that <strong>recency-based guessing</strong> is what
+          keeps hit rates high, and Clock buys most of LRU's benefit for far less per-access cost.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          When the pool is full, a <strong>replacement policy</strong> chooses an unpinned victim to evict.
+          The optimal policy (OPT) needs the future, so real systems approximate it. <strong>LRU</strong> evicts
+          the least-recently-used page but contends on a shared list and suffers from sequential flooding.
+          <strong>Clock/second-chance</strong> approximates LRU with one reference bit and no work on hits, which
+          is why it's so widely used. Pinning constrains the policy: only <code class="inl">pin_count = 0</code>
+          pages can ever be chosen. Smarter policies like LRU-K come in Session 5.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a database keeps its working data in memory. Here's the one-paragraph story that
+        connects all four topics:</p>
+        <div class="bigidea">
+          <p>Because <strong>disk is thousands of times slower than RAM</strong>, the DBMS runs its own
+          <strong>buffer pool</strong> — a cache of disk pages in memory that it controls better than the OS could.
+          The pool is divided into page-sized <strong>frames</strong>, and a <strong>page table</strong> maps each
+          page-id to the frame holding it, so <code class="inl">getPage</code> is an instant <strong>hit</strong>
+          when the page is resident and a slow disk <strong>miss</strong> when it isn't. While a page is in use its
+          <strong>pin count</strong> protects it from eviction, and if it's modified its <strong>dirty flag</strong>
+          forces a flush to disk before the frame can be reused (lazily, respecting the WAL ordering rule). When
+          memory fills up, a <strong>replacement policy</strong> — LRU, or the cheaper <strong>Clock/second-chance</strong>
+          approximation — evicts the least-valuable <em>unpinned</em> page, keeping the hit rate high. Smarter
+          policies like LRU-K are next, in Session 5.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does a database build its own buffer pool instead of relying on the OS page cache?</summary>
+          <p class="ans">Because the DBMS knows its own access patterns and query plans (so it evicts smarter),
+          it must control <em>write ordering</em> for crash recovery (the WAL rule), it can <em>pin</em> pages the
+          OS can't, and it avoids the wasteful double-copy of caching the same data in both the OS cache and DBMS
+          memory.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between a cache hit and a cache miss in the buffer pool?</summary>
+          <p class="ans">A hit means the requested page is already in a frame (found via the page table) and is
+          returned with no disk I/O. A miss means it isn't resident, so the pool must find a free or evicted frame
+          and read the page from disk — slow.</p>
+        </details>
+        <details class="quiz">
+          <summary>When can a page be evicted, and what extra step is needed if it's dirty?</summary>
+          <p class="ans">Only when its pin count is 0 (nobody is using it). If the page is dirty (modified in
+          memory), it must be flushed — written back to disk — <em>before</em> the frame is reused, or the changes
+          would be lost. A clean page can be dropped for free.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's a "pin leak" and why is it dangerous?</summary>
+          <p class="ans">A pin leak is forgetting to unpin a page after use, so its pin count never returns to
+          zero. That frame becomes permanently un-evictable. Enough leaks and the pool can't free any frames, so
+          new misses fail with "buffer pool full" and the database stalls.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does the Clock (second-chance) policy approximate LRU so cheaply?</summary>
+          <p class="ans">Each frame has one reference bit, set on access (cheap, no list reordering on hits). To
+          evict, a hand sweeps the ring: a frame with bit 1 gets cleared to 0 and a second chance; a frame with
+          bit 0 (and unpinned) is evicted. Recently-touched pages survive a lap, untouched ones leave — LRU-like
+          behaviour for one bit per frame.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a plain LRU policy struggle with a large sequential scan?</summary>
+          <p class="ans">Sequential flooding: scanning a huge table reads many pages that are never reused, and
+          LRU evicts your genuinely-hot pages to cache this one-time data, tanking the hit rate. LRU-K (Session 5)
+          fixes this by tracking multiple recent accesses to distinguish "used once" from "used repeatedly."</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 4 — Buffer Pool"</strong>.</li>
+          <li>🛠️ Capstone: <strong>MiniDB — Milestone M1 (Buffer Pool)</strong> — implement frames, the page table, pin/unpin, the dirty flag, and a Clock or LRU replacement policy.</li>
+          <li>✍️ Written assignment: <strong>"Design a buffer pool"</strong> — specify the data structures, the <code class="inl">getPage</code>/<code class="inl">unpin</code> paths, and your eviction policy with its trade-offs.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445/645 — Database Systems</a> — the gold-standard course; see the "Buffer Pools / Database Storage" lectures and notes for this exact material.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Database System Concepts (Silberschatz, Korth, Sudarshan)</a> — the buffer management chapter is the classic textbook treatment of frames, pinning, and replacement.</li>
+          <li><a href="https://www.postgresql.org/docs/current/runtime-config-resource.html" target="_blank" rel="noopener">PostgreSQL docs — <code class="inl">shared_buffers</code> &amp; resource config</a> — how a real production system exposes and tunes its buffer pool.</li>
+          <li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html" target="_blank" rel="noopener">MySQL / InnoDB Buffer Pool documentation</a> — a real LRU-based buffer pool with a "midpoint insertion" twist to resist sequential flooding.</li>
+          <li><a href="https://dl.acm.org/doi/10.1145/170035.170081" target="_blank" rel="noopener">O'Neil, O'Neil &amp; Weikum — "The LRU-K Page Replacement Algorithm" (1993)</a> — the original paper behind the policy we study in Session 5.</li>
+          <li><a href="https://en.wikipedia.org/wiki/Cache_replacement_policies" target="_blank" rel="noopener">Cache replacement policies (overview)</a> — a clear survey of OPT, LRU, Clock/second-chance, FIFO and friends.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-3.html"><div class="dir">← Previous</div><div class="ttl">Session 3: Storage Engine — Heap Files</div></a>
+        <a class="next" href="session-5.html"><div class="dir">Next →</div><div class="ttl">Session 5: Buffer Pool — Replacement</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 4 — The Buffer Pool · Your pages now live in memory 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

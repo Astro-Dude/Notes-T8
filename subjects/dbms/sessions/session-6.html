@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 6 — Index Structures — B+ Trees (Part 1)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 6</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 06 · Index Structures — B+ Trees</span>
+      <h1>How databases find a row without reading the whole table</h1>
+      <p class="lead">
+        Imagine a phone book with a million names and <em>no</em> alphabetical order. Finding "Zara"
+        would mean reading every page. Databases face this exact problem — and the clever answer is
+        an <strong>index</strong>, most often a <strong>B+ tree</strong>. We assume you've studied
+        <em>none</em> of this. Every topic starts with a tiny everyday story, then we build up the
+        real structure, the search, and the inserts — slowly, with pictures and pseudocode.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why indexes exist</a></li>
+          <li><a href="#structure">B+ tree structure &amp; invariants</a></li>
+          <li><a href="#search">Searching: point &amp; range</a></li>
+          <li><a href="#insert">Insertion &amp; page splits</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY INDEXES ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why indexes — the full-scan problem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a giant book with no contents page. To find the one page that mentions
+          dinosaurs, you'd have to flip through <strong>every single page</strong> from the start.
+          Exhausting! Now imagine someone added an <strong>index at the back</strong>:
+          "Dinosaurs … page 184." You jump straight there. A database <span class="term">index</span>
+          is exactly that back-of-the-book index — a sorted shortcut that tells the database
+          <em>where</em> to look, so it doesn't have to read everything.</p>
+        </div>
+
+        <p>A database table is stored as rows packed into fixed-size blocks on disk called
+        <span class="term">pages</span> (recall the buffer pool from Session 5 — pages are the unit the
+        database reads from disk into memory). When you ask a question like
+        <code class="inl">SELECT * FROM students WHERE id = 8472</code>, the database has two options.</p>
+
+        <h3>Option A — the full table scan</h3>
+        <p>A <span class="term">full table scan</span> means reading <em>every</em> page of the table,
+        row by row, checking each one to see if it matches. If the table has a million rows spread
+        across thousands of pages, that's thousands of disk reads — even though you only wanted
+        <strong>one</strong> row. Disk reads are slow (orders of magnitude slower than memory), so this
+        is the expensive thing we want to avoid.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example</span>
+          <p>A table of 1,000,000 students, 100 rows per page → <strong>10,000 pages</strong>. To find one
+          student by <code class="inl">id</code> with no index, the database reads up to all 10,000 pages.
+          With a good index, it reads about <strong>3–4 pages</strong> instead. That's the difference
+          between a query that takes seconds and one that takes milliseconds.</p>
+        </div>
+
+        <h3>Option B — use an index (the sorted shortcut)</h3>
+        <p>An <span class="term">index</span> is a separate, <strong>sorted</strong> data structure built on
+        one or more columns (the <span class="term">search key</span>). Because it's kept in sorted order,
+        the database can use fast lookup techniques — like binary search, or walking down a tree — to
+        zoom in on the matching rows without scanning the whole table.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>An index trades a little extra storage and slightly slower writes for <strong>dramatically
+          faster reads</strong>. Instead of "look at everything," the database can say "the sorted index
+          tells me exactly where row 8472 lives — fetch just that page."</p>
+        </div>
+
+        <h3>Index vs. the table itself</h3>
+        <p>It's important to keep these two things separate in your head:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>The table (heap)</th><th>The index</th></tr></thead>
+            <tbody>
+              <tr><td>What it stores</td><td>All the actual row data.</td><td>Just the search-key values, plus a pointer to where the full row lives.</td></tr>
+              <tr><td>Order</td><td>Usually unordered ("heap") — rows sit wherever there was room.</td><td>Always kept <strong>sorted</strong> by the search key.</td></tr>
+              <tr><td>Size</td><td>Big — holds everything.</td><td>Smaller — only key + pointer per row.</td></tr>
+              <tr><td>Purpose</td><td>Be the source of truth.</td><td>Be a fast lookup map <em>into</em> the table.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The pointer in an index is typically a <span class="term">record ID</span> (often written
+        <code class="inl">RID</code>): the page number plus the slot on that page where the full row sits.
+        Find the key in the index, follow the pointer, fetch one page — done.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The trade-off (there's no free lunch)</span>
+          <p>Indexes make reads fast, but they cost you:</p>
+          <ul>
+            <li><strong>Slower writes.</strong> Every <code class="inl">INSERT</code>,
+            <code class="inl">UPDATE</code>, or <code class="inl">DELETE</code> must also update every index
+            on that column to keep it sorted. More indexes = more write work.</li>
+            <li><strong>Extra space.</strong> Each index is a whole separate structure stored on disk.</li>
+          </ul>
+          <p>So you index the columns you <em>search and join on a lot</em> — not every column. Choosing
+          indexes wisely is a core database-tuning skill.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Many kinds of index exist</span>
+          <p>Hash indexes, bitmap indexes, and tree indexes are all options. By far the most common
+          default in real databases (PostgreSQL, MySQL/InnoDB, SQLite, Oracle…) is the
+          <span class="term">B+ tree</span> — because it's great at both single-value lookups <em>and</em>
+          range queries, and it stays fast even when it's huge. That's our whole focus from here on.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Without an index, finding a row means a slow full table scan of every page. An index is a
+          separate <strong>sorted</strong> structure of (key → pointer) that lets the database jump
+          straight to the right page. The price is slower writes and extra disk space — so you index
+          the columns you query most.
+        </div>
+      </section>
+
+      <!-- ===================== 2. STRUCTURE ===================== -->
+      <section id="structure">
+        <h2><span class="sec-num">2</span> B+ tree structure &amp; invariants</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a company org chart, but upside down. At the top is one boss (the
+          <strong>root</strong>). The boss doesn't do the work — they just point you to the right manager.
+          That manager points you to the right team lead, and finally you reach the workers
+          (the <strong>leaves</strong>) who actually hold the answers. To find anything, you only ask a
+          few people on the way down instead of bothering everyone. A B+ tree is that pointing-you-down
+          structure, kept perfectly balanced so the trip is always short.</p>
+        </div>
+
+        <p>A <span class="term">B+ tree</span> is a balanced, sorted tree designed specifically for disk.
+        Each node is exactly one <strong>page</strong>, so reading a node = one disk read. There are two
+        kinds of nodes.</p>
+
+        <h3>Two node types: internal vs. leaf</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Node type</th><th>What it holds</th><th>Job</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Internal node</span> (incl. the root)</td><td>Sorted <em>separator keys</em> and <em>child pointers</em> only — <strong>no data</strong>.</td><td>Act as a signpost: "keys below X go left, keys ≥ X go right."</td></tr>
+              <tr><td><span class="term">Leaf node</span></td><td>The actual sorted keys, each with its data pointer (RID), <strong>plus a pointer to the next leaf</strong>.</td><td>Hold the real answers and chain together for range scans.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The defining feature of a B+ tree</span>
+          <p>In a B+ tree, <strong>all the real data lives only in the leaves</strong>. Internal nodes are
+          pure signposts. (This is the key difference from a plain B-tree, where data can sit in internal
+          nodes too.) Putting all data at the bottom keeps internal nodes tiny, so each one can point to
+          <em>many</em> children — which makes the tree very shallow.</p>
+        </div>
+
+        <h3>Order / fanout — why the tree is so shallow</h3>
+        <p>The <span class="term">fanout</span> (also called the <span class="term">order</span>) is the
+        maximum number of children an internal node can have. Because each node is one page (say 4 KB or
+        8 KB) and a key+pointer pair is small (maybe ~16 bytes), a single node can hold
+        <em>hundreds</em> of pointers. A fanout of a few hundred is normal.</p>
+
+        <p>High fanout is the whole magic. A tree where each node has ~hundreds of children gets
+        <strong>very tall capacity from very few levels</strong>:</p>
+        <div class="callout example">
+          <span class="c-title">Example: how few levels you need</span>
+          <p>With a fanout of <strong>100</strong>:</p>
+          <ul>
+            <li>1 level (just leaves) → ~100 keys</li>
+            <li>2 levels → ~100 × 100 = <strong>10,000</strong> keys</li>
+            <li>3 levels → ~100 × 100 × 100 = <strong>1,000,000</strong> keys</li>
+            <li>4 levels → ~<strong>100,000,000</strong> keys</li>
+          </ul>
+          <p>So a B+ tree holding 100 million rows is only <strong>4 levels deep</strong>. Finding any row
+          touches just 4 nodes = <strong>4 disk reads</strong> (and the top levels are usually already
+          cached in the buffer pool, so it's often fewer). <em>That's</em> why databases love B+ trees.</p>
+        </div>
+
+        <h3>A picture of a small B+ tree</h3>
+        <p>Here's a tiny B+ tree (fanout small, just for drawing). Notice the leaves are chained left to
+        right with arrows — that's the linked list.</p>
+        <pre>
+                          <span class="cm">[ internal / root ]</span>
+                          +-------------------+
+                          |   <span class="nm">13</span>   |   <span class="nm">30</span>   |
+                          +--+-----+------+---+
+                  &lt;13       |     | 13..29|      |  &gt;=30
+            +---------------+     +---+   +------------------+
+            v                         v                      v
+      <span class="cm">[ leaf ]</span>                  <span class="cm">[ leaf ]</span>                <span class="cm">[ leaf ]</span>
+   +----+----+----+         +----+----+----+        +----+----+----+
+   |  <span class="nm">5</span> |  <span class="nm">9</span> | <span class="nm">11</span> |  --&gt;   | <span class="nm">13</span> | <span class="nm">20</span> | <span class="nm">27</span> |  --&gt;  | <span class="nm">30</span> | <span class="nm">41</span> | <span class="nm">55</span> |  --&gt; (null)
+   +----+----+----+         +----+----+----+        +----+----+----+
+     each key also carries a pointer (RID) to its full row in the table
+        </pre>
+        <p>Read the root as a set of signposts: keys <strong>&lt; 13</strong> go to the first child,
+        keys <strong>13 to 29</strong> go to the middle child, keys <strong>≥ 30</strong> go to the last
+        child. Notice <strong>13 appears both in the root (as a separator) and in a leaf (as real data)</strong>
+        — that's normal in a B+ tree, because the root copy is just a signpost.</p>
+
+        <h3>The invariants (rules the tree always keeps)</h3>
+        <p>A B+ tree is always valid because it enforces these rules on every operation:</p>
+        <ul>
+          <li><strong>Sorted.</strong> Keys within every node are in ascending order, and leaves overall
+          read left-to-right as one fully sorted sequence.</li>
+          <li><strong>Balanced.</strong> <em>Every leaf is at the exact same depth.</em> The tree never
+          gets lopsided, so every lookup costs the same number of steps. This is the
+          <span class="term">balance invariant</span>.</li>
+          <li><strong>Half-full (the occupancy rule).</strong> Every node except the root must be at least
+          <strong>half full</strong> (roughly between ⌈order/2⌉ and order entries). This guarantees the tree
+          doesn't waste space or grow needlessly tall.</li>
+          <li><strong>Leaf chain.</strong> Leaves form a <span class="term">linked list</span>: each leaf
+          points to the next leaf in sorted order. This is what makes range scans fast (Topic 3).</li>
+          <li><strong>Height stays low.</strong> Because of balance + high fanout, height is
+          <strong>O(log<sub>fanout</sub> n)</strong> — a small number even for billions of rows.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why "balanced" matters so much</span>
+          <p>An ordinary binary search tree can degenerate into a long thin chain (basically a linked list)
+          if you insert sorted data, making lookups slow again. A B+ tree <em>guarantees</em> balance by
+          splitting nodes as it grows (Topic 4), so it can <strong>never</strong> degenerate. Performance is
+          predictable no matter what order you insert keys.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A B+ tree has <strong>internal nodes</strong> (sorted separator keys + child pointers, pure
+          signposts) and <strong>leaf nodes</strong> (the real sorted keys + data pointers, chained into a
+          linked list). High <strong>fanout</strong> packs hundreds of pointers per page, so even a billion
+          rows fit in ~4 levels. It always stays <strong>sorted, balanced, and at least half full</strong>,
+          giving O(log n) lookups with very few disk reads.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SEARCH ===================== -->
+      <section id="search">
+        <h2><span class="sec-num">3</span> Searching: point lookups &amp; range scans</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You're looking for a friend's apartment in a huge building. At the front door, a sign says
+          "Rooms 1–50 take the left lift, 51–100 take the right." You pick a lift. On your floor, another
+          sign narrows it further. A few signs later, you're at the door. You never wandered every hallway —
+          each sign cut your search in a big chunk. Searching a B+ tree is following those signs from the
+          root down to one leaf.</p>
+        </div>
+
+        <h3>Point lookup — finding one exact key</h3>
+        <p>A <span class="term">point lookup</span> finds the row(s) for one exact value, like
+        <code class="inl">WHERE id = 27</code>. You start at the root and walk down, at each internal node
+        choosing the child whose key range contains your target, until you reach a leaf — then look inside
+        the leaf for the key.</p>
+
+        <pre>
+<span class="kw">function</span> search(node, target):
+    <span class="kw">while</span> node <span class="kw">is</span> an internal node:
+        <span class="cm"># pick the child pointer for target's range</span>
+        i = smallest index <span class="kw">where</span> target &lt; node.key[i]
+             (<span class="kw">or</span> last child <span class="kw">if</span> target &gt;= all keys)
+        node = node.child[i]
+    <span class="cm"># now node is a leaf</span>
+    <span class="kw">if</span> target <span class="kw">in</span> node.keys:
+        <span class="kw">return</span> node.pointer_for(target)   <span class="cm"># the RID → fetch the row</span>
+    <span class="kw">else</span>:
+        <span class="kw">return</span> NOT_FOUND
+        </pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: look up key 27</span>
+          <p>Using the tree from Topic 2 (root separators <strong>13</strong> and <strong>30</strong>):</p>
+          <div class="flow">
+            <div class="step"><div class="s-ico">🌳</div><div class="s-t">Root</div><div class="s-d">27 is ≥13 and &lt;30 → take the <strong>middle</strong> child</div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">🍃</div><div class="s-t">Leaf [13,20,27]</div><div class="s-d">scan inside → find <strong>27</strong></div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">📄</div><div class="s-t">Follow RID</div><div class="s-d">fetch the full row from the table page</div></div>
+          </div>
+          <p>The whole lookup touched the root, one leaf, then one table page. On a real tree that's a
+          handful of nodes regardless of how big the table is.</p>
+        </div>
+
+        <h3>Range scan — finding everything in an interval</h3>
+        <p>A <span class="term">range scan</span> answers queries like
+        <code class="inl">WHERE id BETWEEN 20 AND 50</code> or
+        <code class="inl">WHERE age &gt; 30</code>. This is where the <strong>leaf linked list</strong> shines.
+        You search down to the leaf holding the <em>start</em> of the range, then simply
+        <strong>walk along the leaf chain</strong> collecting keys until you pass the end of the range.</p>
+
+        <pre>
+<span class="kw">function</span> rangeScan(low, high):
+    leaf = search down to the leaf that would contain low
+    results = []
+    <span class="kw">while</span> leaf <span class="kw">is not</span> null:
+        <span class="kw">for</span> key <span class="kw">in</span> leaf.keys (ascending):
+            <span class="kw">if</span> key &gt; high:
+                <span class="kw">return</span> results        <span class="cm"># passed the end → done</span>
+            <span class="kw">if</span> key &gt;= low:
+                results.add(leaf.pointer_for(key))
+        leaf = leaf.next         <span class="cm"># hop to next leaf via the linked list</span>
+    <span class="kw">return</span> results
+        </pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: keys BETWEEN 20 AND 50</span>
+          <ul>
+            <li>Search down to the leaf containing the start (20) → land in leaf <strong>[13, 20, 27]</strong>.</li>
+            <li>Collect <strong>20, 27</strong> (both in range; 13 is below <code class="inl">low</code>, skip it).</li>
+            <li>Follow <code class="inl">next</code> to leaf <strong>[30, 41, 55]</strong>; collect <strong>30, 41</strong>.</li>
+            <li>Hit <strong>55</strong> &gt; 50 → stop. Result: <strong>{20, 27, 30, 41}</strong>.</li>
+          </ul>
+          <p>No need to climb back up the tree between leaves — the chain pointers let us slide along the
+          bottom row like reading a sorted list.</p>
+        </div>
+
+        <h3>Complexity</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Point lookup</td><td><strong>O(log<sub>F</sub> n)</strong> disk reads, where F = fanout</td><td>One node read per level; height is log<sub>F</sub> n (≈ 3–4 for huge tables).</td></tr>
+              <tr><td>Range scan</td><td><strong>O(log<sub>F</sub> n + k)</strong></td><td>log to find the start, then k for the matching results streamed along the leaf chain (k = number of matches).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Because fanout F is large, log<sub>F</sub> n is tiny — a million rows is ~3 levels, a billion
+          is ~4–5. The base of the logarithm being hundreds (not 2, like a binary tree) is exactly why B+
+          trees are so disk-friendly: <strong>fewer levels = fewer slow disk reads</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>point lookup</strong> walks root → leaf following signpost keys, in O(log<sub>F</sub> n)
+          reads. A <strong>range scan</strong> finds the start leaf the same way, then glides along the
+          <strong>leaf linked list</strong> collecting matches until it passes the upper bound, in
+          O(log<sub>F</sub> n + k). High fanout keeps the height — and the disk reads — tiny.
+        </div>
+      </section>
+
+      <!-- ===================== 4. INSERTION ===================== -->
+      <section id="insert">
+        <h2><span class="sec-num">4</span> Insertion &amp; page splits</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a school bus with rows of seats. New kids keep getting on. When a row is full and one
+          more kid needs to sit there, you <strong>split the row into two</strong> and tell the bus monitor
+          (one level up) "there's a new row now, here's where it starts." If the monitor's clipboard is also
+          full, <em>they</em> split too, and tell <em>their</em> boss. Occasionally even the head teacher's
+          list overflows and a brand-new top boss is created — that's the bus (the tree) growing one level
+          taller. B+ tree insertion is exactly this splitting-and-telling-upward.</p>
+        </div>
+
+        <p>Inserting a key must keep <em>all</em> the invariants true (sorted, balanced, half-full). The
+        trick that preserves balance is the <span class="term">page split</span>.</p>
+
+        <h3>The algorithm in words</h3>
+        <ul>
+          <li><strong>Find the leaf</strong> where the key belongs (same downward search as a lookup).</li>
+          <li><strong>If the leaf has room</strong>, insert the key in sorted position. Done — easy case.</li>
+          <li><strong>If the leaf is full</strong>, <span class="term">split</span> it into two leaves,
+          dividing the keys roughly in half. Then <strong>copy up</strong> the smallest key of the new right
+          leaf into the parent as a new separator, and fix the leaf-chain pointers.</li>
+          <li><strong>If the parent is now full too</strong>, split the parent the same way — but for an
+          <em>internal</em> node you <span class="term">push up</span> the middle key (it moves up, it
+          isn't copied), since internal nodes only hold signposts.</li>
+          <li><strong>If the split reaches the root and the root splits</strong>, a brand-new root is created
+          above it. This is the <strong>only</strong> way a B+ tree grows taller — from the top, which is why
+          all leaves always stay at the same depth.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">"Copy up" vs "push up" — the one subtlety</span>
+          <p>When a <strong>leaf</strong> splits, the separator key still needs to physically remain in the
+          leaf (it's real data), so a <em>copy</em> of it goes up. When an <strong>internal</strong> node
+          splits, the middle key is only a signpost, so it <em>moves</em> up entirely (push up) — it should
+          not be duplicated. Mixing these up is the classic B+ tree bug.</p>
+        </div>
+
+        <pre>
+<span class="kw">function</span> insert(key, rid):
+    leaf = search down to the target leaf
+    add (key, rid) into leaf <span class="kw">in</span> sorted order
+    <span class="kw">if</span> leaf overflows (more than order-1 keys):
+        split(leaf)
+
+<span class="kw">function</span> split(node):
+    mid = middle position
+    right = new node with the upper half of node's entries
+    fix sibling/leaf-chain pointers
+    <span class="kw">if</span> node <span class="kw">is</span> a leaf:
+        sep = right.keys[0]            <span class="cm"># COPY up (key stays in right leaf too)</span>
+    <span class="kw">else</span>:
+        sep = node.keys[mid]           <span class="cm"># PUSH up (key leaves this node)</span>
+    <span class="kw">if</span> node <span class="kw">is</span> root:
+        make a new root holding sep, with node and right as children   <span class="cm"># tree grows +1 level</span>
+    <span class="kw">else</span>:
+        insert sep into parent, pointing to right
+        <span class="kw">if</span> parent overflows: split(parent)   <span class="cm"># propagate upward</span>
+        </pre>
+
+        <h3>Step-by-step worked example</h3>
+        <p>Let's build a small tree where a node holds at most <strong>3 keys</strong> (so it splits when a
+        4th would arrive). We insert: <strong>10, 20, 30, 40, 50</strong>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Insert 10, 20, 30 — the easy case</span>
+          <pre>
+insert 10 → [ <span class="nm">10</span> ]
+insert 20 → [ <span class="nm">10</span> | <span class="nm">20</span> ]
+insert 30 → [ <span class="nm">10</span> | <span class="nm">20</span> | <span class="nm">30</span> ]      <span class="cm"># leaf now full (3 keys), still a single leaf = the root</span>
+          </pre>
+          <p>So far no split — there was always room.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Insert 40 — the first leaf split (tree grows to 2 levels)</span>
+          <p>The leaf <code class="inl">[10|20|30]</code> is full and 40 needs to go in. We'd have
+          <code class="inl">[10,20,30,40]</code> → overflow → split into two leaves around the middle:</p>
+          <pre>
+                 <span class="cm">[ new root ]</span>
+                 +--------+
+                 |   <span class="nm">30</span>   |          <span class="cm"># 30 = smallest key of right leaf, COPIED up</span>
+                 +--+--+--+
+            &lt;30   |     |  &gt;=30
+            v           v
+        +----+----+   +----+----+
+        | <span class="nm">10</span> | <span class="nm">20</span> | --&gt;| <span class="nm">30</span> | <span class="nm">40</span> |  --&gt; (null)
+        +----+----+   +----+----+
+          </pre>
+          <p>Note: <strong>30 stays in the right leaf</strong> (it's real data) <em>and</em> a copy went up to
+          the new root as a separator. A brand-new root was created → the tree is now <strong>2 levels tall</strong>,
+          and both leaves are at the same depth (balance preserved). The two leaves are chained left → right.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Insert 50 — back to the easy case</span>
+          <pre>
+                 +--------+
+                 |   <span class="nm">30</span>   |
+                 +--+--+--+
+            v           v
+        +----+----+   +----+----+----+
+        | <span class="nm">10</span> | <span class="nm">20</span> | --&gt;| <span class="nm">30</span> | <span class="nm">40</span> | <span class="nm">50</span> |  --&gt; (null)
+        +----+----+   +----+----+----+
+          </pre>
+          <p>50 belongs in the right leaf, which has room (only 2 of 3 slots used). Insert in sorted order,
+          no split needed. The next insert into that right leaf (say <strong>60</strong>) would overflow it
+          and trigger another leaf split, copying a separator up into the root.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">When the root itself splits (height +1)</span>
+          <p>Keep inserting and eventually the <em>root</em> fills with separators. When it overflows, it
+          splits and the <strong>middle separator is pushed up</strong> into a fresh root holding just that
+          one key with two children. This is the only moment a B+ tree gets taller — and it happens at the
+          top, which is precisely why every leaf always stays on the same level. Deletes do the mirror image:
+          if a node drops below half-full it borrows from a sibling or merges, occasionally shrinking the
+          tree — we'll cover deletion fully in <a href="session-7.html">Session 7</a>.</p>
+        </div>
+
+        <h3>Complexity</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Insert (no split)</td><td><strong>O(log<sub>F</sub> n)</strong></td><td>Walk down to the leaf, insert in place.</td></tr>
+              <tr><td>Insert (with splits)</td><td><strong>O(log<sub>F</sub> n)</strong></td><td>Splits propagate <em>up at most one level per step</em>, and the height is log<sub>F</sub> n — so even cascading splits stay logarithmic.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — the write cost from Topic 1, in action</span>
+          <p>This is the "slower writes" trade-off made concrete. A single insert is usually cheap, but a
+          split touches multiple pages (the leaf, its new sibling, the parent, sometimes more) and must be
+          written back to disk. Every index on a table pays this on <em>every</em> insert. Useful indexes are
+          worth it; needless ones just tax your writes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          To insert, walk to the right leaf and add the key. If the node overflows, <strong>split</strong> it
+          in half: leaves <strong>copy up</strong> a separator, internal nodes <strong>push up</strong> the
+          middle key, and splits cascade upward. The tree only ever grows taller when the <strong>root</strong>
+          splits — keeping it perfectly balanced. All of this stays O(log<sub>F</sub> n).
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how databases find rows fast. Here's the one-paragraph story that ties the four
+        topics together:</p>
+        <div class="bigidea">
+          <p>Reading a whole table to find one row is a slow <strong>full scan</strong>, so databases build an
+          <strong>index</strong> — a sorted (key → pointer) shortcut. The workhorse index is the
+          <strong>B+ tree</strong>: <em>internal nodes</em> are pure signposts and <em>leaf nodes</em> hold the
+          real sorted keys, chained into a <strong>linked list</strong>. Thanks to high <strong>fanout</strong>,
+          even a billion rows fit in ~4 levels, so a <strong>point lookup</strong> is just a few disk reads
+          (O(log<sub>F</sub> n)) and a <strong>range scan</strong> glides along the leaf chain
+          (O(log<sub>F</sub> n + k)). Inserts walk to a leaf and, when a node fills, <strong>split</strong> —
+          copying up from leaves, pushing up from internal nodes — so the tree stays <strong>balanced</strong>
+          and grows taller only by splitting the root. That balance is what makes reads, ranges, and writes all
+          predictably fast.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does an index make reads faster but writes slower?</summary>
+          <p class="ans">Reads get faster because the sorted index lets you jump straight to the right page
+          instead of scanning the whole table. Writes get slower because every insert/update/delete must also
+          update the index (and may trigger splits) to keep it sorted and balanced.</p>
+        </details>
+        <details class="quiz">
+          <summary>In a B+ tree, where does the actual row data (or its pointer) live?</summary>
+          <p class="ans">Only in the <strong>leaf nodes</strong>. Internal nodes hold separator keys and child
+          pointers only — they're signposts. This keeps internal nodes small, raising fanout and lowering height.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is a B+ tree only ~4 levels deep even for 100 million rows?</summary>
+          <p class="ans">High <strong>fanout</strong>: each node (one disk page) holds hundreds of child
+          pointers, so capacity multiplies by ~hundreds per level. Height is O(log<sub>F</sub> n) with a large
+          base F, so few levels cover enormous tables — meaning very few disk reads per lookup.</p>
+        </details>
+        <details class="quiz">
+          <summary>What makes range scans (e.g. BETWEEN 20 AND 50) efficient?</summary>
+          <p class="ans">The <strong>leaf-level linked list</strong>. You search down once to the start leaf,
+          then follow <code class="inl">next</code> pointers along the bottom row, collecting matches until you
+          pass the upper bound — no climbing back up the tree. Cost: O(log<sub>F</sub> n + k).</p>
+        </details>
+        <details class="quiz">
+          <summary>When a leaf splits, why is the separator "copied up" but for an internal node it's "pushed up"?</summary>
+          <p class="ans">Leaf keys are real data and must stay in the leaf, so a copy of the separator goes to
+          the parent. Internal keys are only signposts, so the middle one moves up entirely (no duplication).</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the only event that increases a B+ tree's height?</summary>
+          <p class="ans">A <strong>root split</strong>. When the root overflows it splits and a new root is
+          created above it. Because growth happens at the top, all leaves always remain at the same depth — the
+          tree stays balanced.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 DBMS Session 6 — Index Structures (class handout for this session).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems (Tree Indexes / B+Trees lecture)</a> — the gold-standard university course; its B+ tree lecture and slides are the clearest free walkthrough of structure, search, and splits.</li>
+          <li><a href="https://www.cs.usfca.edu/~galles/visualization/BPlusTree.html" target="_blank" rel="noopener">B+ Tree Visualizer (USF, David Galles)</a> — interactively insert and delete keys and watch nodes split and merge in real time; the best way to build intuition.</li>
+          <li><a href="https://dl.acm.org/doi/10.1145/356770.356776" target="_blank" rel="noopener">Comer, "The Ubiquitous B-Tree" (ACM Computing Surveys, 1979)</a> — the classic survey that explains B-trees and the B+ tree variant and why they dominate database indexing.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">"Database System Concepts" (Silberschatz, Korth, Sudarshan) — Indexing chapter</a> — the standard textbook treatment of B+ tree indexes, with full algorithms for search, insert, and delete.</li>
+          <li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Use The Index, Luke! (Markus Winand)</a> — a friendly, practical guide to how B+ tree indexes behave in real SQL databases and how to use them well.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-5.html"><div class="dir">← Previous</div><div class="ttl">Session 5: Buffer Pool — Replacement</div></a>
+        <a class="next" href="session-7.html"><div class="dir">Next →</div><div class="ttl">Session 7: Index Structures — B+ Trees 2</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 6 — Index Structures — B+ Trees (Part 1) · Now you know how databases find a needle in a haystack 🔍</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

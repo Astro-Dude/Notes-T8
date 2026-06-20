@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 12 — Sequence Modeling — Recurrent Neural Networks</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 12</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 12 · Sequence Modeling — RNNs</span>
+      <h1>Teaching a network to remember: how RNNs read things in order</h1>
+      <p class="lead">
+        Until now our networks looked at one thing at a time — one image, one fixed row of features.
+        But the world is full of things that come in <em>order</em>: words in a sentence, beats in a
+        song, the daily price of a stock. This session is about giving a network a <strong>memory</strong>
+        so it can read a sequence step by step and carry what it saw forward. We assume you've studied
+        <em>none</em> of this before — every topic starts with a tiny "explain like I'm 5" story, then we
+        slowly go deeper with real math, code, and diagrams.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why sequences need a new model</a></li>
+          <li><a href="#cell">The RNN cell &amp; hidden state</a></li>
+          <li><a href="#bptt">Backprop Through Time</a></li>
+          <li><a href="#vanishing">Vanishing &amp; exploding gradients</a></li>
+          <li><a href="#tasks">Sequence task types</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY SEQUENCES ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why sequences need a new model</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine I read you a story one word at a time, but I make you <strong>forget every word the
+          instant after you hear it</strong>. By the end you'd have no idea what happened — you can't
+          understand a story if you can't remember the words that came before. That's exactly the problem
+          with the networks we've built so far: they look at one snapshot and have <strong>no memory</strong>.
+          A Recurrent Neural Network is a network that's allowed to <em>remember</em> as it goes.</p>
+        </div>
+
+        <p>So far in this course we built two big kinds of network. A <span class="term">Multi-Layer
+        Perceptron (MLP)</span> takes a fixed list of numbers and produces an answer. A
+        <span class="term">Convolutional Neural Network (CNN)</span> (Sessions 8–11) takes a fixed-size
+        image and produces an answer. Both share two limits that turn out to matter a lot:</p>
+        <ul>
+          <li><strong>They expect a fixed-size input.</strong> An MLP built for 10 numbers cannot read 7
+          numbers or 3,000 numbers. But a sentence can be 3 words or 300.</li>
+          <li><strong>They have no memory of order.</strong> Each input is processed on its own, from
+          scratch. Nothing from the previous input carries over.</li>
+        </ul>
+
+        <h3>Why "order matters" is the whole game</h3>
+        <p>A <span class="term">sequence</span> is just data where the <em>order</em> of the items carries
+        meaning. Shuffle it and you destroy the meaning. Three huge examples:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Domain</th><th>The sequence is…</th><th>Why order matters</th></tr></thead>
+            <tbody>
+              <tr><td>Text / language</td><td>A list of words (or tokens) in order</td><td>"dog bites man" vs "man bites dog" — same words, opposite meaning.</td></tr>
+              <tr><td>Time series</td><td>A value sampled over time (stock price, temperature, sensor)</td><td>Tomorrow's value depends on today's and yesterday's, in that order.</td></tr>
+              <tr><td>Audio</td><td>A waveform sampled thousands of times per second</td><td>The same sounds in a different order are a different word entirely.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Why an MLP can't just "read a sentence"</span>
+          <p>Suppose you wanted to feed the sentence <code class="inl">"the food was not good"</code> into an
+          MLP. You'd have to glue all the words into one fixed-length block of numbers. But:</p>
+          <ul>
+            <li>A different sentence has a different length — the MLP's input size is fixed, so it breaks.</li>
+            <li>Even if you padded everything to the same length, the MLP has <em>no notion</em> that word 5
+            ("good") is being flipped by word 4 ("not"). It just sees a bag of numbers in fixed slots.</li>
+          </ul>
+          <p>The word "not" needs to <strong>change how a later word is understood</strong>. That requires
+          carrying information <em>forward</em> through the sequence — which is memory.</p>
+        </div>
+
+        <h3>The core new idea: process step by step, and keep a memory</h3>
+        <p>Instead of swallowing the whole input at once, a <span class="term">Recurrent Neural Network
+        (RNN)</span> reads a sequence <strong>one element at a time</strong>. After each step it updates a
+        little internal summary of "everything I've seen so far," then carries that summary into the next
+        step. That carried-forward summary is called the <span class="term">hidden state</span>, and it is
+        the network's memory.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">Step 1</div><div class="s-d">read "the", update memory</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">Step 2</div><div class="s-d">read "food" + memory</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">Step 3</div><div class="s-d">read "was" + memory</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">…</div><div class="s-d">memory keeps growing</div></div>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>An RNN handles <strong>any-length</strong> sequences by reusing the <em>same</em> small network at
+          every step, and it remembers context by passing a <strong>hidden state</strong> from each step to the
+          next. "Same network, applied repeatedly, with a memory" — that is the whole secret.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Where this is heading</span>
+          <p>Plain RNNs (this session) are the foundation. They struggle to remember things from <em>long</em>
+          ago — a problem we'll diagnose in Topic 4 and cure in <strong>Session 13</strong> with LSTMs and GRUs.
+          The attention-based Transformer (the engine behind modern language models) grew out of fixing these
+          same limits.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Sequences (text, time series, audio) carry meaning in their <strong>order</strong>. MLPs and CNNs
+          expect fixed-size inputs and have no memory, so they can't track how earlier items affect later ones.
+          RNNs fix this by reading one step at a time and carrying a <strong>hidden state</strong> (a memory)
+          forward through the sequence.
+        </div>
+      </section>
+
+      <!-- ===================== 2. THE RNN CELL ===================== -->
+      <section id="cell">
+        <h2><span class="sec-num">2</span> The RNN cell — hidden state as memory</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a person reading a book out loud while keeping a tiny notepad. After every sentence they
+          scribble a quick summary on the notepad, then read the next sentence <em>together with</em> a glance
+          at the notepad, and update the summary again. The book is the input sequence. The notepad is the
+          <strong>hidden state</strong>. The same person doing the same routine over and over is the
+          <strong>RNN cell</strong>.</p>
+        </div>
+
+        <p>An RNN is built from one small reusable piece called the <span class="term">RNN cell</span>. The
+        same cell — the same set of weights — is applied at every time step. At each step it takes two things
+        in and produces an updated memory:</p>
+        <ul>
+          <li><span class="term">x<sub>t</sub></span> — the input at the current step <em>t</em> (e.g. the
+          current word's vector).</li>
+          <li><span class="term">h<sub>t-1</sub></span> — the hidden state from the <em>previous</em> step
+          (the memory so far).</li>
+          <li>It outputs <span class="term">h<sub>t</sub></span> — the updated hidden state, which is both the
+          memory passed forward <em>and</em> (optionally) used to make a prediction at this step.</li>
+        </ul>
+
+        <h3>The recurrence formula</h3>
+        <p>Here is the heart of the whole session — the <span class="term">recurrence relation</span>. At each
+        step the cell mixes the new input with the old memory and squashes the result:</p>
+
+        <pre>h<sub>t</sub> = f( W<sub>x</sub> · x<sub>t</sub>  +  W<sub>h</sub> · h<sub>t-1</sub>  +  b )</pre>
+
+        <p>Let's name every piece — none of it is mysterious:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symbol</th><th>Name</th><th>Job</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">x_t</code></td><td>input at step t</td><td>The new thing we're reading right now.</td></tr>
+              <tr><td><code class="inl">h_{t-1}</code></td><td>previous hidden state</td><td>The memory of everything read before now.</td></tr>
+              <tr><td><code class="inl">W_x</code></td><td>input weights</td><td>How much each part of the new input matters. <strong>Reused every step.</strong></td></tr>
+              <tr><td><code class="inl">W_h</code></td><td>recurrent weights</td><td>How the old memory carries forward. <strong>Reused every step.</strong></td></tr>
+              <tr><td><code class="inl">b</code></td><td>bias</td><td>A learned offset.</td></tr>
+              <tr><td><code class="inl">f</code></td><td>activation (often <code class="inl">tanh</code>)</td><td>Squashes the result into a stable range (e.g. −1…1).</td></tr>
+              <tr><td><code class="inl">h_t</code></td><td>new hidden state</td><td>The updated memory, passed to the next step.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>If we also want a prediction at a step (say, the next word, or a class), we read it off the hidden
+        state with one more small layer:</p>
+        <pre>y<sub>t</sub> = softmax( W<sub>y</sub> · h<sub>t</sub>  +  b<sub>y</sub> )</pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway: weight sharing</span>
+          <p>There is only <strong>one</strong> set of weights (W<sub>x</sub>, W<sub>h</sub>, b), and it is
+          used at <em>every</em> time step. This is why an RNN handles any length: 5 steps or 5,000 steps, it's
+          the same little cell applied again and again. It also keeps the parameter count small.</p>
+        </div>
+
+        <h3>Unrolling through time</h3>
+        <p>It helps to <span class="term">unroll</span> the loop: draw the same cell once per time step, side
+        by side, with the hidden state flowing left to right like a conveyor belt. The picture below is the
+        same cell three times — not three different cells.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">x₁</div><div class="s-t">Cell</div><div class="s-d">h₀ → h₁ → y₁</div></div>
+          <div class="arrow">→ h₁ →</div>
+          <div class="step"><div class="s-ico">x₂</div><div class="s-t">Cell</div><div class="s-d">h₁ → h₂ → y₂</div></div>
+          <div class="arrow">→ h₂ →</div>
+          <div class="step"><div class="s-ico">x₃</div><div class="s-t">Cell</div><div class="s-d">h₂ → h₃ → y₃</div></div>
+        </div>
+
+        <p>The very first hidden state <code class="inl">h₀</code> is usually just a vector of zeros — a blank
+        notepad before reading anything.</p>
+
+        <div class="callout example">
+          <span class="c-title">A tiny RNN cell in code (NumPy)</span>
+          <p>This is a full forward pass over a sequence, written from scratch so nothing is hidden:</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+<span class="cm"># Learned parameters (random here; training would set them)</span>
+W_x = np.random.randn(hidden_size, input_size) <span class="cm"># input  → hidden</span>
+W_h = np.random.randn(hidden_size, hidden_size) <span class="cm"># hidden → hidden</span>
+b   = np.zeros(hidden_size)
+
+<span class="kw">def</span> rnn_step(x_t, h_prev):
+    <span class="cm"># the recurrence: mix new input + old memory, then squash</span>
+    <span class="kw">return</span> np.tanh(W_x @ x_t + W_h @ h_prev + b)
+
+<span class="kw">def</span> rnn_forward(inputs):           <span class="cm"># inputs: list of x_t vectors</span>
+    h = np.zeros(hidden_size)        <span class="cm"># h_0 = blank notepad</span>
+    states = []
+    <span class="kw">for</span> x_t <span class="kw">in</span> inputs:           <span class="cm"># step through the sequence</span>
+        h = rnn_step(x_t, h)         <span class="cm"># SAME weights every step</span>
+        states.append(h)
+    <span class="kw">return</span> states                   <span class="cm"># h_1, h_2, …, h_T</span></pre>
+          <p>Notice the <code class="inl">for</code> loop: that loop <em>is</em> the recurrence. And notice
+          <code class="inl">W_x</code>, <code class="inl">W_h</code>, <code class="inl">b</code> never change
+          inside the loop — that's weight sharing.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The same thing in PyTorch</span>
+          <p>In practice you don't write the loop by hand. PyTorch's <code class="inl">nn.RNN</code> does it for
+          you, efficiently:</p>
+          <pre><span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+rnn = nn.RNN(input_size=<span class="nm">50</span>, hidden_size=<span class="nm">128</span>, batch_first=<span class="kw">True</span>)
+<span class="cm"># x shape: (batch, seq_len, input_size)</span>
+outputs, h_final = rnn(x)   <span class="cm"># outputs = every h_t; h_final = last h_t</span></pre>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The RNN cell applies one shared formula at every step:
+          <strong>h<sub>t</sub> = f(W<sub>x</sub>x<sub>t</sub> + W<sub>h</sub>h<sub>t-1</sub> + b)</strong>.
+          The <strong>hidden state</strong> is the memory carried forward; the <strong>same weights</strong> are
+          reused at every step (weight sharing), which is what lets one small cell handle any-length sequences.
+          Unrolling just draws that one cell once per time step.
+        </div>
+      </section>
+
+      <!-- ===================== 3. BPTT ===================== -->
+      <section id="bptt">
+        <h2><span class="sec-num">3</span> Backprop Through Time (BPTT)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a row of friends passing a whisper down a line. At the end, the last friend says the
+          message out loud and it's <em>wrong</em>. To fix it, you walk <strong>backwards</strong> down the
+          line asking each friend "how much did you mess it up?" — all the way back to the first. Then everyone
+          adjusts a little. Training an RNN is exactly that backwards walk through every step in time.</p>
+        </div>
+
+        <p>Recall from earlier sessions that we train a network with <span class="term">backpropagation</span>:
+        we measure how wrong the output is (the <span class="term">loss</span>), then push that error
+        <em>backwards</em> through the network to compute a <span class="term">gradient</span> for each weight —
+        a number saying "nudge me this way to reduce the loss." <span class="term">Backpropagation Through Time
+        (BPTT)</span> is just ordinary backprop applied to the <strong>unrolled</strong> RNN.</p>
+
+        <h3>How BPTT works, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">▶️</div><div class="s-t">1. Forward</div><div class="s-d">run all T steps, save every h_t</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📏</div><div class="s-t">2. Loss</div><div class="s-d">compare outputs to targets</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">◀️</div><div class="s-t">3. Backward</div><div class="s-d">push error back through every step</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">4. Sum</div><div class="s-d">add up each weight's gradient over all steps</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔧</div><div class="s-t">5. Update</div><div class="s-d">one gradient-descent step</div></div>
+        </div>
+
+        <p>The twist that makes it "through time": because the <em>same</em> weights are used at every step
+        (weight sharing, Topic 2), each weight gets a gradient contribution from <strong>every</strong> time
+        step. So we compute the contribution at each step and <strong>add them all up</strong> before updating.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Unroll the RNN into a deep chain (one layer per time step), run normal backprop down that chain,
+          and because every "layer" shares the same weights, <strong>sum</strong> the gradients across all
+          steps. A 100-step sequence trains like a 100-layer-deep network.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Why the gradient is a sum: a peek at the chain rule</span>
+          <p>The loss at the final step depends on h<sub>T</sub>, which depends on h<sub>T-1</sub>, which depends
+          on h<sub>T-2</sub>, … all the way back. To get the gradient for W<sub>h</sub>, the chain rule forces us
+          to multiply derivatives <em>along the whole chain</em>:</p>
+          <pre>∂L/∂W<sub>h</sub>  =  Σ<sub>t</sub>  ( ∂L/∂h<sub>T</sub> )·( ∂h<sub>T</sub>/∂h<sub>t</sub> )·( ∂h<sub>t</sub>/∂W<sub>h</sub> )
+
+where  ∂h<sub>T</sub>/∂h<sub>t</sub>  =  ∏<sub>k=t+1..T</sub>  ∂h<sub>k</sub>/∂h<sub>k-1</sub>   <span class="cm"># a long product!</span></pre>
+          <p>Keep an eye on that long <strong>product</strong> term — in Topic 4 it's the exact reason RNNs
+          struggle with long-range memory.</p>
+        </div>
+
+        <h3>Truncated BPTT — making it practical</h3>
+        <p>For a very long sequence (say a whole book, or a long audio clip), unrolling <em>all</em> the steps
+        is far too expensive in memory and time. The standard fix is <span class="term">Truncated BPTT</span>:
+        process the sequence in chunks of, say, 35 steps. You still carry the hidden state forward across
+        chunks (so the memory continues), but you only backpropagate the error <strong>within each chunk</strong>,
+        not all the way to the start.</p>
+
+        <div class="callout example">
+          <span class="c-title">Truncated BPTT in pseudocode</span>
+          <pre>h = zeros(...)                  <span class="cm"># persistent memory across chunks</span>
+<span class="kw">for</span> chunk <span class="kw">in</span> split(sequence, size=<span class="nm">35</span>):
+    h = h.detach()              <span class="cm"># stop gradients flowing past this chunk</span>
+    outputs, h = rnn(chunk, h)  <span class="cm"># forward: memory continues</span>
+    loss = criterion(outputs, targets_for(chunk))
+    loss.backward()             <span class="cm"># backprop only within the 35 steps</span>
+    optimizer.step()
+    optimizer.zero_grad()</pre>
+          <p>The crucial line is <code class="inl">h.detach()</code>: the hidden state keeps flowing
+          <em>forward</em> as memory, but we cut the gradient so we don't backprop through the entire history.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Truncated BPTT is a trade-off. It makes training feasible, but the network can only <em>learn</em>
+          dependencies that fit inside one chunk — it can't directly learn "this word matters because of
+          something 500 steps ago" if your chunk is only 35 steps. Choosing the chunk length balances cost
+          against how far back you need the network to learn relationships.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          BPTT = ordinary backprop on the <strong>unrolled</strong> RNN. Because the same weights repeat at every
+          step, each weight's gradient is the <strong>sum</strong> of its contributions over all steps. For long
+          sequences we use <strong>truncated BPTT</strong>: carry the hidden state forward but only backprop
+          within fixed-size chunks to keep memory and compute manageable.
+        </div>
+      </section>
+
+      <!-- ===================== 4. VANISHING / EXPLODING ===================== -->
+      <section id="vanishing">
+        <h2><span class="sec-num">4</span> The vanishing &amp; exploding gradient problem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Play "telephone" with a long line of people. By the time the whisper reaches the end, it's either
+          faded into nothing ("I couldn't hear it, so I said almost nothing") or it snowballed into a shout.
+          Multiply a number smaller than 1 by itself many times and it vanishes toward zero; multiply a number
+          bigger than 1 and it explodes toward infinity. That repeated multiplication is exactly what happens to
+          an RNN's gradient as it travels back through many time steps.</p>
+        </div>
+
+        <p>Remember that long <strong>product</strong> term from Topic 3:
+        <code class="inl">∂h<sub>T</sub>/∂h<sub>t</sub> = ∏ ∂h<sub>k</sub>/∂h<sub>k-1</sub></code>. To send error
+        from step T back to a much earlier step t, BPTT multiplies many small matrices together. Multiplying
+        many numbers in a chain has a dramatic effect:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>If each factor is…</th><th>Over many steps the product…</th><th>Name</th><th>Symptom</th></tr></thead>
+            <tbody>
+              <tr><td>&lt; 1 (e.g. 0.8)</td><td>shrinks toward 0</td><td><span class="term">Vanishing gradient</span></td><td>early steps get almost no learning signal</td></tr>
+              <tr><td>&gt; 1 (e.g. 1.5)</td><td>blows up toward ∞</td><td><span class="term">Exploding gradient</span></td><td>weights jump wildly, loss becomes NaN</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Feel the numbers</span>
+          <p>Say each step multiplies the gradient by 0.8. Over 50 steps: <code class="inl">0.8⁵⁰ ≈ 0.000014</code>
+          — essentially zero. The error signal from the end of the sentence is far too faint to teach the
+          beginning anything. Now say each step multiplies by 1.5: <code class="inl">1.5⁵⁰ ≈ 637,000,000</code>
+          — a gigantic number that makes training blow up. Only a factor very close to 1 survives a long
+          chain, and that's hard to maintain.</p>
+        </div>
+
+        <h3>Why this breaks long-range dependencies</h3>
+        <p>Language is full of <span class="term">long-range dependencies</span> — relationships between words
+        far apart:</p>
+        <div class="callout example">
+          <span class="c-title">The classic example</span>
+          <p><em>"I grew up in France … (50 words later) … so I speak fluent <strong>French</strong>."</em></p>
+          <p>To predict "French," the network must remember "France" from 50 steps earlier. But with vanishing
+          gradients, the learning signal connecting "French" back to "France" shrinks to nothing — so the plain
+          RNN <strong>never learns</strong> that long-distance link. It handles short context fine and forgets
+          the distant past.</p>
+        </div>
+
+        <h3>Two cures</h3>
+        <p><strong>Exploding gradients</strong> are the easy one. We use <span class="term">gradient clipping</span>:
+        if the gradient's total size exceeds a threshold, we scale it back down before the update. It caps the
+        step so the weights can't jump off a cliff.</p>
+        <div class="callout example">
+          <span class="c-title">Gradient clipping (one line)</span>
+          <pre>loss.backward()
+<span class="cm"># rescale gradients so their combined norm ≤ 5.0</span>
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=<span class="nm">5.0</span>)
+optimizer.step()</pre>
+        </div>
+
+        <p><strong>Vanishing gradients</strong> are the hard one — clipping doesn't help a signal that's already
+        faded to zero. Partial mitigations help (using the <code class="inl">ReLU</code> family instead of
+        <code class="inl">tanh</code>, careful weight initialisation), but the real fix is a better cell design
+        with a protected "memory highway" that lets information flow across many steps without being squashed
+        each time.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway — this motivates Session 13</span>
+          <p>This single problem is why plain RNNs are rarely used today for long sequences. The
+          <span class="term">LSTM</span> and <span class="term">GRU</span> cells — our entire next session —
+          were invented specifically to defeat the vanishing gradient. They add <em>gates</em> that learn when to
+          remember, forget, and update, giving the gradient a clear path across long distances.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          BPTT multiplies many factors along a chain. Factors below 1 make the gradient <strong>vanish</strong>
+          (early steps stop learning — kills long-range memory); factors above 1 make it <strong>explode</strong>
+          (training blows up). <strong>Gradient clipping</strong> fixes explosion; vanishing needs better cells —
+          <strong>LSTMs and GRUs in Session 13</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SEQUENCE TASK TYPES ===================== -->
+      <section id="tasks">
+        <h2><span class="sec-num">5</span> Sequence task types</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think about how many things you read versus how many you say. Sometimes you read a whole paragraph
+          and give a one-word answer ("thumbs up or down?"). Sometimes you say one word and it sparks a whole
+          story. Sometimes you read a sentence and reply with another sentence (translating). RNNs come in
+          these same shapes — based on <strong>how many things go in vs how many come out</strong>.</p>
+        </div>
+
+        <p>The flexibility of having a hidden state means we can wire an RNN up in several shapes depending on
+        the task. The shapes are named by <strong>inputs-to-outputs</strong>:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Shape</th><th>Inputs → Outputs</th><th>Example task</th><th>Idea</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">One-to-one</span></td><td>1 → 1</td><td>Plain classification (no sequence)</td><td>A normal network; the degenerate case.</td></tr>
+              <tr><td><span class="term">One-to-many</span></td><td>1 → many</td><td>Image captioning, music generation</td><td>One input seeds a generated sequence.</td></tr>
+              <tr><td><span class="term">Many-to-one</span></td><td>many → 1</td><td>Sentiment classification</td><td>Read a whole sequence, emit one answer.</td></tr>
+              <tr><td><span class="term">Many-to-many (aligned)</span></td><td>many → many (same length)</td><td>Part-of-speech tagging, naming each frame</td><td>One output per input step.</td></tr>
+              <tr><td><span class="term">Many-to-many (seq2seq)</span></td><td>many → many (different length)</td><td>Machine translation</td><td>Read it all, <em>then</em> generate.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Many-to-one — sentiment analysis</h3>
+        <p>Read the whole review one word at a time; ignore the intermediate outputs; take only the
+        <strong>final</strong> hidden state (which has "seen everything") and classify it.</p>
+        <div class="callout example">
+          <span class="c-title">Sentiment in code</span>
+          <pre>review = [<span class="st">"the"</span>, <span class="st">"food"</span>, <span class="st">"was"</span>, <span class="st">"amazing"</span>]
+outputs, h_final = rnn(embed(review))   <span class="cm"># h_final = summary of WHOLE review</span>
+prediction = classifier(h_final)        <span class="cm"># → 👍 positive / 👎 negative</span></pre>
+          <p>Only <code class="inl">h_final</code> is used — that one vector is the network's whole impression
+          of the review.</p>
+        </div>
+
+        <h3>One-to-many — generation</h3>
+        <p>Start from one input (a topic, a starting note, or even nothing) and generate a sequence by feeding
+        each output <em>back in</em> as the next input — the <span class="term">autoregressive</span> trick.</p>
+        <div class="callout example">
+          <span class="c-title">Character-by-character text generation</span>
+          <pre>h = seed_state
+char = <span class="st">"T"</span>
+<span class="kw">for</span> _ <span class="kw">in</span> range(<span class="nm">100</span>):
+    out, h = rnn_step(embed(char), h)
+    char = sample(out)        <span class="cm"># pick next char from the probabilities</span>
+    print(char, end=<span class="st">""</span>)  <span class="cm"># …feed it back in as next input</span></pre>
+          <p>This is exactly the "one token at a time, feeding itself" loop behind text generators — Karpathy's
+          famous demo had a tiny RNN write Shakespeare-flavoured text this way.</p>
+        </div>
+
+        <h3>Many-to-many (seq2seq) — translation</h3>
+        <p>When input and output lengths differ (English "I am hungry" → French "j'ai faim" — different word
+        counts), we use the <span class="term">sequence-to-sequence (seq2seq)</span> design: an
+        <span class="term">encoder</span> RNN reads the whole input into a single summary vector (the
+        <span class="term">context vector</span>), then a <span class="term">decoder</span> RNN generates the
+        output sequence from that summary.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🇬🇧</div><div class="s-t">Encoder</div><div class="s-d">reads "I am hungry"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Context</div><div class="s-d">one summary vector</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🇫🇷</div><div class="s-t">Decoder</div><div class="s-d">writes "j'ai faim"</div></div>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A famous bottleneck — and where attention came from</span>
+          <p>Squeezing an entire sentence into one fixed context vector is a tight bottleneck: long inputs get
+          blurred. The fix — letting the decoder look back at <em>all</em> the encoder states and focus on the
+          relevant ones — is <strong>attention</strong>, which eventually grew into the Transformer. Plain RNN
+          seq2seq is the direct ancestor of today's translation and chat models.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Matching the shape to the task</span>
+          <ul>
+            <li><strong>Spam / sentiment?</strong> Many-to-one (read all, one verdict).</li>
+            <li><strong>Write a story / caption an image?</strong> One-to-many (seed, then generate).</li>
+            <li><strong>Translate / summarise / chat?</strong> Many-to-many seq2seq (encode, then decode).</li>
+            <li><strong>Tag every word with its part of speech?</strong> Aligned many-to-many (one out per in).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          RNNs flex into shapes by <strong>inputs vs outputs</strong>: <strong>one-to-many</strong> (generation),
+          <strong>many-to-one</strong> (sentiment — use the final hidden state), aligned
+          <strong>many-to-many</strong> (one output per step), and <strong>seq2seq</strong> (encoder summarises,
+          decoder generates — for translation). The seq2seq bottleneck motivated <strong>attention</strong> and
+          the Transformer.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a network gains a memory and reads things in order. Here's the one-paragraph
+        story that connects all five topics:</p>
+        <div class="bigidea">
+          <p>Real data — text, time series, audio — carries meaning in its <strong>order</strong>, but MLPs and
+          CNNs are fixed-size and memoryless (Topic 1). The <strong>RNN cell</strong> solves this by reading one
+          step at a time and carrying a <strong>hidden state</strong> forward via the shared recurrence
+          <strong>h<sub>t</sub> = f(W<sub>x</sub>x<sub>t</sub> + W<sub>h</sub>h<sub>t-1</sub> + b)</strong>
+          (Topic 2). We train it by <strong>unrolling through time and backpropagating</strong> — BPTT, summing
+          each shared weight's gradient over all steps, and truncating for long sequences (Topic 3). But that
+          backward chain is a long <strong>product</strong>, so gradients <strong>vanish</strong> or
+          <strong>explode</strong>; clipping fixes explosion, and the vanishing problem motivates the gated cells
+          of Session 13 (Topic 4). Finally, by wiring inputs to outputs differently we get
+          <strong>one-to-many, many-to-one, and seq2seq</strong> tasks like generation, sentiment, and
+          translation (Topic 5).</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why can't a plain MLP read a sentence the way an RNN can?</summary>
+          <p class="ans">An MLP needs a fixed-size input and processes it all at once with no memory, so it
+          can't handle variable-length sequences or carry information about earlier words forward to influence
+          later ones. An RNN reads step by step and keeps a hidden state (memory).</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the hidden state, and what does "weight sharing" mean in an RNN?</summary>
+          <p class="ans">The hidden state h<sub>t</sub> is the network's memory — a summary of everything seen so
+          far, passed from each step to the next. Weight sharing means the same parameters (W<sub>x</sub>,
+          W<sub>h</sub>, b) are reused at every time step, which is what lets one cell handle any length.</p>
+        </details>
+        <details class="quiz">
+          <summary>In BPTT, why is each weight's gradient a sum over time steps?</summary>
+          <p class="ans">Because the same weights are used at every step, each step contributes to the loss. The
+          chain rule produces a gradient term for each step, and we add them all up before doing one update.</p>
+        </details>
+        <details class="quiz">
+          <summary>What causes the vanishing gradient, and which problem does gradient clipping actually solve?</summary>
+          <p class="ans">Backprop multiplies many factors along the time chain; factors below 1 shrink the
+          gradient toward zero (vanishing), so early steps stop learning long-range links. Gradient clipping
+          solves the <em>opposite</em> problem — exploding gradients — by capping the gradient's size. Vanishing
+          needs better cells (LSTM/GRU).</p>
+        </details>
+        <details class="quiz">
+          <summary>Which RNN shape fits sentiment classification, and which fits translation?</summary>
+          <p class="ans">Sentiment is many-to-one: read the whole review, then use the final hidden state to
+          produce one verdict. Translation is many-to-many seq2seq: an encoder reads the input into a context
+          vector, then a decoder generates the output of a different length.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does truncated BPTT use <code class="inl">detach()</code> on the hidden state?</summary>
+          <p class="ans">So the hidden state still flows <em>forward</em> as memory across chunks, but gradients
+          don't flow <em>backward</em> past the current chunk — keeping memory and compute manageable on long
+          sequences.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 12) — your course handout for this session, available via the class portal at <a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">priyanshsaxena.com/sst-deep-learning-nn</a>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://karpathy.github.io/2015/05/21/rnn-effectiveness/" target="_blank" rel="noopener">Andrej Karpathy — "The Unreasonable Effectiveness of Recurrent Neural Networks"</a> — the classic, fun blog post that shows char-level RNNs generating text; the best intuition-builder for this whole session.</li>
+          <li><a href="https://cs231n.github.io/" target="_blank" rel="noopener">Stanford CS231n — course notes (RNN / sequence material)</a> — clear, authoritative lecture notes covering RNNs, BPTT, and sequence tasks with diagrams.</li>
+          <li><a href="https://onlinelibrary.wiley.com/doi/10.1207/s15516709cog1402_1" target="_blank" rel="noopener">Jeffrey L. Elman — "Finding Structure in Time" (1990)</a> — the foundational paper introducing the recurrent ("Elman") network and the idea of hidden state as memory.</li>
+          <li><a href="https://www.deeplearningbook.org/contents/rnn.html" target="_blank" rel="noopener">Goodfellow, Bengio &amp; Courville — Deep Learning, Ch. 10 "Sequence Modeling"</a> — the rigorous textbook treatment of RNNs, BPTT, and the vanishing/exploding gradient analysis.</li>
+          <li><a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">Sutskever, Vinyals &amp; Le — "Sequence to Sequence Learning with Neural Networks" (2014)</a> — the seq2seq paper behind the encoder–decoder translation design in Topic 5.</li>
+          <li><a href="https://www.bioinf.jku.at/publications/older/2604.pdf" target="_blank" rel="noopener">Hochreiter &amp; Schmidhuber — "Long Short-Term Memory" (1997)</a> — the original LSTM paper that fixes vanishing gradients; the bridge into Session 13.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-11.html"><div class="dir">← Previous</div><div class="ttl">Session 11: Transfer Learning &amp; Applications</div></a>
+        <a class="next" href="session-13.html"><div class="dir">Next →</div><div class="ttl">Session 13: LSTMs, GRUs &amp; Gating</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 12 — Sequence Modeling — Recurrent Neural Networks · You taught a network to remember 🧠</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

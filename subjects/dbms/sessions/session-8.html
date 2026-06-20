@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 8 — Query Parsing &amp; Planning</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 8</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 08 · Query Parsing</span>
+      <h1>How your SQL becomes a plan the database can run</h1>
+      <p class="lead">
+        You type a line of SQL and an answer comes back — but a lot happens in between. In this class we
+        open up the <em>front-end</em> of a database: the part that reads your SQL text, checks it makes
+        sense, and turns it into a clean little tree of operations. We assume you've studied <em>none</em>
+        of this before. Every topic starts with a tiny "explain like I'm 5" story, then we build up the
+        real machinery with diagrams and code. By the end you'll be able to trace a query from raw text
+        all the way to a logical plan.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 17 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#overview">From SQL text to a plan</a></li>
+          <li><a href="#parsing">Lexing &amp; parsing</a></li>
+          <li><a href="#binding">Binding &amp; semantic analysis</a></li>
+          <li><a href="#logical">Logical plan generation</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. OVERVIEW ===================== -->
+      <section id="overview">
+        <h2><span class="sec-num">1</span> From SQL text to a plan — the front-end</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you write a wish on a piece of paper and hand it to a genie. The genie can't grant it
+          straight away. First he reads the letters and groups them into words. Then he checks the words form
+          a real sentence, not gibberish. Then he makes sure the things you asked for actually exist ("you
+          want the <em>red</em> bicycle — okay, that one is real"). Only then does he write himself a little
+          to-do list of steps to make the wish come true. A database does exactly this with your SQL before
+          it fetches a single row.</p>
+        </div>
+
+        <p>Back in <strong>Session 1</strong> we saw the big picture of how a query travels through the
+        database engine. This session zooms into the very first stretch of that journey — the part we call
+        the <span class="term">query front-end</span> (also called the <span class="term">query
+        compiler</span>). Its job is to take the SQL <em>string</em> you typed and convert it into a precise,
+        unambiguous internal form the rest of the engine can work with.</p>
+
+        <h3>Where the front-end sits in the pipeline</h3>
+        <p>A database processes a query in stages, like an assembly line. The front-end is the first three or
+        four stations; everything after it (optimisation and execution) we cover in later sessions.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">⌨️</div><div class="s-t">SQL text</div><div class="s-d">The string you typed</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔤</div><div class="s-t">Lex + Parse</div><div class="s-d">Tokens → AST (Topic 2)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">Bind</div><div class="s-d">Check names &amp; types (Topic 3)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌳</div><div class="s-t">Logical plan</div><div class="s-d">Operator tree (Topic 4)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧮</div><div class="s-t">Optimiser</div><div class="s-d">Best physical plan (Session 11)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">Execute</div><div class="s-d">Run it (Session 9)</div></div>
+        </div>
+
+        <p>Notice the shape of the transformation. We start with <strong>unstructured text</strong> and end
+        the front-end with a <strong>structured tree of operations</strong>. Each stage adds more meaning:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>Input</th><th>Output</th><th>What it adds</th></tr></thead>
+            <tbody>
+              <tr><td>Lexing</td><td>Raw characters</td><td><span class="term">Tokens</span></td><td>Groups characters into meaningful words/symbols.</td></tr>
+              <tr><td>Parsing</td><td>Tokens</td><td><span class="term">AST</span> (parse tree)</td><td>Checks grammar; reveals structure (which clause is which).</td></tr>
+              <tr><td>Binding</td><td>AST + catalog</td><td>Resolved / bound AST</td><td>Connects names to real tables/columns; checks types.</td></tr>
+              <tr><td>Logical planning</td><td>Bound AST</td><td><span class="term">Logical plan</span></td><td>Restates the query as relational-algebra operators.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>The front-end is a <strong>translator with a fact-checker</strong>. It turns human-friendly SQL
+          into a machine-friendly tree, rejecting anything that is misspelt, ungrammatical, or refers to
+          things that don't exist — <em>before</em> the engine wastes effort touching real data.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why "declarative" makes this necessary</span>
+          <p>SQL is a <span class="term">declarative</span> language: you say <em>what</em> you want ("give me
+          customers in London"), not <em>how</em> to get it. The front-end (plus the optimiser later) is what
+          bridges that gap — it figures out the <em>how</em>. A language like C, by contrast, is
+          <span class="term">imperative</span>: you spell out every step yourself.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example</span>
+          <p>Take this query:</p>
+          <pre><span class="kw">SELECT</span> name <span class="kw">FROM</span> customers <span class="kw">WHERE</span> city = <span class="st">'London'</span>;</pre>
+          <p>By the end of the front-end this becomes, roughly, a three-step plan: <strong>scan</strong> the
+          customers table → keep only rows where <strong>city = 'London'</strong> → output just the
+          <strong>name</strong> column. That little tree is what we hand to the optimiser. We'll build exactly
+          this tree by the end of the session.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The query front-end is the database's translator-plus-fact-checker. It moves a query through
+          lexing → parsing → binding → logical planning, turning unstructured SQL text into a structured,
+          validated operator tree that the optimiser (Session 11) and executor (Session 9) can use.
+        </div>
+      </section>
+
+      <!-- ===================== 2. LEXING & PARSING ===================== -->
+      <section id="parsing">
+        <h2><span class="sec-num">2</span> Lexing &amp; parsing — text into a tree</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When you learn to read, you first see a row of letters: <code class="inl">t-h-e c-a-t</code>.
+          Your eyes group them into words: "the", "cat". That's <strong>lexing</strong>. Then your brain
+          figures out the sentence's shape — "the cat" is the thing doing something. That's
+          <strong>parsing</strong>. The database does the same two steps to your SQL: first chop it into
+          words, then work out the sentence structure.</p>
+        </div>
+
+        <h3>Step A — Lexing (tokenising)</h3>
+        <p>The <span class="term">lexer</span> (also called a <span class="term">tokeniser</span> or
+        <em>scanner</em>) reads the SQL one character at a time and groups characters into
+        <span class="term">tokens</span> — the smallest meaningful units. It also throws away things that
+        don't matter, like extra spaces and comments. Each token has a <strong>type</strong> (keyword,
+        identifier, number, string, operator, punctuation) and a <strong>value</strong>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: tokenising a query</span>
+          <p>Input SQL:</p>
+          <pre><span class="kw">SELECT</span> name, age <span class="kw">FROM</span> users <span class="kw">WHERE</span> age &gt; <span class="nm">18</span>;</pre>
+          <p>The lexer emits this stream of tokens:</p>
+          <pre><span class="cm"># type          value</span>
+KEYWORD        SELECT
+IDENTIFIER     name
+PUNCT          ,
+IDENTIFIER     age
+KEYWORD        FROM
+IDENTIFIER     users
+KEYWORD        WHERE
+IDENTIFIER     age
+OPERATOR       &gt;
+NUMBER         18
+PUNCT          ;</pre>
+          <p>Notice the whitespace is gone, and each piece now carries a label. <code class="inl">SELECT</code>
+          is recognised as a reserved keyword, while <code class="inl">name</code> and <code class="inl">users</code>
+          are <span class="term">identifiers</span> (names of things in your database).</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Keyword vs identifier</span>
+          <p>A <span class="term">keyword</span> is a word SQL reserves for itself (<code class="inl">SELECT</code>,
+          <code class="inl">FROM</code>, <code class="inl">WHERE</code>, <code class="inl">JOIN</code>…). An
+          <span class="term">identifier</span> is a name <em>you</em> chose for a table, column, or alias. The
+          lexer keeps a list of reserved keywords so it can tell them apart. This is why you usually can't
+          name a column <code class="inl">select</code> without quoting it.</p>
+        </div>
+
+        <h3>Step B — Parsing (applying the grammar)</h3>
+        <p>The <span class="term">parser</span> takes that flat list of tokens and checks they form a
+        <em>valid sentence</em> according to SQL's rules. Those rules are written as a
+        <span class="term">grammar</span>: a set of patterns describing what a legal statement looks like.
+        Grammars are usually written in a notation called <span class="term">BNF</span> (Backus–Naur Form).</p>
+
+        <div class="callout example">
+          <span class="c-title">A tiny slice of SQL's grammar (BNF-style)</span>
+          <pre><span class="cm">&lt;select_stmt&gt; ::= SELECT &lt;select_list&gt; FROM &lt;table&gt;
+                  [ WHERE &lt;condition&gt; ] ;</span>
+
+&lt;select_list&gt; ::= <span class="st">"*"</span> | &lt;column&gt; { <span class="st">","</span> &lt;column&gt; }
+&lt;condition&gt;   ::= &lt;column&gt; &lt;op&gt; &lt;value&gt;
+&lt;op&gt;          ::= <span class="st">"="</span> | <span class="st">"&gt;"</span> | <span class="st">"&lt;"</span> | <span class="st">"&gt;="</span> | <span class="st">"&lt;="</span></pre>
+          <p>Read <code class="inl">::=</code> as "is defined as", <code class="inl">|</code> as "or",
+          <code class="inl">[ ]</code> as "optional", and <code class="inl">{ }</code> as "repeated zero or
+          more times". So a SELECT statement is the word <code class="inl">SELECT</code>, then a list of
+          columns, then <code class="inl">FROM</code> and a table, then an <em>optional</em> WHERE.</p>
+        </div>
+
+        <p>As the parser matches tokens against the grammar, it builds an <span class="term">Abstract Syntax
+        Tree (AST)</span> — a tree that captures the <em>structure</em> of the statement, with each grammar
+        rule becoming a node. "Abstract" means it drops noise like commas, semicolons, and parentheses,
+        keeping only what matters for meaning.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: the AST for our query</span>
+          <p>Parsing <code class="inl">SELECT name, age FROM users WHERE age &gt; 18;</code> produces this AST:</p>
+          <pre>        SelectStatement
+        ┌───────┼─────────────┐
+        │       │             │
+    projection  from        where
+        │       │             │
+   ┌────┴───┐ Table        BinaryExpr (&gt;)
+ Column   Column "users"   ┌────┴────┐
+ "name"   "age"          Column   Literal
+                         "age"      18</pre>
+          <p>Read it top-down: the root says "this is a SELECT". It has three children — the
+          <strong>projection</strong> (the columns we want), the <strong>from</strong> (the source table),
+          and the <strong>where</strong> (the filter). The filter itself is a <span class="term">binary
+          expression</span>: a <code class="inl">&gt;</code> operator with a column on the left and the
+          number <code class="inl">18</code> on the right.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">This is where syntax errors are caught</span>
+          <p>If the tokens don't fit the grammar, parsing fails with a <strong>syntax error</strong>. Type
+          <code class="inl">SELECT name FORM users;</code> (misspelt FROM) and the parser sees an identifier
+          where it expected the <code class="inl">FROM</code> keyword, and complains — often pointing at the
+          exact spot. Crucially, the parser only checks <em>grammar</em>, not <em>meaning</em>: it doesn't
+          yet know or care whether a table called <code class="inl">users</code> actually exists. That's the
+          next topic's job.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Parse tree vs AST</span>
+          <p>You'll hear both terms. A <span class="term">parse tree</span> (or concrete syntax tree) keeps
+          <em>every</em> token, including punctuation. An <span class="term">AST</span> is the cleaned-up
+          version with the noise removed. Most engines build something close to an AST directly. PostgreSQL,
+          for instance, produces a tree of <code class="inl">parse nodes</code> at this stage.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The lexer chops SQL text into labelled tokens (keywords, identifiers, numbers, operators). The
+          parser checks those tokens against SQL's grammar and builds an Abstract Syntax Tree capturing the
+          query's structure. Syntax (grammar) errors are caught here — but meaning isn't checked yet.
+        </div>
+      </section>
+
+      <!-- ===================== 3. BINDING ===================== -->
+      <section id="binding">
+        <h2><span class="sec-num">3</span> Binding &amp; semantic analysis</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Suppose you write a grammatically perfect sentence: "Please bring me the purple elephant from
+          the kitchen." It's a real sentence — but there <em>is</em> no purple elephant, and elephants don't
+          live in kitchens. A friend checking your note would say "that doesn't make sense." The database has
+          a friend like that too. After the grammar is fine, this step checks that the tables and columns you
+          named really exist and that you're using them sensibly.</p>
+        </div>
+
+        <p>The AST from Topic 2 is grammatically correct but <em>naïve</em>: the names in it are still just
+        text. The word <code class="inl">users</code> is a string, not yet connected to a real table. The
+        job of <span class="term">binding</span> (also called <span class="term">semantic analysis</span>,
+        or <em>name resolution</em>) is to give those names meaning by looking them up.</p>
+
+        <h3>The catalog — the database's phone book</h3>
+        <p>To resolve names, the binder consults the <span class="term">catalog</span> (also called the
+        <span class="term">system catalog</span> or <em>data dictionary</em>): the database's own internal
+        record of every table, column, data type, index, and constraint. It's "metadata" — data about your
+        data. When the binder sees <code class="inl">users</code>, it asks the catalog: "Is there a table
+        called <code class="inl">users</code>? What columns does it have? What are their types?"</p>
+
+        <div class="callout note">
+          <span class="c-title">Where does the catalog live?</span>
+          <p>The catalog is itself stored as tables inside the database. In PostgreSQL you can literally query
+          it (<code class="inl">pg_class</code>, <code class="inl">pg_attribute</code>); the SQL standard
+          exposes a tidy view of it called <code class="inl">INFORMATION_SCHEMA</code>. So the database stores
+          knowledge about itself in the same way it stores your data.</p>
+        </div>
+
+        <h3>What semantic analysis actually checks</h3>
+        <p>Binding walks the AST and performs several checks and transformations:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Check / task</th><th>What it does</th><th>Example error it catches</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Table resolution</strong></td><td>Confirms each named table/view exists and you may access it.</td><td><code class="inl">relation "userz" does not exist</code></td></tr>
+              <tr><td><strong>Column resolution</strong></td><td>Confirms each column exists in the right table; attaches its data type.</td><td><code class="inl">column "naem" does not exist</code></td></tr>
+              <tr><td><strong>Ambiguity check</strong></td><td>If two joined tables both have a column <code class="inl">id</code>, an unqualified <code class="inl">id</code> is ambiguous.</td><td><code class="inl">column reference "id" is ambiguous</code></td></tr>
+              <tr><td><strong>Type checking</strong></td><td>Verifies operators/functions get sensible types; may insert casts.</td><td><code class="inl">operator does not exist: integer &gt; text</code></td></tr>
+              <tr><td><strong>Expanding <code class="inl">*</code></strong></td><td>Replaces <code class="inl">SELECT *</code> with the real, explicit column list from the catalog.</td><td>—</td></tr>
+              <tr><td><strong>Function/aggregate validity</strong></td><td>Checks functions exist and aggregates like <code class="inl">COUNT</code> are used in legal places.</td><td><code class="inl">function lengthh(text) does not exist</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: expanding the star</span>
+          <p>You write:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> users;</pre>
+          <p>The binder asks the catalog what columns <code class="inl">users</code> has and rewrites the
+          query internally to the explicit list:</p>
+          <pre><span class="kw">SELECT</span> id, name, age, city <span class="kw">FROM</span> users;</pre>
+          <p>From here on, the engine works with the real columns and their types. This is also why
+          <code class="inl">SELECT *</code> can be slightly slower to plan and is discouraged in production
+          code — and why adding a column to a table can change what <code class="inl">*</code> returns.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: type checking with a fix</span>
+          <p>Imagine <code class="inl">age</code> is an <code class="inl">INTEGER</code> column and you write
+          <code class="inl">WHERE age &gt; '18'</code> (a string). A strict binder would reject comparing an
+          integer to text. Many databases instead insert an <span class="term">implicit cast</span>, quietly
+          turning the AST node into <code class="inl">age &gt; CAST('18' AS INTEGER)</code>. The bound AST now
+          carries explicit type information on every expression.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea — fail fast, fail cheap</span>
+          <p>Binding lets the database catch mistakes <strong>early</strong>, before any disk is touched or
+          any row is read. A typo in a column name costs microseconds to detect here, versus scanning a
+          billion-row table only to discover the column was never real. Catching errors at compile time is
+          far cheaper than at run time.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The result: a bound (annotated) AST</span>
+          <p>The output of this stage is the same tree shape as before, but <strong>enriched</strong>: each
+          table node now points at a real catalog object, each column node knows its table and data type, and
+          <code class="inl">*</code> is expanded. Some textbooks call this a <span class="term">resolved query
+          tree</span>. It is unambiguous and ready to be turned into a plan.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Binding (semantic analysis) gives meaning to the names in the AST by looking them up in the catalog.
+          It resolves tables and columns, checks types, flags ambiguity, validates functions, and expands
+          <code class="inl">*</code>. This is where "table/column does not exist" and type errors are caught —
+          early and cheaply. The output is an annotated, fully-resolved query tree.
+        </div>
+      </section>
+
+      <!-- ===================== 4. LOGICAL PLAN ===================== -->
+      <section id="logical">
+        <h2><span class="sec-num">4</span> Logical plan generation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a recipe. "Chocolate chip cookies" is <em>what</em> you want. The recipe card is the
+          ordered list of steps: get flour, mix in sugar, add chips, bake. The logical plan is the database
+          writing itself a recipe card from your wish — a stack of simple steps, each feeding the next. It
+          doesn't yet say <em>which oven</em> or <em>how fast</em> (that's the optimiser later); it just lists
+          the steps in a sensible order.</p>
+        </div>
+
+        <p>We now have a clean, fully-resolved query tree. The final front-end step turns it into a
+        <span class="term">logical plan</span>: a tree of <span class="term">relational-algebra
+        operators</span>. Relational algebra is the mathematical foundation of SQL — a small set of
+        operations that each take one or more tables (relations) as input and produce a table as output.
+        Because every operator outputs a table, you can stack them into a tree.</p>
+
+        <h3>The core relational-algebra operators</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operator</th><th>Symbol</th><th>Plain English</th><th>SQL clause it comes from</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Scan</span></td><td>—</td><td>Read all rows from a table.</td><td><code class="inl">FROM users</code></td></tr>
+              <tr><td><span class="term">Filter</span> (selection)</td><td>σ (sigma)</td><td>Keep only rows matching a condition.</td><td><code class="inl">WHERE age &gt; 18</code></td></tr>
+              <tr><td><span class="term">Project</span></td><td>π (pi)</td><td>Keep only certain columns.</td><td><code class="inl">SELECT name, age</code></td></tr>
+              <tr><td><span class="term">Join</span></td><td>⋈ (bowtie)</td><td>Combine rows from two tables on a condition.</td><td><code class="inl">JOIN … ON …</code></td></tr>
+              <tr><td><span class="term">Aggregate</span></td><td>γ (gamma)</td><td>Group rows and compute sums/counts/etc.</td><td><code class="inl">GROUP BY</code>, <code class="inl">COUNT()</code></td></tr>
+              <tr><td><span class="term">Sort</span></td><td>τ (tau)</td><td>Order the rows.</td><td><code class="inl">ORDER BY</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">"Logical" vs "physical" — an important distinction</span>
+          <p>A logical operator says <em>what</em> to do ("join these two tables"), not <em>how</em>. There
+          are usually several <span class="term">physical operators</span> that implement the same logical
+          one — a join could be done as a nested-loop join, a hash join, or a merge join. Choosing the actual
+          physical algorithm is the <strong>optimiser's</strong> job in <strong>Session 11</strong>. The
+          logical plan deliberately leaves the "how" open.</p>
+        </div>
+
+        <h3>Building the plan from the query tree</h3>
+        <p>The planner reads the bound query and assembles operators bottom-up, so that data flows from the
+        leaves (tables) up to the root (final result). A handy way to remember the canonical order:
+        <strong>FROM → WHERE → SELECT</strong> becomes <strong>Scan → Filter → Project</strong>, reading the
+        tree from the bottom up.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: our query as a logical plan</span>
+          <p>Recall the query:</p>
+          <pre><span class="kw">SELECT</span> name <span class="kw">FROM</span> customers <span class="kw">WHERE</span> city = <span class="st">'London'</span>;</pre>
+          <p>The logical plan is a three-node tree. Data flows <strong>upward</strong>: the scan produces all
+          rows, the filter throws most away, the project trims the columns.</p>
+          <pre>        Project [ name ]            <span class="cm"># π — keep only the name column</span>
+              │
+              ▼
+        Filter [ city = 'London' ]    <span class="cm"># σ — drop rows that don't match</span>
+              │
+              ▼
+        Scan  [ customers ]           <span class="cm"># read every row of the table</span></pre>
+          <p>Equivalently, in relational-algebra notation:</p>
+          <pre>π<span class="nm">name</span> ( σ<span class="nm">city = 'London'</span> ( customers ) )</pre>
+          <p>Read the algebra inside-out: scan <code class="inl">customers</code>, apply the filter σ, then
+          project π. The tree and the algebra say the same thing.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">A meatier example: a join with a filter</span>
+          <p>Now a two-table query:</p>
+          <pre><span class="kw">SELECT</span> c.name, o.total
+<span class="kw">FROM</span> customers c
+<span class="kw">JOIN</span> orders o <span class="kw">ON</span> c.id = o.customer_id
+<span class="kw">WHERE</span> c.city = <span class="st">'London'</span>;</pre>
+          <p>Its logical plan has two leaves (one scan per table) feeding a join, then a filter, then a
+          project:</p>
+          <pre>             Project [ c.name, o.total ]
+                      │
+                      ▼
+             Filter [ c.city = 'London' ]
+                      │
+                      ▼
+              Join [ c.id = o.customer_id ]   <span class="cm"># ⋈</span>
+                 ┌────┴─────┐
+                 ▼          ▼
+        Scan [ customers ]  Scan [ orders ]</pre>
+          <p>This plan is <em>correct</em> but not necessarily <em>fast</em> — for instance, filtering London
+          customers <em>before</em> the join would usually be cheaper. Rearranging the plan into a faster but
+          equivalent one is precisely what the optimiser does next. The front-end just needs a correct
+          starting tree.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Gotcha: the plan order isn't the SQL writing order</span>
+          <p>You write <code class="inl">SELECT</code> first, but logically it happens almost <em>last</em>.
+          The true logical evaluation order is roughly: <code class="inl">FROM</code> → <code class="inl">JOIN</code>
+          → <code class="inl">WHERE</code> → <code class="inl">GROUP BY</code> → <code class="inl">HAVING</code>
+          → <code class="inl">SELECT</code> → <code class="inl">ORDER BY</code> → <code class="inl">LIMIT</code>.
+          That mismatch explains a classic beginner error: you can't use a column alias defined in
+          <code class="inl">SELECT</code> inside the <code class="inl">WHERE</code> clause, because WHERE runs
+          before SELECT exists.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Milestone M2</span>
+          <p>Producing a correct logical plan from a SQL string is the goal we'll call <span class="term">Milestone
+          M2</span> in our build-a-database project. M2 ends the front-end: you have lexing, parsing, binding,
+          and logical-plan generation all working. The next milestone hands this plan to the
+          <strong>optimiser (Session 11)</strong>, which chooses physical operators and access paths (using
+          the index structures from <strong>Session 7</strong>), and then the <strong>executor (Session
+          9)</strong> actually runs it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Logical-plan generation turns the bound query tree into a tree of relational-algebra operators —
+          scan, filter, project, join, aggregate, sort — with data flowing from the leaf tables up to the
+          root. It captures <em>what</em> to compute, not <em>how</em> (that's the optimiser). Reaching a
+          correct logical plan is Milestone M2, the end of the front-end and the input to optimisation.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just walked the entire query front-end — the path from a raw SQL string to a plan. Here's the
+        one-paragraph story that connects all four topics:</p>
+        <div class="bigidea">
+          <p>Your SQL starts as plain <strong>text</strong>. The <strong>lexer</strong> chops it into
+          <strong>tokens</strong>; the <strong>parser</strong> checks those tokens against SQL's
+          <strong>grammar</strong> and builds an <strong>Abstract Syntax Tree</strong>, catching
+          <em>syntax</em> errors. <strong>Binding</strong> then consults the <strong>catalog</strong> to
+          resolve every table and column, check <strong>types</strong>, and expand <code class="inl">*</code>,
+          catching <em>semantic</em> errors early and cheaply. Finally, <strong>logical-plan generation</strong>
+          restates the resolved query as a tree of <strong>relational-algebra operators</strong> (scan,
+          filter, project, join) — a correct but unoptimised plan, our <strong>Milestone M2</strong>. That
+          tree is the baton passed to the <strong>optimiser (Session 11)</strong> and then the
+          <strong>executor (Session 9)</strong>.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What's the difference between lexing and parsing?</summary>
+          <p class="ans">Lexing groups raw characters into labelled tokens (keywords, identifiers, numbers,
+          operators). Parsing takes that token stream and checks it against SQL's grammar, building an AST that
+          captures the statement's structure. Lexing = words; parsing = sentence structure.</p>
+        </details>
+        <details class="quiz">
+          <summary>A query is grammatically perfect but names a table that doesn't exist. Which stage catches it, and why not the parser?</summary>
+          <p class="ans">Binding / semantic analysis catches it, by looking the table up in the catalog. The
+          parser only checks grammar (structure), not meaning — to it, <code class="inl">users</code> is just a
+          valid identifier whether or not the table is real.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the catalog, and why does binding need it?</summary>
+          <p class="ans">The catalog (system catalog / data dictionary) is the database's internal metadata:
+          every table, column, type, index, and constraint. Binding needs it to resolve names to real objects
+          and attach data types so it can type-check expressions and expand <code class="inl">*</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does it mean that a logical plan is "logical" and not "physical"?</summary>
+          <p class="ans">It says <em>what</em> to do (e.g. "join these tables", "filter these rows") but not
+          <em>how</em>. Choosing the concrete algorithm (nested-loop vs hash vs merge join, which index to use)
+          is the optimiser's job in Session 11.</p>
+        </details>
+        <details class="quiz">
+          <summary>Write the logical plan for <code class="inl">SELECT name FROM users WHERE age &gt; 18;</code></summary>
+          <p class="ans">Bottom-up: Scan[users] → Filter[age &gt; 18] → Project[name]. In algebra:
+          π<sub>name</sub>(σ<sub>age &gt; 18</sub>(users)).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't you reference a SELECT alias inside the WHERE clause?</summary>
+          <p class="ans">Because of logical evaluation order: WHERE is evaluated before SELECT, so the alias
+          defined in SELECT doesn't exist yet when WHERE runs. The order is roughly FROM → JOIN → WHERE →
+          GROUP BY → HAVING → SELECT → ORDER BY → LIMIT.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📝 Class handout: <strong>"DBMS Session 8 — Query Parsing"</strong>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445/645 — Database Systems</a> — the gold-standard free course; see the query-processing lectures (parser, binder, optimiser) for a working engine's view.</li>
+          <li><a href="https://www.postgresql.org/docs/current/parser-stage.html" target="_blank" rel="noopener">PostgreSQL Docs — The Parser Stage</a> — a real production database explaining exactly how it lexes, parses, and produces parse trees.</li>
+          <li><a href="https://www.postgresql.org/docs/current/planner-optimizer.html" target="_blank" rel="noopener">PostgreSQL Docs — Planner / Optimizer</a> — how the resolved query becomes a plan tree; the stage right after the front-end.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">"Database System Concepts" (Silberschatz, Korth, Sudarshan)</a> — the query-processing chapter covers parsing, translation to relational algebra, and logical plans in depth.</li>
+          <li><a href="https://www.postgresql.org/docs/current/information-schema.html" target="_blank" rel="noopener">PostgreSQL Docs — The Information Schema</a> — a concrete look at the catalog/metadata that binding queries to resolve names and types.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-7.html"><div class="dir">← Previous</div><div class="ttl">Session 7: Index Structures — B+ Trees 2</div></a>
+        <a class="next" href="session-9.html"><div class="dir">Next →</div><div class="ttl">Session 9: Query Execution</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 8 — Query Parsing &amp; Planning · From SQL text to a logical plan 🌳</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

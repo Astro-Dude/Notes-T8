@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 2 — Load Balancing &amp; Consistent Hashing</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 2</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 02 · Load Balancing &amp; Consistent Hashing</span>
+      <h1>How big systems spread the work — fairly and without chaos</h1>
+      <p class="lead">
+        In Session 1 we learned that real systems run on <em>many</em> servers, not one. But that
+        raises a question: when a request arrives, <strong>which</strong> server should handle it? And
+        when you add or remove servers, how do you avoid breaking everything? This session answers both.
+        We assume you've studied <em>none</em> of this before — every topic starts with a tiny
+        "explain like I'm 5" story, then we go deeper with real examples and code. Take it slow.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 39 min read</span><span class="badge-rt">📖 9 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#lb-types">Load balancers &amp; their types</a></li>
+          <li><a href="#ip-addresses">A detour: IP addresses</a></li>
+          <li><a href="#sharding">Storing data: sharding &amp; partitioning</a></li>
+          <li><a href="#routing">Routing = sharding, and a good algorithm</a></li>
+          <li><a href="#algorithms">Load balancing algorithms</a></li>
+          <li><a href="#naive-hash">Naive routing schemes &amp; their problems</a></li>
+          <li><a href="#hash-functions">Hash functions &amp; the hash ring</a></li>
+          <li><a href="#consistent-hashing">Consistent hashing</a></li>
+          <li><a href="#where-used">Where consistent hashing is used</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. LB TYPES ===================== -->
+      <section id="lb-types">
+        <h2><span class="sec-num">1</span> Load balancers &amp; their types</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a busy ice-cream shop with one queue but <strong>five servers</strong> behind the
+          counter. If everyone lined up for the same person, that one server would be exhausted and the
+          other four would be bored. So a friendly <strong>host at the door</strong> points each new
+          customer to whichever server is free. That host is a <span class="term">load balancer</span> —
+          it stands in front of your servers and sends each request to one of them so the work is shared.</p>
+        </div>
+
+        <p>Recall from Session 1 that we scale a system <span class="term">horizontally</span> by running
+        many identical copies of our server. A <span class="term">load balancer (LB)</span> is the piece
+        that sits in front of those copies and decides which one gets each incoming request. It gives us
+        three superpowers at once:</p>
+        <ul>
+          <li><strong>Spreading load</strong> — no single server gets overwhelmed. It distributes the load
+          (requests <em>and</em> data) equally across the app/DB servers behind it.</li>
+          <li><strong>High availability</strong> — if one server dies, the LB stops sending traffic to it,
+          and users never notice.</li>
+          <li><strong>A single, unified front door</strong> — clients talk to one address (the LB) instead of
+          needing to know about every server behind it. This gives the end user a
+          <strong>unified view of the entire backend</strong>: the user doesn't care <em>which</em> exact
+          server handles their request.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The purpose of a load balancer</span>
+          <p>Two jobs, stated the way the class did: (1) <strong>provide a unified view</strong> of the entire
+          backend system to the end user — because the end user doesn't care which exact server handles their
+          request; and (2) <strong>distribute the load</strong> (requests / data) equally across the
+          app / DB servers.</p>
+        </div>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">👤</div><div class="s-t">Clients</div><div class="s-d">Browsers / apps</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚖️</div><div class="s-t">Load balancer</div><div class="s-d">One front door</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">Server pool</div><div class="s-d">Many identical backends</div></div>
+        </div>
+
+        <h3>L4 vs L7 — two places the LB can do its job</h3>
+        <p>Load balancers are usually described by which <span class="term">OSI layer</span> they operate on.
+        The OSI model is just a 7-layer map of how network data travels; you only need two layers here.
+        <strong>Layer 4 (L4)</strong> is the <em>transport</em> layer — it deals with TCP/UDP connections,
+        IP addresses, and ports. <strong>Layer 7 (L7)</strong> is the <em>application</em> layer — it
+        understands HTTP, so it can read URLs, headers, and cookies.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>L4 (transport)</th><th>L7 (application)</th></tr></thead>
+            <tbody>
+              <tr><td>Works with</td><td>TCP/UDP packets, IP + port</td><td>Full HTTP requests (URL, headers, cookies)</td></tr>
+              <tr><td>Can route on</td><td>Source/destination IP, port, protocol</td><td>URL path, hostname, headers, cookies, request body</td></tr>
+              <tr><td>Sees the content?</td><td>No — it just forwards the connection</td><td>Yes — it reads and understands the message</td></tr>
+              <tr><td>Speed</td><td>Very fast (less work per packet)</td><td>Slightly slower (must parse HTTP)</td></tr>
+              <tr><td>Smarts</td><td>Low — can't tell a login from an image request</td><td>High — can send <code class="inl">/api/*</code> one way, <code class="inl">/images/*</code> another</td></tr>
+              <tr><td>TLS</td><td>Passes encrypted traffic straight through</td><td>Often <em>terminates</em> TLS (decrypts) so it can read the request</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">When the difference actually matters</span>
+          <p>Say all your image requests live at <code class="inl">/images/*</code> and your API lives at
+          <code class="inl">/api/*</code>, and you want images served by a separate, cheaper pool of servers.</p>
+          <ul>
+            <li>An <strong>L4 LB</strong> only sees "a TCP connection to port 443" — it has <em>no idea</em> the
+            URL says <code class="inl">/images</code>, so it cannot split this traffic.</li>
+            <li>An <strong>L7 LB</strong> reads the HTTP request, sees the path is <code class="inl">/images/cat.jpg</code>,
+            and routes it to the image pool. This is called <span class="term">content-based routing</span>.</li>
+          </ul>
+        </div>
+
+        <h3>Hardware vs software load balancers</h3>
+        <p>Historically, load balancers were expensive dedicated <span class="term">hardware appliances</span>
+        (think specialized boxes from vendors like F5 or Citrix) that you bought and racked in your data
+        center. Today most teams use <span class="term">software load balancers</span> — programs running on
+        ordinary servers — or a cloud-managed LB you rent by the hour. On AWS the cloud-managed option is the
+        <span class="term">Elastic Load Balancer (ELB)</span>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>Examples</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>Hardware appliance</td><td>F5 BIG-IP, Citrix ADC</td><td>Very fast, very expensive, fixed capacity, you maintain it.</td></tr>
+              <tr><td>Software (self-run)</td><td><span class="term">Nginx</span>, <span class="term">HAProxy</span>, Envoy</td><td>Run on normal Linux boxes, cheap, flexible, you configure &amp; scale them.</td></tr>
+              <tr><td>Cloud-managed</td><td>AWS ELB/ALB/NLB, GCP Cloud Load Balancing, Azure Load Balancer</td><td>You click a few buttons; the cloud runs and scales it for you. ALB = L7, NLB = L4.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Quick name guide</span>
+          <p><strong>Nginx</strong> and <strong>HAProxy</strong> are the two most common open-source software
+          LBs — Nginx is also a web server and reverse proxy, HAProxy specializes in load balancing. On AWS,
+          the <strong>ALB</strong> (Application Load Balancer) is L7 and the <strong>NLB</strong> (Network
+          Load Balancer) is L4. The words "appliance," "reverse proxy," and "load balancer" overlap a lot in
+          practice — don't let the jargon scare you.</p>
+        </div>
+
+        <h3>Health checks — how the LB knows who's alive</h3>
+        <p>A load balancer must never send a request to a dead server. So it constantly runs
+        <span class="term">health checks</span>: it periodically pings each backend (often a tiny HTTP request
+        to a special URL like <code class="inl">/healthz</code>) and waits for an "I'm OK" reply.</p>
+        <ul>
+          <li>If a server answers correctly → it stays in the rotation ("<strong>healthy</strong>").</li>
+          <li>If it fails a few checks in a row → the LB marks it "<strong>unhealthy</strong>" and stops
+          routing traffic to it. Users never hit the broken box.</li>
+          <li>When it starts answering again → the LB quietly adds it back.</li>
+        </ul>
+        <div class="callout example">
+          <span class="c-title">A tiny health-check endpoint</span>
+          <pre><span class="cm"># The backend exposes a cheap "am I alive?" route</span>
+<span class="kw">GET</span> /healthz  <span class="cm"># LB calls this every few seconds</span>
+
+<span class="cm"># Healthy response:</span>
+<span class="nm">200</span> OK   {<span class="st">"status"</span>: <span class="st">"ok"</span>}
+
+<span class="cm"># If the server is overloaded or broken:</span>
+<span class="nm">503</span> Service Unavailable   <span class="cm"># → LB pulls it out of rotation</span></pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Where to learn the practical setup</span>
+          <p>The class linked hands-on configuration guides: a setup doc, the AviNetworks "What is load
+          balancing?" tutorial, and AWS's "Getting started with Elastic Load Balancing." See
+          <a href="#refs">References</a> for the links.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A load balancer sits in front of a pool of identical servers and spreads requests across them,
+          giving us a <strong>unified front door</strong>, shared load, and high availability.
+          <strong>L4</strong> balancers route on IP/port (fast, blind to content); <strong>L7</strong> balancers
+          read HTTP and can route on URL, headers, or cookies (smarter, slightly slower). They come as hardware
+          appliances, software (Nginx, HAProxy), or cloud-managed services (AWS ELB), and they use
+          <strong>health checks</strong> to route around dead servers automatically.
+        </div>
+      </section>
+
+      <!-- ===================== 2. IP ADDRESSES ===================== -->
+      <section id="ip-addresses">
+        <h2><span class="sec-num">2</span> A detour: IP addresses</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Every house needs an address so the mail carrier can find it. On the internet, every machine
+          needs an <strong>IP address</strong> so packets can find it. An old-style address (IPv4) is like a
+          short street number that's starting to run out — there just aren't enough numbers for all the houses
+          being built. So we invented a longer address (IPv6) with so many numbers we'll <em>never</em> run out.</p>
+        </div>
+
+        <p>Before we decide which server a request goes to, it helps to remember how machines are even
+        addressed. An <span class="term">IPv4</span> address looks like <code class="inl">142.250.192.4</code> —
+        four numbers separated by dots, each in the range <code class="inl">0–255</code>.</p>
+
+        <pre><span class="cm"># IPv4 layout: four octets, each 0–255</span>
+IPv4:  0-255 . 0-255 . 0-255 . 0-255
+
+<span class="cm"># Each octet is 8 bits, so total possibilities:</span>
+2^8 * 2^8 * 2^8 * 2^8  =  2^32  ~  4 billion addresses</pre>
+
+        <p>The problem: there are roughly <strong>100 billion to 1 trillion</strong> devices on the internet,
+        but IPv4 offers only <strong>~4 billion</strong> addresses. That's nowhere near enough — which is why we
+        also have <span class="term">static vs dynamic IPs</span> (some machines keep a fixed address; most
+        devices borrow one temporarily) and, ultimately, a bigger address space.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Version</th><th>Size</th><th>Total possibilities</th></tr></thead>
+            <tbody>
+              <tr><td>IPv4</td><td>32 bits</td><td>2³² ≈ <strong>4 billion</strong></td></tr>
+              <tr><td>IPv6</td><td>128 bits</td><td>2¹²⁸ ≈ <strong>256 billion billion billion billion</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><span class="term">IPv6</span> uses <strong>128 bits</strong>, giving 2¹²⁸ ≈ 256 billion billion
+        billion billion possibilities — effectively unlimited. <span class="term">Static IPs</span> stay the
+        same over time (useful for servers you must always reach at the same address); <span class="term">dynamic
+        IPs</span> are assigned on the fly and can change (typical for home/phone devices).</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          IPv4 is four <code class="inl">0–255</code> octets (32 bits, 2³² ≈ 4 billion addresses) — too few for
+          the 100 billion–1 trillion devices online, so we have static vs dynamic IPs and IPv6 (128 bits,
+          2¹²⁸ ≈ practically infinite). This addressing is the backdrop for the real question: which server
+          should a given request go to?
+        </div>
+      </section>
+
+      <!-- ===================== 3. SHARDING ===================== -->
+      <section id="sharding">
+        <h2><span class="sec-num">3</span> Storing data: sharding &amp; partitioning</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You have too many toys for one toy box, so you buy more boxes. But you can't just throw toys in
+          randomly — then you'd never find anything! You need a <strong>rule</strong>: "all the cars go in box 1,
+          all the dolls in box 2." That way, when you want a toy, you know exactly which box to open. Splitting
+          your stuff across boxes with a findable rule is <span class="term">sharding</span>.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big question</span>
+          <p><strong>Which server should a particular request be sent to?</strong> To answer that, we first
+          have to understand how the <em>data</em> is spread across servers — otherwise we'd send requests to
+          servers that don't even have the right data (Sanjana's request lands on a server holding Ashok's data).</p>
+        </div>
+
+        <h3>Why not just one server?</h3>
+        <p><strong>Q: Can we store all the data on 1 server?</strong> No. We added more machines in the first
+        place because we were running out of resources — disk space, CPU, memory. One server can't hold it all.</p>
+
+        <p><strong>Q: Should we split the data randomly?</strong> No — then how would we retrieve it? Data
+        storage has to follow some <strong>logic that can be repeated</strong>. At any moment we must be able to
+        figure out <em>which data lives on which server</em>.</p>
+
+        <h3>Two kinds of partitioning</h3>
+        <p>"Splitting data" has two flavors, and each can happen <em>within</em> a database or
+        <em>across</em> servers.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Kind</th><th>What it splits</th><th>Why you'd do it</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Vertical partitioning</strong> (within a DB)</td><td>Splits a table by <em>columns</em></td><td>Normalization — break a wide table into related tables.</td></tr>
+              <tr><td><strong>Horizontal partitioning</strong> (within a DB)</td><td>Splits a table by <em>rows</em></td><td>Improve indexing performance; support multi-tenancy (prevent data cross-communication between clients).</td></tr>
+              <tr><td><strong>Vertical partitioning across servers</strong></td><td>Different features/tables on different servers</td><td>Migrate to microservices / separation of concerns.</td></tr>
+              <tr><td><strong>Horizontal partitioning across servers</strong></td><td>Different rows on different servers</td><td>All the data cannot fit on a single server.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">Sharding, defined</span>
+          <p><span class="term">Sharding</span> is simply <strong>"horizontal partitioning across servers."</strong>
+          You split your rows across many machines because they won't all fit on one.</p>
+        </div>
+
+        <h3>The sharding key</h3>
+        <p>Sharding is always based on some value — the <span class="term">sharding key</span>. The key is what
+        decides which shard (server) a piece of data lives on. (How to <em>choose</em> a good sharding key is a
+        topic for a later lecture.)</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We can't store everything on one server (we ran out of resources), and we can't split data randomly
+          (we'd never find it again) — storage must follow repeatable logic. <strong>Vertical partitioning</strong>
+          splits by columns (normalization / microservices); <strong>horizontal partitioning</strong> splits by
+          rows (indexing, multi-tenancy, capacity). <strong>Sharding = horizontal partitioning across servers</strong>,
+          always driven by a <strong>sharding key</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. ROUTING = SHARDING ===================== -->
+      <section id="routing">
+        <h2><span class="sec-num">4</span> Routing = sharding, and what makes a good algorithm</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Pretend the host at the door always sends <strong>you</strong> to the same scooper every time you
+          visit. Then, without anyone planning it, <em>your</em> ice-cream preferences end up known only by
+          <em>that</em> scooper — because no one else ever served you! Deciding "which person serves which
+          customer" automatically decides "who remembers which customer." Routing and storing are two sides of
+          the same coin.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">Sharding ⟺ Routing</span>
+          <p>It must <strong>not</strong> be the case that sharding follows logic A while routing follows logic B.
+          If they differ, requests land on servers that don't hold the needed data! So the algorithm must be the
+          <strong>same</strong> for both. In fact, sharding <em>happens via routing</em>: routing is the thing
+          that happens, and sharding is just a <strong>side effect</strong> of it.</p>
+        </div>
+
+        <p>Here's the insight. If we route based on <code class="inl">user_id</code>, then sharding
+        automatically happens based on <code class="inl">user_id</code> too. Why? Because if Sanjana's requests
+        are always routed to server A, then <em>only</em> server A ever sees (and therefore stores) Sanjana's
+        data — servers B and C never received her requests in the first place.</p>
+
+        <div class="callout key">
+          <span class="c-title">The one decision that decides two things</span>
+          <p>We only decide <strong>(which request → which server)</strong>. The moment we decide that, we've
+          <em>also</em> automatically decided <strong>(which data → which server)</strong>. So all we really
+          need is a good <span class="term">routing algorithm</span>.</p>
+        </div>
+
+        <h3>Where routing lives</h3>
+        <p>The <span class="term">routing algorithm</span> runs <strong>inside the load balancers</strong>. It's
+        how the LB decides which request goes to which server.</p>
+
+        <h3>What makes a routing algorithm "good"?</h3>
+        <p>A good routing algorithm should have these characteristics:</p>
+        <ul>
+          <li><strong>Fast</strong> — computationally easy to decide which request goes to which server.</li>
+          <li><strong>Equal distribution</strong> — divides the load (data &amp; requests) equally across all
+          servers.</li>
+          <li><strong>Freely add / remove servers</strong> — servers are unreliable and crash (count goes down),
+          and we scale out by adding more (count goes up). The algorithm must cope with both.</li>
+          <li><strong>Minimal data movement</strong> — when the number of servers changes, the amount of data
+          that has to move should be minimal.</li>
+          <li><strong>Deterministic without exchanging information</strong> — we have multiple load balancers,
+          and they must all stay "in sync," forwarding the same type of request (say Sanjana's) to the same
+          server. Otherwise Sanjana's data ends up scattered everywhere. Crucially, they must achieve this
+          <em>without</em> constantly communicating — per-request chatter between LBs would be far too much
+          overhead.</li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Sharding and routing must use the <strong>same</strong> logic, because sharding is a side effect of
+          routing — deciding which request goes to which server automatically decides which data lives where.
+          The routing algorithm runs inside the LBs, and a <em>good</em> one is <strong>fast</strong>, gives
+          <strong>equal distribution</strong>, lets you <strong>freely add/remove servers</strong> with
+          <strong>minimal data movement</strong>, and is <strong>deterministic without LBs syncing</strong> with
+          each other. The next topics test candidate algorithms against this checklist.
+        </div>
+      </section>
+
+      <!-- ===================== 5. ALGORITHMS ===================== -->
+      <section id="algorithms">
+        <h2><span class="sec-num">5</span> Load balancing algorithms</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back at the ice-cream shop, <em>how</em> does the host decide which server to send you to? They
+          could just go around the circle: you, then the next person, then the next (taking turns). Or they
+          could look and send you to whoever has the <strong>shortest line</strong>. Or send more customers
+          to the fastest scooper. These different "rules for choosing" are called
+          <span class="term">load balancing algorithms</span> — and picking the right rule keeps everyone
+          happy.</p>
+        </div>
+
+        <p>Once the LB has a list of healthy servers, it needs a rule to pick one for each request. Here are
+        the classic algorithms, from simplest to smartest.</p>
+
+        <h3>Round Robin</h3>
+        <p><span class="term">Round Robin</span> just cycles through the servers in order: request 1 → server A,
+        request 2 → server B, request 3 → server C, request 4 → back to A, and so on. Simple, fair, and needs
+        no extra information. Its weakness: it assumes every server and every request is equal — which isn't
+        always true. (When applied to <em>data</em> routing via a modulo trick, it has a bigger flaw we'll
+        dissect in Topic 6.)</p>
+
+        <h3>Weighted Round Robin</h3>
+        <p><span class="term">Weighted Round Robin</span> is Round Robin with a "strength" number per server.
+        A beefier server gets a higher <em>weight</em> and therefore more requests. If A has weight 3 and B
+        has weight 1, A receives three requests for every one B receives. Great when your servers aren't all
+        the same size.</p>
+
+        <h3>Least Connections</h3>
+        <p><span class="term">Least Connections</span> sends each new request to the server currently handling
+        the <em>fewest</em> active connections. This adapts to reality: if one server is stuck on a few slow,
+        long-lived requests, it stops getting new ones. Ideal when requests vary a lot in how long they take.</p>
+
+        <h3>Least Response Time</h3>
+        <p><span class="term">Least Response Time</span> goes further: it picks the server with the lowest
+        combination of active connections <em>and</em> fastest recent response time. It's the most
+        "performance-aware" of the common algorithms — it actively favors the server that is currently
+        quickest to answer.</p>
+
+        <h3>IP hash / hash-based</h3>
+        <p><span class="term">IP hash</span> (a form of hash-based balancing) computes a hash of the client's
+        IP address (or some other key) and uses it to pick a server. The key property: <strong>the same client
+        always lands on the same server</strong>. This gives us <span class="term">session stickiness</span> —
+        useful when a server keeps some per-user state in memory. (Spoiler: this is the bridge to consistent
+        hashing in the next topics.)</p>
+
+        <h3>Random</h3>
+        <p><span class="term">Random</span> simply picks a server at random. With enough requests, the math of
+        large numbers spreads load fairly evenly. A popular refinement is <span class="term">"power of two
+        choices"</span>: pick two servers at random and send the request to whichever has fewer connections —
+        surprisingly close to optimal, with almost no bookkeeping.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: 6 requests, 3 servers</span>
+          <p>Servers <code class="inl">A, B, C</code>. Watch how the choice differs:</p>
+          <ul>
+            <li><strong>Round Robin:</strong> A, B, C, A, B, C — perfectly even, ignores how busy each is.</li>
+            <li><strong>Weighted RR</strong> (A=3, B=2, C=1): A, A, A, B, B, C — A does the most work.</li>
+            <li><strong>Least Connections:</strong> if A is stuck on a slow upload, requests skip A and go to
+            B and C until A frees up.</li>
+            <li><strong>IP hash:</strong> client <code class="inl">203.0.113.7</code> always → C, every time,
+            so its session stays put.</li>
+          </ul>
+        </div>
+
+        <h3>Comparison — which fits when</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Algorithm</th><th>How it chooses</th><th>Needs server state?</th><th>Best when…</th></tr></thead>
+            <tbody>
+              <tr><td>Round Robin</td><td>Take turns in order</td><td>No</td><td>Servers &amp; requests are roughly equal</td></tr>
+              <tr><td>Weighted Round Robin</td><td>Take turns, more for stronger servers</td><td>No (weights are fixed)</td><td>Servers have different capacities</td></tr>
+              <tr><td>Least Connections</td><td>Fewest active connections</td><td>Yes (live counts)</td><td>Request durations vary a lot</td></tr>
+              <tr><td>Least Response Time</td><td>Fastest + least busy</td><td>Yes (timings + counts)</td><td>Latency matters most</td></tr>
+              <tr><td>IP / hash-based</td><td>Hash of a key → server</td><td>No</td><td>You need the same client on the same server (stickiness)</td></tr>
+              <tr><td>Random</td><td>Pick at random (or best of two)</td><td>No (or tiny)</td><td>Simplicity at large scale</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out: "sticky" sessions are a trap</span>
+          <p>IP-hash stickiness feels handy, but it ties a user to one specific server. If that server dies,
+          everyone stuck to it loses their session. The cleaner design is to make servers
+          <span class="term">stateless</span> (keep session data in a shared cache/database — we cover caching
+          in Session 3) so <em>any</em> server can handle <em>any</em> request. Use stickiness only when you
+          truly must.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Round Robin</strong> takes turns; <strong>Weighted RR</strong> gives stronger servers more
+          turns; <strong>Least Connections</strong> and <strong>Least Response Time</strong> react to how busy
+          and fast each server is; <strong>IP/hash-based</strong> pins a client to one server for stickiness;
+          <strong>Random</strong> (especially "power of two choices") is simple yet effective at scale. Pick
+          based on whether your servers are equal, how much requests vary, and whether you need stickiness.
+        </div>
+      </section>
+
+      <!-- ===================== 6. NAIVE ROUTING SCHEMES ===================== -->
+      <section id="naive-hash">
+        <h2><span class="sec-num">6</span> Naive routing schemes &amp; their problems</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have 3 toy boxes and a rule for where each toy lives: "count the letters in the toy's
+          name, divide by 3, and use the leftover to pick a box." It works great… until you buy a
+          <strong>4th box</strong>. Now your rule says "divide by 4," and suddenly <em>almost every toy</em>
+          has to move to a different box! That huge, annoying reshuffle is the problem with naive routing.</p>
+        </div>
+
+        <p>Let's test simple routing ideas against our checklist from Topic 4 (fast, equal, free add/remove,
+        minimal data movement, no syncing). Each one fails somewhere — which is exactly why consistent hashing
+        exists.</p>
+
+        <h3>Attempt 1 — Round Robin via modulo</h3>
+        <p>The simplest routing is a <strong>% (modulo) based</strong> technique: send each request to the
+        "next" server, computed as <code class="inl">key % N</code>.</p>
+
+        <pre>server_list = [<span class="st">"10.11.6.12"</span>, <span class="st">"10.11.5.17"</span>, ...]
+
+<span class="kw">fn</span> handle_request(request):
+    key = request.user_id
+    N = len(server_list)
+    server_id = key % N
+    server = server_list[server_id]
+    forward_request(request, server)</pre>
+
+        <p>With <code class="inl">server_list = [A, B, C, D]</code> and user_ids <code class="inl">0…100</code>,
+        the initial distribution (<code class="inl">user_id % 4</code>) is tidy:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Server</th><th colspan="3">user_ids it holds (n = 4)</th></tr></thead>
+            <tbody>
+              <tr><td>A</td><td>0</td><td>4</td><td>8 …</td></tr>
+              <tr><td>B</td><td>1</td><td>5</td><td>9 …</td></tr>
+              <tr><td>C</td><td>2</td><td>6</td><td>10 …</td></tr>
+              <tr><td>D</td><td>3</td><td>7</td><td>11 …</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Now <strong>server B crashes</strong>, so <code class="inl">N = 3</code> and everything becomes
+        <code class="inl">user_id % 3</code>:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Server</th><th colspan="4">user_ids it now holds (n = 3)</th></tr></thead>
+            <tbody>
+              <tr><td>A</td><td>0</td><td>3</td><td>6</td><td>9 …</td></tr>
+              <tr><td>B</td><td colspan="4"><em>(crashed)</em></td></tr>
+              <tr><td>C</td><td>1</td><td>4</td><td>7</td><td>10 …</td></tr>
+              <tr><td>D</td><td>2</td><td>5</td><td>8</td><td>11 …</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Yes, users (1, 5, 9, …) who were on the crashed server B obviously have to move — that's expected
+        (their data is migrated; <em>how</em> is a separate topic the class jokingly tags "Son Pari"). But other
+        users' data <strong>should not</strong> need to move, since their servers are still fine. <strong>Is that
+        the case? No!</strong> Pretty much <em>all</em> the data gets shuffled around, because changing N changes
+        <code class="inl">user_id % N</code> for almost everyone. Adding servers has the same effect.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Round Robin (modulo)</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Pros</strong></td><td>Fast; equal distribution; no need to sync information between LBs.</td></tr>
+              <tr><td><strong>Cons</strong></td><td>Lots of unnecessary data movement when N changes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Attempt 2 — Bucketing</h3>
+        <p><span class="term">Bucketing</span> assigns user_ids to servers in fixed <em>ranges</em>:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Server</th><th>user_ids (total users = 400)</th></tr></thead>
+            <tbody>
+              <tr><td>A</td><td>0 … 99</td></tr>
+              <tr><td>B</td><td>100 … 199</td></tr>
+              <tr><td>C</td><td>200 … 299</td></tr>
+              <tr><td>D</td><td>300 … 399</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>If <strong>server B crashes</strong>, the ranges have to be recomputed across the remaining three
+        servers — moving a lot of data:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Server</th><th>user_ids after B crashes</th></tr></thead>
+            <tbody>
+              <tr><td>A</td><td>0 … 132</td></tr>
+              <tr><td>C</td><td>133 … 265</td></tr>
+              <tr><td>D</td><td>266 … 399</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>And when <strong>more users sign up</strong>, there's a second problem: we already decided the
+        buckets, so there's no room for new users in existing servers. It's <em>impossible</em> to add new
+        users without first buying more servers.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Bucketing</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Pros</strong></td><td>Equal data distribution; fast.</td></tr>
+              <tr><td><strong>Cons</strong></td><td>Too much data re-shuffling when servers change; can't even add new users without buying servers.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Attempt 3 — Mapping table</h3>
+        <p>What if the LB just keeps a <span class="term">hashmap</span> from <code class="inl">user_id</code> to
+        <code class="inl">server_id</code>?</p>
+
+        <pre>server_list = [<span class="st">"10.11.6.12"</span>, <span class="st">"10.11.5.17"</span>, ...]
+mapping = {
+    sanjana: A,
+    prem:    B,
+    bathula: A,
+    pallavi: C,
+    venkat:  B,
+    ...
+}
+
+<span class="kw">fn</span> handle_request(request):
+    key = request.user_name
+    server = mapping[key]
+    forward_request(request, server)</pre>
+
+        <p>Handling crashes and new users is straightforward — only the affected entries change:</p>
+
+        <pre><span class="kw">fn</span> handle_server_crash(crashed_server):
+    <span class="kw">for</span> user, server <span class="kw">in</span> mapping:
+        <span class="kw">if</span> server == crashed_server:
+            <span class="cm"># assign a new server to this user</span>
+            new_server = get_random_server()
+            mapping[user] = new_server
+            son_pari_please_migrate(user, crashed_server, new_server)
+
+<span class="kw">fn</span> handle_new_user(user):
+    server = get_random_server()
+    mapping[user] = server</pre>
+
+        <p>This is much better on data movement: users who were on the crashed server get moved (desired), and
+        users whose servers are still running do <strong>not</strong> get moved. But there's a fatal catch.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The killer problem: keeping the table in sync</span>
+          <p>We have many load balancers, and they must <strong>all</strong> share the exact same mapping table.
+          If different LBs hold different mappings, requests land on random servers and a user's data scatters.
+          And keeping data in sync, <em>always</em>, with <em>very low latency</em>, across many machines is an
+          extremely hard problem — practically <strong>impossible</strong>.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Mapping table</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Pros</strong></td><td>Equal data distribution; fast; minimizes data movement.</td></tr>
+              <tr><td><strong>Cons</strong></td><td>Must keep the mapping table in sync across all LBs — keeping data in sync always with low latency is essentially impossible.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The deeper flaw behind modulo hashing</h3>
+        <p>When the goal is to spread <em>data</em> (e.g. which cache server stores which key), the modulo trick
+        <code class="inl">hash(key) % N</code> is the same Attempt 1 in disguise:</p>
+
+        <pre><span class="cm"># N = number of servers</span>
+server_index = hash(key) % N</pre>
+
+        <p>Here <code class="inl">hash(key)</code> turns the key into a big number, and <code class="inl">% N</code>
+        squashes it into <code class="inl">0 … N-1</code> — a valid server index. Looks perfect, until
+        <strong>N changes</strong>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked numeric example: adding one server remaps almost everything</span>
+          <p>Suppose 5 keys hash to these numbers, and we start with <strong>N = 4</strong> servers:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Key</th><th>hash(key)</th><th>% 4 → server (N=4)</th><th>% 5 → server (N=5)</th><th>Moved?</th></tr></thead>
+              <tbody>
+                <tr><td>"apple"</td><td>20</td><td>20 % 4 = <strong>0</strong></td><td>20 % 5 = <strong>0</strong></td><td>no</td></tr>
+                <tr><td>"banana"</td><td>21</td><td>21 % 4 = <strong>1</strong></td><td>21 % 5 = <strong>1</strong></td><td>no</td></tr>
+                <tr><td>"cherry"</td><td>22</td><td>22 % 4 = <strong>2</strong></td><td>22 % 5 = <strong>2</strong></td><td>no</td></tr>
+                <tr><td>"date"</td><td>23</td><td>23 % 4 = <strong>3</strong></td><td>23 % 5 = <strong>3</strong></td><td>no</td></tr>
+                <tr><td>"elder"</td><td>24</td><td>24 % 4 = <strong>0</strong></td><td>24 % 5 = <strong>4</strong></td><td><strong>YES</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>That small set looks tame, but it's a coincidence of tidy numbers. With realistic, scattered hash
+          values the effect is brutal. Watch what happens to these:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>hash(key)</th><th>% 4 (old)</th><th>% 5 (new)</th><th>Moved?</th></tr></thead>
+              <tbody>
+                <tr><td>100</td><td>0</td><td>0</td><td>no</td></tr>
+                <tr><td>101</td><td>1</td><td>1</td><td>no</td></tr>
+                <tr><td>102</td><td>2</td><td>2</td><td><strong>changed → moves</strong></td></tr>
+                <tr><td>103</td><td>3</td><td>3</td><td>no</td></tr>
+                <tr><td>104</td><td>0</td><td><strong>4</strong></td><td><strong>moves</strong></td></tr>
+                <tr><td>105</td><td>1</td><td>0</td><td><strong>moves</strong></td></tr>
+                <tr><td>106</td><td>2</td><td>1</td><td><strong>moves</strong></td></tr>
+                <tr><td>107</td><td>3</td><td>2</td><td><strong>moves</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Of 8 keys, <strong>6 moved</strong>. In general, changing from N to N+1 servers forces roughly
+          <strong>(N / (N+1)) of <em>all</em> keys to relocate</strong> — for N=4 that's about <strong>80%</strong>.
+          This mass relocation is called the <span class="term">rehashing problem</span>.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why this is so painful</span>
+          <p>If those servers are <strong>caches</strong>, "moving a key" means the data for that key is now
+          looked for on a server that doesn't have it — a <span class="term">cache miss</span>. Adding one
+          cache node could invalidate ~80% of your cache at once, sending a flood of traffic to your database.
+          This is sometimes called a <span class="term">cache stampede</span>, and it can take a system down.
+          If those servers are a <strong>database shard</strong>, you'd have to physically copy most of your
+          data between machines just to add capacity. Unacceptable.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The core flaw</span>
+          <p>With <code class="inl">hash(key) % N</code>, the server a key maps to depends on <strong>N</strong>.
+          Change N — even by one — and you've changed the answer for almost every key. We need a scheme where
+          adding or removing a server moves <em>only a small fraction</em> of keys. That's exactly what
+          consistent hashing delivers.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Round Robin / modulo</strong> is fast and even but reshuffles almost all data when N changes.
+          <strong>Bucketing</strong> uses fixed ranges — equal &amp; fast but re-shuffles on change and can't even
+          admit new users without new servers. A <strong>mapping table</strong> minimizes data movement but must
+          be kept perfectly in sync across all LBs — effectively impossible. And modulo hashing's
+          <strong>rehashing problem</strong> remaps ~N/(N+1) of keys (mass cache misses / data copying). Every
+          naive scheme fails the Topic 4 checklist — we need something smarter.
+        </div>
+      </section>
+
+      <!-- ===================== 7. HASH FUNCTIONS & THE RING ===================== -->
+      <section id="hash-functions">
+        <h2><span class="sec-num">7</span> Hash functions &amp; the hash ring</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A <strong>hash function</strong> is a magic blender. You drop in <em>anything</em> — a name, a
+          number, a whole book — and out comes a number inside a fixed range, like 0 to 99. And it's reliable:
+          blend the same thing twice and you always get the same number. We use this to give every user and
+          every server a spot on a giant circle.</p>
+        </div>
+
+        <h3>What is a function?</h3>
+        <p>A <span class="term">function</span> is a <strong>deterministic</strong> mapping from inputs to
+        outputs. No matter how many times you call it with the same input, you get the same output:</p>
+
+        <pre><span class="kw">fn</span> add(a, b):
+    <span class="kw">return</span> a + b
+
+add(2, 3)  =&gt; 5
+add(2, 3)  =&gt; 5
+add(2, 3)  =&gt; 5   <span class="cm"># always the same for the same input</span></pre>
+
+        <p>Compare that to a <strong>procedure</strong> (an "impure" function) that has
+        <span class="term">side effects</span> — it can return different values for the same input because it
+        reads or writes external state:</p>
+
+        <pre>state = 0
+<span class="kw">proc</span> add(a, b):
+    state = b
+    <span class="kw">return</span> a + b + state
+<span class="cm"># Not always the same output — it has side effects.</span></pre>
+
+        <h3>What is a hash function?</h3>
+        <p>A <span class="term">hash function</span> is a <strong>"digest"</strong> function: it takes
+        <em>anything</em> as input but returns values within a <strong>fixed range</strong>. Some toy examples
+        that all output a value in <code class="inl">0 … 99</code> (or some fixed range):</p>
+
+        <pre><span class="kw">fn</span> hash_1(data):
+    <span class="kw">return</span> (sum of ascii values of chars of data) % 100
+<span class="kw">fn</span> hash_2(data):
+    <span class="kw">return</span> (sum of squares of ascii values of chars of data) % 799
+<span class="kw">fn</span> hash_3(data):
+    <span class="kw">return</span> (multiply even and odd numbers in the data) % 1337
+
+<span class="cm"># No matter the input, the output is always within the fixed range.</span></pre>
+
+        <div class="callout note">
+          <span class="c-title">Worth a read</span>
+          <p>The class linked Wikipedia on <em>hash functions</em> (definitions &amp; properties),
+          <em>cryptographic hash functions</em> (extra guarantees), and <em>universal hashing</em> (families of
+          hashes). See <a href="#refs">References</a>.</p>
+        </div>
+
+        <h3>The hash ring</h3>
+        <p>The <span class="term">hash ring</span> is simply the <strong>output space</strong> of a given hash
+        function, drawn as a circle. If your hash outputs values in <code class="inl">0 … (2⁶⁴ − 1)</code>,
+        the ring runs from 0 around to 2⁶⁴−1 and wraps back to 0.</p>
+
+        <h3>Placing users &amp; servers on the ring</h3>
+        <ul>
+          <li>Use <strong>1 hash function</strong> <code class="inl">hash_0</code> for hashing the
+          <strong>users</strong>.</li>
+          <li>Use <strong>k hash functions</strong> <code class="inl">hash_1 … hash_k</code> for hashing the
+          <strong>servers</strong> — a typical value of <code class="inl">k</code> is <strong>32 or 64</strong>.
+          (Each server is placed at k spots on the ring; this is the "virtual nodes" idea of Topic 8.)</li>
+        </ul>
+        <p>These hash functions are set up while the LB is being coded/configured. <strong>All LBs for a system
+        share the exact same set of hash functions</strong>, and all <code class="inl">(k+1)</code> functions
+        have the same output space (say <code class="inl">0 … 2⁶⁴ − 1</code>).</p>
+
+        <div class="callout example">
+          <span class="c-title">Interview question: will hashes collide?</span>
+          <p>Suppose the hash function outputs values in <code class="inl">0 … (2⁶⁴ − 1)</code>. Given
+          <strong>1 billion users</strong> and <strong>1 million servers</strong>, what's the probability that
+          two hashes collide? <strong>Very close to 0</strong> — the output space (2⁶⁴ ≈ 18 quintillion) dwarfs
+          the number of things we're placing on it, so collisions are essentially negligible.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>function</strong> is a deterministic input→output mapping; a <strong>procedure</strong> with
+          side effects is not. A <strong>hash function</strong> is a digest that maps any input into a fixed
+          range. The <strong>hash ring</strong> is that output space drawn as a circle. We hash users with one
+          function (<code class="inl">hash_0</code>) and servers with <code class="inl">k</code> functions
+          (k ≈ 32–64), all sharing the same output space across every LB — and with a 2⁶⁴ space, collisions are
+          effectively impossible.
+        </div>
+      </section>
+
+      <!-- ===================== 8. CONSISTENT HASHING ===================== -->
+      <section id="consistent-hashing">
+        <h2><span class="sec-num">8</span> Consistent hashing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a giant <strong>clock face</strong>. We give each toy box a spot on the clock, and we give
+          each toy a spot too. To find a toy's box, start at the toy and walk <strong>clockwise</strong> until
+          you bump into the first box — that's its home. Now if you add a new box, you only steal the toys
+          sitting just <em>before</em> it on the clock; every other toy stays exactly where it was. No giant
+          reshuffle! That clock is the <span class="term">hash ring</span>.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">Consistent hashing: the only scheme that ticks every box</span>
+          <p>Against the Topic 4 checklist, consistent hashing scores <strong>all of the above</strong>:
+          fast · equal load distribution · freely add/remove servers · minimal data movement · no need for any
+          sync between LBs. <strong>Cons? None.</strong></p>
+        </div>
+
+        <p><span class="term">Consistent hashing</span> solves the rehashing problem with one clever change:
+        instead of hashing keys directly into "server slots," we hash <strong>both servers and keys onto the
+        same circle</strong>, called the <span class="term">hash ring</span>.</p>
+
+        <h3>The algorithm</h3>
+        <ol>
+          <li>For each server, hash it using all the hash functions <code class="inl">hash_1 … hash_k</code> and
+          place the server at those spots on the ring.</li>
+          <li>When a request arrives, hash the <code class="inl">user_id</code> using
+          <code class="inl">hash_0</code> and place the user on the ring.</li>
+          <li>Forward the request to the <strong>first server clockwise</strong> from the user's position.</li>
+        </ol>
+
+        <div class="callout note">
+          <span class="c-title">Diagram: the hash ring</span>
+          <pre><span class="cm">        0 / 360°  (top of the ring)</span>
+                  │
+        S_A ●─────┼─────● S_B
+          ╱       │       ╲
+         ╱   k1   │   k2    ╲     <span class="cm">keys walk CLOCKWISE → first server</span>
+        │    ↓    │    ↓     │
+        │   (→A)  │   (→B)   │
+         ╲        │        ╱
+          ╲   k3  │       ╱
+        S_C ●─────┼─────● (back to S_A)
+                  │
+        <span class="cm">k1 → next server clockwise = A</span>
+        <span class="cm">k2 → next server clockwise = B</span>
+        <span class="cm">k3 → next server clockwise = C</span></pre>
+        </div>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔑</div><div class="s-t">Key</div><div class="s-d">hash(key) → a point on the ring</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧭</div><div class="s-t">Walk clockwise</div><div class="s-d">until you hit a server</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">First server</div><div class="s-d">owns this key</div></div>
+        </div>
+
+        <h3>The class's Python implementation</h3>
+        <p>Here is the actual implementation from class. The ring is a <strong>sorted array</strong> of
+        <code class="inl">(hash, server)</code> points, and routing is a <strong>binary search</strong>
+        (<code class="inl">bisect_right</code>) for the first server to the right of the user, wrapping around
+        the end of the ring.</p>
+
+        <pre><span class="kw">import</span> bisect
+
+<span class="kw">def</span> custom_hash(data, i):
+    h = sum(ord(c) ** i | 0xaff <span class="kw">for</span> c <span class="kw">in</span> data)
+    h *= 3
+    h &gt;&gt;= 1
+    <span class="kw">return</span> h % 10
+
+<span class="kw">def</span> build_ring(servers, k):
+    ring = []
+    <span class="kw">for</span> server <span class="kw">in</span> servers:
+        <span class="kw">for</span> i <span class="kw">in</span> range(1, k + 1):   <span class="cm"># 1..k</span>
+            h = custom_hash(server, i)
+            print(<span class="st">f'adding {server} to spot {h}'</span>)
+            ring.append((h, server))
+
+    ring = sorted(ring)
+    print(<span class="st">'final ring:'</span>, ring)
+    <span class="kw">return</span> ring
+
+<span class="kw">def</span> route(user):
+    user_hash = custom_hash(user, 0)
+
+    <span class="cm"># find the 1st server in the ring to the right of the user</span>
+    index = bisect.bisect_right(ring, (user_hash, user))
+    index = index % len(ring)   <span class="cm"># wrap around the ring</span>
+    server_hash, server = ring[index]
+    print(<span class="st">f'{user} hashed to {user_hash}. Routing them to {server} at location {server_hash}'</span>)
+    <span class="kw">return</span> server
+
+servers = [
+    <span class="st">'10.11.1.13'</span>,
+    <span class="st">'10.11.2.17'</span>,
+    <span class="st">'10.11.13.167'</span>,
+    <span class="st">'10.11.12.255'</span>,
+    <span class="st">'10.11.1.0'</span>,
+]
+ring = build_ring(servers, 3)
+
+route(<span class="st">'Vishal'</span>)
+route(<span class="st">'Vishal'</span>)
+route(<span class="st">'Sanjana'</span>)
+route(<span class="st">'Vishal'</span>)
+route(<span class="st">'Sanjana'</span>)
+route(<span class="st">'Sanjana'</span>)</pre>
+
+        <h3>Checking it against the requirements</h3>
+        <div class="callout example">
+          <span class="c-title">Interview-style Q&amp;A on this algorithm</span>
+          <ul>
+            <li><strong>Is the algo deterministic?</strong> Will Sanjana always go to server C (as long as
+            Sanjana is alive, server C is running, and no servers are added/removed)? <strong>Yes.</strong></li>
+            <li><strong>Is the algo fast?</strong> <strong>Yes.</strong> The ring is a sorted array, so finding
+            the nearest server clockwise is a binary search (upper bound) for the user's hash:
+            <code class="inl">O(log(Nk))</code>, where N = number of servers and k = number of server hashes.</li>
+            <li><strong>Do the LBs have to share any data to stay in sync?</strong> <strong>No.</strong> Each LB
+            knows which servers are running (via health-check / heartbeat), and the code in every LB is identical
+            — so each LB computes the same hashes, builds the same ring, and picks the same server for any user.</li>
+            <li><strong>Is the data distribution even?</strong> With enough server hashes (k ≈ 32–64) the points
+            interleave finely around the ring, so each server owns many small arcs that add up to a fair share —
+            this is what virtual nodes fix (below).</li>
+          </ul>
+        </div>
+
+        <h3>The payoff: only K/N keys move</h3>
+        <p>Here's the magic. When a new server <code class="inl">S_D</code> joins, it lands at some single spot
+        on the ring. The <em>only</em> keys that change homes are the ones sitting in the arc between
+        <code class="inl">S_D</code> and the previous server clockwise-before it — those keys now bump into
+        <code class="inl">S_D</code> first. <strong>Every other key on the ring is completely unaffected.</strong></p>
+
+        <p>On average, a single node owns about <code class="inl">1/N</code> of the ring, so adding or removing
+        a node only moves about <strong>K/N keys</strong> (where K = total keys, N = number of servers) instead
+        of nearly all of them. Removing a server is the mirror image: its keys simply flow clockwise to the
+        next server, and nobody else moves.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: adding a node</span>
+          <p>Ring positions (0–100 for simplicity). Servers: <code class="inl">A=10, B=40, C=70</code>.
+          Keys land at: <code class="inl">k1=5, k2=25, k3=55, k4=85</code>. Walking clockwise:</p>
+          <ul>
+            <li>k1=5 → first server clockwise is A(10) → <strong>A</strong></li>
+            <li>k2=25 → B(40) → <strong>B</strong></li>
+            <li>k3=55 → C(70) → <strong>C</strong></li>
+            <li>k4=85 → wraps past 100 back to A(10) → <strong>A</strong></li>
+          </ul>
+          <p>Now we add <strong>D at position 60</strong>. Re-walk only what could change:</p>
+          <ul>
+            <li>k1 → A (unchanged)</li>
+            <li>k2 → B (unchanged)</li>
+            <li>k3=55 → first server clockwise is now D(60) → <strong>moved from C to D</strong></li>
+            <li>k4 → A (unchanged)</li>
+          </ul>
+          <p><strong>Only k3 moved.</strong> Compare that to naive modulo, where adding a 4th server would have
+          relocated most keys. <em>That</em> is the win.</p>
+        </div>
+
+        <h3>A simpler pseudocode view of the ring</h3>
+        <pre><span class="cm"># A sorted list of (position, server) points around the ring.</span>
+ring = sorted_map()   <span class="cm"># keyed by position 0 .. 2^32-1</span>
+
+<span class="kw">def</span> add_server(name):
+    pos = hash(name) % RING_SIZE
+    ring[pos] = name
+
+<span class="kw">def</span> remove_server(name):
+    pos = hash(name) % RING_SIZE
+    <span class="kw">del</span> ring[pos]
+
+<span class="kw">def</span> get_server(key):
+    pos = hash(key) % RING_SIZE
+    <span class="cm"># walk clockwise: first server position &gt;= pos</span>
+    <span class="kw">for</span> p <span class="kw">in</span> ring.keys_sorted():
+        <span class="kw">if</span> p &gt;= pos:
+            <span class="kw">return</span> ring[p]
+    <span class="cm"># wrapped past the end → take the first server (smallest pos)</span>
+    <span class="kw">return</span> ring.first_value()</pre>
+
+        <h3>Virtual nodes — fixing uneven balance</h3>
+        <p>One catch: if you only place <em>one</em> point per server, the ring can be lumpy. By bad luck, two
+        servers might land close together, leaving a huge arc owned by a third server — which then gets far
+        more keys. The fix is <span class="term">virtual nodes</span> (also called <span class="term">vnodes</span>):
+        place each physical server at <strong>many</strong> points around the ring (e.g.
+        <code class="inl">A#1, A#2, … A#150</code>), each hashed separately. This is exactly the role of the
+        <code class="inl">k</code> server hash functions (k ≈ 32–64) from Topic 7.</p>
+        <ul>
+          <li>With ~100–200 vnodes per server, the points interleave finely, so each physical server owns many
+          small arcs that add up to a fair, even share.</li>
+          <li>Bonus: when a server dies, its load spreads across <em>many</em> other servers (one per vnode arc),
+          rather than dumping entirely onto a single unlucky neighbor.</li>
+        </ul>
+
+        <pre><span class="kw">def</span> add_server(name, vnodes=<span class="nm">150</span>):
+    <span class="kw">for</span> i <span class="kw">in</span> range(vnodes):
+        pos = hash(<span class="st">f"{name}#{i}"</span>) % RING_SIZE
+        ring[pos] = name   <span class="cm"># many points, all mapping back to 'name'</span></pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Consistent hashing decouples a key's location from the <em>count</em> of servers. Because keys and
+          servers share one ring and a key belongs to "the next server clockwise," adding or removing a node
+          only disturbs the keys in one arc — about <strong>K/N</strong> of them — instead of nearly all.
+          <strong>Virtual nodes</strong> make the arcs even and spread failure load smoothly.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Consistent hashing places servers and keys on a circular <strong>hash ring</strong>; each key is
+          owned by the first server clockwise from it. It is the only scheme that's fast, evenly distributed,
+          add/remove-friendly, low-movement, <em>and</em> needs no LB sync (all LBs run identical code + know
+          live servers via heartbeat). Routing is a binary search, <code class="inl">O(log(Nk))</code>. Adding or
+          removing a node moves only the keys in one arc (~<strong>K/N</strong>), not everything.
+          <strong>Virtual nodes</strong> (the k server hashes) give each server many ring points so load stays
+          balanced and a failed node's keys redistribute across many peers.
+        </div>
+      </section>
+
+      <!-- ===================== 9. WHERE USED ===================== -->
+      <section id="where-used">
+        <h2><span class="sec-num">9</span> Where consistent hashing is used</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The "clock with toy boxes" trick is so useful that grown-up systems use it everywhere they have to
+          decide "which machine holds this piece of data?" — caches, databases, even the networks that deliver
+          videos. Anytime you might want to add or remove machines without shuffling everything, the ring shows
+          up.</p>
+        </div>
+
+        <p>Consistent hashing is one of the most reused ideas in distributed systems. It appears wherever data
+        must be <span class="term">sharded</span> (split) across many nodes that can come and go. Here's where
+        you'll meet it in the real world.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Area</th><th>Real systems</th><th>What the ring decides</th></tr></thead>
+            <tbody>
+              <tr><td>Distributed caches</td><td>Memcached clients, Redis Cluster, Twitter's Twemproxy</td><td>Which cache node stores each key, so adding nodes doesn't wipe the cache (Topic 6 problem).</td></tr>
+              <tr><td>NoSQL databases</td><td><span class="term">Amazon DynamoDB</span>, <span class="term">Apache Cassandra</span>, Riak, ScyllaDB</td><td>Which node owns each row/partition; nodes join/leave with minimal data movement.</td></tr>
+              <tr><td>CDNs</td><td>Akamai, Cloudflare, Fastly edge caches</td><td>Which edge server caches a given object, so a popular file isn't duplicated everywhere.</td></tr>
+              <tr><td>Sharding / partitioning</td><td>Application-level shard routers, message-queue partitioners</td><td>Which shard a user or record belongs to, allowing the fleet to grow smoothly.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Real example: Amazon DynamoDB &amp; Cassandra</span>
+          <p>The famous 2007 <em>Amazon Dynamo</em> paper popularized consistent hashing in databases, and its
+          ideas live on in DynamoDB and Cassandra. In Cassandra, every node owns a set of
+          <span class="term">token</span> ranges on a ring — exactly the virtual-node arcs from Topic 8. When
+          you add a node to a Cassandra cluster, it claims some ranges and only the data in those ranges streams
+          over from neighbors; the rest of the cluster keeps serving traffic untouched. That's why these
+          databases can scale by "just adding nodes."</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Real example: distributed caches &amp; CDNs</span>
+          <p>A memcached cluster with a consistent-hashing client (sometimes called
+          <span class="term">ketama hashing</span>) means restarting or adding a cache node only invalidates a
+          small slice of cached keys — avoiding the cache stampede we saw in Topic 6. CDNs use the same trick at
+          the edge: a request for <code class="inl">/video/123.mp4</code> is consistently routed to the one edge
+          server that should cache it, so the file isn't needlessly stored on every edge box and cache hit rates
+          stay high.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Connecting the dots</span>
+          <p>We'll use consistent hashing directly when we build distributed caches in <strong>Session 3
+          (Caching 1)</strong>, and again when we discuss database <strong>sharding</strong> and replication in
+          later sessions. Notice it also overlaps with the IP-hash load balancing from Topic 5 — both use a hash
+          to pin "this thing" to "that machine," just for different purposes (requests vs. data).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Consistent hashing powers <strong>distributed caches</strong> (Memcached, Redis Cluster),
+          <strong>NoSQL databases</strong> (DynamoDB, Cassandra), <strong>CDNs</strong> (edge caching), and
+          general <strong>sharding</strong>. Everywhere the question is "which machine holds this key and can I
+          add/remove machines cheaply?", the hash ring is the answer — and we'll lean on it again in upcoming
+          caching and sharding sessions.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was all about <em>spreading work and data across many machines</em> — gracefully. Here's
+        the one-paragraph story tying the topics together:</p>
+        <div class="bigidea">
+          <p>A <strong>load balancer</strong> gives users a <strong>unified front door</strong> and routes each
+          request to a healthy backend, operating at <strong>L4</strong> (IP/port, fast and blind) or
+          <strong>L7</strong> (HTTP-aware), as hardware, software like <strong>Nginx/HAProxy</strong>, or a cloud
+          service (AWS ELB) — using <strong>health checks</strong> to skip dead nodes. But which server gets a
+          request is the same question as <em>which data lives where</em>: <strong>sharding is a side effect of
+          routing</strong>. A good routing algorithm must be <strong>fast, evenly distributed, add/remove-friendly,
+          low-movement, and need no LB sync</strong>. Naive schemes all fail it: <strong>Round Robin/modulo</strong>
+          and <strong>bucketing</strong> reshuffle almost everything when N changes (the <strong>rehashing
+          problem</strong>, ~N/(N+1) of keys), and a <strong>mapping table</strong> can't be kept in sync across
+          LBs. <strong>Consistent hashing</strong> wins on every count by putting servers and keys on a
+          <strong>hash ring</strong> (the output space of <code class="inl">k+1</code> shared hash functions),
+          where each key belongs to the next server clockwise — routing is an <code class="inl">O(log Nk)</code>
+          binary search, only ~<strong>K/N</strong> keys move on change, <strong>virtual nodes</strong> keep load
+          even, and identical code in every LB needs zero syncing. That's why real systems like
+          <strong>DynamoDB, Cassandra, Memcached, and CDNs</strong> rely on it to scale by simply adding machines.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the two purposes of a load balancer?</summary>
+          <p class="ans">(1) Provide a unified view of the whole backend to the end user (who doesn't care which
+          exact server handles their request), and (2) distribute the load — requests and data — equally across
+          the app/DB servers.</p>
+        </details>
+        <details class="quiz">
+          <summary>How many IPv4 addresses exist, and why isn't that enough?</summary>
+          <p class="ans">IPv4 is 32 bits → 2³² ≈ 4 billion addresses. But there are roughly 100 billion–1 trillion
+          devices online, so it's far too few — which is why IPv6 uses 128 bits (2¹²⁸ ≈ 256 billion billion
+          billion billion).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is sharding "a side effect of routing"?</summary>
+          <p class="ans">If we always route Sanjana's requests to server A, then only server A ever sees and
+          stores her data — B and C never received it. So deciding (request → server) automatically decides
+          (data → server). The same algorithm must drive both, or requests hit servers without the right data.</p>
+        </details>
+        <details class="quiz">
+          <summary>What can an L7 load balancer route on that an L4 one cannot?</summary>
+          <p class="ans">Application-layer details of the HTTP request — URL path, hostname, headers, and cookies
+          (e.g. send <code class="inl">/api/*</code> to one pool, <code class="inl">/images/*</code> to another).
+          An L4 LB only sees IP addresses, ports, and the transport protocol.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does bucketing make it impossible to add new users?</summary>
+          <p class="ans">The buckets (id ranges per server) are fixed in advance, so existing servers have no room
+          for new users. You can't admit new users without first buying more servers — and rebalancing on a crash
+          also reshuffles huge amounts of data.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the fatal flaw of the mapping-table approach?</summary>
+          <p class="ans">All LBs must hold the exact same user→server map. Keeping that data in sync, always, with
+          very low latency across many LBs is practically impossible; if maps diverge, requests land on random
+          servers and a user's data scatters.</p>
+        </details>
+        <details class="quiz">
+          <summary>With <code class="inl">hash(key) % N</code>, why does adding one server cause chaos?</summary>
+          <p class="ans">The chosen server depends on N. Going from N to N+1 changes the remainder for roughly
+          N/(N+1) of all keys, so almost everything remaps — the rehashing problem. For caches that means mass
+          misses; for databases, copying most of the data.</p>
+        </details>
+        <details class="quiz">
+          <summary>Given a 2⁶⁴ hash space, 1 billion users and 1 million servers, will hashes collide?</summary>
+          <p class="ans">The probability is very close to 0. The output space (2⁶⁴ ≈ 18 quintillion) is vastly
+          larger than the number of items being placed, so collisions are negligible.</p>
+        </details>
+        <details class="quiz">
+          <summary>In consistent hashing, how do you find which server owns a key, and how fast is it?</summary>
+          <p class="ans">Hash the key to a point on the ring, then walk clockwise to the first server (wrapping
+          around the top if needed). On a sorted-array ring this is a binary search:
+          <code class="inl">O(log(Nk))</code> for N servers and k hashes each.</p>
+        </details>
+        <details class="quiz">
+          <summary>Do load balancers need to talk to each other to stay in sync under consistent hashing?</summary>
+          <p class="ans">No. Each LB runs identical code (same hash functions) and learns which servers are alive
+          via health-checks/heartbeats. So every LB builds the same ring and routes any given user to the same
+          server — no inter-LB communication needed.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do we use virtual nodes?</summary>
+          <p class="ans">To balance load. Placing each physical server at many points on the ring (the k server
+          hashes) breaks it into many small arcs, so each server owns a fair, even share — and when a server
+          fails, its keys spread across many peers instead of dumping onto one neighbor.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name two real systems that use consistent hashing and what it decides for them.</summary>
+          <p class="ans">For example: Cassandra/DynamoDB use it to decide which node owns each partition (so
+          nodes can join/leave cheaply); Memcached/Redis Cluster and CDNs use it to decide which cache/edge node
+          stores each key (so adding nodes doesn't wipe the cache).</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1ywh8AHebgelMwIWJ1zPQEIbeEavR1F1Y_RBfKizTWKc/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Load Balancing &amp; Consistent Hashing</em>".</li>
+    <li><a href="https://docs.google.com/document/d/1DxQzLpu1XPe_mRWsewNWtKL6E4uwKHQhBp7GX6Sg7qI/edit#heading=h.fzwcs020kou5" target="_blank" rel="noopener">How to configure load balancing</a> — the class setup doc.</li>
+    <li><a href="https://arpitbhayani.me/blogs/consistent-hashing/" target="_blank" rel="noopener">Arpit Bhayani: Consistent Hashing</a> — deep dive matching the class's ring implementation.</li>
+  </ul>
+  <h4>Tutorials &amp; cloud docs</h4>
+  <ul>
+    <li><a href="https://avinetworks.com/what-is-load-balancing/" target="_blank" rel="noopener">AviNetworks: What is load balancing?</a> — friendly intro tutorial.</li>
+    <li><a href="https://aws.amazon.com/elasticloadbalancing/getting-started/" target="_blank" rel="noopener">AWS: Getting started with Elastic Load Balancing (ELB)</a>.</li>
+    <li><a href="https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/" target="_blank" rel="noopener">NGINX: HTTP Load Balancing guide</a> — round-robin, least-connections, IP-hash and health checks in practice.</li>
+  </ul>
+  <h4>Hash functions &amp; consistent hashing</h4>
+  <ul>
+    <li><a href="https://en.wikipedia.org/wiki/Hash_function" target="_blank" rel="noopener">Wikipedia: Hash function</a> — definitions &amp; properties.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Cryptographic_hash_function" target="_blank" rel="noopener">Wikipedia: Cryptographic hash function</a> — extra guarantees.</li>
+    <li><a href="https://en.wikipedia.org/wiki/Universal_hashing" target="_blank" rel="noopener">Wikipedia: Universal hashing</a> — families of hashes.</li>
+    <li><a href="https://en.wikipedia.org/wiki/K-independent_hashing" target="_blank" rel="noopener">Wikipedia: K-independent hashing</a>.</li>
+    <li><a href="https://www.akamai.com/site/en/documents/research-paper/consistent-hashing-and-random-trees-distributed-caching-protocols-for-relieving-hot-spots-on-the-world-wide-web-technical-publication.pdf" target="_blank" rel="noopener">Karger et al.: Consistent Hashing and Random Trees</a> — the original 1997 paper that introduced consistent hashing.</li>
+    <li><a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">The System Design Primer</a> — clear sections on load balancers and balancing strategies.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-1.html"><div class="dir">← Previous</div><div class="ttl">Session 1: System Design 101</div></a>
+        <a class="next" href="session-3.html"><div class="dir">Next →</div><div class="ttl">Session 3: Caching 1</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 2 — Load Balancing &amp; Consistent Hashing · You spread the load like a pro ⚖️</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 16 — Case Study — IRCTC at Scale (Capstone)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 16</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 16 · Case Study — IRCTC Finale</span>
+      <h1>Designing IRCTC: the whole course, in one system</h1>
+      <p class="lead">
+        This is the grand finale. IRCTC — India's railway ticketing platform — is the perfect capstone
+        because it needs <em>everything</em> we've studied at once: load balancing, caching, sharding,
+        replication, queues, and rock-solid consistency under brutal traffic spikes. We'll start from
+        zero (an everyday story), build the full architecture piece by piece, then revisit the genuinely
+        hard parts and finish with an interview-ready checklist. Take it slow — by the end you'll be able
+        to design a system like this on a whiteboard with confidence.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#together">Putting it all together</a></li>
+          <li><a href="#architecture">End-to-end architecture</a></li>
+          <li><a href="#hardparts">The hard parts revisited</a></li>
+          <li><a href="#scaling">Scaling, reliability &amp; interview tips</a></li>
+          <li><a href="#wrapup">Putting it all together &amp; course finale</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. PUTTING IT ALL TOGETHER ===================== -->
+      <section id="together">
+        <h2><span class="sec-num">1</span> Putting it all together</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the busiest train station in the world. At 10:00 every morning, a special "fast tickets"
+          window opens, and <strong>millions of people rush the counter at the exact same second</strong> —
+          all wanting the same few seats. You need lots of clerks (so no one waits forever), a board showing
+          which seats are left (so people don't ask the same question over and over), many copies of the
+          seat ledger (so it never gets lost), and — most important — a rule that the <em>same seat is never
+          sold to two people</em>. IRCTC is exactly that station, built in software.</p>
+        </div>
+
+        <p><span class="term">IRCTC</span> (Indian Railway Catering and Tourism Corporation) runs the online
+        booking system for Indian Railways. It is one of the most demanding systems on Earth, and it stresses
+        almost every idea from this subject simultaneously. Before we draw a single box, let's frame
+        <em>why</em> each tool we learned is forced into the design.</p>
+
+        <h3>The five forces that shape the design</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Force / requirement</th><th>Why IRCTC has it</th><th>Tool we reach for</th></tr></thead>
+            <tbody>
+              <tr><td>Huge, spiky read &amp; write traffic</td><td>Tatkal (last-minute) booking opens at fixed times; lakhs of users hit "search" and "book" within seconds.</td><td><strong>Load balancing</strong> &amp; horizontal scaling (Sessions 2–4).</td></tr>
+              <tr><td>Repeated, identical reads</td><td>Everyone searches the same popular trains/routes; train schedules barely change.</td><td><strong>Caching</strong> (Sessions 6–7).</td></tr>
+              <tr><td>More data &amp; writes than one DB can hold</td><td>Crores of bookings, passengers, and PNRs across thousands of trains.</td><td><strong>Sharding / partitioning</strong> (Sessions 9–10).</td></tr>
+              <tr><td>Must never lose a booking &amp; survive failures</td><td>A confirmed ticket cannot vanish if a server dies.</td><td><strong>Replication</strong> &amp; durability (Sessions 11–12).</td></tr>
+              <tr><td>Absolutely no double-selling a seat</td><td>One berth = one passenger. Money is involved.</td><td><strong>Strong consistency</strong> &amp; concurrency control (Sessions 8, 13).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>No single technique saves IRCTC. The skill of <strong>high-level design</strong> is choosing the
+          <em>right combination</em> — and accepting the trade-offs each choice forces. Caching makes reads fast
+          but can go stale. Sharding adds capacity but complicates transactions. Replication adds durability but
+          risks reading old data. The art is putting them together so the system is fast <em>and</em> correct
+          <em>and</em> survives failure.</p>
+        </div>
+
+        <h3>The tension at the heart of it: speed vs. correctness</h3>
+        <p>Recall the <span class="term">CAP theorem</span> (Session 8): under a network partition you can't have
+        both perfect consistency and full availability. IRCTC is unusual because <em>different parts of it want
+        different things</em>:</p>
+        <ul>
+          <li><strong>Search &amp; availability display</strong> can be slightly stale — "approximately 12 seats
+          left" is fine. This part leans toward <span class="term">availability</span> (AP).</li>
+          <li><strong>The actual seat allocation &amp; payment</strong> must be exactly right — you cannot
+          "approximately" sell a seat. This part demands <span class="term">strong consistency</span> (CP).</li>
+        </ul>
+        <p>Recognising that <strong>one system can mix consistency models per-component</strong> is the single
+        most important insight of this whole case study. Keep it in your back pocket.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: the same seat, two users</span>
+          <p>At 10:00:00.000, User A and User B both see "Seat S7 available" (a cached/read view). Both click
+          Book. If the system naively trusts the read, <strong>both get S7</strong> — a disaster. The fix isn't
+          "make search perfectly consistent" (too slow for millions). The fix is: search can be approximate, but
+          the <em>final commit</em> goes through a strongly-consistent path that lets exactly one of them win and
+          tells the other "sorry, just gone." Speed where it's safe, correctness where it counts.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A back-of-envelope sense of scale</span>
+          <p>IRCTC reportedly handles on the order of <strong>10+ lakh (a million+) bookings a day</strong>, with
+          Tatkal windows pushing <strong>10,000–25,000+ ticket requests per minute</strong> at peak, and far more
+          <em>search</em> traffic than that. Reads vastly outnumber writes — a classic ratio (often 10:1 or higher)
+          that we'll exploit heavily with caching. We'll do proper capacity estimation in Section 4.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          IRCTC needs load balancing (spiky traffic), caching (repeated reads), sharding (too much data/writes),
+          replication (durability + failure survival), and strong consistency (no double-booking) — all at once.
+          The key move is mixing consistency models per component: keep <em>search</em> fast and approximate, keep
+          <em>seat allocation + payment</em> strongly consistent.
+        </div>
+      </section>
+
+      <!-- ===================== 2. END-TO-END ARCHITECTURE ===================== -->
+      <section id="architecture">
+        <h2><span class="sec-num">2</span> End-to-end architecture</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a giant restaurant. A greeter at the door sends you to a free table (load balancer).
+          Specialist chefs each do one job — one makes salads, one makes desserts (microservices). There's a
+          notepad of popular orders so the kitchen doesn't re-cook the same thing (cache). The pantry is split
+          across several rooms so it never runs out of shelf space (sharding), and every important recipe is
+          copied into a backup binder (replication). Slow tasks like "send the bill by email" get dropped into
+          an out-tray someone clears later (a queue). Our whole architecture is just this restaurant, drawn
+          carefully.</p>
+        </div>
+
+        <p>Let's build the full picture. We'll go left-to-right, from the user's phone to the database and back,
+        and at each box explain <em>why</em> it's there, referencing the session that taught the idea.</p>
+
+        <h3>The request's journey, top to bottom</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📱</div><div class="s-t">Clients</div><div class="s-d">App / web / agents</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌐</div><div class="s-t">CDN + DNS</div><div class="s-d">Static assets, GeoDNS</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚦</div><div class="s-t">Load balancer</div><div class="s-d">+ API gateway</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">Microservices</div><div class="s-d">Search, Booking, Payment…</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">Cache</div><div class="s-d">Redis cluster</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">DB</div><div class="s-d">Sharded + replicated</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">Queue</div><div class="s-d">Async jobs &amp; notify</div></div>
+        </div>
+
+        <h3>Component by component</h3>
+
+        <h4>1. Clients &amp; the edge (CDN + DNS)</h4>
+        <p>Users arrive from the mobile app, the website, or third-party travel agents (which hit the API directly).
+        Static, rarely-changing content — JavaScript bundles, CSS, station logos, schedule PDFs — is served by a
+        <span class="term">CDN (Content Delivery Network)</span>: edge servers physically close to users (Session 6).
+        <span class="term">GeoDNS</span> points each user at the nearest healthy region. This keeps slow, repetitive
+        downloads off the core servers entirely.</p>
+
+        <h4>2. Load balancer + API gateway</h4>
+        <p>All dynamic traffic hits a <span class="term">load balancer</span> (Session 3–4) that spreads requests
+        across many identical application servers so no single machine is overwhelmed. In front of (or merged with)
+        it sits an <span class="term">API gateway</span> that handles cross-cutting concerns: TLS termination,
+        authentication, <span class="term">rate limiting</span> (crucial for Tatkal — Session 5), and routing each
+        request to the right microservice.</p>
+
+        <div class="callout note">
+          <span class="c-title">Which load-balancing algorithm?</span>
+          <p>Recall from Session 4: <strong>round-robin</strong> is simple and fine when servers are equal and
+          requests are uniform. <strong>Least-connections</strong> is better when some requests are slow (a booking
+          holds a connection longer than a search). IRCTC-style traffic usually picks <strong>least-connections</strong>
+          (or latency-aware) at L7, with health checks so dead servers are pulled out automatically.</p>
+        </div>
+
+        <h4>3. Stateless microservices</h4>
+        <p>Instead of one giant program, the logic is split into focused <span class="term">microservices</span>,
+        each independently deployable and scalable:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Service</th><th>Responsibility</th><th>Scaling profile</th></tr></thead>
+            <tbody>
+              <tr><td>Search / Availability</td><td>Find trains, show seats-left. Read-heavy.</td><td>Scale out a lot; cache aggressively.</td></tr>
+              <tr><td>Booking</td><td>Hold a seat, create a PNR, coordinate the transaction. The correctness core.</td><td>Scale, but guard with locks/transactions.</td></tr>
+              <tr><td>Payment</td><td>Talk to payment gateways; confirm or reverse.</td><td>Reliability over raw speed; idempotent.</td></tr>
+              <tr><td>User / Auth</td><td>Login, profile, saved passengers.</td><td>Moderate; cacheable sessions.</td></tr>
+              <tr><td>Notification</td><td>SMS/email/push of tickets &amp; updates.</td><td>Fully async via queue.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The golden rule: keep services <strong>stateless</strong> (no user data stored in the server's local
+        memory). Any server can handle any request, so the load balancer can freely add/remove machines. State lives
+        in the cache and database, not the app server.</p>
+
+        <h4>4. Cache layer (Redis cluster)</h4>
+        <p>A distributed in-memory cache such as <span class="term">Redis</span> sits between services and the database
+        (Sessions 6–7). It stores hot, repeated data so reads don't pound the DB:</p>
+        <ul>
+          <li>Train schedules &amp; route info (changes rarely → long TTL).</li>
+          <li>Search results / fare lookups (short TTL, e.g. a few seconds).</li>
+          <li>Approximate seat-availability counters (very short TTL or event-updated).</li>
+          <li>Sessions, rate-limit counters, and Tatkal queue tokens.</li>
+        </ul>
+
+        <h4>5. Database — sharded <em>and</em> replicated</h4>
+        <p>This is the heart. We need a relational database (e.g. PostgreSQL/MySQL) for <strong>transactional
+        correctness</strong> on bookings and payments — recall ACID transactions from Session 8. One database can't
+        hold the load, so we apply two orthogonal techniques learned in Sessions 9–12:</p>
+        <ul>
+          <li><strong>Sharding (horizontal partitioning):</strong> split data across many DB servers. A natural shard
+          key is <code class="inl">train_id</code> (or <code class="inl">train_id + journey_date</code>) so that all
+          seats for one train on one day live together — letting a single booking transaction stay inside one shard.</li>
+          <li><strong>Replication:</strong> each shard has a <span class="term">primary</span> (handles writes) and one
+          or more <span class="term">replicas</span> (handle reads + take over on failure). This gives durability,
+          read-scaling, and failover.</li>
+        </ul>
+
+        <h4>6. Queues &amp; the notification pipeline</h4>
+        <p>Slow or non-critical work is pushed onto a <span class="term">message queue</span> (e.g. Kafka/RabbitMQ —
+        Session 14/15) and processed asynchronously. After a booking commits, we drop a "ticket booked" event on the
+        queue; downstream <span class="term">consumers</span> send the SMS, email the e-ticket, update analytics, and
+        notify waitlist logic — none of which the user has to wait for.</p>
+
+        <h3>The full component diagram</h3>
+        <div class="tbl-wrap">
+<pre>
+                 ┌─────────────┐
+   📱 Clients ──▶ │  CDN + DNS  │  (static assets, GeoDNS)
+ (app/web/agent) └──────┬──────┘
+                        │ dynamic requests
+                        ▼
+              ┌────────────────────┐
+              │  Load Balancer +   │  TLS, auth, rate-limit
+              │   API Gateway      │  (Sessions 3–5)
+              └─────────┬──────────┘
+        ┌───────────────┼───────────────┬───────────────┐
+        ▼               ▼               ▼               ▼
+   ┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+   │ Search  │    │ Booking  │    │ Payment  │    │  Auth /  │   ◀ stateless
+   │ Service │    │ Service  │    │ Service  │    │  User    │     microservices
+   └────┬────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘
+        │   reads      │ read+write    │                │
+        ▼              ▼               │                ▼
+   ┌──────────────────────────┐       │          ┌──────────┐
+   │     Redis cache cluster   │◀──────┘          │ sessions │
+   │  (schedules, availability)│                  └──────────┘
+   └────────────┬──────────────┘
+                │ on miss / for writes
+                ▼
+   ┌─────────────────────────────────────────────┐
+   │           Sharded SQL database                │
+   │  shard key = train_id (+ journey_date)        │
+   │                                               │
+   │  Shard A         Shard B         Shard C      │
+   │  ┌────────┐      ┌────────┐      ┌────────┐   │
+   │  │primary │      │primary │      │primary │   │ ◀ writes
+   │  └───┬────┘      └───┬────┘      └───┬────┘   │
+   │   replicas        replicas        replicas    │ ◀ reads + failover
+   └───────────────────────┬───────────────────────┘
+                            │ "booking confirmed" event
+                            ▼
+                  ┌───────────────────┐
+                  │  Message queue    │  (Kafka / RabbitMQ)
+                  └─────────┬─────────┘
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+          📨 SMS        ✉️ Email     📊 Analytics
+        (async notification consumers)
+</pre>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a single search request</span>
+          <p>User searches "NDLS → BCT, 25 Dec":</p>
+          <ul>
+            <li>Request hits the <strong>load balancer</strong> → routed to a free <strong>Search service</strong> instance.</li>
+            <li>Search builds a cache key like <code class="inl">avail:NDLS-BCT:2025-12-25</code> and checks
+            <strong>Redis</strong>. <strong>Cache hit</strong> (likely, popular route) → returns in &lt;5 ms. Done; the DB was never touched.</li>
+            <li>On a <strong>cache miss</strong>, Search reads from a <strong>read replica</strong> of the relevant
+            shard, returns the result, and writes it back to Redis with a short TTL (e.g. 5 s) so the next million
+            identical searches are cheap.</li>
+          </ul>
+          <p>Notice: a read-heavy request never touched a write primary and usually never touched the DB at all. That's
+          how the system survives millions of searches.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a booking request (the write path)</span>
+          <p>User clicks "Book S7 on train 12951":</p>
+          <pre><span class="cm"># Simplified booking flow (pseudocode)</span>
+<span class="kw">def</span> book_seat(train_id, date, seat, user):
+    shard = route_to_shard(train_id)        <span class="cm"># sharding: all seats for this train live here</span>
+    <span class="kw">with</span> shard.transaction():            <span class="cm"># strong consistency on the write path</span>
+        row = SELECT status <span class="kw">FROM</span> seats
+              <span class="kw">WHERE</span> train_id=train_id <span class="kw">AND</span> date=date <span class="kw">AND</span> seat=seat
+              <span class="kw">FOR UPDATE</span>               <span class="cm"># row lock: nobody else can grab S7 now</span>
+        <span class="kw">if</span> row.status != <span class="st">"AVAILABLE"</span>:
+            <span class="kw">raise</span> SeatTaken                <span class="cm"># the loser is told politely</span>
+        UPDATE seats <span class="kw">SET</span> status=<span class="st">"HELD"</span>, held_by=user
+        pnr = create_pnr(...)
+    enqueue(<span class="st">"start_payment"</span>, pnr)         <span class="cm"># payment kicked off; queue + idempotency</span>
+    <span class="kw">return</span> pnr</pre>
+          <p>The write goes to the <strong>primary</strong> of one shard, inside a transaction with a row lock — exactly
+          one booker can win S7. We dig into this in Section 3.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Clients → CDN/DNS → load balancer + API gateway → stateless microservices (Search, Booking, Payment, Auth,
+          Notification) → Redis cache → sharded + replicated SQL database → message queue → async notifications. Reads
+          are absorbed by the cache and replicas; writes go through the primary of one shard inside a transaction;
+          slow work goes async. Every box maps to an idea from an earlier session.
+        </div>
+      </section>
+
+      <!-- ===================== 3. THE HARD PARTS REVISITED ===================== -->
+      <section id="hardparts">
+        <h2><span class="sec-num">3</span> The hard parts revisited</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The easy part is drawing boxes. The hard part is the four "uh oh" moments: two kids grabbing the
+          <em>same</em> toy at once, a thousand kids rushing the gate the instant it opens, paying for a toy but the
+          shop crashing before it's wrapped, and a sign that says "5 toys left" when there are really 2. Every serious
+          system lives or dies on how it handles these. Let's solve each one carefully.</p>
+        </div>
+
+        <p>A clean diagram doesn't make a system work — the details do. Here are the four genuinely hard problems in
+        IRCTC, the design decision for each, and the trade-off you accept.</p>
+
+        <h3>Hard part A — Double-booking (concurrency control)</h3>
+        <p>The nightmare: two users buy the same berth. This is a classic <span class="term">race condition</span>
+        (Session 13). The fix is <span class="term">concurrency control</span> — making sure that for any one seat,
+        bookings are effectively serialised. Two families of approaches:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Approach</th><th>How it works</th><th>Best when</th><th>Trade-off</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Pessimistic locking</span></td><td><code class="inl">SELECT … FOR UPDATE</code> locks the seat row; others wait or fail.</td><td>High contention (Tatkal — everyone wants the same seats).</td><td>Locks reduce concurrency; risk of lock waits / deadlocks.</td></tr>
+              <tr><td><span class="term">Optimistic locking</span></td><td>Read a version number; on update, check it didn't change (<code class="inl">WHERE version = v</code>); retry if it did.</td><td>Low contention; many distinct seats.</td><td>Wasted work under high contention (lots of retries).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: optimistic vs. pessimistic on seat S7</span>
+          <pre><span class="cm">-- PESSIMISTIC: take the lock up front (good under Tatkal contention)</span>
+<span class="kw">BEGIN</span>;
+<span class="kw">SELECT</span> status <span class="kw">FROM</span> seats
+  <span class="kw">WHERE</span> train_id=12951 <span class="kw">AND</span> date=<span class="st">'2025-12-25'</span> <span class="kw">AND</span> seat=<span class="st">'S7'</span>
+  <span class="kw">FOR UPDATE</span>;                 <span class="cm">-- row locked; the other txn blocks here</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status=<span class="st">'HELD'</span> <span class="kw">WHERE</span> ...;
+<span class="kw">COMMIT</span>;
+
+<span class="cm">-- OPTIMISTIC: no lock; detect the clash at write time</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status=<span class="st">'HELD'</span>, version=version+<span class="nm">1</span>
+  <span class="kw">WHERE</span> seat=<span class="st">'S7'</span> <span class="kw">AND</span> status=<span class="st">'AVAILABLE'</span> <span class="kw">AND</span> version=<span class="nm">42</span>;
+<span class="cm">-- if 0 rows updated → someone beat us → retry or report "seat gone"</span></pre>
+          <p>Because Tatkal is extreme contention on a few seats, IRCTC-style designs lean <strong>pessimistic</strong>
+          (or a short-lived distributed lock / atomic counter), keeping the locked section tiny so locks are held for
+          milliseconds.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The "hold" trick</span>
+          <p>Real booking adds a step: when you start booking, the seat is moved to <strong>HELD</strong> with a short
+          timer (e.g. you have 10 minutes to pay). If you don't pay, a background job releases it back to AVAILABLE.
+          This prevents seats being locked forever by people who abandoned checkout — at the cost of needing a
+          timeout/cleanup mechanism.</p>
+        </div>
+
+        <h3>Hard part B — Tatkal traffic spikes</h3>
+        <p>At the Tatkal window, traffic jumps maybe 10–50× in <em>seconds</em>. You cannot keep that many servers
+        running 24/7. The toolkit:</p>
+        <ul>
+          <li><strong>Autoscaling + pre-warming:</strong> scale out app servers <em>before</em> the known window (you
+          know exactly when it opens — pre-provision capacity).</li>
+          <li><strong>Rate limiting &amp; throttling</strong> (Session 5) at the gateway: cap requests per user/IP to
+          stop bots and protect the core.</li>
+          <li><strong>A virtual waiting room / queue:</strong> admit users in controlled batches instead of letting all
+          of them hit the booking DB at once — turning a stampede into an orderly line.</li>
+          <li><strong>Load shedding:</strong> if overwhelmed, reject excess requests fast with a clear message rather
+          than letting everything slow to a crawl (a slow system that serves no one is worse than a fast "try again").</li>
+          <li><strong>Cache &amp; CAPTCHA</strong> the read-heavy parts so only genuine booking writes reach the DB.</li>
+        </ul>
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>A waiting room and rate limits frustrate users ("why am I in a queue?") — but the alternative is the whole
+          system collapsing for <em>everyone</em>. Controlled fairness beats uncontrolled failure. This is a deliberate
+          availability decision.</p>
+        </div>
+
+        <h3>Hard part C — Payment consistency</h3>
+        <p>The scary scenario: money leaves the user's account but no ticket is issued — or a ticket is issued but the
+        payment failed. The booking and the payment live in <em>different systems</em> (your DB vs. an external payment
+        gateway), so a single ACID transaction can't span both. The tools:</p>
+        <ul>
+          <li><strong>Idempotency keys:</strong> every payment attempt carries a unique key so retries don't charge
+          twice. Critical, because mobile networks drop and clients retry constantly.</li>
+          <li><strong>The Saga pattern</strong> (Session 14): model the booking as a sequence of steps, each with a
+          <em>compensating action</em>. If payment fails after the seat was HELD, the compensation releases the seat.
+          If the ticket can't be issued after payment succeeded, the compensation triggers a refund.</li>
+          <li><strong>An outbox + reconciliation:</strong> record intended actions durably and have a background job
+          reconcile against the gateway, so nothing is silently lost.</li>
+        </ul>
+        <div class="callout example">
+          <span class="c-title">Worked example: a booking saga</span>
+          <div class="flow">
+            <div class="step"><div class="s-ico">🔒</div><div class="s-t">1. Hold seat</div><div class="s-d">seat → HELD</div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">💳</div><div class="s-t">2. Charge</div><div class="s-d">idempotent payment</div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">🎫</div><div class="s-t">3. Confirm</div><div class="s-d">seat → BOOKED, issue PNR</div></div>
+          </div>
+          <p>If step 2 fails → compensate step 1 (release seat). If step 3 fails after step 2 succeeded → compensate
+          step 2 (refund). The system reaches a correct end state even though no single transaction covered everything.
+          <strong>Trade-off:</strong> sagas give <em>eventual</em> consistency and need careful compensation logic — but
+          they're the realistic way to coordinate across services and external gateways.</p>
+        </div>
+
+        <h3>Hard part D — Search / availability caching</h3>
+        <p>Search is read-heavy and must be fast, so we cache aggressively. But availability <em>changes</em> as seats
+        sell — so the cache goes <span class="term">stale</span>. The design decision is to <strong>accept staleness on
+        the display, but never on the commit</strong>:</p>
+        <ul>
+          <li>Show a cached, slightly-stale count ("~12 available", short TTL). Cheap and fast.</li>
+          <li>Re-check the <em>true</em> availability inside the strongly-consistent transaction at booking time
+          (Section 2's <code class="inl">FOR UPDATE</code>). The cache can lie; the transaction cannot.</li>
+          <li>Use <span class="term">cache invalidation</span> / event-driven updates: when a seat is booked, publish an
+          event so caches refresh sooner.</li>
+        </ul>
+        <div class="callout warn">
+          <span class="c-title">Watch out: the thundering herd</span>
+          <p>When a hot key (popular train) expires, thousands of requests miss the cache <em>simultaneously</em> and
+          stampede the DB — the <span class="term">thundering herd</span> / <span class="term">cache stampede</span>
+          problem (Session 7). Mitigate with request coalescing (only one request rebuilds the key while others wait),
+          slightly randomised TTLs (jitter), and serving stale-while-revalidate.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Four hard parts, four decisions: <strong>(A)</strong> double-booking → locking (pessimistic under Tatkal
+          contention) + short HELD timers; <strong>(B)</strong> spikes → pre-warmed autoscaling, rate limiting, a virtual
+          waiting room, load shedding; <strong>(C)</strong> payments → idempotency + the saga pattern with compensations
+          + reconciliation; <strong>(D)</strong> search caching → tolerate stale display but verify truth in the
+          transaction, and guard against cache stampedes. Each fixes a real problem and costs something — naming the
+          trade-off is the whole job.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SCALING, RELIABILITY & INTERVIEW TIPS ===================== -->
+      <section id="scaling">
+        <h2><span class="sec-num">4</span> Scaling, reliability &amp; interview tips</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before building a bridge, engineers count how many cars will cross and where it might break, then add
+          backups so it doesn't fall down. We do the same for software: estimate the traffic (capacity), find the part
+          most likely to snap (bottleneck), plan for failures, and — in an interview — explain all of this out loud in a
+          calm, organised way. This section is your toolkit and your script.</p>
+        </div>
+
+        <h3>Capacity estimation (back-of-the-envelope)</h3>
+        <p>Interviewers love this. You won't be exact — they want to see structured reasoning. A worked pass for IRCTC:</p>
+        <div class="callout example">
+          <span class="c-title">Worked estimate</span>
+          <ul>
+            <li><strong>Bookings/day:</strong> ~1,200,000 (round to 1M+). Spread over a busy ~12 h →
+            ~1,200,000 / (12 × 3600) ≈ <strong>~28 writes/sec average</strong>.</li>
+            <li><strong>Peak (Tatkal) factor ~50× →</strong> ~1,400 booking writes/sec at peak. Plan headroom for
+            ~2,000–3,000/sec.</li>
+            <li><strong>Reads (search) ≫ writes.</strong> At, say, 30 searches per booking → average ~850 reads/sec,
+            peaking into the tens of thousands/sec. <em>This is why caching is non-negotiable.</em></li>
+            <li><strong>Storage:</strong> 1.2M bookings/day × ~2 KB/record ≈ ~2.4 GB/day ≈ ~0.9 TB/year of booking rows
+            (plus passengers, logs, indexes). Comfortably needs sharding over a few years.</li>
+            <li><strong>Bandwidth:</strong> dominated by search responses; offloaded heavily to CDN + cache.</li>
+          </ul>
+          <p>The takeaway numbers: <strong>writes are modest but spiky; reads are enormous; storage grows steadily.</strong>
+          That single sentence justifies the entire architecture.</p>
+        </div>
+
+        <h3>Bottleneck analysis</h3>
+        <p>Always ask "what breaks first?" For IRCTC the answer is almost always the <strong>write path to the booking
+        database</strong> during Tatkal — because writes need consistency and can't just be cached. Mitigations, in
+        order of leverage:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Bottleneck</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+            <tbody>
+              <tr><td>Booking DB write contention</td><td>Lock waits, timeouts at 10:00</td><td>Shard by train; short transactions; waiting room to flatten the spike.</td></tr>
+              <tr><td>Cache stampede on hot keys</td><td>DB CPU spikes when a key expires</td><td>Request coalescing, TTL jitter, stale-while-revalidate.</td></tr>
+              <tr><td>Single hot shard (one super-popular train)</td><td>One shard maxed, others idle</td><td>Finer shard key (train+date), or replicate that shard's reads.</td></tr>
+              <tr><td>Payment gateway latency</td><td>Threads tied up waiting</td><td>Async/saga, timeouts, circuit breakers.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Failure handling &amp; reliability</h3>
+        <ul>
+          <li><strong>No single point of failure (SPOF):</strong> redundant load balancers, multiple app instances,
+          replica DBs that can be promoted on primary failure (automatic <span class="term">failover</span>, Session 12).</li>
+          <li><strong>Replication for durability:</strong> a committed booking exists on a primary <em>and</em> replicas,
+          so one disk dying never loses a ticket.</li>
+          <li><strong>Circuit breakers &amp; timeouts:</strong> if the payment gateway is down, fail fast and stop
+          hammering it — don't let one slow dependency take down everything.</li>
+          <li><strong>Graceful degradation:</strong> if search is struggling, serve cached/stale results rather than
+          erroring. Read features can survive even if some write features are paused.</li>
+          <li><strong>Idempotency everywhere on the write path</strong> so retries are safe.</li>
+          <li><strong>Monitoring &amp; alerting:</strong> watch latency, error rate, queue depth, lock waits — you can't
+          fix what you can't see.</li>
+        </ul>
+
+        <h3>How to present this in a system-design interview</h3>
+        <p>The biggest mistake is diving into a database schema in minute one. Use this order — it's the same order this
+        page followed, which is no accident:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">1. Clarify</div><div class="s-d">requirements &amp; scope</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔢</div><div class="s-t">2. Estimate</div><div class="s-d">capacity / traffic</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧱</div><div class="s-t">3. High-level</div><div class="s-d">draw the boxes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔬</div><div class="s-t">4. Deep dive</div><div class="s-d">the hard parts</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚖️</div><div class="s-t">5. Trade-offs</div><div class="s-d">&amp; failure modes</div></div>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Interview checklist</span>
+          <p>Tick these off out loud and you'll cover what interviewers grade:</p>
+          <ul>
+            <li><strong>☑ Functional requirements:</strong> search trains, check availability, book, pay, cancel, view PNR.</li>
+            <li><strong>☑ Non-functional:</strong> high availability for search, strong consistency for booking, handle spikes, low latency.</li>
+            <li><strong>☑ Capacity estimate:</strong> reads ≫ writes; writes spiky; storage grows → state it explicitly.</li>
+            <li><strong>☑ High-level diagram:</strong> clients → LB/gateway → services → cache → sharded+replicated DB → queue.</li>
+            <li><strong>☑ Data model &amp; shard key:</strong> seats keyed by train_id + date; justify the choice.</li>
+            <li><strong>☑ The hard parts:</strong> double-booking (locking), spikes (rate limit + waiting room), payment (saga + idempotency), caching (stale display, true commit).</li>
+            <li><strong>☑ Consistency story:</strong> AP for search, CP for booking — say it clearly (CAP, Session 8).</li>
+            <li><strong>☑ Failure handling:</strong> no SPOF, replication/failover, circuit breakers, graceful degradation.</li>
+            <li><strong>☑ Trade-offs named:</strong> for every choice, what you gained and what it cost.</li>
+            <li><strong>☑ Bottleneck &amp; future scaling:</strong> identify the booking-write path; how you'd grow it.</li>
+          </ul>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common pitfalls to avoid</span>
+          <p>Don't claim "I'll just cache everything" (booking writes can't be cached). Don't forget idempotency on
+          payments. Don't propose strong consistency for <em>everything</em> (you'll never hit the throughput). Don't go
+          silent — narrate your reasoning. And always state trade-offs; an answer with no trade-offs reads as naïve.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Estimate capacity (reads ≫ writes, spiky writes, growing storage); find the bottleneck (the booking-write
+          path during Tatkal); design for failure (no SPOF, replication/failover, circuit breakers, graceful
+          degradation, idempotency, monitoring); and present in the order clarify → estimate → high-level → deep-dive →
+          trade-offs, narrating throughout. The checklist is your safety net.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together &amp; course finale</h2>
+        <hr class="section-rule" />
+        <p>You just designed one of the hardest real-world systems there is — and in doing so you used <em>every</em>
+        major idea from this subject. Here's the one-paragraph story that ties this capstone together:</p>
+        <div class="bigidea">
+          <p>IRCTC must be <strong>fast, correct, and survive failure</strong> all at once. Requests flow from clients
+          through a <strong>CDN</strong> and a <strong>load balancer + API gateway</strong> into <strong>stateless
+          microservices</strong>. A <strong>Redis cache</strong> absorbs the enormous read traffic; a <strong>sharded</strong>
+          (by train) and <strong>replicated</strong> SQL database holds the truth and survives machine death; a
+          <strong>message queue</strong> carries slow work like notifications asynchronously. The design's soul is
+          mixing consistency models: search is <strong>AP</strong> (fast, slightly stale), but seat allocation and
+          payment are <strong>CP</strong> — protected by <strong>locking</strong>, the <strong>saga pattern</strong> with
+          <strong>idempotency</strong>, and short HELD timers, so a seat is never sold twice and money is never lost.
+          Spikes are tamed with <strong>autoscaling, rate limiting, and a virtual waiting room</strong>; failures are
+          contained with <strong>replication/failover, circuit breakers, and graceful degradation</strong>. Name the
+          trade-off behind every choice, and you've given a senior-level answer.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">🎉 You finished the entire HLD course!</span>
+          <p>Congratulations — this was the final session, and you made it all the way through high-level system
+          design. Look back at the journey you took:</p>
+          <ul>
+            <li><strong>Scaling foundations</strong> — vertical vs. horizontal scaling, statelessness, and why we add
+            machines instead of bigger machines.</li>
+            <li><strong>Load balancing</strong> — spreading traffic with round-robin / least-connections, health checks,
+            and API gateways.</li>
+            <li><strong>Caching</strong> — CDNs, Redis, cache strategies, TTLs, invalidation, and the stampede problem.</li>
+            <li><strong>Storage &amp; replication</strong> — SQL vs. NoSQL, sharding/partitioning, primary–replica
+            replication, durability, and failover.</li>
+            <li><strong>Consistency &amp; NoSQL internals</strong> — CAP, ACID vs. BASE, concurrency control, sagas, and
+            how distributed databases really behave.</li>
+            <li><strong>Case studies</strong> — culminating here, where you wove all of it into one coherent system.</li>
+          </ul>
+          <p>That arc — <strong>scaling → load balancing → caching → storage/replication → NoSQL internals → case
+          studies</strong> — is exactly the mental model you'll reuse for <em>any</em> system-design problem. You now
+          have it. Go draw some boxes with confidence. 🚆</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why can search tolerate stale data but booking cannot?</summary>
+          <p class="ans">Showing "~12 seats left" when it's really 11 is harmless — the user just sees an approximate
+          count. But selling the <em>same physical seat</em> to two people is a hard failure involving money. So search
+          is AP (fast, cacheable, slightly stale) while booking is CP (strongly consistent, transactional). One system,
+          two consistency models.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's a good shard key for IRCTC seats, and why?</summary>
+          <p class="ans"><code class="inl">train_id</code> (often combined with <code class="inl">journey_date</code>).
+          It keeps all seats for one train on one day inside a single shard, so a booking transaction stays local to one
+          shard — no slow cross-shard distributed transaction needed.</p>
+        </details>
+        <details class="quiz">
+          <summary>Under heavy Tatkal contention, do you prefer optimistic or pessimistic locking?</summary>
+          <p class="ans">Pessimistic. When everyone fights over the same few seats, optimistic locking causes endless
+          retries (wasted work). A short-held pessimistic lock (or atomic counter / distributed lock) serialises access
+          cleanly. Keep the locked section tiny so locks last milliseconds.</p>
+        </details>
+        <details class="quiz">
+          <summary>The booking succeeds but the payment fails. How do we stay correct?</summary>
+          <p class="ans">Use the saga pattern: each step has a compensating action. If payment fails after the seat was
+          HELD, the compensation releases the seat. With idempotency keys, retries don't double-charge, and a
+          reconciliation job ensures nothing is silently lost.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the thundering herd / cache stampede, and how do you prevent it?</summary>
+          <p class="ans">When a hot cache key expires, thousands of requests miss simultaneously and stampede the DB.
+          Prevent it with request coalescing (one rebuild while others wait), randomised TTLs (jitter), and
+          stale-while-revalidate (serve old data while refreshing).</p>
+        </details>
+        <details class="quiz">
+          <summary>In a system-design interview, what should you do before drawing any boxes?</summary>
+          <p class="ans">Clarify requirements (functional + non-functional) and do a capacity estimate. Only then draw
+          the high-level diagram, deep-dive the hard parts, and discuss trade-offs and failure modes. Narrate your
+          reasoning throughout.</p>
+        </details>
+      </section>
+
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=77917834" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>Class handout: "<em>[SST-2028] HLD Capstone</em>".</li>
+        </ul>
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li>📄 <a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">The System Design Primer</a> — an end-to-end reference for the full architecture, with worked case studies.</li>
+          <li>📄 <a href="https://dataintensive.net/" target="_blank" rel="noopener">Martin Kleppmann — <em>Designing Data-Intensive Applications</em> (DDIA)</a> — the definitive book on replication, partitioning, consistency, and transactions.</li>
+          <li>📄 <a href="https://aws.amazon.com/architecture/well-architected/" target="_blank" rel="noopener">AWS Well-Architected Framework</a> — reliability, performance, and operational-excellence pillars for production systems.</li>
+          <li>📄 <a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Microservices.io — The Saga Pattern</a> — the canonical reference for the booking/payment consistency story.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-15.html"><div class="dir">← Previous</div><div class="ttl">Session 15: NoSQL Types &amp; Messaging 2</div></a>
+        <a class="next disabled" href="#"><div class="dir">Next →</div><div class="ttl">End of subject 🎉</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 16 — Case Study: IRCTC at Scale (Capstone) · You finished the whole course 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1193 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 7 — The Storage Layer — CAP, PACELC &amp; Replication</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 7</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 07 · CAP &amp; Replication</span>
+      <h1>The Storage Layer — CAP, PACELC &amp; Replication</h1>
+      <p class="lead">
+        So far our system has been mostly one box doing the thinking. But the moment you have more
+        users than one database can handle — or you can't afford to ever lose their data — you need
+        <em>more than one copy of the data, living on more than one machine</em>. The instant you do
+        that, a whole family of deep, unavoidable questions appears: which copy is "right"? what
+        happens when the copies disagree? Today we'll meet the famous theorems (CAP and PACELC) that
+        explain the trade-offs every distributed database must make, and the two big tools —
+        replication and sharding — for actually building one. We assume you've studied <em>none</em>
+        of this; every topic starts with a tiny story.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 39 min read</span><span class="badge-rt">📖 8 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#distributed">Why one database isn't enough</a></li>
+          <li><a href="#consistency">Consistency &amp; the kinds of consistency</a></li>
+          <li><a href="#availability">Availability</a></li>
+          <li><a href="#partition">Partition tolerance &amp; A-vs-P (the bank)</a></li>
+          <li><a href="#cap">The CAP theorem</a></li>
+          <li><a href="#pacelc">The PACELC theorem</a></li>
+          <li><a href="#story">Proof by story — Aditi's Reminder Service</a></li>
+          <li><a href="#repl-shard">Replication vs Sharding</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. DISTRIBUTED STORAGE ===================== -->
+      <section id="distributed">
+        <h2><span class="sec-num">1</span> Why one database isn't enough</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the whole class shares <strong>one notebook</strong> to write down everyone's
+          lunch order. At first that's fine. But then the notebook gets <em>full</em> (too much to
+          write), or a hundred kids want to scribble in it <em>at the same time</em> (a huge line
+          forms), or someone <strong>spills juice on it</strong> and it's ruined forever. So the
+          teacher says: "Let's keep <em>several</em> notebooks, in different rooms." Now nobody waits
+          in one giant line, and if one notebook is ruined we still have the others. But a brand-new
+          problem appears: if I write "pizza" in the Room A notebook, the Room B notebook still says
+          "salad." <strong>Which one is correct?</strong> That puzzle is what today is all about.</p>
+        </div>
+
+        <p>Everything we've built in earlier sessions — the load balancers, the application servers
+        from <a href="session-6.html">Session 6</a> — eventually has to read and write <em>data</em>
+        that outlives a single request: user accounts, messages, orders. That permanent home for data
+        is the <span class="term">storage layer</span>, usually a database. For a while, a single
+        powerful database server handles it all. But a single server hits three hard walls.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea: what "distributed" even means</span>
+          <p>The CAP and PACELC theorems tell us <strong>what is possible and what is not possible</strong>
+          when we talk about distributed systems. A system is <span class="term">distributed</span> the
+          moment it has <strong>more than one server, connected via some network</strong>. Everything
+          today only matters once you cross that line.</p>
+        </div>
+
+        <h3>The three walls of a single database</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Wall</th><th>What goes wrong</th><th>In plain English</th></tr></thead>
+            <tbody>
+              <tr><td>Capacity</td><td>The dataset grows bigger than one machine's disk or memory.</td><td>The notebook is full.</td></tr>
+              <tr><td>Throughput</td><td>Too many reads/writes per second for one machine's CPU and disk.</td><td>Too many kids want to write at once.</td></tr>
+              <tr><td>Durability &amp; availability</td><td>If that one machine dies (disk failure, power cut), <em>all</em> your data and service are gone.</td><td>Juice spilled — notebook ruined, and the whole class is stuck.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The fix for all three is the same big move: <strong>use more than one machine</strong>. We
+        call each machine a <span class="term">node</span>. A database spread across many nodes is a
+        <span class="term">distributed database</span>, and the whole collection working together is a
+        <span class="term">cluster</span>. There are two fundamentally different ways to spread data
+        across nodes, and they solve different walls:</p>
+        <ul>
+          <li><strong>Make copies</strong> of the same data on several nodes — called
+          <span class="term">replication</span>. This mainly helps the <em>durability/availability</em>
+          and <em>read throughput</em> walls (Topic 8).</li>
+          <li><strong>Split the data</strong> into pieces, each piece on a different node — called
+          <span class="term">sharding</span> (or partitioning). This mainly helps the
+          <em>capacity</em> and <em>write throughput</em> walls (Topic 8).</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The moment your data lives on more than one node, those nodes must talk over a network —
+          and <strong>networks are unreliable</strong>. Messages get delayed or lost; a cable gets
+          cut. So the copies can temporarily <em>disagree</em>. Every distributed database is, at its
+          core, a set of carefully chosen answers to one question: <em>"When my nodes disagree, what
+          do I do?"</em></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          One database hits walls of capacity, throughput, and durability, so we spread data across many
+          <strong>nodes</strong> in a <strong>cluster</strong> — by <strong>copying</strong>
+          (replication) or <strong>splitting</strong> (sharding). <em>Distributed</em> just means more than
+          one server connected via a network. Multiple copies mean copies can <em>disagree</em> over an
+          unreliable network, which is the entire reason CAP and PACELC exist.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CONSISTENCY ===================== -->
+      <section id="consistency">
+        <h2><span class="sec-num">2</span> Consistency &amp; the kinds of consistency</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If there is only <strong>one</strong> jar of cookies, you always know exactly how many are
+          left — you put cookies in and take them out of the <em>same jar</em>. But if you keep
+          <strong>two</strong> jars and try to keep them matching, one jar can fall behind: you ate a
+          cookie from jar A, but jar B still "thinks" it's there. "Consistency" is just the question of
+          whether the jars agree. With one jar, the question doesn't even make sense — there's nothing
+          to disagree with.</p>
+        </div>
+
+        <h3>When can we even talk about consistency?</h3>
+        <p><span class="term">Consistency is always about data.</span> A few consequences fall straight
+        out of that:</p>
+        <ul>
+          <li><strong>Stateless app servers cannot be consistent or inconsistent</strong> — they're
+          stateless, they hold no data, so there's nothing to be in or out of sync. Asking "is this app
+          server consistent?" is like asking <em>"at how many km/hr is your door cooking the colour 9?"</em>
+          or the classic IIT ragging question, <em>"what's the colour of an electron?"</em> — the
+          answer is simply <strong>undefined</strong>. The question doesn't apply.</li>
+          <li>Consistency is typically discussed in the context of a <strong>database or a cache</strong>.</li>
+          <li>There must be <strong>multiple copies of the same data</strong> (replication / caching). If
+          there's only <strong>one</strong> copy, it's guaranteed up to date — you read and write the
+          same place. The only way data goes stale is having multiple copies (database + cache, or
+          database replicas).</li>
+          <li>There must be <strong>a read after a write/update</strong>. If the data is
+          <strong>static/immutable</strong>, there's no way to read stale data — it's never updated.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Example: the leaderboard after a contest</span>
+          <p>After a contest ends, no new submissions arrive, so the leaderboard is always up to date.
+          We don't say "the leaderboard is consistent" — we say <strong>consistency is no longer
+          relevant</strong>, because the data has become immutable.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two terms: state &amp; stale reads</span>
+          <p><span class="term">State</span> = some data we wish to preserve across multiple requests.
+          So <strong>state == data</strong>. A <span class="term">stale read</span> happens when an
+          <strong>old value of data is read after an update</strong>. Stale reads <em>can</em> (not
+          always) lead to bad user experience. If a stale read is possible, it means we do
+          <strong>not</strong> have immediate consistency.</p>
+        </div>
+
+        <h3>The kinds of consistency (a spectrum)</h3>
+
+        <h4>Immediate consistency (aka "Consistent")</h4>
+        <ul>
+          <li>It is <strong>impossible</strong> for stale reads to happen — every read is guaranteed to
+          read the latest data.</li>
+          <li>Only possible when all the copies are <strong>always kept in sync, all the time</strong>
+          (or you use a <span class="term">quorum</span>).</li>
+          <li>Always nice to have, but <strong>very hard to achieve</strong> — typically requires
+          <span class="term">2-phase commit</span>, which means high latency and low availability. Because
+          it's so costly, we do <strong>not</strong> always go with immediate consistency.</li>
+        </ul>
+
+        <h4>Eventual consistency (aka "Not Consistent")</h4>
+        <ul>
+          <li>It <em>is</em> possible for some reads to be stale for some time. But if we wait long
+          enough, eventually we'll be able to read the updated data.</li>
+          <li>In <strong>99% of cases, eventual consistency is good enough.</strong></li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">The subtle wording everyone gets wrong</span>
+          <p>Eventual consistency does <strong>not</strong> mean "eventually the data will become
+          consistent (latest)." It means <strong>every write will eventually reflect in all copies</strong>.</p>
+          <ul>
+            <li><strong>"Eventually the data will be consistent" — WRONG.</strong> That would imply a
+            future point in time after which the data <em>always stays</em> consistent. Not true: new
+            writes keep arriving.</li>
+            <li><strong>"Eventually every write will reflect in all copies" — CORRECT.</strong> Wait long
+            enough and what you wrote earlier shows up everywhere. The data can <em>still</em> be stale,
+            because newer writes are continuously coming in.</li>
+          </ul>
+        </div>
+
+        <h4>Data loss — no consistency whatsoever</h4>
+        <ul>
+          <li>If it's possible for some data to be <strong>permanently lost</strong>, then there are
+          updates that will <em>never</em> reflect — no matter how long we wait, the data never becomes
+          consistent.</li>
+          <li>Very rare. Only relevant for <strong>analytics</strong>, where the overall trend matters
+          more than any individual data point.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Q: Are there more forms of consistency?</span>
+          <p>Yes — but they all fall <em>inside</em> the umbrella of eventual consistency. A famous one
+          is <span class="term">read-your-write consistency</span>: if Ashish edits his post, he
+          <strong>immediately</strong> sees the update, but his friends might not see it right away
+          (they get it eventually). There are still more forms beyond this.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: the disagreeing copies</span>
+          <p>You change your profile photo. The write hits <strong>Node A</strong> and it says
+          "done." A friend in another region reads from <strong>Node B</strong>, which hasn't received
+          the update yet, and still sees your <em>old</em> photo — a stale read.</p>
+          <ul>
+            <li>Under <strong>immediate consistency</strong>, the system wouldn't have said "done"
+            until Node B (and others) also had the new photo — so your friend always sees the new one.
+            (More waiting for you.)</li>
+            <li>Under <strong>eventual consistency</strong>, your friend sees the old photo for maybe a
+            second, then it catches up. (Faster, but briefly "wrong.")</li>
+          </ul>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A related term: replica lag</span>
+          <p>The short delay before a copy catches up is called <span class="term">replication
+          lag</span>. Usually milliseconds, but it's never exactly zero — light and network packets
+          take time to travel. That's the physical reason "immediate consistency everywhere, instantly"
+          is essentially impossible across distant machines.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Consistency is <strong>always about data</strong> and only meaningful with <strong>multiple
+          copies + a read after a write</strong>. The spectrum: <strong>immediate</strong> (no stale
+          reads ever, but costly — 2-phase commit), <strong>eventual</strong> (briefly stale, every
+          write eventually reflects in all copies — good enough 99% of the time), and <strong>data
+          loss</strong> (some updates never reflect — only OK for analytics). Read-your-write and friends
+          live under the eventual umbrella.
+        </div>
+      </section>
+
+      <!-- ===================== 3. AVAILABILITY ===================== -->
+      <section id="availability">
+        <h2><span class="sec-num">3</span> Availability</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Availability is just: <strong>"will the shop serve you when you ask?"</strong> If a healthy
+          shop with stock turns you away for no good reason, that's bad (low availability). But if you
+          asked for something silly, or the shopkeeper happened to be out for a second and you can just
+          ask again, that doesn't count against the shop.</p>
+        </div>
+
+        <p><span class="term">Availability</span> refers to whether a server can deny a request or not.
+        If a server <strong>can deny</strong> a request, the system is "not available" / has
+        <strong>low availability</strong>. If a server <strong>always satisfies</strong> the request,
+        the system is "available" / has <strong>high availability</strong>. But the details matter —
+        two classic interview questions:</p>
+
+        <div class="callout example">
+          <span class="c-title">Q1: A bad request comes in and the server denies it — low availability?</span>
+          <p>Think <strong>4xx</strong> (bad request) or <strong>3xx</strong> (auth) errors. When the
+          <em>user</em> is at fault, the server is allowed to deny the request — it must still
+          <strong>respond</strong>, but with the appropriate error message. <strong>No</strong>, this is
+          NOT low availability. We still call the system highly available.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Q2: A request comes in but the server crashes and doesn't respond — low availability?</span>
+          <p>Again, <strong>NOT</strong> low availability. The request times out, the client just
+          retries, and the load balancer routes the next request to a healthy server.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">What low availability actually is</span>
+          <p>Low availability is when a <strong>healthy request</strong> comes to a <strong>healthy
+          server</strong>, but the server <em>still refuses</em> to provide the service for some
+          internal reason — most often because it <strong>can't sync up with other replicas</strong>.
+          Examples:</p>
+          <ul>
+            <li>Internal server error (bad code, or unable to access a critical resource).</li>
+            <li>Some specific reason the server <em>wants</em> to deny service.</li>
+            <li>The request times out because the server is <em>busy</em> (not because it's down).</li>
+          </ul>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The numbers: "five nines"</span>
+          <p>At <strong>99.999%</strong> availability, a service can have a maximum downtime of about
+          <strong>5.26 minutes per year</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Availability = "does a server deny requests?" A <strong>4xx/3xx</strong> on a bad request is
+          <em>not</em> low availability (the user was at fault, but the server still responded). A
+          <strong>crash</strong> is <em>not</em> low availability (retry + LB handles it). True low
+          availability = a <strong>healthy server denies a healthy request</strong>, usually because it
+          can't sync with replicas. 99.999% ("five nines") allows ~5.26 min downtime/year.
+        </div>
+      </section>
+
+      <!-- ===================== 4. PARTITION TOLERANCE & A vs P ===================== -->
+      <section id="partition">
+        <h2><span class="sec-num">4</span> Partition tolerance &amp; the bank (A vs P)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine two friends who normally text to keep their notes matching. One day their phones
+          can't reach each other — that's a <strong>partition</strong>. A system is "partition tolerant"
+          if it keeps working <em>at least partially</em> even while they can't talk, instead of the
+          whole thing shutting down.</p>
+        </div>
+
+        <h3>What is partition tolerance?</h3>
+        <p>A system is <span class="term">partition tolerant</span> if it can continue functioning
+        seamlessly in the face of <strong>network partitions</strong>. When a partition happens, if the
+        system continues working at least partially (some availability might be lost, some consistency
+        might be lost, but the <em>entire</em> system doesn't go down), it's partition tolerant. If
+        <em>any</em> loss of communication between nodes brings the whole system down, it's <strong>not</strong>
+        partition tolerant. Partition tolerance is <strong>very highly desired</strong>.</p>
+
+        <h3>What is a network partition?</h3>
+        <p>In a network of servers (a distributed system), if some subset of servers cannot communicate
+        with the other subset, we have a <span class="term">network partition</span>.</p>
+        <div class="callout warn">
+          <span class="c-title">A slow network is a broken network</span>
+          <p>The connection doesn't have to physically break for a partition to happen. A
+          <strong>slow / congested</strong> network behaves like a broken one, because requests time
+          out.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Q: How likely is a network partition? — 100%</span>
+          <p>In large-scale distributed systems (Google has <strong>10 million+ servers</strong>),
+          network partitions are not just likely, they <strong>ALWAYS exist</strong>. Some subset is
+          always disconnected — some node or link is always down, creating a small partition somewhere.
+          <strong>100% probability.</strong> There is <em>always</em> a partition somewhere.</p>
+        </div>
+
+        <h3>Availability vs Partition tolerance — the bank/ATM story</h3>
+        <p>Tarun wants to withdraw money from his bank account via the ATM. In the backend, the bank
+        <strong>replicates</strong> the account information — we don't want to lose account data if a
+        server/hard disk crashes. When Tarun withdraws, the bank must update <strong>both</strong>
+        copies to reflect the new balance. Now imagine a network partition happens and the two bank
+        database servers can't communicate. Two cases arise:</p>
+
+        <div class="callout example">
+          <span class="c-title">Case AP — highly available, low consistency (partition tolerant)</span>
+          <p>The bank returns <strong>success without updating both servers</strong> — it updates the
+          balance in just one server and gives Tarun his money. This gives <strong>eventual
+          consistency</strong> (stale reads possible, but once the network is back the DB servers sync
+          up) and <strong>high availability</strong>. The data was inconsistent, but the system stayed
+          available through the partition.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Case CP — consistent without availability (partition tolerant)</span>
+          <p>The bank database <strong>detects</strong> it can't reach its replica and <strong>denies
+          service</strong>. This is <strong>low availability</strong> (a healthy request to a healthy
+          server got denied!), but we got <strong>immediate consistency</strong> — no stale read was
+          possible.</p>
+          <p>Note: the <em>withdraw money</em> functionality is down, but <em>check balance</em> is still
+          up. So the system as a whole did not crash — it is still <strong>partition tolerant</strong>.
+          There was low availability for "money withdrawal," but the system didn't crash.</p>
+        </div>
+
+        <h3>When is a system NOT partition tolerant?</h3>
+        <p>When <strong>any</strong> network partition brings down the <em>entire</em> system. This is
+        very, very rare — about <strong>99.99%</strong> of backend systems are designed to be partition
+        tolerant.</p>
+        <div class="callout note">
+          <span class="c-title">The exception: stock exchanges</span>
+          <p>Stock exchanges (<strong>NSE / BSE / SSE / NYSE</strong>) are <strong>A+C systems</strong> —
+          they do <em>not</em> have partition tolerance. If two servers inside the exchange can't
+          communicate, the <strong>entire exchange shuts down</strong> until it's resolved. So they do a
+          lot of engineering to minimise the chance of a partition: each pair of servers is connected by
+          <strong>multiple redundant fiber connections</strong>.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Why real banks are actually A+P (and earn from it)</span>
+          <p>In reality the ATM system and most banks follow <strong>A+P (eventual consistency)</strong>,
+          because banks have found a way to "earn" from their own mistakes. If, due to a partition, Tarun
+          redeems more money than he has, eventually the partition resolves, both DBs reconcile, and an
+          automatic <strong>audit</strong> realises he withdrew twice. Tarun's balance is now negative —
+          the bank charges him an <strong>overdraft fee plus interest</strong> on the ₹100 he effectively
+          borrowed.</p>
+          <p>This is also why <strong>refunds take 5–7 business days</strong> even though payment happens
+          immediately. (Typically the refund actually happens immediately — but in the worst case it can
+          take a long time, because of eventual consistency.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A system is <strong>partition tolerant</strong> if it keeps working at least partially during a
+          network partition (a subset of nodes can't talk — and a <em>slow</em> network counts). In big
+          systems a partition <strong>always exists (100%)</strong>. During the bank partition you must
+          choose <strong>AP</strong> (give the money, sync later — eventual consistency) or
+          <strong>CP</strong> (deny the withdrawal, stay correct — low availability, but check-balance
+          still works so it's still partition tolerant). Non-partition-tolerant systems (stock
+          exchanges, A+C) are rare and avoid partitions by brute-force redundant fiber.
+        </div>
+      </section>
+
+      <!-- ===================== 5. CAP ===================== -->
+      <section id="cap">
+        <h2><span class="sec-num">5</span> The CAP theorem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You and your sibling each have a copy of the family shopping list, and you keep them the
+          same by texting each other. One day the <strong>phone network goes down</strong> between you
+          — you literally can't text. Now your sibling walks into the store and asks: "Should I add
+          milk?" You have only two choices. (1) <strong>Say "wait!"</strong> until the phones work
+          again, so you don't both buy milk — that's <em>safe but you got stuck waiting</em>. Or (2)
+          <strong>just decide on your own</strong> and sort out any double-buy later — that's
+          <em>you keep going, but your lists might disagree for a bit</em>. When the connection is
+          broken, you simply cannot have both "always agree" AND "never wait." CAP is the grown-up
+          name for that exact dilemma.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">When do the theorems even apply?</span>
+          <p>CAP / PACELC apply <strong>only when you have replication</strong> — multiple copies of the
+          same data, distributed across multiple servers, connected by a network. No replication, no
+          theorem.</p>
+        </div>
+
+        <p>The <span class="term">CAP theorem</span> (proposed by Eric Brewer in 2000, later proven) is
+        the most famous rule about distributed data stores. It gives you a <strong>fundamental limit of
+        what you can achieve</strong> with distributed systems: a system can offer at most
+        <strong>two</strong> of these three guarantees at the same time:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Letter</th><th>Name</th><th>Promise it makes</th></tr></thead>
+            <tbody>
+              <tr><td>C</td><td><span class="term">Consistency</span></td><td>Every read sees the most recent write (or an error). All nodes agree on the data — as if there were one single copy.</td></tr>
+              <tr><td>A</td><td><span class="term">Availability</span></td><td>Every request gets a (non-error) response, even if it might not be the very latest data. The system always answers.</td></tr>
+              <tr><td>P</td><td><span class="term">Partition tolerance</span></td><td>The system keeps working even when the network between nodes drops or delays messages (a <span class="term">network partition</span>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Does Google Spanner break CAP?</span>
+          <p>Google Spanner <em>seems</em> to violate CAP — they claim to provide all three. They don't
+          actually violate it (and don't claim to). They do some <strong>black magic with
+          timestamps</strong> (TrueTime) to <em>practically</em> achieve all three.</p>
+        </div>
+
+        <h3>The three categories of system (with real percentages)</h3>
+
+        <div class="callout example">
+          <span class="c-title">A+P systems — high availability + eventual consistency (~99%)</span>
+          <p>Even during a partial failure (network partition), the system keeps serving users' requests.
+          AP systems <strong>give up on consistency</strong> — they're eventually consistent.
+          <strong>99% of all systems are AP</strong>, because mostly we do not care about immediate
+          consistency. Example: <strong>social media</strong> (Twitter / Facebook / Instagram). If a
+          user keeps seeing an old post, or a new post doesn't appear in a friend's feed immediately,
+          it's not the end of the world — as long as it updates eventually.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">C+P systems — immediate consistency + low availability (~0.9%)</span>
+          <p>Only if there's <strong>no</strong> partition can the system serve users. The moment a
+          partition happens, it may deny requests (lose availability). <strong>Rare — only 0.9%</strong>,
+          used when data is critical. Candidate examples: financial transactions &amp; banks (though these
+          are <em>often</em> actually eventually consistent), stock brokers (<strong>Zerodha</strong>),
+          ticket booking (<strong>BookMyShow</strong>) / product purchase (don't oversell inventory).</p>
+          <p>Even <strong>IRCTC</strong> makes ticket booking <em>eventually</em> consistent — they offer
+          <strong>RAC tickets</strong> that get resolved later ("eventually"). CP is rare because in most
+          cases we're OK with eventual consistency; immediate consistency is always nice but rarely
+          strictly needed.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">A+C systems — immediate consistency + high availability, but no partition tolerance (~0.1%)</span>
+          <p>Never denies a request and always stays consistent — <em>as long as there's no partition</em>.
+          The moment a partition happens, the <strong>entire system crashes</strong>.
+          <strong>Extremely rare — only 0.1%</strong>. Example: stock exchanges (NSE, NYSE, SSE, BSE).
+          A+C systems are typically <strong>not geographically distributed</strong> because they can't
+          afford partitions: very powerful servers, all in the same building, connected with high-speed
+          fiber, multiple redundant connections. The chance of a partition is close to 0 (by design,
+          extremely expensive). Still, if one happens, the whole system must shut down.</p>
+        </div>
+
+        <h3>CAP — two ways to state it</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">1️⃣</div><div class="s-t">Definition 1</div><div class="s-d">Pick any 2 of C, A, P</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">2️⃣</div><div class="s-t">Definition 2</div><div class="s-d">When there's a partition, choose A or C — you can't have both</div></div>
+        </div>
+        <p><strong>1st definition:</strong> pick any 2. <strong>2nd definition (the better one):</strong>
+        when there's a network partition, you must choose between <strong>Availability</strong> or
+        <strong>Consistency</strong> — you cannot have both. As long as there's no partition, you don't
+        have to worry. The moment one happens, you choose C or A, not both.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The most misunderstood part of CAP</span>
+          <p>People say "pick 2 of 3" as if you freely choose any pair. But because in large systems
+          <strong>there's always a partition somewhere</strong>, you <em>definitely</em> want partition
+          tolerance. So effectively your real choice is between <strong>A+P</strong> and
+          <strong>C+P</strong> — "during a Partition, choose Consistency or Availability."</p>
+        </div>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🟢</div><div class="s-t">Normal</div><div class="s-d">A &amp; B sync; C, A and P all fine</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">Partition!</div><div class="s-d">Network between A &amp; B breaks</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛡️</div><div class="s-t">CP choice</div><div class="s-d">Refuse/wait → stay correct, lose availability</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">AP choice</div><div class="s-d">Keep answering → stay up, allow stale data</div></div>
+        </div>
+
+        <h3>Why you can't have all three during a partition</h3>
+        <p>Picture two nodes, A and B, that normally sync. The network breaks — the partition. A write
+        arrives at A. Node A faces an impossible choice:</p>
+        <ul>
+          <li><strong>Accept the write</strong> (stay <em>Available</em>) → but B doesn't know about it,
+          so a read from B is stale → you <em>gave up Consistency</em>.</li>
+          <li><strong>Refuse the write / make it wait</strong> until it can reach B (stay
+          <em>Consistent</em>) → but now A isn't answering → you <em>gave up Availability</em>.</li>
+        </ul>
+        <p>There's no third option while the cable is cut. That's the theorem in one breath.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a bank vs a social feed</span>
+          <p><strong>Bank (wants CP).</strong> The network between two data centres glitches. You try
+          to withdraw $100. A CP system would rather <em>fail your request</em> ("please try again")
+          than risk letting you and your partner both withdraw the last $100 from two sides of the
+          partition and end up overdrawn. Correctness beats uptime.</p>
+          <p><strong>Twitter/X-style feed (wants AP).</strong> The same glitch happens; you post a
+          tweet. An AP system <em>accepts it immediately</em>. A friend on the other side might not see
+          it for a few seconds. That's fine — a slightly late tweet beats a site that says "down."</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">CP/AP and modern databases</span>
+          <p>By how they behave during a partition: <strong>CP</strong> examples include MongoDB (default
+          config), HBase, Zookeeper, etcd, traditional RDBMS clusters; <strong>AP</strong> examples
+          include Apache Cassandra, Amazon DynamoDB, Riak, CouchDB. The textbook "CA" category really
+          just describes a single non-distributed node — once you have multiple nodes over a network,
+          partitions are inevitable, so the meaningful choice is CP vs AP.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>CAP isn't a menu where you tick two boxes for fun. Partitions are a fact of nature, so the
+          engineering decision is: <strong>when the network splits, would my product rather be
+          <em>correct</em> (CP) or <em>online</em> (AP)?</strong> The answer comes from the business,
+          not from the database.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          CAP applies only with <strong>replication</strong>. It says keep at most 2 of C/A/P — or, better
+          stated, <strong>during a partition choose A or C</strong>. Since partitions always exist, the
+          real choice is <strong>A+P (~99%, e.g. social media, eventual consistency)</strong> vs
+          <strong>C+P (~0.9%, e.g. Zerodha/BookMyShow, immediate consistency, low availability)</strong>;
+          <strong>A+C (~0.1%, e.g. stock exchanges)</strong> drops partition tolerance entirely. Google
+          Spanner "fakes" all three with TrueTime timestamps.
+        </div>
+      </section>
+
+      <!-- ===================== 6. PACELC ===================== -->
+      <section id="pacelc">
+        <h2><span class="sec-num">6</span> The PACELC theorem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>CAP only talks about what happens when the phones are <em>broken</em>. But here's the
+          thing: most days, the phones <strong>work just fine</strong> — and you <em>still</em> have a
+          choice to make! Every time your sibling wants to add something to the list, do you (1) wait
+          to text everyone and make sure all the copies match before saying "ok" — <em>safe but
+          slow</em>? Or (2) just write it down right away and text the others a moment later —
+          <em>fast but the lists briefly differ</em>? PACELC is the smarter rule that says: "Tell me
+          your choice when the phones are broken, <strong>AND ALSO</strong> your choice on a normal day
+          when they work."</p>
+        </div>
+
+        <p>CAP has a blind spot: it <em>only</em> describes behaviour during a partition — a rare event.
+        But a distributed database makes a consistency-vs-speed trade-off on <strong>every single
+        request, all the time</strong>, even when the network is perfectly healthy. The
+        <span class="term">PACELC theorem</span> (Daniel Abadi, 2010) is an <strong>extension to
+        CAP</strong> that fills that gap. Read it as a sentence:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The PACELC sentence</span>
+          <p>When there's a <strong>P</strong>artition, choose between
+          <strong>A</strong>vailability (serve potentially stale data) <em>OR</em>
+          <strong>C</strong>onsistency (service down, but data stays consistent).
+          <strong>E</strong>lse (even with no partition) there's a trade-off between
+          <strong>L</strong>atency (low latency because sync-up happens later) <em>OR</em>
+          <strong>C</strong>onsistency (sync up right away, but higher latency).</p>
+          <p style="margin-top:.5rem;">In symbols: <code class="inl">if (P) then (A or C) else (L or C)</code>.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The deeper point: consistency is expensive</span>
+          <p>Just like in DSA we trade <strong>Time Complexity vs Space Complexity</strong>, in HLD we
+          trade <strong>Consistency vs Availability</strong> and <strong>Consistency vs Latency</strong>.
+          Basically: if you choose <strong>immediate consistency</strong>, you give up on
+          <strong>both</strong> Availability and Latency. An always-consistent system will be
+          <strong>slow (high latency)</strong> and might <strong>deny requests (low availability)</strong>.
+          So immediate consistency comes at a huge cost.</p>
+        </div>
+
+        <p>The first half (<strong>P → A/C</strong>) is just CAP. The new, important half is the
+        <strong>"ELC"</strong>: <span class="term">latency</span> (how long a request takes) is traded
+        against consistency <em>even when everything is healthy</em>. To be strongly consistent, a node
+        must wait to confirm the other copies agree before answering — and waiting <em>is</em> latency.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why PACELC is "more complete" than CAP</span>
+          <p>CAP describes the <em>exceptional</em> moment (a partition). PACELC also describes the
+          <em>normal</em> 99.9% of the time. Since latency directly drives user experience and cost
+          every day, the "Else" branch often matters <strong>more in practice</strong> than the rare
+          partition branch. PACELC = CAP + the everyday trade-off CAP forgot.</p>
+        </div>
+
+        <h3>The four PACELC personalities</h3>
+        <p>Each system gets a two-part label: its partition choice (<code class="inl">PA</code> or
+        <code class="inl">PC</code>) and its normal-time choice (<code class="inl">EL</code> or
+        <code class="inl">EC</code>).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Label</th><th>During partition</th><th>Normal time</th><th>Example systems</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">PA/EL</code></td><td>Stay available (allow stale)</td><td>Favour low latency (allow stale)</td><td>Cassandra, DynamoDB, Riak — "fast and always up; consistency is best-effort."</td></tr>
+              <tr><td><code class="inl">PC/EC</code></td><td>Stay consistent (may reject)</td><td>Favour consistency (accept higher latency)</td><td>HBase, BigTable, VoltDB — "always correct, even if slower or briefly down."</td></tr>
+              <tr><td><code class="inl">PC/EL</code></td><td>Stay consistent during partition</td><td>But favour latency when healthy</td><td>MongoDB (typical config), PNUTS — "strict when it matters most, fast on a normal day."</td></tr>
+              <tr><td><code class="inl">PA/EC</code></td><td>Stay available during partition</td><td>But favour consistency when healthy</td><td>Rarer; some tunable configs. Up during outages, careful when calm.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: Cassandra (PA/EL) vs a strict store (PC/EC)</span>
+          <p>Two requests arrive on a perfectly healthy network (no partition — the "Else" branch).</p>
+          <p><strong>Cassandra (PA/EL).</strong> You write a value. By default it can reply "ok" as
+          soon as <em>one</em> (or a quorum of) replica acknowledges, <em>without</em> waiting for all
+          copies. Response is super fast (low <strong>L</strong>atency), but a read a millisecond later
+          from a not-yet-updated replica might be stale. It chose <strong>L over C</strong>.</p>
+          <p><strong>A PC/EC store like HBase.</strong> The same write waits until the system can
+          guarantee subsequent reads see it. The reply comes back a little slower, but any later read
+          is correct. It chose <strong>C over L</strong>.</p>
+          <p>Notice: <em>no partition was involved</em>. CAP can't even describe this difference — but
+          PACELC's "ELC" half captures it precisely.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Tunable consistency — the modern reality</span>
+          <p>Many systems (Cassandra, DynamoDB) let you pick the trade-off <em>per request</em> using a
+          <span class="term">quorum</span>: roughly, "how many of the N copies must reply before I
+          answer." Wait for more copies = more consistent but slower; wait for fewer = faster but
+          riskier. So a single database can behave like different PACELC labels depending on the knob —
+          which is why these theorems are guides, not rigid boxes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          PACELC = <code class="inl">if (P) then (A or C) else (L or C)</code> — an extension of CAP. The
+          first half restates CAP (partition → A vs C); the second, new half says that even on a
+          <strong>healthy</strong> network you trade <strong>latency</strong> against
+          <strong>consistency</strong> on every request. Immediate consistency therefore costs you
+          <em>both</em> availability and latency (like Time vs Space in DSA). Labels like Cassandra's
+          <code class="inl">PA/EL</code> vs HBase's <code class="inl">PC/EC</code> capture both branches.
+        </div>
+      </section>
+
+      <!-- ===================== 7. PROOF BY STORY ===================== -->
+      <section id="story">
+        <h2><span class="sec-num">7</span> Proof by story — Aditi's Reminder Service</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two people answer phone calls and write reminders in their own diaries. Everything you
+          learned today — scaling, consistency, availability, partitions, CAP, PACELC — shows up
+          naturally as their little business grows. Watch what choices they're forced to make.</p>
+        </div>
+
+        <h3>Scaling up, then out</h3>
+        <ul>
+          <li><span class="term">Vertical scaling (scaling up)</span>: at first Aditi runs the reminder
+          service alongside her day job; as requests grow, she quits and does it full time.</li>
+          <li><span class="term">Horizontal scaling (scaling out)</span>: she can't handle all the calls
+          alone, so she hires <strong>Sanjana</strong>.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Q: One shared diary, or two independent diaries?</span>
+          <p><strong>Single diary</strong> → Aditi &amp; Sanjana must be in the same room (colocated, not
+          distributed), and they'll fight over the diary — it becomes a <strong>bottleneck</strong>.
+          <strong>Two diaries</strong> → they can be far apart (Sanjana works from home) and the diary
+          isn't a bottleneck. So they go with two diaries; a single diary would render the scaling
+          useless.</p>
+        </div>
+
+        <h3>The angry customer (a consistency issue)</h3>
+        <p>Customer: <em>"Yesterday I called to remind me of my 11am flight. Then I called at 8am to ask
+        my flight time and you said you don't remember. You lost my data and I missed my flight."</em>
+        <strong>Why?</strong> The write went to Sanjana, but the read came to Aditi, and Aditi's data was
+        not in sync with Sanjana's. A <strong>consistency issue</strong>.</p>
+
+        <h3>Protocol 1 — sync eventually (at night)</h3>
+        <p>They copy each other's data each night before closing, so in the morning both have the same
+        copy.</p>
+        <pre>PROTOCOL 1 — Sync eventually (at night)
+
+on WRITE(data):
+    write data to MY diary only
+    return SUCCESS                # fast: write in one place
+
+every NIGHT (before closing):
+    copy MY diary  -&gt; OTHER diary
+    copy OTHER diary -&gt; MY diary  # both diaries now match</pre>
+        <p><strong>Q: Can there still be stale reads / angry calls?</strong> Yes — until the nightly sync,
+        any read before the sync can be stale. But wait long enough and the data syncs (eventual
+        consistency). Data can be stale (<strong>low consistency</strong>), but a write only touches one
+        place (<strong>low latency</strong>).</p>
+        <div class="callout key"><span class="c-title">Protocol 1 = Low Consistency + Low Latency</span></div>
+
+        <h3>Protocol 2 — sync immediately</h3>
+        <p>Whenever one gets a call, they write to their own diary, put the customer on hold, call the
+        other person, get them to write it too, and only return success when the other confirms. If the
+        other returns an error, roll back (delete from own diary) and return error.</p>
+        <pre>PROTOCOL 2 — Sync immediately (synchronous replication)
+
+on WRITE(data):
+    write data to MY diary
+    put customer ON HOLD
+    call OTHER person, ask them to write data
+    if OTHER responds SUCCESS:
+        return SUCCESS
+    else:                         # OTHER returned error
+        delete data from MY diary  # ROLLBACK
+        return ERROR
+
+on READ(query):
+    answer from MY diary directly   # no waiting — both have all data</pre>
+        <p>This gives <strong>immediate consistency</strong> — data is always in sync because every write
+        goes to both diaries. But latency is higher (the client waits on hold while Aditi calls Sanjana),
+        and <strong>throughput suffers</strong> — every call is now effectively made twice (to both Aditi
+        and Sanjana), which undercuts the horizontal scaling we did.</p>
+        <p><strong>Q: Does Protocol 2 apply to reads too?</strong> No — only writes. On a read, Aditi and
+        Sanjana each respond independently from their own diary (both have all the data). So no waiting on
+        reads (<strong>low latency for reads</strong>).</p>
+        <div class="callout key"><span class="c-title">Protocol 2 = High Consistency + High Latency</span></div>
+
+        <div class="callout note">
+          <span class="c-title">Q: How does Google Docs handle this?</span>
+          <p>It gives <strong>eventual consistency</strong> — you can make changes even while offline, and
+          they sync up once your network is restored — by performing <strong>conflict resolution</strong>
+          later. The powerful (but complex) general technique is
+          <span class="term">Conflict-Free Replicated Data Types (CRDTs)</span>. Google Docs doesn't
+          actually use CRDTs; it uses a custom protocol that is slightly weaker than (but similar to)
+          CRDTs.</p>
+        </div>
+
+        <h3>Vacation time (a server is down — but no partition)</h3>
+        <p>Sanjana goes on vacation. <strong>No availability issue</strong> — calls just route to Aditi.
+        <strong>No network partition</strong> — Sanjana is simply on leave. When she returns, she syncs
+        with Aditi's diary <em>before</em> taking calls — <strong>no consistency issue</strong>. This
+        holds for <em>both</em> protocols: since Sanjana is absent, Aditi keeps writing to her own diary
+        (even in Protocol 2), and Sanjana syncs up on return. So no availability and no consistency issue
+        — because there's <strong>no partition</strong>; it's just that a server (Sanjana) is down.</p>
+
+        <h3>The big fight (a real network partition)</h3>
+        <p>Aditi &amp; Sanjana have a big fight and refuse to talk — a <strong>network partition</strong>.</p>
+        <div class="callout example">
+          <span class="c-title">Protocol 1 during the fight</span>
+          <p>No worries — both keep taking calls and writing in their own diaries. Eventually the fight
+          resolves (network heals) and they sync. Data stays stale until then, but the service stays
+          available.</p>
+          <p><strong>Partition ⇒ High Availability + Eventual Consistency (AP).</strong></p>
+        </div>
+        <div class="callout example">
+          <span class="c-title">Protocol 2 during the fight</span>
+          <p>The protocol requires writing to <em>both</em> places, but Aditi isn't talking to Sanjana.
+          So on a <strong>write</strong> call she must <strong>deny</strong>. She can still serve
+          <strong>read</strong> requests from her own diary, but writes are denied until the fight
+          resolves.</p>
+          <p><strong>Partition ⇒ Immediate Consistency + Low Availability (CP).</strong> Note only writes
+          are unavailable — reads continue — but overall we say the system has low availability.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The diary story reproduces the whole theory: two diaries = horizontal scaling; out-of-sync
+          diaries = consistency issues. <strong>Protocol 1</strong> (sync at night) = low consistency +
+          low latency, and under partition gives <strong>AP</strong> (high availability + eventual
+          consistency). <strong>Protocol 2</strong> (sync immediately) = high consistency + high latency
+          (and lower throughput), and under partition gives <strong>CP</strong> (immediate consistency +
+          low availability). A server merely being <em>down</em> (vacation) is <em>not</em> a partition.
+          Google Docs picks eventual consistency via conflict resolution (CRDT-like).
+        </div>
+      </section>
+
+      <!-- ===================== 8. REPLICATION VS SHARDING ===================== -->
+      <section id="repl-shard">
+        <h2><span class="sec-num">8</span> Replication vs Sharding</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two different ways to handle "too much for one notebook." <strong>Replication</strong> is
+          like <em>photocopying</em> the same notebook so every room has an identical copy — if one is
+          ruined you still have the data, and lots of kids can <em>read</em> at the same time from
+          different copies. <strong>Sharding</strong> is like <em>tearing the address book by letter</em>:
+          names A–H in one notebook, I–P in the next, Q–Z in the last — now no single notebook is full,
+          and three kids can write at once because they're using different books. Copies = safety and
+          fast reading. Splitting = more room and fast writing. Real systems do <em>both</em>.</p>
+        </div>
+
+        <p><span class="term">Replication</span> means <strong>explicitly, by choice</strong>, having
+        multiple copies of the same data, stored on different servers. These are the two foundational
+        techniques for scaling the storage layer, and they are <strong>not the same thing</strong> —
+        confusing them is a classic beginner trap.</p>
+
+        <h3>Isn't replication bad? (the normalization angle)</h3>
+        <p>In RDBMS we study <span class="term">normalization</span>, which says
+        <strong>redundancy (duplicate data) is bad</strong> because it leads to anomalies (read / write /
+        delete). Consider an un-normalized table:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Course</th><th>Student</th></tr></thead>
+            <tbody>
+              <tr><td>HLD</td><td>Tarun</td></tr>
+              <tr><td>HLD</td><td>Sanjana</td></tr>
+              <tr><td>LLD</td><td>Harini</td></tr>
+              <tr><td>DBMS</td><td>Sanjana</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>Update anomaly:</strong> rename HLD → "High Level Design" but miss a row → the two
+          rows now disagree, effectively creating an <em>extra</em> course.</li>
+          <li><strong>Delete anomaly:</strong> delete Sanjana and you accidentally delete the course
+          <strong>DBMS</strong> (she was its only entry).</li>
+        </ul>
+        <p>The <strong>normalized</strong> design removes these anomalies by splitting into separate
+        tables:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Course ID</th><th>Course Name</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>HLD</td></tr>
+              <tr><td>2</td><td>LLD</td></tr>
+              <tr><td>3</td><td>DBMS</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Student ID</th><th>Student Name</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Sanjana</td></tr>
+              <tr><td>2</td><td>Tarun</td></tr>
+              <tr><td>3</td><td>Harini</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Student ID</th><th>Course ID</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>1</td></tr>
+              <tr><td>1</td><td>3</td></tr>
+              <tr><td>2</td><td>1</td></tr>
+              <tr><td>3</td><td>2</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">So why deliberately replicate?</span>
+          <p>Normalization fights <em>accidental</em> redundancy within one DB. Replication is
+          <em>deliberate, useful</em> redundancy across servers — a completely different goal: protecting
+          against data loss.</p>
+        </div>
+
+        <h3>Why do we need replication? Durability ≠ replication</h3>
+        <div class="callout key">
+          <span class="c-title">Replication is the ONLY protection against data loss</span>
+          <p>The "<strong>D</strong>" in <strong>ACID</strong> stands for <span class="term">durability</span>:
+          any committed transaction is persisted to disk, so after a power failure and restart it's still
+          there. But ACID durability is only about <strong>persistent vs volatile memory</strong> — it
+          does <em>NOT</em> protect you from <strong>HDD failures</strong>. The only way to prevent data
+          loss when a hard disk dies is <strong>replication</strong>: multiple copies of the same data
+          across multiple disks.</p>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Replicate across servers, not within one</span>
+          <p>There's no point replicating data within the same server (useless redundancy) — you waste
+          disk space and still lose everything if the server crashes. <strong>Always replicate across
+          multiple servers</strong> (useful redundancy).</p>
+        </div>
+
+        <h3>Replication vs Sharding — the core distinction</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Replication</th><th>Sharding</th></tr></thead>
+            <tbody>
+              <tr><td>What it does</td><td>Multiple <em>copies</em> of the same data across servers.</td><td>Partition data <em>horizontally</em> across servers.</td></tr>
+              <tr><td>One word</td><td><strong>Copying</strong></td><td><strong>Splitting</strong></td></tr>
+              <tr><td>Servers hold</td><td>Different servers (replicas) hold the <strong>same</strong> data.</td><td>Different servers (shards) hold <strong>different</strong> data.</td></tr>
+              <tr><td>Each node holds</td><td>The <strong>whole</strong> dataset.</td><td>One <strong>slice</strong> of the dataset.</td></tr>
+              <tr><td>If a node dies</td><td>Fine — another copy has the data.</td><td>That slice is unavailable (unless that shard is <em>also</em> replicated).</td></tr>
+              <tr><td>Analogy</td><td>Photocopying the whole notebook.</td><td>Tearing the address book A–H, I–P, Q–Z.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Pros &amp; cons</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Replication</th><th>Sharding</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>Pros</strong></td>
+                <td>Minimises chance of data loss (resilience). <strong>Only read</strong> throughput
+                improves — you can read from any copy, spreading read load across replicas.</td>
+                <td>Store more data than one server's capacity (scaling out). <strong>Both</strong> read
+                &amp; write throughput increase — load is distributed across shards.</td>
+              </tr>
+              <tr>
+                <td><strong>Cons</strong></td>
+                <td>Increases data size → capacity decreases (3× replication ⇒ ~3× less effective storage).
+                Worsens <em>write</em> throughput (extra writes, even if done in the background). Must keep
+                replicas in sync (consistency troubles).</td>
+                <td>Complex. Requires <span class="term">consistent hashing</span> for routing. Risk of
+                <span class="term">fan-out queries</span> (joins/transactions across shards).</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Q: Which should we use? — Both, together!</span>
+          <p>You have more data than one server can handle, <em>and</em> you don't want to lose data. So
+          large systems run <strong>sharding and replication at the same time</strong>: shard the data
+          for capacity &amp; write throughput, then replicate <em>each shard</em> for durability &amp;
+          read throughput. E.g. 4 shards, each with 3 copies → 12 nodes total.</p>
+        </div>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Shard 1</div><div class="s-d">Leader + 2 followers</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Shard 2</div><div class="s-d">Leader + 2 followers</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Shard 3</div><div class="s-d">Leader + 2 followers</div></div>
+          <div class="arrow">=</div>
+          <div class="step"><div class="s-ico">🏛️</div><div class="s-t">Cluster</div><div class="s-d">Scales reads, writes, capacity &amp; survives failures</div></div>
+        </div>
+
+        <h3>How replication works (leader–follower)</h3>
+        <p>The most common pattern is <span class="term">leader–follower</span> (master–slave /
+        primary–replica): one <strong>leader</strong> accepts all writes and streams changes to several
+        read-only <strong>followers</strong>. We go deep on this — sync vs async, failover, lag — in
+        <a href="session-8.html">Session 8</a>.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">Write</div><div class="s-d">Goes to the leader</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👑</div><div class="s-t">Leader</div><div class="s-d">Stores it, streams changes out</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Followers</div><div class="s-d">Copy 1, Copy 2, Copy 3 — identical data</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👀</div><div class="s-t">Reads</div><div class="s-d">Spread across all the copies</div></div>
+        </div>
+
+        <h3>How sharding works (the shard key)</h3>
+        <p>The rule that decides which row goes to which shard is the <span class="term">shard key</span>
+        (partition key). <span class="term">Range-based</span> splits by key ranges (A–H, I–P, Q–Z) —
+        easy range scans but risks <span class="term">hot spots</span>. <span class="term">Hash-based</span>
+        hashes the key — even load, but range scans become hard.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: sharding users by ID with a hash</span>
+          <p>Say we have 4 shards (nodes 0–3) and route each user by hashing their ID:</p>
+          <pre><span class="cm"># pick which shard a user lives on</span>
+<span class="kw">def</span> shard_for(user_id, num_shards=<span class="nm">4</span>):
+    <span class="kw">return</span> hash(user_id) % num_shards   <span class="cm"># 0, 1, 2, or 3</span>
+
+shard_for(<span class="st">"alice"</span>)   <span class="cm"># -&gt; 2  (alice's row lives on node 2)</span>
+shard_for(<span class="st">"bob"</span>)     <span class="cm"># -&gt; 0  (bob's row lives on node 0)</span>
+shard_for(<span class="st">"carol"</span>)   <span class="cm"># -&gt; 1</span></pre>
+          <p>A write for "alice" goes only to node 2; a write for "bob" only to node 0 — they happen
+          <strong>at the same time on different machines</strong>. That parallelism is how sharding scales
+          writes. The trade-off: "list <em>all</em> users alphabetically" must now visit every shard and
+          merge — a <strong>fan-out query</strong>.</p>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">The hidden cost of <code class="inl">% num_shards</code></span>
+          <p>Plain <code class="inl">hash(key) % N</code> looks neat, but if you ever <em>add</em> a shard
+          (N: 4 → 5), almost <strong>every</strong> key remaps to a different node — a massive reshuffle.
+          Real systems use <span class="term">consistent hashing</span>, which moves only a small fraction
+          of keys when a node is added/removed.</p>
+        </div>
+
+        <h3>What about caching? Caching is kind-of like replication</h3>
+        <p>In caching, your data lives in 2 places: the <strong>database</strong> and the
+        <strong>cache</strong>. So it resembles replication — but it's <em>not</em> pure replication.</p>
+        <div class="callout note">
+          <span class="c-title">Cache vs replication</span>
+          <ul>
+            <li><strong>Does NOT save you from data loss</strong> — caches are volatile (store data in RAM).</li>
+            <li><strong>Improves read throughput</strong> (good).</li>
+            <li><strong>Worsens write latency &amp; throughput</strong> (bad) — every write must also touch the cache.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p><strong>Replication = copying</strong> (same data, many copies → safety + read scale).
+          <strong>Sharding = splitting</strong> (different data, many pieces → capacity + read &amp; write
+          scale). They're orthogonal — use both. And the moment you replicate, the consistency questions
+          from CAP and PACELC come right back, because now you have copies that can disagree.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Replication = <strong>copying</strong> same data across servers (read-throughput + resilience,
+          but worse write throughput and 3× the storage); sharding = <strong>splitting</strong> data
+          horizontally (capacity + read &amp; write throughput, but needs consistent hashing and risks
+          fan-out queries). Normalization fights <em>accidental</em> redundancy; replication is
+          <em>deliberate</em> redundancy and the <strong>only</strong> defence against HDD-failure data
+          loss (ACID durability only covers volatile vs persistent memory). Always replicate across
+          servers; use sharding + replication together. Caching is replication-like but volatile (no data-loss
+          protection). Session 8 dives into leader–follower replication.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Today we left the comfort of a single machine and entered the world of distributed storage.
+        Here's the one-paragraph story tying all the topics together:</p>
+        <div class="bigidea">
+          <p>A single database eventually hits walls of <strong>capacity, throughput, and
+          durability</strong>, so we spread data across many <strong>nodes</strong>. The instant we
+          have multiple copies talking over an unreliable network, those copies can
+          <strong>disagree</strong> — consistency (always about data) ranges from <strong>immediate</strong>
+          (no stale reads, but needs 2-phase commit) to <strong>eventual</strong> (every write reflects
+          eventually — good 99% of the time) to <strong>data loss</strong>. Meanwhile
+          <strong>availability</strong> is about a <em>healthy server denying a healthy request</em> (a
+          4xx or a crash doesn't count), and a <strong>network partition</strong> (a slow network counts!)
+          always exists somewhere in big systems. The <strong>CAP theorem</strong>: during a partition you
+          keep only two of C/A/P, so you really choose <strong>CP</strong> (~0.9%, stay correct — Zerodha,
+          BookMyShow) or <strong>AP</strong> (~99%, stay online — social media), while <strong>A+C</strong>
+          (~0.1%, stock exchanges) abandons partition tolerance. <strong>PACELC</strong> completes it:
+          <em>Else</em> (no partition) you <em>still</em> trade <strong>latency vs consistency</strong> on
+          every request — immediate consistency costs you both availability and latency. Aditi &amp;
+          Sanjana's diaries make it concrete (Protocol 1 = AP/low-latency, Protocol 2 = CP/high-latency).
+          The build tools are <strong>replication</strong> (copies → safety + read scale, the only defence
+          against HDD data loss) and <strong>sharding</strong> (splits → capacity + write scale), usually
+          combined. Replication is exactly where these trade-offs bite, which is why
+          <a href="session-8.html">Session 8</a> zooms into master–slave replication.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why can't a stateless app server be "consistent" or "inconsistent"?</summary>
+          <p class="ans">Consistency is always about data, and stateless servers hold no data — there's
+          nothing to be in or out of sync. The question is undefined, like asking the colour of an
+          electron.</p>
+        </details>
+        <details class="quiz">
+          <summary>"Eventually the data will be consistent" — right or wrong?</summary>
+          <p class="ans">Wrong. That implies a future point after which data stays consistent forever. The
+          correct statement is "every write will eventually reflect in all copies" — data can still be
+          stale because new writes keep arriving.</p>
+        </details>
+        <details class="quiz">
+          <summary>A server returns a 4xx on a bad request. Is that low availability?</summary>
+          <p class="ans">No. The user was at fault and the server still responded (with an error). Low
+          availability is when a <em>healthy</em> server denies a <em>healthy</em> request — usually
+          because it can't sync with its replicas.</p>
+        </details>
+        <details class="quiz">
+          <summary>How likely is a network partition in a system with millions of servers?</summary>
+          <p class="ans">100% — there is always some subset disconnected somewhere. That's why partition
+          tolerance is effectively mandatory and the real choice is AP vs CP.</p>
+        </details>
+        <details class="quiz">
+          <summary>In CAP, why is "partition tolerance" not really optional for a real distributed system?</summary>
+          <p class="ans">Because networks genuinely fail (and a slow/congested network behaves like a
+          broken one). You can't choose to never have a partition, so P is effectively mandatory; the real
+          decision is whether, during a partition, you sacrifice C (become CP) or A (become AP).</p>
+        </details>
+        <details class="quiz">
+          <summary>A bank's core ledger should lean toward CP or AP, and why?</summary>
+          <p class="ans">CP for correctness — better to reject/delay than allow a double-withdrawal. In
+          practice many real banks actually run A+P and reconcile later via auditing (overdraft fee +
+          interest), which is also why refunds can take 5–7 business days.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does PACELC add that CAP misses?</summary>
+          <p class="ans">The "ELC" half: even with no partition (normal operation), the system still
+          trades latency against consistency on every request. Immediate consistency costs both
+          availability and latency.</p>
+        </details>
+        <details class="quiz">
+          <summary>In Aditi's story, which protocol gives AP and which gives CP during a partition?</summary>
+          <p class="ans">Protocol 1 (sync at night) → AP: both keep serving, data is eventually consistent.
+          Protocol 2 (sync immediately) → CP: writes are denied during the fight (low availability) but
+          data stays immediately consistent.</p>
+        </details>
+        <details class="quiz">
+          <summary>Cassandra is often labelled PA/EL. Decode that label.</summary>
+          <p class="ans">During a Partition it favours Availability (stays up, allows stale data); Else, on
+          a healthy network, it favours low Latency (answers fast, again allowing some staleness).</p>
+        </details>
+        <details class="quiz">
+          <summary>You're running out of disk space because the dataset is too big for one machine. Replication or sharding?</summary>
+          <p class="ans">Sharding. Replication copies the <em>whole</em> dataset onto each node, so it
+          doesn't help capacity. Sharding splits the data so 10 nodes hold ~10× the data.</p>
+        </details>
+        <details class="quiz">
+          <summary>ACID durability protects you from a hard-disk failure. True or false?</summary>
+          <p class="ans">False. Durability only guarantees committed data survives in persistent (vs
+          volatile) memory across restarts. The only protection against HDD failure is replication across
+          multiple servers/disks.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why doesn't a single leader–follower replication setup scale write throughput?</summary>
+          <p class="ans">All writes funnel through the one leader; followers are read-only. To scale writes
+          you need sharding, so different nodes accept writes for different slices in parallel.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1hrZ9_18wXISAUqoztCwEF1z9q4hAuXpL5hpNvl00LlA/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] CAP-PACELC</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li><a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/" target="_blank" rel="noopener">Eric Brewer — CAP Twelve Years Later</a> — the author of the CAP theorem revisits and clarifies what it actually claims.</li>
+    <li><a href="https://dbmsmusings.blogspot.com/2010/04/problems-with-cap-and-yahoos-little.html" target="_blank" rel="noopener">Daniel Abadi — PACELC</a> — extends CAP to reason about latency vs consistency when there is no partition.</li>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications (Kleppmann)</a> — chapters on replication and consistency models that ground both theorems.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-6.html"><div class="dir">← Previous</div><div class="ttl">Session 6: Microservices &amp; Chat App</div></a>
+        <a class="next" href="session-8.html"><div class="dir">Next →</div><div class="ttl">Session 8: Master-Slave Replication</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 7 — The Storage Layer — CAP, PACELC &amp; Replication · You can now reason about distributed-data trade-offs 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

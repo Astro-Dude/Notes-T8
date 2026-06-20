@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 13 — LSTMs, GRUs &amp; Gating</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 13</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 13 · LSTMs, GRUs &amp; Gating</span>
+      <h1>Teaching a network to remember (and forget) on purpose</h1>
+      <p class="lead">
+        Last session we built plain RNNs and watched them choke on long sequences — the dreaded
+        vanishing gradient. Today we fix that with one beautiful idea: <em>gates</em>. We'll open up
+        the famous LSTM cell piece by piece, see why its "conveyor belt" lets gradients flow far
+        back in time, meet its leaner cousin the GRU, and finish by stacking and reversing RNNs in
+        real PyTorch. We assume you've studied <em>none</em> of this before — every topic starts
+        with a tiny everyday story before the math.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#gating">The gating idea</a></li>
+          <li><a href="#lstm">The LSTM cell anatomy</a></li>
+          <li><a href="#gradient">Why LSTMs fix gradient flow</a></li>
+          <li><a href="#gru">GRUs — the leaner gated cell</a></li>
+          <li><a href="#stacked">Bidirectional &amp; stacked RNNs</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. GATING ===================== -->
+      <section id="gating">
+        <h2><span class="sec-num">1</span> The gating idea</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're listening to a long story so you can answer a question at the end. You
+          don't try to memorise <em>every single word</em> — that's impossible. Instead you keep a
+          little notepad: when something important happens ("the key is under the mat") you
+          <strong>write it down</strong>, when something stops mattering you <strong>cross it out</strong>,
+          and when someone asks you a question you <strong>read out</strong> only the relevant bits.
+          A "gate" is just a tiny decision: <em>let this through, or not?</em> Today's networks learn
+          to make those write / cross-out / read-out decisions all by themselves.</p>
+        </div>
+
+        <h3>First, a quick recap of the problem</h3>
+        <p>Recall from <strong>Session 12</strong> that a plain <span class="term">RNN
+        (Recurrent Neural Network)</span> processes a sequence one step at a time, carrying a
+        <span class="term">hidden state</span> <code class="inl">h_t</code> from each step to the
+        next. At every step it does roughly:</p>
+
+        <pre><span class="cm"># plain RNN update (from Session 12)</span>
+h_t = tanh(W_h · h_{t-1} + W_x · x_t + b)</pre>
+
+        <p>The trouble is in that little <code class="inl">h_{t-1}</code> term. To learn from a clue
+        100 steps ago, the training signal (the gradient) has to travel back through 100 of those
+        multiplications. Each step multiplies by roughly the same weight matrix and a
+        <code class="inl">tanh</code> derivative that's less than 1. Multiply 100 numbers that are
+        each &lt; 1 together and you get something microscopic — the <span class="term">vanishing
+        gradient problem</span>. The opposite can also happen (numbers &gt; 1 multiplied many times
+        blow up) — the <span class="term">exploding gradient problem</span>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Why this hurts</span>
+          <p>A vanished gradient means the network <strong>literally cannot learn long-range
+          dependencies</strong>. By the time the error signal travels back to step 1, it's so faint
+          that the early weights barely change. The network forgets the start of the sentence —
+          exactly when "remembering the start" is the whole point (e.g. matching a pronoun to a noun
+          mentioned paragraphs earlier).</p>
+        </div>
+
+        <h3>The insight: stop forcing it, let it learn</h3>
+        <p>A plain RNN <em>completely rewrites</em> its memory at every single step — it has no
+        choice. The hidden state is squashed through a <code class="inl">tanh</code> and replaced.
+        That constant rewriting is exactly what destroys the gradient.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Don't hard-code <em>when</em> to remember. Give the network small, learnable
+          <strong>gates</strong> — values between 0 and 1 produced by the network itself — that
+          decide <strong>how much</strong> information to keep, throw away, or read out at each step.
+          The network <em>learns</em> the right remembering policy from data, just like it learns
+          everything else.</p>
+        </div>
+
+        <h3>What exactly is a gate?</h3>
+        <p>A <span class="term">gate</span> is a vector of numbers between 0 and 1, produced by a
+        tiny neural layer with a <span class="term">sigmoid</span> activation
+        (<code class="inl">σ</code>, which always outputs 0–1). You then <strong>multiply</strong> it
+        element-wise (the <code class="inl">⊙</code> symbol) against some information:</p>
+        <ul>
+          <li>A gate value near <strong>0</strong> = "block this" (multiply by ~0 → information
+          disappears).</li>
+          <li>A gate value near <strong>1</strong> = "let it all through" (multiply by ~1 →
+          information passes untouched).</li>
+          <li>Values in between = "let some fraction through" — gates are <em>soft</em>, not
+          on/off switches, which is what makes them trainable by gradient descent.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why sigmoid for gates, tanh for content?</span>
+          <p>Gates use <code class="inl">σ</code> because we want a clean 0-to-1 "how much" knob.
+          Actual <em>content</em> (the new candidate memory) usually uses <code class="inl">tanh</code>,
+          which outputs −1 to +1, so memory can move in either direction. Watch for this pairing —
+          it shows up in every gated cell below.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a one-number memory with a gate</span>
+          <p>Suppose our memory is a single number <code class="inl">c</code>, currently
+          <code class="inl">c = 5.0</code> (it means "the subject is plural"). A new word arrives.
+          The network computes a forget gate from the input and gets <code class="inl">f = 0.9</code>
+          (mostly keep), and an input gate <code class="inl">i = 0.2</code> with new candidate
+          content <code class="inl">g = −1.0</code>. The updated memory is:</p>
+          <pre>c_new = f ⊙ c + i ⊙ g
+      = 0.9 × 5.0 + 0.2 × (−1.0)
+      = 4.5 − 0.2
+      = 4.3</pre>
+          <p>The memory was <strong>mostly preserved</strong> (because <code class="inl">f</code> was
+          high) with a <strong>small nudge</strong> from the new word. Nobody told it to keep 90% —
+          it learned that gate value because keeping plural-ness around was useful for the loss.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Plain RNNs rewrite their memory every step, which makes gradients vanish over long
+          sequences. The fix is <strong>gating</strong>: learnable sigmoid-valued knobs (0–1) that
+          the network multiplies against information to decide how much to keep, add, or read out.
+          The network <em>learns</em> its own remembering policy. Next we'll see the most famous
+          design that uses this idea — the LSTM.
+        </div>
+      </section>
+
+      <!-- ===================== 2. LSTM CELL ===================== -->
+      <section id="lstm">
+        <h2><span class="sec-num">2</span> The LSTM cell anatomy</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a factory conveyor belt running straight through a room. Boxes (memories) ride
+          along it. As the belt passes three little workers, each worker can act on it: the first
+          worker can <strong>toss boxes off</strong> the belt (forget), the second can
+          <strong>place new boxes on</strong> (add), and the third decides which boxes to
+          <strong>show to the next room</strong> (output). The belt itself barely changes as it
+          rolls along — that's the secret. An LSTM is exactly this: a memory belt plus three gates.</p>
+        </div>
+
+        <p>The <span class="term">LSTM (Long Short-Term Memory)</span> cell was introduced by
+        Hochreiter &amp; Schmidhuber in 1997. Its key innovation is keeping <strong>two</strong>
+        things flowing through time instead of one:</p>
+        <ul>
+          <li>The <span class="term">cell state</span> <code class="inl">c_t</code> — the
+          long-term memory "conveyor belt." It's edited only by gentle additions and removals.</li>
+          <li>The <span class="term">hidden state</span> <code class="inl">h_t</code> — the
+          short-term, "what I output right now" state (same role as in a plain RNN).</li>
+        </ul>
+
+        <h3>The three gates at a glance</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Gate</th><th>Symbol</th><th>Question it answers</th><th>Conveyor-belt job</th></tr></thead>
+            <tbody>
+              <tr><td>Forget gate</td><td><code class="inl">f_t</code></td><td>What in the old memory should we erase?</td><td>Tosses boxes off the belt</td></tr>
+              <tr><td>Input gate</td><td><code class="inl">i_t</code></td><td>What new info should we write to memory?</td><td>Places new boxes on the belt</td></tr>
+              <tr><td>Output gate</td><td><code class="inl">o_t</code></td><td>What part of memory do we reveal right now?</td><td>Decides which boxes to show next room</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The data flow, as a diagram</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">Inputs</div><div class="s-d">x_t and h_{t-1} arrive</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗑️</div><div class="s-t">Forget</div><div class="s-d">f_t erases part of c_{t-1}</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">Input</div><div class="s-d">i_t adds new content g_t</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎞️</div><div class="s-t">Cell state</div><div class="s-d">c_t = the updated belt</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📤</div><div class="s-t">Output</div><div class="s-d">o_t reveals h_t from c_t</div></div>
+        </div>
+
+        <h3>The equations, one by one</h3>
+        <p>At each timestep the LSTM first glues together the previous hidden state
+        <code class="inl">h_{t-1}</code> and the current input <code class="inl">x_t</code>, then runs
+        five small computations. Don't be scared — they're all the <em>same shape</em>: a weighted
+        sum followed by an activation. Let's read each line like a sentence.</p>
+
+        <pre><span class="cm"># σ = sigmoid (outputs 0..1, a "how much" knob)</span>
+<span class="cm"># ⊙ = element-wise multiply</span>
+
+f_t = σ( W_f · [h_{t-1}, x_t] + b_f )      <span class="cm"># 1. forget gate</span>
+i_t = σ( W_i · [h_{t-1}, x_t] + b_i )      <span class="cm"># 2. input gate</span>
+g_t = tanh( W_g · [h_{t-1}, x_t] + b_g )   <span class="cm"># 3. candidate memory</span>
+c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t           <span class="cm"># 4. update the cell state</span>
+o_t = σ( W_o · [h_{t-1}, x_t] + b_o )      <span class="cm"># 5. output gate</span>
+h_t = o_t ⊙ tanh( c_t )                    <span class="cm"># 6. new hidden state</span></pre>
+
+        <p>Line by line, in plain English:</p>
+        <ul>
+          <li><strong>1 — Forget gate <code class="inl">f_t</code>:</strong> looks at the new input
+          and old hidden state and outputs a number 0–1 <em>per memory slot</em>. 0 means "erase this
+          slot," 1 means "keep it."</li>
+          <li><strong>2 — Input gate <code class="inl">i_t</code>:</strong> decides <em>how much</em>
+          of the brand-new candidate we'll actually write.</li>
+          <li><strong>3 — Candidate memory <code class="inl">g_t</code>:</strong> the new information
+          we <em>could</em> add, squashed to −1..+1 by <code class="inl">tanh</code> so it can push
+          memory up or down.</li>
+          <li><strong>4 — The update (the heart of it):</strong>
+          <code class="inl">c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t</code>. Read it as: "keep the fraction
+          <code class="inl">f_t</code> of the old belt, then add the fraction <code class="inl">i_t</code>
+          of the new content." This is the famous additive update — remember it for Topic 3.</li>
+          <li><strong>5 — Output gate <code class="inl">o_t</code>:</strong> decides which parts of
+          the (now updated) memory to expose to the outside world this step.</li>
+          <li><strong>6 — Hidden state <code class="inl">h_t</code>:</strong> the cell state passed
+          through <code class="inl">tanh</code> and filtered by the output gate. This is what leaves
+          the cell and feeds the next layer / the prediction.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Notation note: <code class="inl">[h_{t-1}, x_t]</code></span>
+          <p>The square brackets just mean "stack the two vectors into one long vector," then one
+          weight matrix acts on the whole thing. In code you often see this as two separate matrices
+          (<code class="inl">W·h + U·x</code>) — mathematically identical, just split. Each gate has
+          its <em>own</em> learned weights, so the cell has 4 sets of weights total.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: remembering grammatical number</span>
+          <p>Sentence: <em>"The <strong>dogs</strong> that chased the cat across the yard ... <strong>were</strong> tired."</em>
+          The verb must be "were" (plural) to match "dogs," even though many words intervene.</p>
+          <ul>
+            <li>At "dogs," the <strong>input gate opens</strong> (<code class="inl">i_t ≈ 1</code>) and
+            writes "subject = plural" into a memory slot via <code class="inl">g_t</code>.</li>
+            <li>Through "that chased the cat across the yard," the <strong>forget gate stays near 1</strong>
+            for that slot (<code class="inl">f_t ≈ 1</code>), so plural-ness rides the conveyor belt
+            untouched while other slots churn.</li>
+            <li>At the verb, the <strong>output gate opens</strong> for that slot, revealing "plural"
+            so the network predicts "were," not "was."</li>
+          </ul>
+          <p>No human wrote those gate values — they emerged from training to minimise prediction
+          error.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An LSTM carries two states: the long-term <strong>cell state</strong> <code class="inl">c_t</code>
+          (the conveyor belt) and the short-term <strong>hidden state</strong> <code class="inl">h_t</code>.
+          Three gates control it — <strong>forget</strong> (erase old memory), <strong>input</strong>
+          (write new memory via candidate <code class="inl">g_t</code>), and <strong>output</strong>
+          (reveal memory as <code class="inl">h_t</code>). The cell state is updated additively:
+          <code class="inl">c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 3. GRADIENT FLOW ===================== -->
+      <section id="gradient">
+        <h2><span class="sec-num">3</span> Why LSTMs fix gradient flow</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine passing a whispered secret down a line of 100 kids. In a plain RNN, every kid
+          <em>re-says it in their own words</em> — by kid 100 the message is total nonsense. In an
+          LSTM there's a special rule: most kids are allowed to just <strong>pass the note along
+          unchanged</strong>. A clear note can travel all the way down the line. That "pass it along
+          unchanged" highway is the cell state, and it's why the message (the gradient) survives.</p>
+        </div>
+
+        <h3>Recall what killed the plain RNN</h3>
+        <p>In a plain RNN the hidden state is <em>transformed</em> every step:
+        <code class="inl">h_t = tanh(W · h_{t-1} + ...)</code>. When we backpropagate, the gradient
+        of <code class="inl">h_t</code> with respect to <code class="inl">h_{t-1}</code> includes the
+        weight matrix <code class="inl">W</code> and a <code class="inl">tanh'</code> factor (always
+        &lt; 1). Chain those across many steps and you're multiplying many small numbers — the
+        product shrinks toward zero. Gradient vanishes.</p>
+
+        <h3>The additive path is the whole trick</h3>
+        <p>Now look at the LSTM's cell-state update again, and ask: how does
+        <code class="inl">c_t</code> depend on <code class="inl">c_{t-1}</code>?</p>
+
+        <pre>c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t
+
+<span class="cm"># the part of the gradient that travels straight back in time:</span>
+∂c_t / ∂c_{t-1} = f_t        <span class="cm"># just the forget gate!</span></pre>
+
+        <p>This is the magic. The connection from one cell state to the next is essentially
+        <strong>multiplication by the forget gate</strong> — and <em>nothing else</em>. There's no
+        weight matrix and no <code class="inl">tanh</code> squashing on this path. So when the
+        gradient flows back through time along the cell state, it gets multiplied by
+        <code class="inl">f_t</code> at each step.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>If the network learns to keep a forget gate <strong>open</strong>
+          (<code class="inl">f_t ≈ 1</code>) for a memory slot it cares about, then the gradient down
+          that path is multiplied by ≈1 over and over — so it <strong>neither vanishes nor
+          explodes</strong>. The cell state is a near-uninterrupted highway for gradients to travel
+          far back in time. This is sometimes called the <span class="term">constant error
+          carousel</span> — error "rides the carousel" without decaying.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: 50 steps later</span>
+          <p>Plain RNN, with an effective per-step factor of 0.8:</p>
+          <pre>gradient after 50 steps ≈ 0.8^50 ≈ 0.000014   <span class="cm"># vanished</span></pre>
+          <p>LSTM, with the network keeping the relevant forget gate near 1.0 (say 0.99):</p>
+          <pre>gradient after 50 steps ≈ 0.99^50 ≈ 0.61       <span class="cm"># very much alive</span></pre>
+          <p>Same depth, wildly different survival — purely because the LSTM's path multiplies by a
+          learnable gate that it can choose to hold open, instead of a fixed shrinking factor.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">It's an addition, not a forced overwrite</span>
+          <p>The deeper reason this works: <code class="inl">c_t</code> is built by <em>adding</em> to
+          the old state (<code class="inl">+ i_t ⊙ g_t</code>) rather than replacing it. Additive
+          updates have gradients that flow through unchanged — the very same principle behind
+          <span class="term">residual / skip connections</span> in deep CNNs and Transformers (we'll
+          revisit those in <strong>Session 14</strong>). Gating + addition = the recurring recipe for
+          training very deep or very long networks.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Honest caveat</span>
+          <p>LSTMs <em>greatly reduce</em> vanishing gradients but don't make them mathematically
+          impossible — if the network learns small forget gates, memory still fades. And exploding
+          gradients can still occur, which is why people pair LSTMs with
+          <span class="term">gradient clipping</span> (capping the gradient's size during training).
+          LSTMs make long-range learning <em>practical</em>, not magic.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The gradient along the cell state is multiplied only by the <strong>forget gate</strong>
+          (<code class="inl">∂c_t/∂c_{t-1} = f_t</code>) — no weight matrix, no tanh squashing. If the
+          network holds that gate open (≈1), gradients survive across hundreds of steps: the
+          "constant error carousel." This additive memory path is the same idea as residual
+          connections, and it's why LSTMs can learn long-range dependencies that plain RNNs cannot.
+        </div>
+      </section>
+
+      <!-- ===================== 4. GRU ===================== -->
+      <section id="gru">
+        <h2><span class="sec-num">4</span> GRUs — the leaner gated cell</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The LSTM was a factory with three workers and two conveyor belts — powerful, but a lot
+          of machinery. The <strong>GRU</strong> is a tidier shop: <em>one</em> belt and <em>two</em>
+          workers. One worker decides "how much of the old memory to keep vs. replace" and the other
+          decides "how much of the past to even look at when writing the new memory." Fewer parts,
+          often just as good, and faster to run.</p>
+        </div>
+
+        <p>The <span class="term">GRU (Gated Recurrent Unit)</span>, introduced by Cho et al. in 2014,
+        keeps the gating idea but simplifies it. The two big changes versus an LSTM:</p>
+        <ul>
+          <li>It has <strong>no separate cell state</strong> — the hidden state <code class="inl">h_t</code>
+          carries both long- and short-term memory.</li>
+          <li>It uses <strong>two gates instead of three</strong>: a <span class="term">reset
+          gate</span> and an <span class="term">update gate</span>.</li>
+        </ul>
+
+        <h3>The GRU equations</h3>
+        <pre><span class="cm"># σ = sigmoid, ⊙ = element-wise multiply</span>
+
+r_t = σ( W_r · [h_{t-1}, x_t] + b_r )           <span class="cm"># 1. reset gate</span>
+z_t = σ( W_z · [h_{t-1}, x_t] + b_z )           <span class="cm"># 2. update gate</span>
+h~_t = tanh( W_h · [r_t ⊙ h_{t-1}, x_t] + b_h ) <span class="cm"># 3. candidate state</span>
+h_t = (1 − z_t) ⊙ h_{t-1} + z_t ⊙ h~_t          <span class="cm"># 4. blend old &amp; new</span></pre>
+
+        <p>Reading it as a story:</p>
+        <ul>
+          <li><strong>Reset gate <code class="inl">r_t</code>:</strong> when computing the new
+          <em>candidate</em> memory, how much of the past should we let influence it? Near 0 = "ignore
+          the past, this is a fresh start" (great at sentence/clause boundaries).</li>
+          <li><strong>Update gate <code class="inl">z_t</code>:</strong> the star of the GRU. It does
+          the job of the LSTM's forget <em>and</em> input gates at once. Line 4 says: keep fraction
+          <code class="inl">(1 − z_t)</code> of the old state and take fraction <code class="inl">z_t</code>
+          of the new candidate. They're <em>tied together</em> — what you don't keep, you replace.</li>
+          <li><strong>Candidate <code class="inl">h~_t</code>:</strong> the proposed new memory,
+          computed using a reset-filtered view of the past.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Where's the additive highway?</span>
+          <p>Line 4 still has the precious additive structure: when the update gate
+          <code class="inl">z_t ≈ 0</code>, we get <code class="inl">h_t ≈ h_{t-1}</code> — memory
+          passes through nearly unchanged, so gradients flow back just like the LSTM's cell state. The
+          GRU keeps the gradient-friendly skip path while using fewer parameters.</p>
+        </div>
+
+        <h3>LSTM vs GRU — side by side</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>LSTM</th><th>GRU</th></tr></thead>
+            <tbody>
+              <tr><td>Gates</td><td>3 (forget, input, output)</td><td>2 (reset, update)</td></tr>
+              <tr><td>Memory states</td><td>2 (cell <code class="inl">c_t</code> + hidden <code class="inl">h_t</code>)</td><td>1 (hidden <code class="inl">h_t</code> only)</td></tr>
+              <tr><td>Parameters per cell</td><td>More (4 weight sets)</td><td>~25% fewer (3 weight sets)</td></tr>
+              <tr><td>Speed / memory</td><td>Slower, heavier</td><td>Faster, lighter</td></tr>
+              <tr><td>Exposes full memory?</td><td>No — output gate filters it</td><td>Yes — whole state is the output</td></tr>
+              <tr><td>Best on</td><td>Very long / complex sequences; when you have lots of data</td><td>Smaller datasets, shorter sequences, when compute is tight</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: which would you pick?</span>
+          <ul>
+            <li><strong>Long documents, big dataset, accuracy is king</strong> (e.g. document-level
+            sentiment): start with an <strong>LSTM</strong> — its extra control sometimes squeezes out
+            more performance on long dependencies.</li>
+            <li><strong>Modest dataset, want fast training, mobile/edge deployment</strong> (e.g. a
+            small on-device text classifier): start with a <strong>GRU</strong> — fewer parameters
+            means faster training and less overfitting risk.</li>
+          </ul>
+          <p>In practice their accuracy is usually <em>very close</em>. The honest advice: try both
+          and let your validation set decide. Neither is universally "better."</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A GRU is a streamlined LSTM: it merges the cell and hidden states into one, and merges
+          forget+input into a single update gate. You lose a little fine-grained control but gain
+          speed and fewer parameters — and you keep the all-important additive gradient highway.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The GRU uses two gates — <strong>reset</strong> (how much past to use when forming the
+          candidate) and <strong>update</strong> (how much to keep vs. replace) — and a single hidden
+          state. It's lighter and faster than an LSTM with usually comparable accuracy. Choose GRU
+          when data/compute is limited, LSTM for large data and the longest dependencies; in doubt,
+          benchmark both.
+        </div>
+      </section>
+
+      <!-- ===================== 5. BIDIRECTIONAL & STACKED ===================== -->
+      <section id="stacked">
+        <h2><span class="sec-num">5</span> Bidirectional &amp; stacked RNNs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two simple upgrades. First: when you fill in a missing word in a sentence, you read both
+          the words <em>before</em> and <em>after</em> the blank — a <strong>bidirectional</strong> RNN
+          does the same by reading the sequence forward <em>and</em> backward. Second: one pair of
+          eyes is good, but a team passing notes catches more — a <strong>stacked</strong> RNN piles
+          several RNN layers on top of each other so deeper layers spot higher-level patterns.</p>
+        </div>
+
+        <h3>Bidirectional RNNs — reading both directions</h3>
+        <p>A normal RNN reads left-to-right, so its understanding of word <em>t</em> only uses words
+        <em>before</em> it. But meaning often depends on what comes <em>after</em>. A
+        <span class="term">bidirectional RNN (BiRNN)</span> runs <strong>two</strong> independent RNNs:
+        one forward (start→end) and one backward (end→start). At each position it
+        <strong>concatenates</strong> both hidden states, so every output knows about the entire
+        sequence on both sides.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">▶️</div><div class="s-t">Forward RNN</div><div class="s-d">reads x₁…xₜ</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">◀️</div><div class="s-t">Backward RNN</div><div class="s-d">reads xₜ…x₁</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔗</div><div class="s-t">Concatenate</div><div class="s-d">[h→ , h←] per step</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Output</div><div class="s-d">uses full context</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: why both directions help</span>
+          <p>Tag the word <em>"book"</em>:</p>
+          <ul>
+            <li>"I want to <strong>book</strong> a flight" → verb. You only know this from the word
+            <em>after</em> ("a flight").</li>
+            <li>"I read a <strong>book</strong>" → noun.</li>
+          </ul>
+          <p>A forward-only RNN at "book" hasn't seen "a flight" yet. A BiRNN's backward pass has, so
+          it disambiguates correctly.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">When you cannot use bidirectional</span>
+          <p>BiRNNs need the <em>whole</em> sequence up front, so they're great for tasks like
+          tagging or classification on complete texts. But for <strong>real-time generation or
+          forecasting</strong> (predicting the next word/value as data streams in) you can't peek at
+          the future — there is none yet. Use a forward-only model there.</p>
+        </div>
+
+        <h3>Stacked (deep) RNNs — layers on layers</h3>
+        <p>A <span class="term">stacked RNN</span> (or deep RNN) feeds the sequence of hidden states
+        from one RNN layer as the <em>input</em> sequence to the next RNN layer. Lower layers capture
+        local patterns (letters→words), higher layers capture abstract ones (phrases→meaning) — the
+        same "hierarchy of features" idea you saw with CNNs in earlier sessions.</p>
+
+        <div class="callout note">
+          <span class="c-title">How deep?</span>
+          <p>2–4 layers is the common sweet spot. More layers add capacity but cost compute and can
+          overfit; people add <span class="term">dropout</span> <em>between</em> layers to regularise.
+          You can absolutely combine ideas: a <strong>stacked bidirectional LSTM</strong> is a very
+          common workhorse for sequence labelling.</p>
+        </div>
+
+        <h3>Real PyTorch: it's basically free</h3>
+        <p>The wonderful part: PyTorch's <code class="inl">nn.LSTM</code> gives you stacking and
+        bidirectionality with two arguments. You don't hand-write any of the gate equations from
+        Topic 2 — they're built in.</p>
+
+        <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+<span class="cm"># A 2-layer BIDIRECTIONAL LSTM</span>
+lstm = nn.LSTM(
+    input_size=<span class="nm">100</span>,      <span class="cm"># size of each input vector (e.g. word embedding)</span>
+    hidden_size=<span class="nm">128</span>,     <span class="cm"># size of the hidden state per direction</span>
+    num_layers=<span class="nm">2</span>,        <span class="cm"># STACKED: 2 LSTM layers</span>
+    batch_first=<span class="kw">True</span>,    <span class="cm"># input shape is (batch, seq_len, features)</span>
+    bidirectional=<span class="kw">True</span>,  <span class="cm"># BIDIRECTIONAL: read both ways</span>
+    dropout=<span class="nm">0.2</span>,        <span class="cm"># dropout between stacked layers</span>
+)
+
+<span class="cm"># Fake batch: 32 sequences, each 10 steps long, 100 features per step</span>
+x = torch.randn(<span class="nm">32</span>, <span class="nm">10</span>, <span class="nm">100</span>)
+
+<span class="cm"># output: per-step hidden states (both directions concatenated)</span>
+<span class="cm"># h_n, c_n: final hidden and cell states for each layer/direction</span>
+output, (h_n, c_n) = lstm(x)
+
+<span class="kw">print</span>(output.shape)  <span class="cm"># (32, 10, 256)  -&gt; 128 * 2 directions</span>
+<span class="kw">print</span>(h_n.shape)     <span class="cm"># (4, 32, 128)   -&gt; 2 layers * 2 directions</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: reading those shapes</span>
+          <ul>
+            <li><code class="inl">output</code> is <code class="inl">(32, 10, 256)</code>: for all 32
+            sequences and all 10 timesteps, a 256-dim vector — that's 128 forward + 128 backward
+            concatenated. Use this for per-token tasks (tagging).</li>
+            <li><code class="inl">h_n</code> is <code class="inl">(4, 32, 128)</code>: the
+            <em>final</em> hidden state, with the first axis = <code class="inl">num_layers ×
+            num_directions = 2 × 2 = 4</code>. Use the top layer's states for whole-sequence tasks
+            (classification).</li>
+            <li>Swapping to a GRU is a one-word change: <code class="inl">nn.GRU(...)</code> — and it
+            returns just <code class="inl">output, h_n</code> (no cell state, as we learned in Topic 4).</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Bidirectionality and stacking are <em>orthogonal</em> upgrades you can mix freely with
+          LSTM or GRU. In PyTorch they're just the <code class="inl">bidirectional</code> and
+          <code class="inl">num_layers</code> flags — the heavy lifting is done for you.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Bidirectional</strong> RNNs read the sequence forward and backward and concatenate,
+          so each output sees full context — great for tagging/classification, impossible for live
+          generation. <strong>Stacked</strong> RNNs layer cells to learn a hierarchy of features.
+          PyTorch's <code class="inl">nn.LSTM</code> / <code class="inl">nn.GRU</code> expose both via
+          the <code class="inl">bidirectional</code> and <code class="inl">num_layers</code> arguments.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was really about <em>one</em> elegant idea applied five ways. Here's the
+        story that ties it all together:</p>
+        <div class="bigidea">
+          <p>Plain RNNs forget the distant past because they <em>overwrite</em> their memory every
+          step, making gradients <strong>vanish</strong>. The cure is <strong>gating</strong>:
+          learnable 0–1 knobs that decide how much information to keep, add, or reveal. The
+          <strong>LSTM</strong> bundles three gates (forget, input, output) around a long-term
+          <strong>cell-state "conveyor belt,"</strong> updated <em>additively</em>
+          (<code class="inl">c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t</code>). That addition is exactly why
+          gradients survive — they ride the cell state, multiplied only by the forget gate (the
+          <strong>constant error carousel</strong>). The <strong>GRU</strong> achieves the same with
+          fewer parts: two gates, one state. And whichever cell you choose, you can make it
+          <strong>bidirectional</strong> (read both ways) and <strong>stacked</strong> (deep) — both
+          one-line flags in PyTorch. Next session we use these recurrent encoders to build
+          <strong>Seq2Seq</strong> models and meet <strong>attention</strong>, which eventually
+          makes the recurrence itself optional.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does a plain RNN's gradient vanish but an LSTM's cell-state gradient doesn't?</summary>
+          <p class="ans">A plain RNN multiplies the gradient by a weight matrix and a tanh derivative
+          (&lt;1) at every step, so it shrinks. The LSTM's cell-state path multiplies only by the
+          forget gate (<code class="inl">∂c_t/∂c_{t-1} = f_t</code>); if the network holds that gate
+          near 1, gradients pass through nearly unchanged.</p>
+        </details>
+        <details class="quiz">
+          <summary>What do the three LSTM gates do?</summary>
+          <p class="ans">Forget gate erases parts of the old cell state; input gate decides how much
+          new candidate content to write; output gate decides which parts of the cell state to expose
+          as the hidden state <code class="inl">h_t</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>How is a GRU different from an LSTM?</summary>
+          <p class="ans">A GRU has only one state (the hidden state, no separate cell state) and two
+          gates (reset and update). Its update gate does the job of the LSTM's forget+input gates
+          together. It's lighter and faster with usually comparable accuracy.</p>
+        </details>
+        <details class="quiz">
+          <summary>When should you NOT use a bidirectional RNN?</summary>
+          <p class="ans">When you can't see the future — real-time generation or forecasting, where
+          you predict the next item as data streams in. BiRNNs need the entire sequence up front.</p>
+        </details>
+        <details class="quiz">
+          <summary>In <code class="inl">nn.LSTM</code>, you set <code class="inl">hidden_size=128</code>, <code class="inl">num_layers=2</code>, <code class="inl">bidirectional=True</code>. What's the last-dim size of <code class="inl">output</code>?</summary>
+          <p class="ans">256 — that's <code class="inl">hidden_size × num_directions = 128 × 2</code>,
+          because the forward and backward hidden states are concatenated at each timestep.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is the additive update <code class="inl">c_t = f_t ⊙ c_{t-1} + ...</code> conceptually similar to a residual connection?</summary>
+          <p class="ans">Both <em>add</em> to an existing signal rather than fully replacing it, so the
+          gradient has an unobstructed path to flow backward. This shared principle is what lets both
+          LSTMs and very deep residual networks train across long distances.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>Your course handout for this session: <strong>"SST Deep Learning handout (Session 13)"</strong>
+          — the primary reference for this class. (<a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">course page</a>)</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.bioinf.jku.at/publications/older/2604.pdf" target="_blank" rel="noopener">Hochreiter &amp; Schmidhuber, "Long Short-Term Memory" (1997)</a> — the original paper that introduced the LSTM and the "constant error carousel" argument behind Topic 3.</li>
+          <li><a href="https://colah.github.io/posts/2015-08-Understanding-LSTMs/" target="_blank" rel="noopener">Christopher Olah, "Understanding LSTM Networks"</a> — the legendary, diagram-rich blog post; the best companion to our cell-anatomy section.</li>
+          <li><a href="https://arxiv.org/abs/1406.1078" target="_blank" rel="noopener">Cho et al., "Learning Phrase Representations using RNN Encoder–Decoder" (2014)</a> — the paper that introduced the GRU (Topic 4).</li>
+          <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html" target="_blank" rel="noopener">PyTorch <code class="inl">nn.LSTM</code> documentation</a> — official reference for the arguments and tensor shapes used in Topic 5.</li>
+          <li><a href="https://arxiv.org/abs/1412.3555" target="_blank" rel="noopener">Chung et al., "Empirical Evaluation of Gated Recurrent Neural Networks" (2014)</a> — head-to-head comparison of LSTM vs GRU, backing the "benchmark both" advice.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-12.html"><div class="dir">← Previous</div><div class="ttl">Session 12: Sequence Modeling — RNNs</div></a>
+        <a class="next" href="session-14.html"><div class="dir">Next →</div><div class="ttl">Session 14: Seq2Seq &amp; Attention</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 13 — LSTMs, GRUs &amp; Gating · You taught a network to remember on purpose 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

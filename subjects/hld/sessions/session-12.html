@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 12 — Case Study — Search Typeahead / Autocomplete</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 12</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 12 · Case Study — Search Typeahead</span>
+      <h1>How Google finishes your search before you do</h1>
+      <p class="lead">
+        You start typing "how to ti…" and a list pops up — "how to tie a tie," "how to tie shoes" —
+        before you've finished the word. That little dropdown is one of the most demanding systems on
+        the internet: it has to answer in a blink, for millions of people at once. This is a
+        <em>design</em> session: we'll take everything from earlier sessions (caching, sharding, load
+        balancing) and assemble a real system from scratch. No prior systems knowledge assumed — every
+        idea starts with a tiny story.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 30 min read</span><span class="badge-rt">📖 8 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#approach">Approaching a design problem</a></li>
+          <li><a href="#requirements">Requirements &amp; scale</a></li>
+          <li><a href="#api">API &amp; data flow</a></li>
+          <li><a href="#nfr">Non-functional requirements</a></li>
+          <li><a href="#estimation">Scale estimation</a></li>
+          <li><a href="#trie">The Trie data structure</a></li>
+          <li><a href="#ranking">Ranking &amp; data collection</a></li>
+          <li><a href="#serving">Serving at scale</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. APPROACHING A DESIGN PROBLEM ===================== -->
+      <section id="approach">
+        <h2><span class="sec-num">1</span> Approaching a design problem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your teacher says "build something cool" and walks away. No instructions! A bad student
+          builds a random toy. A great student first asks lots of little questions — "Cool for who? How big? How
+          fast?" — until they know exactly what to build, <em>then</em> builds it. A design interview is exactly
+          that: the question is fuzzy on purpose, and your real job is to turn the fog into a clear plan before
+          you build.</p>
+        </div>
+
+        <p>Before we touch a single trie or cache, we need to know <em>how</em> to attack an open-ended design
+        question. This is a skill of its own — and it's very different from a coding (DSA) interview.</p>
+
+        <h3>DSA interviews vs design interviews</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>DSA interview</th><th>Design interview</th></tr></thead>
+            <tbody>
+              <tr><td>Problem statement</td><td>Concrete, well-defined</td><td>Extremely vague — e.g. just "Design Typeahead" (you might not even know what typeahead <em>is</em>)</td></tr>
+              <tr><td>Inputs / outputs</td><td>Example input-output pairs given</td><td>You have to figure them out</td></tr>
+              <tr><td>Direction</td><td>You know the kind of solution that works</td><td>Open-ended; discussion can go anywhere, depends on your and the interviewer's expertise</td></tr>
+              <tr><td>Constraints</td><td>Given (e.g. array of 10⁶ ints ⇒ can't use O(n²), max O(n log n))</td><td>You must discover the constraints by asking</td></tr>
+              <tr><td>Time</td><td>Time constrained</td><td>Still time constrained — typically <strong>45 mins</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">How to solve a DSA problem (for contrast)</span>
+          <p>Problem statement → work examples by hand → brute force → draw observations → optimize. A design
+          interview borrows the spirit ("understand before you build") but the structure is different.</p>
+        </div>
+
+        <p>In a design interview your job is to (1) figure out <strong>what you're supposed to build</strong> —
+        i.e. what the interviewer actually wants, (2) build that solution, and (3) deliberately take on
+        <strong>sufficiently complex things</strong> so you can showcase your skills and impress the interviewer.</p>
+
+        <h3>The 5-step design approach</h3>
+        <p>A reliable script for the 45 minutes. Roughly the first half is about <em>understanding</em>, the
+        second half about <em>building</em>.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">1</div><div class="s-t">Problem Statement</div><div class="s-d">~20–25 min for steps 1–4</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">2</div><div class="s-t">Functional Reqs</div><div class="s-d">the features</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">3</div><div class="s-t">Non-functional Reqs</div><div class="s-d">the qualities</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">4</div><div class="s-t">Scale Estimation</div><div class="s-d">how big?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">5</div><div class="s-t">API + System Design</div><div class="s-d">~20–25 min, the build</div></div>
+        </div>
+
+        <h3>Step 1 — Problem statement: reason by analogy</h3>
+        <p>When the statement is vague, <span class="term">reason by analogy</span>: find existing companies or
+        systems that offer a similar product/feature. This gives you an overview of the umbrella of different
+        <em>scopes</em> you could consider.</p>
+        <ul>
+          <li><strong>Typeahead is a specific form of autocomplete</strong> — literally trying to type
+          <em>ahead</em> of the user.</li>
+          <li>Examples: <strong>typeahead in Google</strong>, <strong>typeahead in Amazon</strong>.</li>
+          <li>Typeahead &amp; Search are <em>different</em> products, but typeahead is <strong>always followed by
+          some form of search</strong>.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">What NOT to build — autocomplete ≠ typeahead</span>
+          <p>Autocomplete shows up in many settings, and most of them are <em>not</em> what we're designing:</p>
+          <ul>
+            <li><strong>Smartphone keyboards:</strong> word completion / contacts.</li>
+            <li><strong>Text / code editors:</strong> intellisense (complete next token), GitHub Copilot (whole functions).</li>
+            <li><strong>Grammarly:</strong> sentence completion while writing prose.</li>
+            <li><strong>Gmail / Outlook:</strong> sentence completion for mail; to/cc/bcc email completion from contacts.</li>
+          </ul>
+          <p><strong>The key difference:</strong> autocomplete is typically <em>local</em> to your machine and
+          standalone — suggestions are specific to you. <strong>Typeahead is always associated with search</strong>,
+          and its suggestions are the <strong>most popular queries searched globally in the past</strong> that match
+          the given prefix.</p>
+        </div>
+
+        <h3>Functional requirements &amp; the MVP mindset</h3>
+        <p>Functional requirements (FR) start from a <span class="term">Minimal Viable Product (MVP)</span>:</p>
+        <ul>
+          <li><strong>Minimal:</strong> the minimal set of features to achieve viability.</li>
+          <li><strong>Viable:</strong> should demonstrate the core features &amp; usability.</li>
+          <li><strong>Product:</strong> solve a genuine problem.</li>
+        </ul>
+        <p>Always keep "minimal" in mind — <strong>MVP features is not a feature-suggestion competition.</strong>
+        Features fall into three buckets:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Bucket</th><th>Meaning</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td>MVP (v0)</td><td>Core features — perfect for discussion</td><td>✅ build &amp; discuss</td></tr>
+              <tr><td>Future scope (v1+)</td><td>Good to have, not absolutely necessary</td><td>🟡 mention, don't build</td></tr>
+              <tr><td>Bad (v-never)</td><td>Gets you rejected in an interview</td><td>❌ avoid</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">What to avoid</span>
+          <p>Don't propose anything that doesn't affect our backend infra / system design:</p>
+          <ul>
+            <li><strong>Frontend / purely cosmetic features</strong> that don't affect backend design.</li>
+            <li><strong>Common dependencies that aren't the core</strong> of the system. E.g. designing Uber needs
+            authentication and payments — but auth isn't what you're asked to design, it's just a dependency. Assume
+            auth &amp; payments already exist.</li>
+          </ul>
+          <p>Also: any suggested feature should come as a <strong>complete sentence from the user's perspective</strong>.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Finding "hidden" features</span>
+          <p>For every feature you discuss, think about its <strong>API</strong> — is it user-facing or internal?
+          That question surfaces features you'd otherwise miss. For typeahead:</p>
+          <pre>typeahead(partial_query) =&gt; suggestions_list   <span class="cm"># user-facing</span>
+log_search(search_query)  =&gt; void              <span class="cm"># internal</span></pre>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Design interviews are <strong>vague and open-ended</strong> — your job is to discover what to build, then
+          build it (in ~45 min). Use the <strong>5-step approach</strong> (problem → FR → NFR → scale → API/system).
+          <strong>Reason by analogy</strong> to scope the problem; remember <strong>typeahead ≠ general
+          autocomplete</strong> (it's global, popularity-based, tied to search). Stick to the <strong>MVP</strong>,
+          park future scope, and avoid cosmetic/dependency features.
+        </div>
+      </section>
+
+      <!-- ===================== 2. REQUIREMENTS ===================== -->
+      <section id="requirements">
+        <h2><span class="sec-num">2</span> Requirements &amp; scale</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a super-helpful librarian who has heard <em>every</em> question anyone has ever asked.
+          The moment you open your mouth and say "how do I tie…", she instantly blurts out the most common
+          ways people finish that sentence — "…tie a tie?", "…tie my shoes?" She's so fast it feels like she's
+          reading your mind, and she only suggests things lots of people actually ask. That librarian is
+          autocomplete.</p>
+        </div>
+
+        <p>Before designing anything, a good engineer writes down <strong>what the system must do</strong>. We
+        split this into two buckets. <span class="term">Functional requirements</span> are the <em>features</em> —
+        what the user can see and do. <span class="term">Non-functional requirements</span> are the <em>qualities</em> —
+        how fast, how reliable, how big. Autocomplete is a fascinating case study because its features are tiny
+        but its quality bar is brutal.</p>
+
+        <p>There's exactly one <span class="term">actor</span> to keep in mind here: the
+        <strong>end user</strong> — the person doing the Google search.</p>
+
+        <h3>Functional requirements (what it does)</h3>
+        <p>Stated as complete user-perspective sentences: <em>"As the user is typing in the search box, we should
+        auto-complete their search query — we should show typeahead suggestions."</em></p>
+        <ul>
+          <li><strong>Prefix suggestions.</strong> Given a <span class="term">prefix</span> /
+          <code class="inl">partial_query</code> (the letters typed so far, like <code class="inl">"how to ti"</code>),
+          return a list of complete queries that start with those letters — the user-facing API
+          <code class="inl">typeahead(partial_query) =&gt; suggestions_list</code>.</li>
+          <li><strong>Suggestions are popular past searches.</strong> The list comes from searches <em>other</em>
+          people made before, captured via the internal API <code class="inl">log_search(search_query) =&gt; void</code>.</li>
+          <li><strong>Ranking by popularity (top 5, relevant).</strong> We show only the
+          <strong>top 5 relevant</strong> suggestions. <em>Relevant</em> = the suggestion is a
+          <strong>prefix match</strong> with the <code class="inl">partial_query</code>. <em>Top 5</em> = we track
+          how many times each <code class="inl">search_query</code> has been searched globally, and among prefix
+          matches we show those with the <strong>highest count</strong>.</li>
+          <li><strong>Update on every keystroke.</strong> With every letter the user types, the suggestions change —
+          we send a <strong>new API request with every letter typed</strong>.</li>
+          <li><strong>Clicking a suggestion triggers a search</strong> (frontend).</li>
+        </ul>
+
+        <h3>Scope boundaries we picked</h3>
+        <ul>
+          <li><strong>Start at ≥ 3 letters.</strong> We only start showing suggestions after the user has typed at
+          least 3 letters — fewer than that gives irrelevant results.</li>
+          <li><strong>Cap at 50 letters.</strong> If a query is longer than ~50 letters, the user has most likely
+          fallen asleep on the keyboard.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Future scope (v1+) — mention, don't build</span>
+          <p>Nice-to-haves that we deliberately defer: <strong>personalization</strong> (by geolocation, the user's
+          own browsing/search history, even age — "why is s…" → "why is sky blue" for a 5-year-old vs "why is scotch
+          smooth" for a 30-year-old); <strong>recency / trending</strong> news factor; showing trending or recent
+          searches even before 3 characters; <strong>spell-correction</strong> and <strong>grammar-correction</strong>
+          of the partial query; <strong>Tab to copy</strong> a suggestion into the box; <strong>highlighting</strong>
+          the already-typed part; and "<em>provide suggestions as per the law of the land</em>" (whatever that means).</p>
+        </div>
+
+        <p>The <em>qualities</em> (latency, consistency, availability) and the <em>numbers</em> (QPS, storage,
+        sharding) are big enough to deserve their own sections — see <a href="#nfr">§4 Non-functional
+        requirements</a> and <a href="#estimation">§5 Scale estimation</a> below. First, though, we sketch the API
+        and where the data comes from.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          One actor (the end user). Functional core: return the <strong>top-5 prefix-matching, most-popular</strong>
+          past queries for a typed <strong>partial query</strong>, re-fetched on <strong>every keystroke</strong>,
+          starting at <strong>≥3 letters</strong> and capped at <strong>~50</strong>. Personalization,
+          spell/grammar-correction and trending are <strong>future scope</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 3. API & DATA FLOW ===================== -->
+      <section id="api">
+        <h2><span class="sec-num">3</span> API &amp; data flow</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two friends pass notes. You hand the librarian a slip with the start of your question and she hands
+          back a list — that's one note ("give me suggestions"). Separately, every time anyone asks a full
+          question, a helper quietly tells the librarian "someone asked <em>this</em>" so she can keep her tallies —
+          that's a second, behind-the-scenes note. Same idea, two different notes.</p>
+        </div>
+
+        <p>For each feature, decide its <strong>API</strong> — its input &amp; output (the interface) — and its
+        <strong>protocol</strong> — <em>how</em> the communication happens (REST / RPC / …). Those are two
+        different things.</p>
+
+        <div class="callout example">
+          <span class="c-title">The two APIs</span>
+          <pre>typeahead(partial_query) =&gt; suggestions_list      <span class="cm"># user-facing</span>
+log_search(search_query)  =&gt; void                 <span class="cm"># internal</span>
+
+GET /typeahead?partialQuery={...}                 <span class="cm"># the HTTP shape</span></pre>
+          <p>Design questions worth raising aloud in the interview: <strong>why REST</strong> (not SOAP / RPC / …)?
+          and <strong>why GET</strong> (not POST)? — naming conventions and idempotent reads point to a cacheable
+          <code class="inl">GET</code>.</p>
+        </div>
+
+        <h3>Where do the suggestions come from?</h3>
+        <p>Users are constantly searching on Google. The data flow that feeds typeahead:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">1. User searches</div><div class="s-d">a search_query is issued</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">2. /search service</div><div class="s-d">returns web results</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">3. async ping</div><div class="s-d">/search tells /typeahead a search happened</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">4. /typeahead stores it</div><div class="s-d">to populate its suggestions list</div></div>
+        </div>
+        <p>Crucially, step 3 is <strong>asynchronous</strong> — the user's search isn't slowed down by logging.
+        The <code class="inl">/typeahead</code> microservice is fed by the <code class="inl">/search</code>
+        microservice rather than living on the search path.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Two APIs: user-facing <code class="inl">typeahead(partial_query)</code> exposed as a cacheable
+          <code class="inl">GET /typeahead</code>, and internal <code class="inl">log_search(...)</code>.
+          <strong>API ≠ protocol.</strong> Suggestions are populated when <code class="inl">/search</code>
+          <strong>asynchronously</strong> informs <code class="inl">/typeahead</code> of each search.
+        </div>
+      </section>
+
+      <!-- ===================== 4. NON-FUNCTIONAL REQUIREMENTS ===================== -->
+      <section id="nfr">
+        <h2><span class="sec-num">4</span> Non-functional requirements</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two questions about the librarian, besides <em>what</em> she does: Is it okay if she's sometimes a
+          tiny bit out of date with her tallies? (Yes — nobody knows or cares about the exact counts.) And how
+          <em>fast</em> must she be? (Faster than you can type the next letter!) Those two answers — "stale is fine"
+          and "be lightning fast" — decide almost everything about how we build her.</p>
+        </div>
+
+        <p>Non-functional requirements (NFR) are our <strong>design goals</strong>. The right tool to reason about
+        them is <span class="term">PACELC</span>: in a <strong>P</strong>artition, choose <strong>A</strong>vailability
+        or <strong>C</strong>onsistency; <strong>E</strong>lse (normal operation), choose <strong>L</strong>atency or
+        <strong>C</strong>onsistency. <strong>Do NOT jump to an answer</strong> — reason it out.</p>
+
+        <h3>Consistency vs Availability</h3>
+        <p><strong>Q: What is the data?</strong> Past search queries and their corresponding counts.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Search Query</th><th>Count</th></tr></thead>
+            <tbody>
+              <tr><td>why is the sky blue?</td><td>49,999</td></tr>
+              <tr><td>why is water wet?</td><td>50,000</td></tr>
+              <tr><td>what is the color of the ocean</td><td>5,000</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><strong>Q: What does eventual consistency mean here? When is the data changing?</strong> Every time
+        someone searches, some entry's count changes, and the top-5 for some <code class="inl">partial_query</code>
+        may change. It's possible for a new count to reflect in the top-5 with a delay — for some time the true
+        count of Query1 may exceed Query2, yet we still show Query2 first.</p>
+
+        <div class="callout key">
+          <span class="c-title">Q: Can we afford stale reads? — Yes.</span>
+          <p>The user doesn't know (or care about) the true search counts. We don't need a strict order in the
+          suggestions, and it's fine for a few good suggestions to be missing <em>as long as the ones shown are
+          also good enough</em>. So we lean toward <strong>availability</strong> over strict consistency.</p>
+        </div>
+
+        <p><strong>Q: What does data loss mean here?</strong> If someone searched but, for whatever reason, we
+        failed to increment that query's count (it didn't get logged), the counts will be off by a small amount:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Search Query</th><th>True Count</th><th>DB Count</th></tr></thead>
+            <tbody>
+              <tr><td>why is suryakumar dropped?</td><td>49,999</td><td>49,999</td></tr>
+              <tr><td>why is water wet?</td><td>50,000</td><td>49,998 <em>(lost a few)</em></td></tr>
+              <tr><td>what is the color of the ocean</td><td>5,000</td><td>5,000</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout key">
+          <span class="c-title">Q: Can we afford data loss? — Yes.</span>
+          <p>Same reasons as stale reads: being off by a small amount in the counts doesn't hurt the user
+          experience.</p>
+        </div>
+
+        <h3>Consistency vs Latency</h3>
+        <div class="callout warn">
+          <span class="c-title">Ultra-low latency</span>
+          <p>We're literally <strong>competing with the user's typing speed</strong>. Target: each typeahead query
+          takes <strong>&lt; 10 ms</strong>. Note this <em>excludes</em> the network round trip, which depends on
+          the user's distance from the servers — we don't control that, and the only fix is
+          <strong>geolocated servers</strong>.</p>
+        </div>
+
+        <h3>Other NFRs (briefly)</h3>
+        <ul>
+          <li><strong>Security:</strong> do NOT roll your own unless you're a security expert — "99% of security
+          issues happen because non-experts try to do security."</li>
+          <li><strong>Observability</strong>, <strong>rate limits</strong>, <strong>idempotency</strong>, and
+          <strong>delivery guarantees</strong> are worth a mention.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">"Read-heavy" is the key insight</span>
+          <p>People <em>read</em> suggestions far more than the popular-query set <em>changes</em>. So this is an
+          overwhelmingly <span class="term">read-heavy</span> system — which (combined with "stale is fine") is why
+          we precompute answers and cache aggressively rather than calculate live.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Reason with <strong>PACELC</strong>, don't guess. Here we can tolerate <strong>stale reads</strong> and
+          even <strong>small data loss</strong> (users don't know the true counts) → favor
+          <strong>availability/eventual consistency</strong>. But latency is brutal: <strong>&lt;10 ms</strong> per
+          query (excluding round trip; geolocate servers for that). Don't DIY security; remember observability, rate
+          limits, idempotency, delivery guarantees.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SCALE ESTIMATION ===================== -->
+      <section id="estimation">
+        <h2><span class="sec-num">5</span> Scale estimation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before building a bridge you guess how many cars will cross it — not the exact number, just "thousands?
+          millions?" If millions, you build a very different bridge. We do the same: rough math to learn whether
+          one librarian can cope, or whether we need a whole building full of them.</p>
+        </div>
+
+        <p>The scale dictates our design choices. We want to know: the <strong>amount of data</strong> (is sharding
+        needed?), and the <strong>amount of load</strong> (requests/second per API, peak vs average, read- vs
+        write-heavy). Those guide the choice of database, cache and sharding.</p>
+
+        <div class="callout note">
+          <span class="c-title">Does accuracy matter? No.</span>
+          <p>These are <strong>back-of-the-envelope</strong> estimates. Being off by a factor of 2 or 3 is fine
+          (true 100 → you say 50 or 200, okay; you say 10, <em>not</em> okay — off by 10×). But every estimate must
+          be <strong>justified</strong> — don't pull numbers from thin air, and state every assumption as an
+          assumption.</p>
+        </div>
+
+        <h3>Step 1 — Daily Active Users</h3>
+        <p>Handy reference numbers: world population ~8 billion; internet users ~5 billion; India ~1.4 billion;
+        USA ~350 million. And the <span class="term">Pareto principle</span> (80/20): only ~20% of users are active.
+        (For social media it extends to <strong>80-20-1</strong>: 80% passively browse, 20% interact, 1% create.)</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked estimate — load</span>
+          <pre><span class="cm"># Assumption: Google has 5 billion users.</span>
+DAU            = 20% of 5 billion        = <span class="nm">1 billion</span> users
+
+<span class="cm"># Assumption: 20 searches / active user / day</span>
+searches/day   = 20 * 1 billion          = <span class="nm">20 billion</span> searches/day
+
+<span class="cm"># 1 day = 86,400 s ~= 10^5 s</span>
+searches/sec   = 20*10^9 / 10^5          = <span class="nm">200,000</span> searches/sec
+<span class="cm"># note: these go to the SEARCH api, not typeahead</span>
+
+<span class="cm"># Assumption: ~10 typeahead calls per search</span>
+<span class="cm"># (avg query ~10 letters, start at letter 3 => 10-3=7 ~ 10)</span>
+typeahead/sec  = 200,000 * 10            = <span class="nm">2,000,000</span> typeaheads/sec
+
+log_search/sec = 1 per search            = <span class="nm">200,000</span> req/sec
+
+<span class="cm"># Peak load ~= 5x average</span>
+peak typeahead = 5 * 2,000,000           = <span class="nm">10,000,000</span> typeaheads/sec</pre>
+          <p>Why ~10 typeaheads per search: typing <em>"why is the sky blue"</em> fires
+          <code class="inl">typeahead("why")</code>, <code class="inl">typeahead("why i")</code>,
+          <code class="inl">typeahead("why is")</code>, … one per keystroke after the third letter.</p>
+        </div>
+
+        <h3>Step 2 — Amount of data</h3>
+        <p>The data is past search queries &amp; their counts (avg query size <strong>10 letters</strong>,
+        assumed earlier). How many <em>entries</em>? Not one per search — repeated searches just
+        <strong>update</strong> a count; only <strong>new (never-seen-before) unique queries</strong> add rows.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked estimate — storage</span>
+          <pre><span class="cm"># Assumption: ~10% of searches are brand-new queries</span>
+new entries/day = 10% of 20 billion      = <span class="nm">2 billion</span> entries/day
+
+<span class="cm"># ~10 bytes per entry</span>
+data/day        = 10 bytes * 2 billion   = <span class="nm">20 GB</span> / day
+
+<span class="cm"># over 20 years (365 ~= 400 days)</span>
+total           = 20 GB/day * 20*400 days
+                = 16 * 10^4 GB           = <span class="nm">160 TB</span></pre>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key conclusion — we need sharding</span>
+          <p>Can 160 TB fit on a single server? <em>Probably yes</em> with modern storage. But can a single server
+          handle <strong>10 million requests/second</strong>? <strong>Absolutely not.</strong> So
+          <strong>sharding is required</strong> — driven by load, not storage.</p>
+        </div>
+
+        <h3>Step 3 — Read-heavy or write-heavy?</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>API</th><th>Type</th><th>Rate</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">typeahead</code></td><td>read</td><td>2,000,000 req/sec</td></tr>
+              <tr><td><code class="inl">log_search</code></td><td>write</td><td>200,000 req/sec</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Reads are <strong>10× writes</strong>, so we call this <strong>read-heavy</strong> — even though the
+        writes are themselves significant.</p>
+        <div class="callout key">
+          <span class="c-title">The design rule this unlocks</span>
+          <p>When a system is read-heavy <em>and</em> the writes are also significant: <strong>absorb the reads in a
+          cache</strong>, and <strong>optimize the database for writes</strong>. No database is optimized for both
+          reads and writes — that's impossible.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Justified back-of-envelope (off by 2–3× is fine): ~1B DAU → ~200k searches/sec → ~<strong>2M
+          typeaheads/sec</strong> (~<strong>10M at peak</strong>), ~200k <code class="inl">log_search</code>/sec.
+          Storage ~<strong>160 TB</strong> over 20 years. The 10M QPS (not the storage) forces
+          <strong>sharding</strong>. Reads are 10× writes ⇒ <strong>read-heavy</strong> ⇒ cache the reads, optimize
+          the DB for writes.
+        </div>
+      </section>
+
+      <!-- ===================== 2. TRIE ===================== -->
+      <section id="trie">
+        <h2><span class="sec-num">6</span> The Trie data structure</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a giant family tree, but for words. At the very top is "nothing." Below it are 26 branches,
+          one for each first letter. Follow the "c" branch, then "a," then "t," and you've spelled "cat." Every
+          word that starts with "ca" — cat, car, cake — lives down the same "c → a" hallway. So if you only know
+          the start of a word, you just walk down that hallway and collect everything hanging below. That word-tree
+          is called a <strong>trie</strong>.</p>
+        </div>
+
+        <p>A <span class="term">trie</span> (pronounced "try," from re<em>trie</em>val — also called a
+        <span class="term">prefix tree</span>) is a tree where each <strong>edge</strong> represents one character
+        and each <strong>path from the root</strong> spells out a prefix. It's the natural fit for autocomplete
+        because finding "all words starting with P-R-E" is just "walk to the node at the end of PRE, then look below."</p>
+
+        <h3>How terms are stored</h3>
+        <p>Every <span class="term">node</span> in the trie holds a map from a character to a child node. To store
+        the word "cat," we walk/create children <code class="inl">c → a → t</code> and mark the final node as the
+        end of a real word. To store "car" too, it <em>shares</em> the <code class="inl">c → a</code> path and only
+        branches at the third letter. Shared prefixes = saved space.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">●</div><div class="s-t">root</div><div class="s-d">empty start</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">c</div><div class="s-t">"c"</div><div class="s-d">prefix c</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">a</div><div class="s-t">"ca"</div><div class="s-d">prefix ca</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">t</div><div class="s-t">"cat" ✓</div><div class="s-d">word ends</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">r</div><div class="s-t">"car" ✓</div><div class="s-d">branches off "ca"</div></div>
+        </div>
+
+        <h3>Insertion and lookup</h3>
+        <p><strong>Insertion</strong>: walk the word letter by letter, creating any missing child nodes, and mark
+        the last node as a word-end. <strong>Lookup of a prefix</strong>: walk the prefix letter by letter from the
+        root; if you ever can't find the next child, there are no matches. If you reach the end of the prefix, the
+        node you land on is the root of a subtree containing every word with that prefix.</p>
+
+        <div class="callout example">
+          <span class="c-title">A trie in code (Python)</span>
+          <pre><span class="kw">class</span> TrieNode:
+    <span class="kw">def</span> __init__(self):
+        self.children = {}        <span class="cm"># char -&gt; TrieNode</span>
+        self.is_word  = <span class="kw">False</span>
+        self.top_k    = []        <span class="cm"># precomputed best suggestions here</span>
+
+<span class="kw">class</span> Trie:
+    <span class="kw">def</span> __init__(self):
+        self.root = TrieNode()
+
+    <span class="kw">def</span> insert(self, word):
+        node = self.root
+        <span class="kw">for</span> ch <span class="kw">in</span> word:                 <span class="cm"># walk/create the path</span>
+            <span class="kw">if</span> ch <span class="kw">not in</span> node.children:
+                node.children[ch] = TrieNode()
+            node = node.children[ch]
+        node.is_word = <span class="kw">True</span>
+
+    <span class="kw">def</span> _find(self, prefix):              <span class="cm"># walk to the prefix node</span>
+        node = self.root
+        <span class="kw">for</span> ch <span class="kw">in</span> prefix:
+            <span class="kw">if</span> ch <span class="kw">not in</span> node.children:
+                <span class="kw">return</span> <span class="kw">None</span>          <span class="cm"># no words with this prefix</span>
+            node = node.children[ch]
+        <span class="kw">return</span> node
+
+    <span class="kw">def</span> suggest(self, prefix):
+        node = self._find(prefix)
+        <span class="kw">return</span> node.top_k <span class="kw">if</span> node <span class="kw">else</span> []</pre>
+        </div>
+
+        <h3>The clever bit: store top-k <em>at each node</em></h3>
+        <p>Here's the trick that makes autocomplete fast. The naive way is: walk to the prefix node, then explore
+        the <em>whole subtree below it</em> to gather all matching words and sort them by popularity. For a popular
+        prefix like "a," that subtree is enormous — far too slow per keystroke.</p>
+
+        <p>Instead, we <strong>precompute and cache the top-k suggestions directly on every node</strong> (the
+        <code class="inl">top_k</code> list above). When we build the trie offline, each node already carries a
+        ready-made answer: the k most popular complete queries that pass through it. Now a lookup is just "walk to
+        the node, read its list." No subtree exploration at request time.</p>
+
+        <div class="callout example">
+          <span class="c-title">What a node's top_k looks like</span>
+          <p>The node for prefix <code class="inl">"how to ti"</code> might store, already sorted by popularity:</p>
+          <pre>node[<span class="st">"how to ti"</span>].top_k = [
+    (<span class="st">"how to tie a tie"</span>,   <span class="nm">980000</span>),
+    (<span class="st">"how to tie shoes"</span>,   <span class="nm">540000</span>),
+    (<span class="st">"how to title a paper"</span>,<span class="nm">120000</span>),
+    (<span class="st">"how to time a roast"</span>, <span class="nm">30000</span>),
+]</pre>
+          <p>A request for that prefix returns this list <em>instantly</em> — the ranking work was done ahead of time.</p>
+        </div>
+
+        <h3>Complexity (the Big-O)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Insert a word of length L</td><td><strong>O(L)</strong></td><td>One step per character.</td></tr>
+              <tr><td>Look up a prefix of length P</td><td><strong>O(P)</strong></td><td>Walk P characters from the root.</td></tr>
+              <tr><td>Get top-k (with precomputed lists)</td><td><strong>O(P + k)</strong></td><td>Walk to the node, copy its k items.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The beautiful part: lookup cost depends only on <strong>how long the prefix is</strong>, <em>not</em> on
+        how many millions of queries are stored. Typing 9 characters costs 9 steps whether the trie holds a thousand
+        words or a billion. That's why a trie hits our latency target.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The trade-off</span>
+          <p>Storing a top-k list on <em>every</em> node uses a lot of memory (we're trading space for speed — a
+          recurring theme in HLD). And because the lists are precomputed, the trie is essentially
+          <strong>read-only at serving time</strong>: you don't edit it live, you rebuild it offline (next section).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>trie</strong> stores words as paths of characters, sharing common prefixes. Insert and prefix
+          lookup are O(L) and O(P) — independent of dataset size. The autocomplete trick is to
+          <strong>precompute the top-k popular suggestions on each node</strong>, turning a request into a quick
+          walk-and-read at the cost of extra memory and a read-only structure.
+        </div>
+      </section>
+
+      <!-- ===================== 3. RANKING ===================== -->
+      <section id="ranking">
+        <h2><span class="sec-num">7</span> Ranking &amp; data collection</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the librarian keeps a tally chart. Every time someone asks a question, she adds a tick mark
+          next to it. When you start a question, she suggests the ones with the <em>most</em> ticks first — because
+          lots of people asking it probably means it's what you want too. And she slowly fades old tick marks so
+          last year's hot question doesn't beat today's. That tally chart is how she ranks.</p>
+        </div>
+
+        <p>In Section 2 we waved our hands and said each node "knows" its top-k. Now we earn that. Where do the
+        popularity numbers come from, and how do we keep them current?</p>
+
+        <h3>Ranking by frequency and recency</h3>
+        <p>The simplest signal is <span class="term">frequency</span>: how many times has each full query been
+        searched? More searches → higher rank. But pure frequency makes the list stale — an all-time favorite would
+        cling to the top forever. So we add <span class="term">recency</span>: recent searches should count for more
+        than ancient ones.</p>
+
+        <p>A common technique is a <span class="term">time-decayed score</span>: every day, multiply all existing
+        counts by a factor like 0.95, then add today's fresh counts. Old popularity gently fades; trending queries
+        rise. The final rank for a query is just this decayed score.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: decay in action</span>
+          <p>Query <em>"world cup schedule"</em> with a daily decay of 0.95:</p>
+          <pre><span class="cm"># score_today = score_yesterday * decay + searches_today</span>
+Day 1:   0      * 0.95 + <span class="nm">100</span>  = <span class="nm">100</span>
+Day 2:   100    * 0.95 +  <span class="nm">50</span>  = <span class="nm">145</span>
+Day 3:   145    * 0.95 +   <span class="nm">0</span>  = <span class="nm">138</span>   <span class="cm"># no searches: fades</span>
+Day 4:   138    * 0.95 + <span class="nm">900</span>  = <span class="nm">1031</span>  <span class="cm"># goes viral: jumps up</span></pre>
+          <p>Notice a once-popular query naturally decays when interest dies, and a sudden spike quickly lifts it.
+          This keeps suggestions feeling alive without us hand-curating anything.</p>
+        </div>
+
+        <h3>How query logs feed popularity</h3>
+        <p>Every search a user runs is recorded in a <span class="term">query log</span> — append-only lines of
+        "this query was searched at this time." At our scale that's billions of lines a day, far too much to count
+        live on the serving path. Instead the logs stream into a <span class="term">message queue</span> (think of a
+        conveyor belt like Kafka) and pile up in cheap storage for batch processing.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why not just count as queries arrive?</span>
+          <p>Updating a live ranking on every single search would put writes on the hot read path and wreck our
+          latency — exactly the read-heavy lesson from Section 1. Decoupling "collect now, compute later" keeps the
+          fast serving path read-only and lets the heavy counting happen safely off to the side.</p>
+        </div>
+
+        <h3>The offline aggregation pipeline</h3>
+        <p>This is the <span class="term">offline pipeline</span> — a scheduled job (say, hourly) that turns raw
+        logs into a fresh trie. "Offline" means it runs separately from live traffic; users never wait on it.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">⌨️</div><div class="s-t">1. Log</div><div class="s-d">Every search written to query logs</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚚</div><div class="s-t">2. Collect</div><div class="s-d">Logs stream to a queue + storage</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧮</div><div class="s-t">3. Aggregate</div><div class="s-d">Count + time-decay per query</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌳</div><div class="s-t">4. Build trie</div><div class="s-d">Insert top queries, fill top-k on nodes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚀</div><div class="s-t">5. Publish</div><div class="s-d">Ship the new trie to serving nodes</div></div>
+        </div>
+
+        <p>Step 3 is typically a <span class="term">MapReduce</span>-style job: "map" each log line to
+        <code class="inl">(query, 1)</code>, then "reduce" by summing per query and applying decay. Step 4 builds a
+        fresh trie and, while building, computes each node's top-k by merging the top-k of its children (a child's
+        best suggestions are candidates for the parent). Step 5 atomically swaps the new trie in for the old one.</p>
+
+        <div class="callout example">
+          <span class="c-title">Computing a node's top_k from its children</span>
+          <pre><span class="cm"># A node's best suggestions come from merging its</span>
+<span class="cm"># children's best suggestions, plus its own word if any.</span>
+<span class="kw">def</span> compute_top_k(node, k=<span class="nm">5</span>):
+    candidates = []
+    <span class="kw">if</span> node.is_word:
+        candidates.append((node.word, node.score))
+    <span class="kw">for</span> child <span class="kw">in</span> node.children.values():
+        compute_top_k(child, k)          <span class="cm"># bottom-up</span>
+        candidates.extend(child.top_k)
+    <span class="cm"># keep only the k highest-scoring</span>
+    node.top_k = sorted(candidates, key=<span class="kw">lambda</span> x: -x[<span class="nm">1</span>])[:k]</pre>
+          <p>Because each node only keeps its k best, the merge stays cheap even near the root.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Ranking is a <strong>blend of frequency and recency</strong> (time-decayed scores), and it's computed
+          <strong>offline from query logs</strong>, never on the live request. The serving trie is just a frozen
+          snapshot of "what's popular right now," rebuilt and swapped in periodically — the same prefill-then-serve
+          spirit you'll see all over HLD.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Rank queries by a <strong>time-decayed popularity score</strong> so trending beats stale. Searches are
+          captured in <strong>query logs</strong> and processed by an <strong>offline aggregation pipeline</strong>
+          (collect → aggregate/decay → build trie with top-k on each node → publish), keeping all the heavy counting
+          off the fast read path.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SERVING ===================== -->
+      <section id="serving">
+        <h2><span class="sec-num">8</span> Serving at scale</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One librarian can't answer a whole stadium at once. So we hire many identical librarians (copies), put
+          a greeter at the door to send each person to a free one (load balancing), and split the giant book
+          collection alphabetically across rooms so no single room is overwhelmed (sharding). We also keep a
+          cheat-sheet of the most-asked questions right at the front desk (caching), and we politely ask you to
+          finish a few letters before we run off to fetch an answer (debouncing). Together they keep everyone served
+          in a blink.</p>
+        </div>
+
+        <p>We now have a fast trie (Section 2) kept fresh by an offline pipeline (Section 3). The last job is
+        delivering it to ~400k QPS with sub-100 ms latency. We reuse the big HLD building blocks from earlier
+        sessions.</p>
+
+        <h3>Caching hot prefixes</h3>
+        <p>A tiny fraction of prefixes accounts for a huge fraction of traffic — single letters and common starts
+        like "f," "you," "how to." We put a <span class="term">cache</span> (a fast in-memory key→value store like
+        Redis, recall the caching session) in front of the trie, keyed by prefix. The first lookup of "how to"
+        computes the answer; the next million read it straight from cache.</p>
+
+        <div class="callout example">
+          <span class="c-title">Why caching wins here</span>
+          <p>Suggestions for "how to" are identical for everyone and change only when we rebuild the trie. That makes
+          them perfect cache entries: <strong>same input → same output, rarely changing.</strong> A cache hit avoids
+          even the cheap trie walk and shaves precious milliseconds. We set a short TTL (time-to-live) so the cache
+          refreshes after each trie rebuild.</p>
+        </div>
+
+        <h3>Sharding the trie</h3>
+        <p>Our 10 GB trie fits in one machine's RAM, but one machine can't handle 400k QPS alone. So we
+        <span class="term">shard</span> (split the data across machines, recall the sharding session). The natural
+        key is the <strong>prefix's first letter(s)</strong>: shard A handles prefixes starting "a," shard B handles
+        "b," and so on. A request for "how to ti" is routed to the "h" shard.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The hot-shard problem</span>
+          <p>Naive first-letter sharding is uneven — far more queries start with "s" than "z," so the "s" shard melts
+          while "z" sits idle. Fixes: shard on the first <em>two or three</em> letters for finer slices, or use
+          <span class="term">consistent hashing</span> to spread load evenly. And because the trie is read-only at
+          serving time, we can freely keep <strong>multiple replicas of each shard</strong> to share the read load —
+          read-heavy systems love replication.</p>
+        </div>
+
+        <h3>CDN and edge</h3>
+        <p>The fastest request is the one that never reaches your servers. A <span class="term">CDN</span>
+        (Content Delivery Network — a fleet of caches physically close to users) and <span class="term">edge</span>
+        nodes can cache the suggestions for the most common prefixes right next to the user, in their region.
+        Latency is dominated by physical distance, so answering "how to" from a city 50 km away instead of a data
+        center 5,000 km away is a giant win for our latency budget.</p>
+
+        <h3>Debouncing on the client</h3>
+        <p>Half of our scaling problem can be solved in the browser. <span class="term">Debouncing</span> means: don't
+        fire a request on <em>every</em> keystroke — wait until the user pauses typing (say 150–300 ms) and only then
+        send the latest prefix. A fast typer entering "how to tie" generates one request instead of ten.</p>
+
+        <div class="callout example">
+          <span class="c-title">Debounce in code (client-side JS)</span>
+          <pre><span class="kw">let</span> timer;
+input.addEventListener(<span class="st">"input"</span>, () =&gt; {
+  clearTimeout(timer);                  <span class="cm">// cancel the pending request</span>
+  timer = setTimeout(() =&gt; {            <span class="cm">// wait for a pause</span>
+    fetchSuggestions(input.value);      <span class="cm">// only the latest prefix is sent</span>
+  }, <span class="nm">200</span>);                            <span class="cm">// 200 ms of quiet</span>
+});</pre>
+          <p>This alone can cut autocomplete QPS several-fold — the cheapest scaling lever we have, and it lives
+          entirely on the client.</p>
+        </div>
+
+        <h3>The end-to-end request flow</h3>
+        <p>Putting every block together, here's the journey of one keystroke from your keyboard to a dropdown:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">⌨️</div><div class="s-t">1. Type</div><div class="s-d">Keystroke, debounced in browser</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌍</div><div class="s-t">2. Edge / CDN</div><div class="s-d">Hot prefix? Return instantly</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚖️</div><div class="s-t">3. Load balancer</div><div class="s-d">Route to a free server</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">4. Cache</div><div class="s-d">Redis hit on prefix? Return</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌳</div><div class="s-t">5. Trie shard</div><div class="s-d">Walk to node, read top-k</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📋</div><div class="s-t">6. Respond</div><div class="s-d">Dropdown shows suggestions</div></div>
+        </div>
+
+        <p>Each layer is an opportunity to answer early: the request stops at the first layer that already knows the
+        answer. Most requests never reach the trie at all — they're caught at the edge or in the cache. That layered,
+        "answer as early as possible" shape is the heart of serving any read-heavy system at scale.</p>
+
+        <div class="callout note">
+          <span class="c-title">Graceful degradation</span>
+          <p>From Section 1, autocomplete is a nice-to-have. If the suggestion service is overloaded or down, the
+          page should simply show <em>no dropdown</em> and let the user search normally — never block the search box.
+          Designing the failure to be invisible is just as important as designing the success.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Serve at scale by stacking the HLD building blocks: <strong>debounce</strong> on the client to cut QPS,
+          <strong>CDN/edge</strong> to answer near the user, a <strong>load balancer</strong> to spread traffic,
+          a <strong>cache</strong> for hot prefixes, and a <strong>sharded, replicated trie</strong> behind it.
+          Each layer answers as early as it can, and autocomplete degrades gracefully if it fails.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just designed a real, production-grade system end to end. Here's the one-paragraph story that
+        connects all four topics:</p>
+        <div class="bigidea">
+          <p>Autocomplete must return the <strong>top-k most popular queries</strong> for a typed
+          <strong>prefix</strong> in <strong>under ~100 ms</strong> at <strong>hundreds of thousands of QPS</strong> —
+          a read-heavy problem whose data is small enough to live in RAM. We store the queries in a
+          <strong>trie</strong> and precompute each node's <strong>top-k</strong> so a lookup is a quick O(P+k)
+          walk-and-read. Those popularity numbers come from <strong>query logs</strong>, turned into
+          <strong>time-decayed rankings</strong> by an <strong>offline pipeline</strong> that periodically rebuilds
+          and publishes the trie. Finally we serve it at scale by stacking <strong>debouncing</strong>,
+          <strong>CDN/edge</strong>, <strong>load balancing</strong>, <strong>caching of hot prefixes</strong>, and a
+          <strong>sharded, replicated trie</strong> — each layer answering as early as it can, and failing
+          gracefully when it can't.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the 5 steps of the design approach, and how is the 45 min split?</summary>
+          <p class="ans">(1) Problem statement, (2) Functional requirements, (3) Non-functional requirements,
+          (4) Scale estimation, (5) API + System design. Roughly the first 20–25 min on steps 1–4 (understanding),
+          the remaining 20–25 min on step 5 (building).</p>
+        </details>
+        <details class="quiz">
+          <summary>How is typeahead different from general autocomplete?</summary>
+          <p class="ans">Autocomplete (keyboards, IDEs, Grammarly, Gmail) is usually local/standalone and personal to
+          you. Typeahead is always tied to search, and its suggestions are the most popular queries searched
+          <em>globally</em> in the past that prefix-match what you typed.</p>
+        </details>
+        <details class="quiz">
+          <summary>Can the typeahead system tolerate stale reads and small data loss? Why?</summary>
+          <p class="ans">Yes to both. Users don't know or care about the true search counts, and we don't need a
+          strict ordering — a few good suggestions missing is fine as long as the shown ones are good enough. So we
+          favor availability/eventual consistency.</p>
+        </details>
+        <details class="quiz">
+          <summary>Walk the load estimate: from DAU to peak typeahead QPS.</summary>
+          <p class="ans">5B users × 20% = 1B DAU; × 20 searches/day = 20B searches/day ÷ 10⁵ s ≈ 200k searches/sec;
+          × ~10 typeaheads/search = 2M typeaheads/sec; × 5 peak factor = ~10M typeaheads/sec at peak. (log_search ≈
+          200k/sec.)</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is autocomplete described as a "read-heavy" system, and why does that matter?</summary>
+          <p class="ans">Users read suggestions billions of times a day, but the popular-query set changes slowly,
+          so there are far more reads than writes. That justifies precomputing answers, caching aggressively, and
+          replicating the read-only trie.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the time complexity of a prefix lookup in a trie, and what does it depend on?</summary>
+          <p class="ans">O(P) to walk the prefix (plus O(k) to copy the precomputed suggestions). It depends only on
+          the prefix length P, not on how many millions of queries are stored — which is why it's fast at any scale.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why precompute top-k on each node instead of searching the subtree at request time?</summary>
+          <p class="ans">Exploring the whole subtree below a popular prefix (like "a") is far too slow per keystroke.
+          Precomputing the top-k offline turns the request into a cheap walk-and-read, trading extra memory for speed.</p>
+        </details>
+        <details class="quiz">
+          <summary>How do we keep suggestions fresh without slowing down live requests?</summary>
+          <p class="ans">Capture searches in query logs, then run an offline pipeline that aggregates them with a
+          time-decayed score, rebuilds the trie, and swaps it in periodically. All the counting happens off the hot
+          read path.</p>
+        </details>
+        <details class="quiz">
+          <summary>Naive first-letter sharding overloads some shards. Name two fixes.</summary>
+          <p class="ans">(1) Shard on the first two or three letters for finer, more even slices; (2) use consistent
+          hashing to distribute load evenly. Also replicate each read-only shard to share the read load.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is debouncing and why is it the cheapest scaling lever?</summary>
+          <p class="ans">Debouncing waits for a short typing pause before sending only the latest prefix, instead of
+          firing on every keystroke. It can cut QPS several-fold and lives entirely on the client — no server cost.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/11YhxJwEiwWLVUoSAfFEacY0e49hb7zg_enOLpsIvNIc/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Case Study: Google Search Typeahead</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li>📄 <a href="https://github.com/donnemartin/system-design-primer#designing-a-system-that-scales-to-millions-of-users-on-aws" target="_blank" rel="noopener">The System Design Primer</a> — widely-used reference covering caching, sharding, and load balancing.</li>
+    <li>📄 <a href="https://en.wikipedia.org/wiki/Trie" target="_blank" rel="noopener">Trie (prefix tree) — Wikipedia</a> — the data structure at the heart of autocomplete, with complexity analysis.</li>
+    <li>📄 <a href="https://systemdesign.one/autocomplete-system-design/" target="_blank" rel="noopener">Design a Search Autocomplete System — write-up</a> — an end-to-end typeahead design with tries, ranking, and serving.</li>
+    <li>📄 <a href="https://kafka.apache.org/documentation/" target="_blank" rel="noopener">Apache Kafka documentation</a> — the message queue used to stream query logs into the offline aggregation pipeline.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-11.html"><div class="dir">← Previous</div><div class="ttl">Session 11: NoSQL Internals — LSM Tree 2</div></a>
+        <a class="next" href="session-13.html"><div class="dir">Next →</div><div class="ttl">Session 13: Case Study — IRCTC</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 12 — Case Study — Search Typeahead / Autocomplete · You designed a system the whole internet uses 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

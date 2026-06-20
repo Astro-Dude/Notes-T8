@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 16 — Distributed Databases (Finale)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 16</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 16 · Distributed Databases</span>
+      <h1>When one machine isn't enough: databases that span many computers</h1>
+      <p class="lead">
+        This is the <em>final</em> session of the whole DBMS course — congratulations on making it here! So far
+        every database we studied lived on a single machine. Today we ask the big question: what if your data is
+        too big, or too important, to trust to one computer? We'll learn how databases spread across many machines,
+        how they stay consistent, and the famous trade-off (the CAP theorem) that no distributed system can escape.
+        As always, every topic starts with a tiny "explain like I'm 5" story, then we go deeper with real examples.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 19 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why distribute a database?</a></li>
+          <li><a href="#partition">Partitioning &amp; replication</a></li>
+          <li><a href="#2pc">Distributed transactions &amp; 2PC</a></li>
+          <li><a href="#cap">The CAP theorem</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY DISTRIBUTE ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why distribute a database?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you run a tiny lemonade stand and keep all your money in one piggy bank. Easy! But what if you
+          grow into a hundred stands across the whole city? One piggy bank can't hold all the coins, and if it
+          breaks, you lose <em>everything</em>. So you get many piggy banks in many places. Now you can hold more
+          money <strong>and</strong> if one breaks, the others still work. That's what a distributed database does
+          with data instead of coins.</p>
+        </div>
+
+        <p>Up to now in this course, every database we built lived on <strong>one machine</strong> — one disk, one
+        buffer pool (recall Session 3), one set of indexes (Session 4). A <span class="term">distributed
+        database</span> is a single logical database whose data is stored on <strong>many machines</strong> (called
+        <span class="term">nodes</span>) that talk to each other over a network and cooperate to look like one
+        database to the user.</p>
+
+        <h3>The two big reasons to distribute</h3>
+        <p>There are essentially two motivations, and it's worth keeping them separate in your head.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Goal</th><th>What it means</th><th>Why a single machine fails</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Scalability</strong></td><td>Handle more data and more requests than one machine can.</td><td>A single server has a hard ceiling on disk, RAM, and CPU. Eventually you simply run out.</td></tr>
+              <tr><td><strong>Availability</strong></td><td>Keep working even when something breaks.</td><td>One machine is a <span class="term">single point of failure</span> — if it dies, your whole app is down.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Scale up vs scale out</h3>
+        <p>When a database gets overwhelmed, you have two choices:</p>
+        <ul>
+          <li><span class="term">Scaling up</span> (vertical scaling) — buy a <em>bigger</em> machine: more RAM, more
+          CPU, faster disk. Simple, but expensive and capped — there is no infinitely large computer.</li>
+          <li><span class="term">Scaling out</span> (horizontal scaling) — buy <em>more</em> machines and split the
+          work among them. Cheaper commodity hardware, and (in principle) you can keep adding machines forever.
+          Distributed databases are all about scaling out.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example</span>
+          <p>A social network has 2 billion users. Their profile data alone might be hundreds of terabytes —
+          far more than any single disk holds. And they get millions of reads per second. No single machine on Earth
+          can serve that. So the data is split across <strong>thousands</strong> of nodes, each holding a slice and
+          serving a fraction of the traffic. That's scaling out.</p>
+        </div>
+
+        <h3>The catch: distribution creates brand-new problems</h3>
+        <p>Spreading data across machines sounds great until you realise the machines must talk over a
+        <strong>network</strong> — and networks are slow and unreliable. Here are the new headaches you sign up for:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>New problem</th><th>What goes wrong</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Network latency</span></td><td>Talking to another machine takes milliseconds — thousands of times slower than reading local RAM. Coordination is expensive.</td></tr>
+              <tr><td><span class="term">Partial failure</span></td><td>On one machine, things either work or the whole thing crashes. With many machines, <em>some</em> can fail while others keep running — and you often can't tell whether a silent node has crashed or is just slow.</td></tr>
+              <tr><td><span class="term">Network partition</span></td><td>A network fault can split the cluster into groups that can't talk to each other, even though every node is alive. This is the scenario behind the CAP theorem (Topic 4).</td></tr>
+              <tr><td>Keeping copies in sync</td><td>If the same data lives on several nodes, how do you make sure they all agree? (Topic 2 &amp; 3.)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The eight fallacies</span>
+          <p>Engineers famously assume the network is reliable, fast, and free — it is <strong>none</strong> of those.
+          The hardest part of distributed databases isn't storing data on many machines; it's reasoning about what
+          happens when the messages between them are <em>delayed, dropped, or duplicated</em>. Almost everything in
+          this session is really about taming partial failure.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We distribute a database to <strong>scale out</strong> (handle more data/traffic than one machine can) and
+          to stay <strong>available</strong> (survive failures). The price is a set of hard new problems — network
+          latency, partial failure, and partitions — that single-machine databases never had to face.
+        </div>
+      </section>
+
+      <!-- ===================== 2. PARTITIONING & REPLICATION ===================== -->
+      <section id="partition">
+        <h2><span class="sec-num">2</span> Partitioning (sharding) &amp; replication</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a giant library with too many books for one room. <strong>Partitioning</strong> is splitting the
+          books across several rooms — A–F in room 1, G–M in room 2, and so on — so each room holds only a slice.
+          <strong>Replication</strong> is making photocopies of each room and putting them in different buildings, so
+          if one building floods, the books still survive elsewhere. Real databases do <em>both</em>: split the data
+          into slices, then keep copies of each slice.</p>
+        </div>
+
+        <p>These are the two fundamental techniques for spreading data across nodes. They solve different problems and
+        are almost always used together.</p>
+
+        <h3>Partitioning (a.k.a. sharding)</h3>
+        <p><span class="term">Partitioning</span> (in many systems called <span class="term">sharding</span>) means
+        splitting one big dataset into smaller disjoint pieces called <span class="term">shards</span> (or partitions),
+        and putting each piece on a different node. Each row lives on exactly one shard. The goal is
+        <strong>scalability</strong>: 10 nodes can hold 10× the data and serve roughly 10× the traffic.</p>
+
+        <p>The key decision is the <span class="term">partition key</span> — the column whose value decides which
+        shard a row goes to (e.g. <code class="inl">user_id</code>). There are two classic strategies:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>How it assigns rows</th><th>Good at</th><th>Weak at</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Hash partitioning</span></td><td>Compute <code class="inl">hash(key) % N</code> (or look it up in a hash ring) to pick the shard.</td><td>Spreading rows <em>evenly</em> — avoids hotspots.</td><td>Range queries (e.g. "all users created in June") — they hit every shard.</td></tr>
+              <tr><td><span class="term">Range partitioning</span></td><td>Assign contiguous ranges of the key to shards (A–F → shard 1, G–M → shard 2…).</td><td>Range queries — they touch just a few adjacent shards.</td><td>Hotspots — a popular range (e.g. recent timestamps) overloads one shard.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: routing a query</span>
+          <p>Suppose users are hash-partitioned across 4 shards on <code class="inl">user_id</code>. A client asks:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> users <span class="kw">WHERE</span> user_id = <span class="nm">8821</span>;</pre>
+          <p>The router (or smart client) computes which shard owns key <code class="inl">8821</code>:</p>
+          <pre><span class="cm">// pick the shard for this key</span>
+shard = hash(<span class="nm">8821</span>) % <span class="nm">4</span>   <span class="cm">// e.g. → 1</span>
+route query to <span class="st">"shard-1"</span> only</pre>
+          <p>Only <strong>one</strong> node does work — fast and cheap. But now ask for everyone created last week:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> users <span class="kw">WHERE</span> created_at &gt; <span class="st">'2026-06-13'</span>;</pre>
+          <p>Because hashing scattered those rows everywhere, the router must <strong>fan out</strong> the query to all
+          4 shards and merge the results — a <span class="term">scatter/gather</span> query. This is exactly the
+          trade-off in the table above: hashing is great for point lookups, painful for ranges.</p>
+        </div>
+
+        <h3>How queries find the right shard (routing)</h3>
+        <p>Something has to know the map from "partition key → node". Three common designs:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧭</div><div class="s-t">Smart client</div><div class="s-d">The client library knows the map and contacts the right node directly</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Routing tier</div><div class="s-d">A proxy/coordinator receives every query and forwards it</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗺️</div><div class="s-t">Any node</div><div class="s-d">Hit any node; it forwards to the owner if needed</div></div>
+        </div>
+
+        <h3>Rebalancing</h3>
+        <p>When you add nodes (to grow) or one dies, the data has to be moved so the load stays even — this is
+        <span class="term">rebalancing</span>. Naïve <code class="inl">hash % N</code> is terrible here: change
+        <code class="inl">N</code> from 4 to 5 and <em>almost every</em> key remaps to a different shard, forcing a
+        massive data shuffle.</p>
+        <div class="callout note">
+          <span class="c-title">Consistent hashing</span>
+          <p>The standard fix is <span class="term">consistent hashing</span> (and "virtual nodes"): keys and nodes
+          are placed on a conceptual ring, and a key belongs to the next node clockwise. Adding or removing a node
+          only moves the keys in <em>one</em> arc of the ring — roughly <code class="inl">1/N</code> of the data —
+          instead of remapping everything. Systems like Cassandra and DynamoDB use this.</p>
+        </div>
+
+        <h3>Replication</h3>
+        <p><span class="term">Replication</span> means keeping <strong>copies</strong> of the same data (each shard,
+        or the whole database) on multiple nodes called <span class="term">replicas</span>. Its goal is
+        <strong>availability and durability</strong>: if one replica dies, another still has the data, so reads and
+        writes can continue and nothing is lost.</p>
+        <p>The most common pattern is <span class="term">leader–follower</span> (also called primary–replica): one
+        replica is the <strong>leader</strong> that accepts writes, and it streams those changes to one or more
+        <strong>followers</strong> that can serve reads.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">Write</div><div class="s-d">Client writes to the leader</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📡</div><div class="s-t">Replicate</div><div class="s-d">Leader ships the change log to followers</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📖</div><div class="s-t">Read</div><div class="s-d">Clients can read from any follower</div></div>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Sync vs async — a real trade-off</span>
+          <p>If the leader waits for followers to confirm before acknowledging a write (<strong>synchronous</strong>),
+          you never lose data but writes are slower and stall if a follower is down. If it doesn't wait
+          (<strong>asynchronous</strong>), writes are fast but a follower can lag behind — so a read from a follower
+          might return <em>stale</em> data, and a crash can lose the last few writes. This tension between fresh and
+          fast is the seed of the CAP theorem (Topic 4).</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p><strong>Partitioning is for scale</strong> (split data so more nodes share the load).
+          <strong>Replication is for availability</strong> (copy data so a failure doesn't lose it or stop service).
+          Big systems combine them: split into shards, and replicate each shard across several nodes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Partitioning (sharding) splits data into disjoint shards by a partition key — hash for even spread, range
+          for range queries. Queries route to the owning shard (or scatter/gather across all). Replication keeps
+          copies for availability, usually leader–follower, with a sync-vs-async trade-off. Consistent hashing keeps
+          rebalancing cheap when nodes come and go.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DISTRIBUTED TRANSACTIONS & 2PC ===================== -->
+      <section id="2pc">
+        <h2><span class="sec-num">3</span> Distributed transactions &amp; Two-Phase Commit</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Three friends want to all jump into a pool together — nobody wants to jump if even one is going to chicken
+          out. So one friend becomes the "counter." She shouts "Ready?" and waits for every friend to yell "Ready!".
+          Only when <em>everyone</em> has said yes does she shout "JUMP!" and they all jump at once. If even one says
+          "no", she shouts "Don't jump!" and nobody moves. That careful two-step — ask everyone, then tell everyone —
+          is exactly how databases make many machines commit a transaction together.</p>
+        </div>
+
+        <p>Recall <span class="term">atomicity</span> from our transactions session: a transaction is all-or-nothing.
+        Easy on one machine. But what if a single transaction touches data on <strong>several</strong> nodes — say,
+        move $100 from an account on shard A to an account on shard B? Now atomicity must hold <em>across machines</em>:
+        either <strong>both</strong> nodes commit, or <strong>neither</strong> does. This is the
+        <span class="term">atomic commit problem</span>, and it's genuinely hard because any node (or the network) can
+        fail at the worst possible moment.</p>
+
+        <h3>Two-Phase Commit (2PC)</h3>
+        <p>The classic solution is <span class="term">Two-Phase Commit (2PC)</span>. One node acts as the
+        <span class="term">coordinator</span>; the others are <span class="term">participants</span>. As the name says,
+        it runs in two phases.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Phase</th><th>Coordinator does</th><th>Participants do</th></tr></thead>
+            <tbody>
+              <tr><td><strong>1. Prepare</strong> (voting)</td><td>Sends <code class="inl">PREPARE</code> to every participant: "can you commit?"</td><td>Each does the work, writes it durably to its log, then votes <code class="inl">YES</code> (and promises it can commit) or <code class="inl">NO</code>.</td></tr>
+              <tr><td><strong>2. Commit / Abort</strong></td><td>If <em>all</em> voted YES → send <code class="inl">COMMIT</code> to all. If <em>any</em> voted NO (or timed out) → send <code class="inl">ABORT</code> to all.</td><td>Apply the decision (commit or roll back) and reply <code class="inl">ACK</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">The crucial promise</span>
+          <p>When a participant votes <code class="inl">YES</code>, it is making a <strong>binding promise</strong>: it
+          must be able to commit later no matter what — even if it crashes and restarts in between. That's why it
+          writes everything to its durable log <em>before</em> voting (recall write-ahead logging from our recovery
+          session). It cannot change its mind. This is what makes the all-or-nothing guarantee possible.</p>
+        </div>
+
+        <h3>The handshake, as a sequence diagram</h3>
+        <pre><span class="cm">Coordinator                Participant A        Participant B</span>
+     |                          |                    |
+     |  ---- PREPARE -------&gt;    |                    |
+     |  ---- PREPARE ------------------------------&gt;  |
+     |                          | (log, then vote)   |
+     |  &lt;------- YES ----------- |                    |
+     |  &lt;------- YES ------------------------------   |
+     |                          |                    |
+   (all YES → decide COMMIT, log the decision)       |
+     |                          |                    |
+     |  ---- COMMIT --------&gt;    |                    |
+     |  ---- COMMIT ----------------------------&gt;     |
+     |  &lt;------- ACK ----------- |                    |
+     |  &lt;------- ACK ------------------------------   |
+     |                          |                    |
+   (transaction is now committed everywhere)</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the $100 transfer</span>
+          <ul>
+            <li><strong>Prepare:</strong> Coordinator asks shard A "can you take $100 off Alice?" and shard B "can you
+            add $100 to Bob?" Both check funds/locks, log the change, and vote YES.</li>
+            <li><strong>Commit:</strong> Both said YES, so the coordinator logs "COMMIT" and tells both to apply.
+            Money leaves Alice and arrives at Bob — atomically across two machines.</li>
+            <li><strong>Abort path:</strong> If shard A had said NO (insufficient funds), the coordinator tells both to
+            ABORT; Bob never receives the phantom $100. No half-completed transfer is possible.</li>
+          </ul>
+        </div>
+
+        <h3>The blocking weakness</h3>
+        <p>2PC has one famous, fatal flaw. Suppose participants have all voted <code class="inl">YES</code> and are
+        waiting for the decision — and right then the <strong>coordinator crashes</strong>. The participants are now
+        stuck: they've promised to commit, so they can't unilaterally abort, but they also haven't heard "commit", so
+        they can't proceed. They must <strong>hold their locks and wait</strong>, possibly for a long time, until the
+        coordinator recovers. This is called <span class="term">blocking</span>, and it makes the coordinator a single
+        point of failure.</p>
+        <div class="callout warn">
+          <span class="c-title">Why this matters</span>
+          <p>While participants block, the rows they touched stay locked, so other transactions queue up behind them.
+          A single coordinator crash can stall part of the system. 2PC also adds latency (two network round-trips) to
+          every distributed transaction — which is why many large systems try to <em>avoid</em> cross-shard
+          transactions altogether by choosing partition keys cleverly.</p>
+        </div>
+
+        <h3>Beyond 2PC</h3>
+        <p>Smarter protocols were invented to fix the blocking problem:</p>
+        <ul>
+          <li><span class="term">Three-Phase Commit (3PC)</span> — adds an extra "pre-commit" phase so participants can
+          make progress even if the coordinator dies. It's non-blocking in theory, but assumes a more reliable network
+          and is rarely used in practice.</li>
+          <li><span class="term">Consensus protocols — Paxos and Raft</span> — instead of one fragile coordinator, a
+          <em>group</em> of nodes agrees on each decision by majority vote. As long as a majority survives, the system
+          keeps making progress with no single point of failure. <span class="term">Raft</span> is the modern,
+          easier-to-understand favourite and powers systems like etcd, CockroachDB, and TiDB. These protocols are also
+          how a cluster reliably elects a new leader for replication (Topic 2) when the old one dies.</li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A distributed transaction must be atomic across nodes. Two-Phase Commit solves this with a coordinator: a
+          <strong>prepare</strong> phase where everyone durably votes YES/NO, then a <strong>commit/abort</strong> phase
+          where the coordinator's decision is applied everywhere. Its weakness is <strong>blocking</strong>: if the
+          coordinator crashes after votes are in, participants are stuck holding locks. 3PC, Paxos, and Raft were
+          designed to remove that single point of failure.
+        </div>
+      </section>
+
+      <!-- ===================== 4. CAP THEOREM ===================== -->
+      <section id="cap">
+        <h2><span class="sec-num">4</span> The CAP theorem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You and your sister each have a walkie-talkie and a shared toy list. You promise: (1) you'll always agree
+          on the list, and (2) you'll always answer when asked. But one day the walkie-talkies stop working — you
+          can't reach each other. Now if your sister asks "what's on the list?", you have two choices: answer with what
+          you have (maybe wrong, because you can't check with her), <em>or</em> refuse to answer until the
+          walkie-talkies work again. You <strong>can't</strong> both always-answer <em>and</em> always-agree when you
+          can't talk. That impossible choice is the CAP theorem.</p>
+        </div>
+
+        <p>The <span class="term">CAP theorem</span> (Eric Brewer, 2000) is the single most important idea in
+        distributed databases. It says that during a network partition, a distributed system can guarantee at most
+        <strong>two</strong> of these three properties:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Letter</th><th>Property</th><th>Plain English</th></tr></thead>
+            <tbody>
+              <tr><td><strong>C</strong></td><td><span class="term">Consistency</span></td><td>Every read sees the most recent write — all nodes show the same, up-to-date data. (Note: this is <em>not</em> the same "C" as in ACID.)</td></tr>
+              <tr><td><strong>A</strong></td><td><span class="term">Availability</span></td><td>Every request gets a (non-error) response — the system always answers.</td></tr>
+              <tr><td><strong>P</strong></td><td><span class="term">Partition tolerance</span></td><td>The system keeps working even when the network drops/delays messages between nodes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Why it's really a choice between C and A</h3>
+        <p>Here's the subtle but vital point: in any real distributed system, <strong>network partitions <em>will</em>
+        happen</strong> — cables break, switches fail. You don't get to opt out of P. So the theorem really forces a
+        choice that only matters <em>during a partition</em>: when two halves of your cluster can't talk, do you
+        prioritise <strong>C</strong> or <strong>A</strong>?</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔌</div><div class="s-t">Partition hits</div><div class="s-d">Network splits the cluster in two</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛑</div><div class="s-t">Choose CP</div><div class="s-d">Refuse risky requests to stay consistent</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">Choose AP</div><div class="s-d">Keep answering, accept possibly stale data</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the split bank</span>
+          <p>A bank's database is replicated across two data centres, and the link between them breaks. Alice has $100.
+          Her phone hits centre 1; her laptop hits centre 2. Both try to withdraw $100 at the same time.</p>
+          <ul>
+            <li><strong>CP choice:</strong> Each centre refuses to act alone (it can't confirm with the other). One or
+            both withdrawals get an error: "try again later." Annoying, but Alice can <em>never</em> overdraw — the data
+            stays correct. The system sacrificed <strong>availability</strong> to keep <strong>consistency</strong>.</li>
+            <li><strong>AP choice:</strong> Each centre happily approves its withdrawal using its local copy. Both
+            succeed — Alice pulls out $200 she didn't have! Available, but now inconsistent; the conflict must be
+            reconciled later. The system sacrificed <strong>consistency</strong> to keep <strong>availability</strong>.</li>
+          </ul>
+          <p>For a bank, CP is the obvious choice. For a "likes" counter on a photo, AP is fine — who cares if the
+          count is briefly off by one? <strong>The right answer depends on the application.</strong></p>
+        </div>
+
+        <h3>CP vs AP databases in the real world</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>During a partition…</th><th>Real examples</th><th>Good for</th></tr></thead>
+            <tbody>
+              <tr><td><strong>CP</strong> (consistency + partition tolerance)</td><td>May reject requests to avoid serving stale/conflicting data.</td><td>HBase, MongoDB (default), Google Spanner, etcd, ZooKeeper, traditional RDBMS clusters.</td><td>Banking, inventory, anything where wrong data is unacceptable.</td></tr>
+              <tr><td><strong>AP</strong> (availability + partition tolerance)</td><td>Always answers, may return stale data and reconcile later.</td><td>Cassandra, DynamoDB, Riak, CouchDB.</td><td>Shopping carts, social feeds, metrics, sensor data — always-on matters more than perfect freshness.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Eventual consistency &amp; the PACELC refinement</span>
+          <p>AP systems usually offer <span class="term">eventual consistency</span>: if writes stop, all replicas
+          <em>eventually</em> converge to the same value — they're just allowed to disagree briefly. CAP is also a bit
+          simplistic: the newer <span class="term">PACELC</span> theorem adds that <em>even when there's no partition
+          (E, "else")</em>, you still trade off latency (L) against consistency (C). In short: consistency almost always
+          costs you either availability or speed.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">How this ties back to everything</span>
+          <p>CAP is the deep reason behind every trade-off in this session. The sync-vs-async replication choice in
+          Topic 2? That's choosing C vs A/latency. The blocking weakness of 2PC in Topic 3? That's a CP system choosing
+          consistency over availability when the coordinator is unreachable. If you've studied the
+          <strong>High-Level Design (HLD)</strong> subject's CAP session, this is the same theorem viewed from the
+          database side — the system-design lens and the database lens meet exactly here.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The CAP theorem says that during a network partition you can keep at most two of Consistency, Availability,
+          and Partition tolerance — and since partitions are unavoidable, you're really choosing <strong>C vs A</strong>.
+          <strong>CP</strong> systems (Spanner, HBase, MongoDB) refuse rather than serve wrong data; <strong>AP</strong>
+          systems (Cassandra, DynamoDB) stay up and reconcile later (eventual consistency). The right pick depends on
+          whether your app can tolerate stale data.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You've reached the end — not just of this session, but of the <strong>entire DBMS course</strong>. Take a
+        moment: that's a huge accomplishment. 🎉</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>We distribute a database to <strong>scale out</strong> and stay <strong>available</strong>, paying for it
+          with network latency and partial failure. We spread data with <strong>partitioning</strong> (hash or range
+          sharding, routed to the owning shard, rebalanced cheaply via consistent hashing) and protect it with
+          <strong>replication</strong> (leader–follower, sync vs async). When a transaction spans nodes, we get
+          atomicity with <strong>Two-Phase Commit</strong> — a prepare vote then a commit/abort decision — whose
+          <strong>blocking</strong> weakness pushed the world toward consensus protocols like <strong>Raft</strong>.
+          And underneath every one of these choices sits the <strong>CAP theorem</strong>: when the network splits, you
+          choose consistency <em>or</em> availability, never both.</p>
+        </div>
+
+        <h3>The journey you just completed</h3>
+        <p>Look back at how far you've come. The whole course was one long climb up the database stack:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Layer</th><th>What you learned</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Architecture</strong></td><td>What a DBMS is and how its components fit together.</td></tr>
+              <tr><td><strong>Storage</strong></td><td>How rows and pages actually live on disk.</td></tr>
+              <tr><td><strong>Buffer pool</strong></td><td>How the database caches pages in memory and decides what to evict.</td></tr>
+              <tr><td><strong>Indexes</strong></td><td>B+ trees and hashing to find data fast instead of scanning everything.</td></tr>
+              <tr><td><strong>Query parse → execute → optimize</strong></td><td>How SQL becomes a plan, how operators run it, and how the optimizer picks the cheapest plan.</td></tr>
+              <tr><td><strong>Transactions &amp; concurrency</strong></td><td>ACID, isolation levels, locking, and serving many users at once without chaos.</td></tr>
+              <tr><td><strong>Recovery</strong></td><td>Write-ahead logging and how a database survives crashes without losing committed data.</td></tr>
+              <tr><td><strong>Modern &amp; distributed</strong></td><td>New architectures, and today — spreading a database across many machines.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Don't forget MiniDB</span>
+          <p>Along the way you didn't just read — you <strong>built</strong>. The <strong>MiniDB capstone</strong> tied
+          the whole stack together into a working miniature database engine: storage, buffer management, indexing,
+          query execution, and transactions, all in code you wrote yourself. That hands-on project is your proof that
+          these ideas aren't just theory — you can implement them.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the two main reasons to distribute a database?</summary>
+          <p class="ans">Scalability (handle more data and traffic than one machine can — scaling out) and availability
+          (survive failures so there's no single point of failure).</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between partitioning and replication?</summary>
+          <p class="ans">Partitioning (sharding) splits data into disjoint pieces across nodes for scale — each row lives
+          on one shard. Replication keeps copies of data on multiple nodes for availability and durability.</p>
+        </details>
+        <details class="quiz">
+          <summary>When would you pick range partitioning over hash partitioning?</summary>
+          <p class="ans">When you do a lot of range queries (e.g. "all orders between two dates"), because range
+          partitioning keeps nearby keys on the same/adjacent shards. Hashing scatters them, forcing scatter/gather.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the blocking problem in Two-Phase Commit?</summary>
+          <p class="ans">If the coordinator crashes after participants have voted YES but before they hear the decision,
+          the participants are stuck holding locks — they can't abort (they promised to commit) and can't proceed (no
+          commit message). They must wait for the coordinator to recover.</p>
+        </details>
+        <details class="quiz">
+          <summary>During a network partition, what does a CP system do that an AP system doesn't?</summary>
+          <p class="ans">A CP system refuses (errors out) requests it can't safely serve, to avoid returning stale or
+          conflicting data — it sacrifices availability for consistency. An AP system keeps answering with whatever it
+          has and reconciles later (eventual consistency).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is the CAP theorem really a choice between C and A?</summary>
+          <p class="ans">Because partitions (P) are unavoidable in real networks, so you can't drop P. The only real
+          decision is what to do <em>when</em> a partition happens: favour consistency or favour availability.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 16 — Distributed DBs + Final"</strong>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445/645 Database Systems</a> — the gold-standard university course; its distributed databases lectures cover sharding, 2PC, and replication in depth.</li>
+          <li><a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications — Martin Kleppmann</a> — the definitive modern book on partitioning, replication, transactions, and consistency. If you read one thing after this course, read this.</li>
+          <li><a href="https://www.vldb.org/conf/1987/P133.PDF" target="_blank" rel="noopener">Mohan, Lindsay &amp; Obermarck — "Transaction Management in R*" (1986)</a> — early, canonical work on the two-phase commit protocol for distributed transactions.</li>
+          <li><a href="https://users.ece.cmu.edu/~adrian/731-sp04/readings/GL-cap.pdf" target="_blank" rel="noopener">Gilbert &amp; Lynch — formal proof of Brewer's CAP conjecture (2002)</a> — the paper that turned CAP from a conjecture into a theorem.</li>
+          <li><a href="https://raft.github.io/" target="_blank" rel="noopener">The Raft Consensus Algorithm</a> — the official site (with the paper and an animated visualization) for the modern consensus protocol that replaces fragile single coordinators.</li>
+          <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Amazon's Dynamo paper (2007)</a> — the influential design behind AP systems, consistent hashing, and eventual consistency.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-15.html"><div class="dir">← Previous</div><div class="ttl">Session 15: Modern Architectures</div></a>
+        <a class="next disabled" href="#"><div class="dir">Next →</div><div class="ttl">End of subject 🎉</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 16 — Distributed Databases (Finale) · You finished the entire DBMS course 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

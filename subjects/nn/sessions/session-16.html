@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 16 — Transformers in Practice — BERT, GPT &amp; Tokenization</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 16</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 16 · Transformers in Practice</span>
+      <h1>BERT, GPT &amp; how machines chop text into tokens</h1>
+      <p class="lead">
+        Last session we built the Transformer from scratch. Now let's see what people actually
+        <em>do</em> with it. We'll meet the two most famous transformer families — <strong>BERT</strong> and
+        <strong>GPT</strong> — learn the pretrain-then-fine-tune recipe that powers them, peek at how text
+        is sliced into <strong>tokens</strong>, and finish by loading a real pretrained model in a few lines
+        of code. We assume you've studied none of the practical side before — every topic starts with a
+        simple story before we go deep.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#pretrain">Pretraining &amp; fine-tuning</a></li>
+          <li><a href="#bert">BERT — the understander</a></li>
+          <li><a href="#gpt">GPT — the generator</a></li>
+          <li><a href="#tokenization">Tokenization: BPE &amp; WordPiece</a></li>
+          <li><a href="#huggingface">Using transformers in practice</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. PRETRAIN / FINE-TUNE ===================== -->
+      <section id="pretrain">
+        <h2><span class="sec-num">1</span> Pretraining &amp; fine-tuning — the paradigm</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a child who spends years reading every book in a giant library. They don't have a
+          job yet — they're just soaking up how language works, what usually comes next, how ideas connect.
+          That's <strong>pretraining</strong>. Later, you give that well-read child a <em>specific</em> job,
+          like sorting letters into "happy" and "angry," and they pick it up almost instantly because they
+          already understand language. That quick job-specific lesson is <strong>fine-tuning</strong>. The
+          hard, slow part (reading the whole library) was already done.</p>
+        </div>
+
+        <p>In Session 15 we built the Transformer architecture. But an architecture is just an empty engine —
+        its millions of weights start out random and meaningless. The breakthrough that made transformers so
+        powerful isn't only the architecture; it's the <em>two-stage training recipe</em> wrapped around it.</p>
+
+        <h3>Stage 1 — Pretraining</h3>
+        <p><span class="term">Pretraining</span> means training a model on a <strong>huge pile of unlabeled
+        text</strong> (think: most of the public internet, books, Wikipedia) on a generic task that needs no
+        human labels. The model isn't told "this sentence is positive" or "this is spam." Instead it plays a
+        self-made guessing game — predict a hidden word, predict the next word — over billions of sentences.
+        Because the text itself supplies the right answers, we call this <span class="term">self-supervised
+        learning</span>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why "self-supervised" is magic</span>
+          <p>Labeling data by hand is slow and expensive — someone has to read each example and tag it. But
+          the next word in a sentence is a <em>free</em> label: the text already tells us the answer. So we can
+          train on essentially unlimited data without paying anyone to label it. This is the single trick that
+          unlocked giant models.</p>
+        </div>
+
+        <h3>Stage 2 — Fine-tuning</h3>
+        <p>A pretrained model understands language in general, but it doesn't know <em>your</em> task yet.
+        <span class="term">Fine-tuning</span> takes that pretrained model and trains it a little more on a
+        <strong>small, labeled dataset</strong> for one specific job — sentiment analysis, spam detection,
+        medical-question answering, whatever you need. You keep almost everything the model already learned and
+        just nudge the weights toward your task.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">1. Pretrain</div><div class="s-d">Huge unlabeled text, self-supervised, slow &amp; costly</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">2. Save weights</div><div class="s-d">A reusable "checkpoint" of general language skill</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">3. Fine-tune</div><div class="s-d">Small labeled data, your task, fast &amp; cheap</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚀</div><div class="s-t">4. Deploy</div><div class="s-d">A specialist model, built in hours not months</div></div>
+        </div>
+
+        <h3>Why does it work so well?</h3>
+        <p>This recipe is an example of <span class="term">transfer learning</span> — knowledge learned on one
+        task transfers to another. It works because language has deep, reusable structure: grammar, word
+        meaning, world facts, reasoning patterns. A model that learned all that to play the "guess the word"
+        game already holds 95% of what it needs for your task. Fine-tuning just teaches the last 5% — the
+        mapping from "understanding" to "your specific output."</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Pretraining</th><th>Fine-tuning</th></tr></thead>
+            <tbody>
+              <tr><td>Data</td><td>Massive, unlabeled (billions of words)</td><td>Small, labeled (hundreds–thousands of examples)</td></tr>
+              <tr><td>Labels</td><td>Self-supervised (text is its own label)</td><td>Human-provided (the task's true answers)</td></tr>
+              <tr><td>Cost</td><td>Enormous — weeks, many GPUs, $millions</td><td>Cheap — minutes to hours on one GPU</td></tr>
+              <tr><td>Who does it</td><td>Big labs (Google, OpenAI, Meta…)</td><td>You, on your own data</td></tr>
+              <tr><td>Goal</td><td>General language understanding</td><td>One specific downstream task</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a sentiment classifier without the agony</span>
+          <p>Suppose you want to flag angry customer reviews. The old way: collect a million labeled reviews
+          and train a model from scratch — months of work, and it still wouldn't understand sarcasm.</p>
+          <p>The pretrain/fine-tune way:</p>
+          <ul>
+            <li>Download a model (e.g. BERT) that already pretrained on billions of words. <strong>Free, done.</strong></li>
+            <li>Collect just <strong>~2,000 labeled reviews</strong> (positive / negative).</li>
+            <li>Fine-tune for ~10 minutes on one GPU.</li>
+            <li>Result: a classifier that already "gets" English — including tone and context — and now also
+            knows your task. Accuracy that used to need a million examples now needs a couple thousand.</li>
+          </ul>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A third option you'll meet: prompting</span>
+          <p>Very large models like GPT can often do a task with <em>no</em> fine-tuning at all — you just
+          describe the task in the prompt (<span class="term">zero-shot</span>) or give a few examples in the
+          prompt (<span class="term">few-shot</span>). That's the application/engineering view, covered in the
+          GenAI track. Here we keep the ML lens: how the model is built and trained.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The transformer recipe has two stages. <strong>Pretraining</strong> teaches general language skill on
+          huge unlabeled text using a self-supervised guessing game (slow, costly, done by big labs).
+          <strong>Fine-tuning</strong> specializes that model on a small labeled dataset for your task (fast,
+          cheap, done by you). It works because language structure transfers — that's transfer learning.
+        </div>
+      </section>
+
+      <!-- ===================== 2. BERT ===================== -->
+      <section id="bert">
+        <h2><span class="sec-num">2</span> BERT — the bidirectional understander</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>It's like a fill-in-the-blank puzzle. You see the sentence <em>"I poured milk into my ___ of
+          cereal"</em> and you guess "bowl" — but to guess it, you used the words on <strong>both sides</strong>
+          of the blank ("poured milk" before, "of cereal" after). BERT learns by playing exactly this game,
+          millions of times. Because it always looks left <em>and</em> right, it becomes great at
+          <em>understanding</em> what a sentence means.</p>
+        </div>
+
+        <p><span class="term">BERT</span> stands for <strong>B</strong>idirectional <strong>E</strong>ncoder
+        <strong>R</strong>epresentations from <strong>T</strong>ransformers (Google, 2018). The name tells you
+        almost everything once you unpack it.</p>
+
+        <h3>Encoder-only</h3>
+        <p>Recall from Session 15 that the original Transformer had two halves: an <strong>encoder</strong>
+        (which reads and understands the input) and a <strong>decoder</strong> (which generates output). BERT
+        throws away the decoder and keeps only a stack of <span class="term">encoder</span> layers. It's not
+        built to <em>write</em> text — it's built to <em>read</em> and produce a rich, context-aware
+        representation (a set of vectors) for every token.</p>
+
+        <h3>Bidirectional</h3>
+        <p>This is the key word. When BERT processes a word, its self-attention can look at <strong>every other
+        word in the sentence at once — both before and after</strong>. That's <span class="term">bidirectional
+        </span> context. (Contrast this with GPT in the next section, which can only look <em>backward</em>.)
+        Seeing the full sentence makes BERT excellent at understanding meaning.</p>
+
+        <h3>How BERT pretrains: two clever games</h3>
+        <p>BERT can't just predict the next word — if it could see the whole sentence including the next word,
+        the answer would be sitting right there ("peeking"). So it pretrains on two tasks:</p>
+
+        <p><strong>1. Masked Language Modeling (MLM).</strong> Randomly hide about 15% of the tokens with a
+        special <code class="inl">[MASK]</code> token, then make the model guess the hidden words using both
+        sides. This is the fill-in-the-blank game from the ELI5.</p>
+
+        <div class="callout example">
+          <span class="c-title">MLM in action</span>
+          <p>Original: <code class="inl">the cat sat on the mat</code><br />
+          Masked input: <code class="inl">the cat [MASK] on the [MASK]</code><br />
+          BERT must predict: position 3 → <strong>"sat"</strong>, position 6 → <strong>"mat"</strong>.</p>
+          <p>To get "sat" it leans on "cat … on"; to get "mat" it leans on "sat on the". It needs both
+          directions — exactly the skill that makes it a strong understander.</p>
+        </div>
+
+        <p><strong>2. Next Sentence Prediction (NSP).</strong> Show BERT two sentences and ask: did sentence B
+        actually follow sentence A in the original text, or is it a random impostor? This teaches it about
+        relationships <em>between</em> sentences (useful for question answering and inference). Later research
+        (e.g. RoBERTa) showed NSP wasn't very helpful and dropped it, but the original BERT used it.</p>
+
+        <h3>The special tokens</h3>
+        <p>BERT wraps its input in two helper tokens you'll see everywhere:</p>
+        <ul>
+          <li><code class="inl">[CLS]</code> — a "classification" token placed at the very start. After all
+          the attention layers, the vector sitting at <code class="inl">[CLS]</code> is treated as a summary of
+          the whole input. To classify a sentence, you attach a small classifier on top of just this one vector.</li>
+          <li><code class="inl">[SEP]</code> — a "separator" placed between two sentences (and at the end) so
+          BERT knows where one piece of text stops and the next begins.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: fine-tuning BERT for sentiment</span>
+          <p>Take pretrained BERT, feed it <code class="inl">[CLS] this movie was fantastic [SEP]</code>, grab
+          the output vector at the <code class="inl">[CLS]</code> position, and run it through a tiny added
+          layer that outputs two numbers (positive / negative). Fine-tune on a few thousand labeled reviews.
+          The big BERT body barely changes; the little classifier on top learns the task. The flow:</p>
+        </div>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">Input</div><div class="s-d">[CLS] this movie was fantastic [SEP]</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">BERT encoder</div><div class="s-d">Bidirectional attention over all tokens</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📌</div><div class="s-t">[CLS] vector</div><div class="s-d">Whole-sentence summary</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">Classifier</div><div class="s-d">→ "Positive" 98%</div></div>
+        </div>
+
+        <h3>What BERT is good at</h3>
+        <p>Because it reads the whole input and builds deep understanding, BERT shines at
+        <strong>understanding tasks</strong> rather than generation:</p>
+        <ul>
+          <li><strong>Text classification</strong> — sentiment, topic, spam, intent.</li>
+          <li><strong>Named-entity recognition</strong> — tagging each word as a person, place, date, etc.</li>
+          <li><strong>Extractive question answering</strong> — pointing to the answer span inside a passage.</li>
+          <li><strong>Sentence similarity / search ranking</strong> — turning text into meaning vectors.</li>
+        </ul>
+        <p>What it's <em>not</em> for: writing free-form text. It can't naturally "continue" a sentence, because
+        it was never trained to generate — that's GPT's job.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>BERT = encoder-only + bidirectional + masked-language-model pretraining. Seeing the whole sentence
+          at once makes it a powerful <em>reader</em>. You fine-tune it by adding a small head on top of the
+          <code class="inl">[CLS]</code> vector for classification, or on every token for tagging tasks.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          BERT keeps only the Transformer's encoder, reads text bidirectionally, and pretrains by filling in
+          masked words (MLM) plus next-sentence prediction (NSP). The <code class="inl">[CLS]</code> token
+          summarizes the input for classification. It's the go-to model for understanding tasks — classification,
+          NER, extractive QA — not for generating text.
+        </div>
+      </section>
+
+      <!-- ===================== 3. GPT ===================== -->
+      <section id="gpt">
+        <h2><span class="sec-num">3</span> GPT — the autoregressive generator</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>GPT is the world's most well-read autocomplete. You give it "Once upon a…" and it says "time,"
+          then reads "Once upon a time" and says "there," then "was," and so on — adding one word at a time
+          until it has written a whole story. It only ever looks <em>backward</em> at what it has written so
+          far, never peeking ahead (it can't — the future words don't exist yet!).</p>
+        </div>
+
+        <p><span class="term">GPT</span> stands for <strong>G</strong>enerative <strong>P</strong>re-trained
+        <strong>T</strong>ransformer (OpenAI). Where BERT is built to read, GPT is built to <em>write</em>.</p>
+
+        <h3>Decoder-only</h3>
+        <p>GPT keeps only the Transformer's <span class="term">decoder</span> stack (minus the part that
+        attended to an encoder). A decoder is designed to generate a sequence one token at a time, so it's the
+        natural choice for text generation.</p>
+
+        <h3>Autoregressive &amp; the causal mask</h3>
+        <p>GPT pretrains on a beautifully simple task: <strong>predict the next token</strong>, given all the
+        previous ones. This is called <span class="term">autoregressive</span> generation ("auto" = self,
+        "regressive" = feeding its own output back in). Because it must not cheat by looking at future words, its
+        attention uses a <span class="term">causal mask</span> (also called a look-ahead mask): each position can
+        attend only to itself and earlier positions. This is the one-directional, left-to-right contrast with
+        BERT's bidirectional reading.</p>
+
+        <div class="callout example">
+          <span class="c-title">Watching GPT generate, step by step</span>
+          <p>Prompt: <code class="inl">The sky is</code></p>
+          <ul>
+            <li>Step 1 → reads "The sky is" → predicts <strong>"blue"</strong> → text is now "The sky is blue"</li>
+            <li>Step 2 → reads "The sky is blue" → predicts <strong>"and"</strong> → "The sky is blue and"</li>
+            <li>Step 3 → reads "The sky is blue and" → predicts <strong>"the"</strong> → …continues…</li>
+            <li>Eventually it predicts a special end-of-text token and stops.</li>
+          </ul>
+          <p>This is the same one-token-at-a-time loop you may have seen in GenAI Session 1 — the ML reason it
+          works is the causal-masked decoder trained on next-token prediction.</p>
+        </div>
+
+        <h3>Next-token pretraining is shockingly general</h3>
+        <p>The famous GPT-2 paper was titled <em>"Language Models are Unsupervised Multitask Learners."</em> The
+        insight: if a model gets good enough at predicting the next word across the whole internet, it
+        implicitly learns translation, question answering, summarization, and more — because all of those appear
+        as text patterns. Just predicting the next token, at scale, produces a model that can do many tasks
+        without task-specific training.</p>
+
+        <h3>What GPT is good at</h3>
+        <ul>
+          <li><strong>Text generation</strong> — stories, articles, emails, dialogue.</li>
+          <li><strong>Code generation</strong> — writing programs token by token.</li>
+          <li><strong>Summarization &amp; translation</strong> — by generating the rewritten text.</li>
+          <li><strong>Open-ended chat &amp; reasoning</strong> — the foundation of ChatGPT and friends.</li>
+        </ul>
+
+        <h3>BERT vs GPT — the comparison you must know</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Dimension</th><th>BERT</th><th>GPT</th></tr></thead>
+            <tbody>
+              <tr><td>Part of Transformer used</td><td>Encoder only</td><td>Decoder only</td></tr>
+              <tr><td>Direction of attention</td><td>Bidirectional (sees left &amp; right)</td><td>Causal / left-to-right (sees only the past)</td></tr>
+              <tr><td>Pretraining task</td><td>Masked Language Modeling (fill the blank) + NSP</td><td>Next-token prediction (autoregressive)</td></tr>
+              <tr><td>Core strength</td><td>Understanding / analysis</td><td>Generation</td></tr>
+              <tr><td>Typical tasks</td><td>Classification, NER, extractive QA, search</td><td>Writing, chat, code, summarization, translation</td></tr>
+              <tr><td>Can it generate free text?</td><td>No (not trained to)</td><td>Yes — that's the whole point</td></tr>
+              <tr><td>How you adapt it</td><td>Fine-tune a head on top</td><td>Fine-tune, or just prompt (zero/few-shot)</td></tr>
+              <tr><td>Released by</td><td>Google (2018)</td><td>OpenAI (2018 onward)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A handy mental model</span>
+          <p><strong>Encoder = reader, decoder = writer.</strong> BERT is all reader. GPT is all writer. (There's
+          also a third family — <em>encoder-decoder</em> models like T5 and the original Transformer — that read
+          one text and write another, great for translation. We touched on the full architecture in Session 15.)</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The choice is task-driven: if you need to <em>understand or label</em> existing text, reach for a
+          BERT-style encoder. If you need to <em>produce</em> text, reach for a GPT-style decoder. Same
+          Transformer building blocks (Session 15) — different half, different masking, different training game.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          GPT is decoder-only and autoregressive: it predicts the next token using a causal mask so it only sees
+          the past. Trained at scale on next-token prediction, it becomes a general-purpose generator — great for
+          writing, code, chat, summarization. BERT understands; GPT generates.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TOKENIZATION ===================== -->
+      <section id="tokenization">
+        <h2><span class="sec-num">4</span> Tokenization — BPE &amp; WordPiece</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A computer can't read letters or words like you do — it only understands numbers. So before any
+          text goes into the model, it's chopped into little puzzle pieces called <strong>tokens</strong>, and
+          each piece gets a number. Sometimes a piece is a whole word ("cat"), sometimes just part of one
+          ("ization"). The trick is choosing the puzzle pieces wisely so we can build <em>any</em> word — even
+          one the model has never seen — out of pieces it knows.</p>
+        </div>
+
+        <p>A <span class="term">token</span> is the basic unit a transformer reads and writes. The component
+        that does the chopping is the <span class="term">tokenizer</span>. Picking the right size of piece is
+        a real design decision, so let's see the two bad extremes first.</p>
+
+        <h3>Why not just use words? Why not just characters?</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Approach</th><th>Problem</th></tr></thead>
+            <tbody>
+              <tr><td><strong>One token per word</strong></td><td>The vocabulary explodes — there are millions of words, plus typos, names, and new words. Worse, any word the tokenizer never saw becomes an <span class="term">out-of-vocabulary (OOV)</span> "unknown" — the model literally can't represent it.</td></tr>
+              <tr><td><strong>One token per character</strong></td><td>No OOV problem (only ~100 characters), but sequences get extremely long — "internationalization" becomes 20 tokens. The model wastes effort and its context window fills up fast, and it has to relearn spelling from scratch.</td></tr>
+              <tr><td><strong>Subword units (the sweet spot)</strong></td><td>Keep common words whole, break rare words into reusable pieces. Small-ish vocabulary, short-ish sequences, and <em>no</em> OOV — any word can be built from subword pieces (down to single characters if needed).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Modern tokenizers use <span class="term">subword units</span>: frequent words stay as one token,
+          rare words split into smaller known pieces. This balances a manageable vocabulary against short
+          sequences, and guarantees any text can be represented.</p>
+        </div>
+
+        <h3>Byte-Pair Encoding (BPE)</h3>
+        <p><span class="term">Byte-Pair Encoding (BPE)</span> (Sennrich et al., 2016 for NLP) builds the
+        vocabulary with a simple, greedy "merge the most common pair" algorithm. GPT models use a BPE-style
+        tokenizer.</p>
+        <ol>
+          <li>Start with a vocabulary of individual characters.</li>
+          <li>Scan the training text and find the <strong>most frequent adjacent pair</strong> of symbols.</li>
+          <li>Merge that pair into a single new token and add it to the vocabulary.</li>
+          <li>Repeat thousands of times, until you reach a target vocabulary size (often ~30k–50k tokens).</li>
+        </ol>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: learning merges</span>
+          <p>Suppose our tiny corpus is the words <code class="inl">low, low, lower, newest, widest</code>.
+          Start as characters. The pair <code class="inl">e + s</code> (in "newest", "widest") is very common,
+          so merge it → <code class="inl">es</code>. Now <code class="inl">es + t</code> is common → merge to
+          <code class="inl">est</code>. Then <code class="inl">l + o</code> → <code class="inl">lo</code>, then
+          <code class="inl">lo + w</code> → <code class="inl">low</code>. After a few merges our vocabulary
+          contains useful chunks like <code class="inl">low</code> and <code class="inl">est</code>.</p>
+          <p>Now a brand-new word <code class="inl">lowest</code> — never seen as a whole — tokenizes cleanly as
+          <code class="inl">["low", "est"]</code>. No OOV, built from known pieces!</p>
+        </div>
+
+        <h3>WordPiece</h3>
+        <p><span class="term">WordPiece</span> (used by BERT) is very similar to BPE — it also merges subword
+        pieces — but instead of merging the <em>most frequent</em> pair, it merges the pair that most increases
+        the <strong>likelihood of the training data</strong> (a probability-based score rather than a raw count).
+        In practice the results look alike. WordPiece marks continuation pieces with a <code class="inl">##</code>
+        prefix.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a WordPiece split</span>
+          <p>BERT's WordPiece tokenizer turns <code class="inl">"playing unhappily"</code> into roughly:</p>
+          <p><code class="inl">["play", "##ing", "un", "##happ", "##ily"]</code></p>
+          <p>The <code class="inl">##</code> means "this piece glues onto the previous one with no space." So
+          "play" + "##ing" = "playing". A word like "play" stays whole (it's common), while rarer "unhappily"
+          breaks into reusable morpheme-like chunks. Detokenizing just strips the <code class="inl">##</code> and
+          rejoins.</p>
+        </div>
+
+        <h3>Surprising consequences (cross-reference: token economics)</h3>
+        <p>Because text is billed and measured in tokens, subword splitting has real-world effects — this is the
+        <strong>token economics</strong> covered in <strong>GenAI Session 1</strong>. A few highlights:</p>
+        <ul>
+          <li><strong>Rough rule of thumb (English):</strong> 1 token ≈ 4 characters ≈ ¾ of a word, so 100 tokens
+          ≈ 75 words.</li>
+          <li><strong>Rare/long words cost more tokens</strong> than common ones — "the" is 1 token,
+          "antidisestablishmentarianism" is many.</li>
+          <li><strong>Other languages</strong> often need more tokens per meaning, since tokenizers are usually
+          optimized for English.</li>
+          <li><strong>The "strawberry" puzzle:</strong> early models struggled to count the r's in "strawberry"
+          because they see chunks like <code class="inl">["straw", "berry"]</code>, not individual letters.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Bytes, not just characters</span>
+          <p>GPT-2 onward use <span class="term">byte-level BPE</span>: they start from raw bytes instead of
+          characters, so the tokenizer can represent <em>any</em> Unicode text — emoji, any language, weird
+          symbols — with truly zero OOV. It's the same merge algorithm, just operating on bytes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Tokenizers chop text into subword units so we avoid both the huge vocabulary of word-level and the long
+          sequences of character-level — with no out-of-vocabulary words. <strong>BPE</strong> (GPT) greedily
+          merges the most frequent pairs; <strong>WordPiece</strong> (BERT) merges by likelihood and marks
+          continuations with <code class="inl">##</code>. Because we count and pay per token, splitting choices
+          drive cost (see GenAI Session 1).
+        </div>
+      </section>
+
+      <!-- ===================== 5. HUGGINGFACE ===================== -->
+      <section id="huggingface">
+        <h2><span class="sec-num">5</span> Using transformers in practice — the HuggingFace ecosystem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a giant free app store, but for trained AI brains. Instead of building and training a model
+          yourself (which costs millions), you just go to the store, pick a model someone already trained, and
+          download it. With a couple of lines of code it's running on your laptop. That store is
+          <strong>HuggingFace</strong>.</p>
+        </div>
+
+        <p>You almost never train a transformer from scratch — the pretraining (Topic 1) is far too expensive.
+        Instead you grab a pretrained one and fine-tune or just use it. The center of this world is
+        <span class="term">HuggingFace</span>, especially its <code class="inl">transformers</code> Python
+        library and the <strong>Model Hub</strong> — a public repository of hundreds of thousands of pretrained
+        models (BERT, GPT-2, and many more).</p>
+
+        <h3>Two things always travel together</h3>
+        <p>Every model on the Hub comes with its matching <span class="term">tokenizer</span>. You must use the
+        <em>same</em> tokenizer the model was trained with — feeding text split a different way would be like
+        handing someone a book in the wrong alphabet. So you load both.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: sentiment in 4 lines (the easy way)</span>
+          <p>The <code class="inl">pipeline</code> helper bundles tokenizer + model + post-processing into one
+          call. Great for getting started:</p>
+          <pre><span class="kw">from</span> transformers <span class="kw">import</span> pipeline
+
+<span class="cm"># Downloads a fine-tuned model + its tokenizer, then runs it</span>
+clf = pipeline(<span class="st">"sentiment-analysis"</span>)
+result = clf(<span class="st">"Transformers make this so easy!"</span>)
+<span class="kw">print</span>(result)
+<span class="cm"># [{'label': 'POSITIVE', 'score': 0.9998}]</span></pre>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: loading a model + tokenizer by hand</span>
+          <p>When you want control, load the tokenizer and model explicitly. Here's BERT for classification:</p>
+          <pre><span class="kw">from</span> transformers <span class="kw">import</span> AutoTokenizer, AutoModelForSequenceClassification
+<span class="kw">import</span> torch
+
+name = <span class="st">"distilbert-base-uncased-finetuned-sst-2-english"</span>
+
+<span class="cm"># 1. Load the matching tokenizer and the pretrained model</span>
+tokenizer = AutoTokenizer.from_pretrained(name)
+model = AutoModelForSequenceClassification.from_pretrained(name)
+
+<span class="cm"># 2. Tokenize: text -&gt; token IDs (note [CLS]/[SEP] added automatically)</span>
+inputs = tokenizer(<span class="st">"This movie was fantastic"</span>, return_tensors=<span class="st">"pt"</span>)
+<span class="kw">print</span>(inputs[<span class="st">"input_ids"</span>])   <span class="cm"># e.g. tensor([[ 101, 2023, 3185, 2001, 10392,  102]])</span>
+
+<span class="cm"># 3. Run the model (inference: no gradients needed)</span>
+<span class="kw">with</span> torch.no_grad():
+    logits = model(**inputs).logits
+
+<span class="cm"># 4. Softmax the logits into probabilities, pick the top label</span>
+probs = torch.softmax(logits, dim=-<span class="nm">1</span>)
+label = model.config.id2label[probs.argmax().item()]
+<span class="kw">print</span>(label, probs.max().item())   <span class="cm"># POSITIVE 0.9994</span></pre>
+          <p>Notice the pieces from earlier topics all show up: the tokenizer adds <code class="inl">101</code>
+          (<code class="inl">[CLS]</code>) and <code class="inl">102</code> (<code class="inl">[SEP]</code>), the
+          model is a pretrained BERT-style encoder, and <code class="inl">softmax</code> (recall it from the
+          decoding math) turns raw logits into probabilities.</p>
+        </div>
+
+        <h3>The "Auto" classes</h3>
+        <p>You'll see <code class="inl">AutoTokenizer</code>, <code class="inl">AutoModel</code>,
+        <code class="inl">AutoModelForSequenceClassification</code>, <code class="inl">AutoModelForCausalLM</code>
+        (for GPT-style generation), and more. The <code class="inl">Auto</code> prefix means "look at the model's
+        config and load the right specific class automatically" — so the same code works whether you point it at
+        BERT, GPT-2, or something else.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Task</th><th>Auto class to use</th></tr></thead>
+            <tbody>
+              <tr><td>Sentence/text classification</td><td><code class="inl">AutoModelForSequenceClassification</code></td></tr>
+              <tr><td>Token tagging (NER)</td><td><code class="inl">AutoModelForTokenClassification</code></td></tr>
+              <tr><td>Text generation (GPT-style)</td><td><code class="inl">AutoModelForCausalLM</code></td></tr>
+              <tr><td>Fill-in-the-blank (BERT MLM)</td><td><code class="inl">AutoModelForMaskedLM</code></td></tr>
+              <tr><td>Just the raw embeddings</td><td><code class="inl">AutoModel</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: generating text with GPT-2</span>
+          <pre><span class="kw">from</span> transformers <span class="kw">import</span> AutoTokenizer, AutoModelForCausalLM
+
+tok = AutoTokenizer.from_pretrained(<span class="st">"gpt2"</span>)
+model = AutoModelForCausalLM.from_pretrained(<span class="st">"gpt2"</span>)
+
+inputs = tok(<span class="st">"In the future, AI will"</span>, return_tensors=<span class="st">"pt"</span>)
+out = model.generate(**inputs, max_new_tokens=<span class="nm">20</span>)
+<span class="kw">print</span>(tok.decode(out[<span class="nm">0</span>], skip_special_tokens=<span class="kw">True</span>))</pre>
+          <p>The autoregressive loop from Topic 3 is hidden inside <code class="inl">.generate()</code> — it
+          predicts one token, appends it, and repeats up to <code class="inl">max_new_tokens</code>.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Always pair a model with <em>its own</em> tokenizer (use the same <code class="inl">name</code> for
+          both). And remember: a downloaded model carries the biases and knowledge cutoff of its pretraining
+          data — fine-tuning steers it but doesn't erase what it learned.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Cross-reference</span>
+          <p>This session is the ML/architecture view. For the application and engineering side — calling hosted
+          LLM APIs, prompt design, cost and context windows — see the <strong>GenAI track</strong> (it picks up
+          right where the token economics in Topic 4 left off).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          You rarely train from scratch — you download a pretrained model and its matching tokenizer from the
+          HuggingFace Hub. The quick path is <code class="inl">pipeline()</code>; the controlled path is
+          <code class="inl">AutoTokenizer</code> + an <code class="inl">AutoModelFor…</code> class chosen for your
+          task. Tokenizer and model always travel as a pair, and the topics from this session (special tokens,
+          softmax, the autoregressive loop) all show up in the code.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You now know how the Transformer from Session 15 turns into the tools people actually use. Here's the
+        one-paragraph story connecting all five topics:</p>
+        <div class="bigidea">
+          <p>Transformers get their power from a two-stage recipe: <strong>pretrain</strong> on huge unlabeled
+          text with a self-supervised guessing game, then <strong>fine-tune</strong> on a small labeled dataset
+          for your task (transfer learning). Two famous families split by which half of the Transformer they keep
+          and which game they play. <strong>BERT</strong> is encoder-only and <em>bidirectional</em>, pretrained
+          by filling in masked words — a powerful <em>understander</em> for classification, NER, and QA.
+          <strong>GPT</strong> is decoder-only and <em>autoregressive</em>, pretrained to predict the next token
+          with a causal mask — a powerful <em>generator</em> for writing, chat, and code. Both read text that's
+          been chopped into <strong>subword tokens</strong> by <strong>BPE</strong> (GPT) or <strong>WordPiece</strong>
+          (BERT), which keeps vocabularies small, sequences short, and out-of-vocabulary words impossible — and
+          drives the token economics you pay for. In practice you grab a pretrained model and its matching
+          tokenizer from <strong>HuggingFace</strong> and run it in a few lines, with the same building blocks
+          (special tokens, softmax, the generation loop) showing up right in your code.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why is pretraining "self-supervised," and why does that matter?</summary>
+          <p class="ans">The training labels come free from the text itself (the next word, or the hidden word),
+          so no humans have to label anything. That lets us train on essentially unlimited data — the key to
+          building giant models.</p>
+        </details>
+        <details class="quiz">
+          <summary>You need to classify support tickets by topic. BERT or GPT?</summary>
+          <p class="ans">BERT (or a BERT-style encoder). Classification is an understanding task, and BERT's
+          bidirectional encoder with a head on the <code class="inl">[CLS]</code> token is built for exactly this.</p>
+        </details>
+        <details class="quiz">
+          <summary>What stops GPT from "cheating" by looking at future words during training?</summary>
+          <p class="ans">The causal (look-ahead) mask: each position can attend only to itself and earlier
+          positions, never to tokens that come after it. That's what makes it autoregressive and left-to-right.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use subword tokens instead of whole words or single characters?</summary>
+          <p class="ans">Whole words give a giant vocabulary and out-of-vocabulary failures; single characters
+          give very long sequences. Subwords keep common words whole and split rare ones into known pieces —
+          small vocabulary, short sequences, and no OOV (any word can be assembled).</p>
+        </details>
+        <details class="quiz">
+          <summary>How do BPE and WordPiece differ?</summary>
+          <p class="ans">Both build subword vocabularies by merging pieces. BPE (used by GPT) merges the
+          <em>most frequent</em> adjacent pair. WordPiece (used by BERT) merges the pair that most increases the
+          training-data likelihood, and marks continuation pieces with <code class="inl">##</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>In HuggingFace, why must you load the tokenizer that matches the model?</summary>
+          <p class="ans">Each model was trained on text split a specific way, with specific token IDs and special
+          tokens. A different tokenizer would feed the model unfamiliar IDs — like reading a book in the wrong
+          alphabet — and the output would be garbage.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 16) — your course handout for this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning — Neural Nets course page</a> — the companion online notes and resources for this course.</li>
+          <li><a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">BERT: Pre-training of Deep Bidirectional Transformers (Devlin et al., 2018)</a> — the original BERT paper; masked-LM and NSP explained by its authors.</li>
+          <li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Language Models are Unsupervised Multitask Learners (GPT-2, Radford et al., 2019)</a> — why scaling next-token prediction yields a general-purpose model.</li>
+          <li><a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">Neural Machine Translation of Rare Words with Subword Units (Sennrich et al., 2016)</a> — the paper that brought Byte-Pair Encoding to NLP.</li>
+          <li><a href="https://huggingface.co/docs/transformers" target="_blank" rel="noopener">HuggingFace Transformers documentation</a> — official docs for loading models, tokenizers, pipelines, and fine-tuning.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-15.html"><div class="dir">← Previous</div><div class="ttl">Session 15: The Transformer</div></a>
+        <a class="next" href="session-17.html"><div class="dir">Next →</div><div class="ttl">Session 17: Project — Neural Style Transfer</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 16 — Transformers in Practice — BERT, GPT &amp; Tokenization · From architecture to real tools 🤗</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

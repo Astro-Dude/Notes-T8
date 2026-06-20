@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 20 — Project Week — Train a Small Language Model (nanoGPT + LoRA)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 20</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 20 · Project — Train a Small LM</span>
+      <h1>Project Week: train your very own small language model</h1>
+      <p class="lead">
+        This is the capstone — the session where everything you've learned becomes a real, running thing.
+        Across this course you built MLPs, hand-cranked backprop, taught CNNs to see, gave RNNs memory,
+        and finally cracked attention and transformers. Today we put it all to work: we'll take Andrej
+        Karpathy's <strong>nanoGPT</strong>, pretrain a tiny GPT from scratch on a text dataset, watch it
+        learn to babble in English, and then specialise it cheaply using <strong>LoRA</strong>. Every step
+        has complete, runnable code. Take it slow, run things yourself, and by the end you'll have trained
+        a language model with your own hands.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 19 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#scaling">From toy to real (nanoGPT)</a></li>
+          <li><a href="#pretrain">Pretraining a small GPT</a></li>
+          <li><a href="#lora">Fine-tuning with LoRA</a></li>
+          <li><a href="#wrapping">Wrapping up the course</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. FROM TOY TO REAL ===================== -->
+      <section id="scaling">
+        <h2><span class="sec-num">1</span> From toy to real — scaling up with nanoGPT</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Last week you built a little toy car out of LEGO that actually rolled. It worked! But it was
+          tiny and slow. Now imagine someone hands you a proper starter kit — real wheels, a real motor,
+          clear instructions — so you can build a car that drives across the whole room. <strong>nanoGPT</strong>
+          is that starter kit for language models. It's the same idea as your toy mini-transformer, just
+          tidied up, sped up, and ready to actually train on lots of text.</p>
+        </div>
+
+        <p>In <strong>Session 19</strong> you built a mini-transformer by hand — embeddings, self-attention,
+        a feed-forward block, and a next-token loss. That was the "toy car." It taught you that the whole
+        machine is understandable. The problem with hand-rolled code is that it's slow and missing the
+        unglamorous bits (efficient data loading, mixed precision, checkpointing, learning-rate schedules).
+        <span class="term">nanoGPT</span> is a famous, deliberately small, readable codebase by Andrej
+        Karpathy that has all those bits while staying simple enough to read in an afternoon.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A "real" GPT is <strong>not a different machine</strong> from your toy. It's the exact same
+          transformer block (attention + feed-forward + residuals + layer-norm, recall Session 18) stacked
+          deeper, made wider, and fed far more data with an industrial training loop. Scaling up is mostly
+          about <em>plumbing and patience</em>, not new ideas.</p>
+        </div>
+
+        <h3>The four stages of any GPT project</h3>
+        <p>nanoGPT organises the work into four scripts, and this is a great mental model for <em>every</em>
+        language-model project:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">1. Data</div><div class="s-d">Tokenise text → binary token stream</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">2. Config</div><div class="s-d">Set model size + training knobs</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏋️</div><div class="s-t">3. Train</div><div class="s-d">Run the loop, watch loss fall</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💬</div><div class="s-t">4. Sample</div><div class="s-d">Generate text from the model</div></div>
+        </div>
+
+        <p>Let's name the parts. The <span class="term">training pipeline</span> is this whole assembly line.
+        <span class="term">prepare.py</span> turns raw text into a stream of token IDs saved to disk.
+        <span class="term">train.py</span> reads those tokens, builds the GPT, and runs gradient descent.
+        <span class="term">sample.py</span> loads a saved <span class="term">checkpoint</span> (the model's
+        learned weights on disk) and generates new text.</p>
+
+        <h3>Getting nanoGPT and seeing the model</h3>
+        <div class="callout example">
+          <span class="c-title">Worked example — clone it and look at the model</span>
+          <p>First, grab the code and dependencies:</p>
+<pre><span class="cm"># Clone Karpathy's nanoGPT and install the essentials</span>
+git clone https://github.com/karpathy/nanoGPT
+cd nanoGPT
+pip install torch numpy tiktoken datasets tqdm
+</pre>
+          <p>The heart of it is <code class="inl">model.py</code>. Stripped to its skeleton, a nanoGPT block
+          is exactly the transformer you built in Session 19:</p>
+<pre><span class="kw">class</span> Block(nn.Module):           <span class="cm"># one transformer layer</span>
+    <span class="kw">def</span> __init__(self, config):
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)   <span class="cm"># masked self-attention</span>
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp  = MLP(config)                    <span class="cm"># the feed-forward part</span>
+
+    <span class="kw">def</span> forward(self, x):
+        x = x + self.attn(self.ln_1(x))   <span class="cm"># residual + attention</span>
+        x = x + self.mlp(self.ln_2(x))    <span class="cm"># residual + MLP</span>
+        <span class="kw">return</span> x
+</pre>
+          <p>Notice <code class="inl">x = x + ...</code> twice — those are the <strong>residual connections</strong>
+          from Session 18. The <code class="inl">CausalSelfAttention</code> is masked so each token can only
+          look <em>backwards</em> (you can't peek at the answer). Stack <code class="inl">n_layer</code> of
+          these <code class="inl">Block</code>s and you have a GPT.</p>
+        </div>
+
+        <h3>GPU and compute realities</h3>
+        <p>Here's the honest part nobody tells beginners. Training language models is bottlenecked by
+        <strong>compute</strong>. The key piece of hardware is a <span class="term">GPU</span> (Graphics
+        Processing Unit) — a chip that does the huge matrix multiplies of a neural net thousands of times
+        faster than a CPU. A few realities:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Setup</th><th>What you can realistically train</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>CPU only (your laptop)</td><td>The tiny char-level Shakespeare model (a few minutes to an hour)</td><td>Fine for learning; far too slow for real datasets.</td></tr>
+              <tr><td>1 consumer GPU / free Colab T4</td><td>A small GPT (a few million to ~100M params) on a modest dataset</td><td>Hours of training. This is our target today.</td></tr>
+              <tr><td>8× datacenter GPUs (A100/H100)</td><td>nanoGPT's GPT-2 (124M) reproduction in ~a day</td><td>This is what "small lab" scale looks like.</td></tr>
+              <tr><td>Thousands of GPUs</td><td>GPT-3/4-scale frontier models</td><td>Millions of dollars and months — out of scope, but same recipe!</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — three things that bite beginners</span>
+          <p><strong>1. Memory (VRAM):</strong> the model's parameters, the activations, and the optimizer
+          state all live in GPU memory. Run out and training crashes — shrink the
+          <code class="inl">batch_size</code> or model. <strong>2. Precision:</strong> use
+          <code class="inl">bfloat16</code>/<code class="inl">float16</code> (called
+          <span class="term">mixed precision</span>) to roughly halve memory and double speed.
+          <strong>3. Time:</strong> loss falls fast at first, then crawls — don't panic when it slows.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>nanoGPT is the bridge from your toy to a real model. Same architecture, professional plumbing,
+          four clean stages: <strong>data → config → train → sample</strong>. The limiting factor isn't
+          cleverness — it's how much GPU compute you can throw at it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A real GPT is just your Session-19 transformer block stacked deeper and trained with proper
+          plumbing. nanoGPT gives you that plumbing in four scripts: <code class="inl">prepare</code>,
+          <code class="inl">config</code>, <code class="inl">train</code>, <code class="inl">sample</code>.
+          Compute (GPU memory + time) is the real constraint, and mixed precision is your friend.
+        </div>
+      </section>
+
+      <!-- ===================== 2. PRETRAINING ===================== -->
+      <section id="pretrain">
+        <h2><span class="sec-num">2</span> Pretraining a small GPT — the full run</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine teaching a parrot to talk by reading it the same big book over and over. At first it
+          just squawks nonsense. After a while it starts saying real words. Later it strings together little
+          phrases that sound like the book. <strong>Pretraining</strong> is exactly that: we read a model
+          a giant pile of text again and again, asking it to guess the next word each time, until it learns
+          to talk like the text.</p>
+        </div>
+
+        <p><span class="term">Pretraining</span> means training a language model <em>from scratch</em> (random
+        weights) on a large amount of raw text, with one job: <strong>predict the next token</strong> (recall
+        Sessions 16 &amp; 19 — this is the core language-modeling objective). The model isn't told facts or
+        rules; it just learns the statistics of language by guessing the next token billions of times.</p>
+
+        <h3>Step 1 — Dataset preparation &amp; tokenization (BPE)</h3>
+        <p>The model can't read letters; it reads <span class="term">tokens</span> — integer IDs for sub-word
+        chunks. We turn text into tokens with a <span class="term">tokenizer</span>. The standard method is
+        <span class="term">Byte-Pair Encoding (BPE)</span>, which we introduced back in <strong>Session 16</strong>
+        (and which the GenAI track covers in depth). BPE keeps frequent chunks whole (like <code class="inl">"the"</code>)
+        and breaks rare words into smaller known pieces, so the model can represent <em>any</em> text with a
+        fixed vocabulary.</p>
+
+        <div class="callout note">
+          <span class="c-title">Two tokenizer choices</span>
+          <p><strong>Character-level</strong> (vocab ≈ 65 unique characters): dead simple, great for a first
+          run on tiny data — every character is a token. <strong>BPE</strong> (vocab ≈ 50,257 for GPT-2 via
+          the <code class="inl">tiktoken</code> library): far more efficient on real text, and what real GPTs
+          use. We'll show both.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — prepare a dataset with BPE</span>
+          <p>Here's a complete <code class="inl">prepare.py</code> that reads a text file, BPE-tokenizes it
+          with GPT-2's tokenizer, splits into train/val, and writes a compact binary token stream:</p>
+<pre><span class="kw">import</span> numpy <span class="kw">as</span> np, tiktoken, os
+
+<span class="cm"># 1. Read raw text (point this at your own corpus, e.g. input.txt)</span>
+<span class="kw">with</span> open(<span class="st">'input.txt'</span>, <span class="st">'r'</span>) <span class="kw">as</span> f:
+    data = f.read()
+n = len(data)
+train_data = data[:<span class="kw">int</span>(n*<span class="nm">0.9</span>)]   <span class="cm"># 90% train</span>
+val_data   = data[<span class="kw">int</span>(n*<span class="nm">0.9</span>):]   <span class="cm"># 10% validation</span>
+
+<span class="cm"># 2. BPE-encode with GPT-2's tokenizer (cross-ref Session 16)</span>
+enc = tiktoken.get_encoding(<span class="st">"gpt2"</span>)
+train_ids = enc.encode_ordinary(train_data)
+val_ids   = enc.encode_ordinary(val_data)
+<span class="kw">print</span>(<span class="st">f"train has </span>{len(train_ids):,}<span class="st"> tokens"</span>)
+
+<span class="cm"># 3. Save as a flat array of uint16 token IDs (vocab &lt; 65536)</span>
+np.array(train_ids, dtype=np.uint16).tofile(<span class="st">'train.bin'</span>)
+np.array(val_ids,   dtype=np.uint16).tofile(<span class="st">'val.bin'</span>)
+</pre>
+          <p>The output is two files of raw token IDs. Why binary? Because at training time we want to grab
+          a random window of tokens instantly, millions of times — a flat array memory-mapped from disk is
+          perfect for that.</p>
+        </div>
+
+        <h3>Step 2 — The config (choosing the model size)</h3>
+        <p>The <span class="term">config</span> is just the set of dials that define your model and training
+        run. For a small GPT trainable on one GPU, sensible starting values are:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Knob</th><th>Meaning</th><th>Small-GPT value</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">n_layer</code></td><td>How many transformer blocks stacked</td><td>6</td></tr>
+              <tr><td><code class="inl">n_head</code></td><td>Attention heads per block (Session 18)</td><td>6</td></tr>
+              <tr><td><code class="inl">n_embd</code></td><td>Embedding/hidden width</td><td>384</td></tr>
+              <tr><td><code class="inl">block_size</code></td><td>Context length (max tokens seen at once)</td><td>256</td></tr>
+              <tr><td><code class="inl">batch_size</code></td><td>Sequences trained on in parallel</td><td>32</td></tr>
+              <tr><td><code class="inl">learning_rate</code></td><td>Step size for gradient descent (Session 3)</td><td>3e-4</td></tr>
+              <tr><td><code class="inl">max_iters</code></td><td>Total training steps</td><td>5000</td></tr>
+              <tr><td><code class="inl">dropout</code></td><td>Regularisation to fight overfitting (Session 7)</td><td>0.2</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>That gives roughly a <strong>10M-parameter</strong> model — small enough for a free Colab GPU,
+        big enough to write coherent text after training.</p>
+
+        <h3>Step 3 — The training run</h3>
+        <p>The training loop is the same recipe from <strong>Sessions 3 and 19</strong>: get a batch, forward
+        pass to get the loss, backward pass for gradients, optimizer step. Here it is, complete and runnable,
+        using nanoGPT's <code class="inl">GPT</code> model:</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a complete training loop</span>
+<pre><span class="kw">import</span> torch, numpy <span class="kw">as</span> np
+<span class="kw">from</span> model <span class="kw">import</span> GPT, GPTConfig   <span class="cm"># from nanoGPT</span>
+
+device = <span class="st">'cuda'</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="st">'cpu'</span>
+block_size, batch_size = <span class="nm">256</span>, <span class="nm">32</span>
+
+<span class="cm"># memory-map the token stream we built in prepare.py</span>
+train_data = np.memmap(<span class="st">'train.bin'</span>, dtype=np.uint16, mode=<span class="st">'r'</span>)
+
+<span class="kw">def</span> get_batch():
+    <span class="cm"># pick batch_size random start positions</span>
+    ix = torch.randint(len(train_data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy(train_data[i:i+block_size].astype(np.int64)) <span class="kw">for</span> i <span class="kw">in</span> ix])
+    y = torch.stack([torch.from_numpy(train_data[i+<span class="nm">1</span>:i+<span class="nm">1</span>+block_size].astype(np.int64)) <span class="kw">for</span> i <span class="kw">in</span> ix])
+    <span class="kw">return</span> x.to(device), y.to(device)   <span class="cm"># y is x shifted by one token</span>
+
+<span class="cm"># build the model from our config</span>
+cfg = GPTConfig(n_layer=<span class="nm">6</span>, n_head=<span class="nm">6</span>, n_embd=<span class="nm">384</span>,
+                block_size=block_size, vocab_size=<span class="nm">50257</span>, dropout=<span class="nm">0.2</span>)
+model = GPT(cfg).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=<span class="nm">3e-4</span>)
+
+<span class="kw">for</span> step <span class="kw">in</span> range(<span class="nm">5000</span>):
+    x, y = get_batch()
+    logits, loss = model(x, y)        <span class="cm"># forward: predict next token, get cross-entropy loss</span>
+    optimizer.zero_grad()
+    loss.backward()                   <span class="cm"># backprop (Session 4) computes gradients</span>
+    optimizer.step()                  <span class="cm"># nudge weights downhill (Session 3)</span>
+    <span class="kw">if</span> step % <span class="nm">500</span> == <span class="nm">0</span>:
+        <span class="kw">print</span>(<span class="st">f"step </span>{step}<span class="st">: loss </span>{loss.item():.3f}<span class="st">"</span>)
+
+torch.save(model.state_dict(), <span class="st">'ckpt.pt'</span>)   <span class="cm"># save the checkpoint</span>
+</pre>
+          <p>Watch the printed loss. A character-level model starts near <code class="inl">ln(65) ≈ 4.2</code>
+          (pure random guessing) and should fall toward <code class="inl">~1.5</code>. The crucial trick is
+          <code class="inl">y</code> being <code class="inl">x</code> shifted one token right — that's how
+          "predict the next token" becomes a supervised label for every position at once.</p>
+        </div>
+
+        <h3>Step 4 — Sampling (generating text)</h3>
+        <p>Once trained, generation is the <span class="term">autoregressive</span> loop you know: feed in a
+        prompt, predict the next token's probabilities, sample one, append it, repeat.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — generate from your model</span>
+<pre><span class="kw">import</span> torch, tiktoken
+<span class="kw">from</span> model <span class="kw">import</span> GPT, GPTConfig
+
+enc = tiktoken.get_encoding(<span class="st">"gpt2"</span>)
+model = GPT(GPTConfig(...))           <span class="cm"># same config as training</span>
+model.load_state_dict(torch.load(<span class="st">'ckpt.pt'</span>))
+model.eval()                          <span class="cm"># turn off dropout for inference</span>
+
+prompt = enc.encode(<span class="st">"Once upon a time"</span>)
+x = torch.tensor(prompt, dtype=torch.long)[<span class="kw">None</span>, ...]   <span class="cm"># add batch dim</span>
+
+<span class="kw">with</span> torch.no_grad():
+    out = model.generate(x, max_new_tokens=<span class="nm">200</span>, temperature=<span class="nm">0.8</span>, top_k=<span class="nm">200</span>)
+<span class="kw">print</span>(enc.decode(out[<span class="nm">0</span>].tolist()))
+</pre>
+          <p>The <code class="inl">temperature</code> and <code class="inl">top_k</code> knobs control how
+          adventurous the sampling is (low = safe and repetitive, high = creative but riskier — exactly the
+          decoding dials from the GenAI track). After a real run, a tiny model will produce text that's
+          grammatical and on-topic, even if not always factual.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — overfitting on small data</span>
+          <p>If your dataset is tiny, the model will memorise it: training loss keeps dropping but
+          <strong>validation loss starts rising</strong>. That's <span class="term">overfitting</span>
+          (Session 7). Watch both losses, use <code class="inl">dropout</code>, and stop when val loss bottoms out.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Pretraining = train from scratch to predict the next token. Prep data by BPE-tokenizing into a
+          binary token stream; pick a small config; run the standard get-batch → forward → backward → step
+          loop while watching train <em>and</em> val loss; then sample autoregressively with temperature/top-k.
+          You now have a model you trained yourself.
+        </div>
+      </section>
+
+      <!-- ===================== 3. LoRA ===================== -->
+      <section id="lora">
+        <h2><span class="sec-num">3</span> Parameter-efficient fine-tuning with LoRA</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a huge, finished painting. You want to give it a slightly different mood — warmer,
+          cosier. You <em>could</em> repaint the entire canvas (slow, expensive, risky). Or you could lay a
+          thin tinted sheet of glass over the top that gently shifts every colour. <strong>LoRA</strong> is
+          that thin sheet: a small add-on that adjusts a giant model's behaviour <em>without repainting the
+          whole thing</em>.</p>
+        </div>
+
+        <p>After pretraining, you usually want to <span class="term">fine-tune</span> — keep training a model
+        on a smaller, specific dataset so it specialises (e.g. answering in your company's style, or on
+        medical text). The obvious way is <span class="term">full fine-tuning</span>: update <em>all</em> the
+        model's weights. But that's expensive.</p>
+
+        <h3>Why full fine-tuning hurts</h3>
+        <ul>
+          <li><strong>Memory:</strong> you must store gradients <em>and</em> optimizer state for every one of
+          the billions of parameters — often 3–4× the model's own size in GPU memory.</li>
+          <li><strong>Storage:</strong> every fine-tuned copy is a full-size model. Ten tasks = ten giant files.</li>
+          <li><strong>Data hunger &amp; overfitting:</strong> nudging all the weights with a small dataset risks
+          forgetting what pretraining taught (called <span class="term">catastrophic forgetting</span>).</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The LoRA idea</span>
+          <p><span class="term">LoRA</span> (Low-Rank Adaptation) <strong>freezes</strong> the entire pretrained
+          model and inserts small, trainable <span class="term">adapter</span> matrices alongside the big weight
+          matrices. You train only those tiny adapters. The huge original weights never change. Because the
+          adapters are <em>low-rank</em> (very skinny), they have a minuscule number of parameters.</p>
+        </div>
+
+        <h3>The low-rank trick, made concrete</h3>
+        <p>Inside the transformer, much of the work is a big matrix multiply <code class="inl">y = W·x</code>,
+        where <code class="inl">W</code> might be <code class="inl">768 × 768</code> (≈590,000 numbers). LoRA
+        doesn't touch <code class="inl">W</code>. Instead it learns a small correction
+        <code class="inl">ΔW</code> and represents it as the product of two skinny matrices:</p>
+        <p style="text-align:center"><code class="inl">y = W·x + (B·A)·x</code>, &nbsp; where
+        <code class="inl">A</code> is <code class="inl">r × 768</code> and <code class="inl">B</code> is
+        <code class="inl">768 × r</code>.</p>
+        <p>Here <code class="inl">r</code> is the <span class="term">rank</span> — a small number like 4, 8, or 16.
+        The insight (from the LoRA paper) is that the <em>update</em> a model needs for a new task has low
+        "intrinsic rank," so two skinny matrices capture it just fine.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — counting the savings</span>
+          <p>For one <code class="inl">768 × 768</code> weight matrix with rank <code class="inl">r = 8</code>:</p>
+          <ul>
+            <li>Full fine-tuning trains <code class="inl">768 × 768 = 589,824</code> parameters.</li>
+            <li>LoRA trains <code class="inl">A</code> (<code class="inl">8 × 768</code>) + <code class="inl">B</code>
+            (<code class="inl">768 × 8</code>) = <code class="inl">6,144 + 6,144 = 12,288</code> parameters.</li>
+            <li>That's <strong>~2%</strong> of the original — a <strong>~48× reduction</strong> in trainable
+            parameters for that matrix.</li>
+          </ul>
+          <p>Across a whole model, LoRA commonly trains <strong>well under 1%</strong> of the parameters while
+          matching full fine-tuning quality. <code class="inl">A</code> starts random, <code class="inl">B</code>
+          starts at zero — so at step 0 the adapter contributes nothing and the model behaves exactly like the
+          frozen original, then gently learns the correction.</p>
+        </div>
+
+        <h3>Code sketch — LoRA in PyTorch</h3>
+        <div class="callout example">
+          <span class="c-title">Worked example — a minimal LoRA layer</span>
+<pre><span class="kw">import</span> torch, torch.nn <span class="kw">as</span> nn
+
+<span class="kw">class</span> LoRALinear(nn.Module):
+    <span class="kw">def</span> __init__(self, base: nn.Linear, r=<span class="nm">8</span>, alpha=<span class="nm">16</span>):
+        super().__init__()
+        self.base = base                 <span class="cm"># the frozen pretrained weight</span>
+        <span class="kw">for</span> p <span class="kw">in</span> self.base.parameters():
+            p.requires_grad = <span class="kw">False</span>   <span class="cm"># FREEZE the big matrix</span>
+        d_in, d_out = base.in_features, base.out_features
+        self.A = nn.Parameter(torch.randn(r, d_in) * <span class="nm">0.01</span>)  <span class="cm"># skinny, random</span>
+        self.B = nn.Parameter(torch.zeros(d_out, r))            <span class="cm"># skinny, zero-init</span>
+        self.scale = alpha / r           <span class="cm"># LoRA scaling factor</span>
+
+    <span class="kw">def</span> forward(self, x):
+        <span class="cm"># frozen path + tiny trainable low-rank correction</span>
+        <span class="kw">return</span> self.base(x) + self.scale * (x @ self.A.T @ self.B.T)
+</pre>
+          <p>Only <code class="inl">A</code> and <code class="inl">B</code> have <code class="inl">requires_grad=True</code>,
+          so the optimizer touches just those. In practice you wrap the attention query/value projections with
+          this and leave everything else frozen.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">You rarely write this by hand</span>
+          <p>HuggingFace's <span class="term">PEFT</span> (Parameter-Efficient Fine-Tuning) library does all of
+          this for you. A real fine-tune is about five lines:</p>
+<pre><span class="kw">from</span> peft <span class="kw">import</span> LoraConfig, get_peft_model
+
+config = LoraConfig(r=<span class="nm">8</span>, lora_alpha=<span class="nm">16</span>, target_modules=[<span class="st">"q_proj"</span>, <span class="st">"v_proj"</span>],
+                    lora_dropout=<span class="nm">0.05</span>)
+model = get_peft_model(base_model, config)
+model.print_trainable_parameters()   <span class="cm"># e.g. "trainable: 0.24% of all params"</span>
+<span class="cm"># ...then train normally; save just the tiny adapter, not the whole model.</span>
+</pre>
+          <p>The saved adapter is often just a few megabytes — you can keep dozens, one per task, and swap them
+          onto the same frozen base model on the fly.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>LoRA = freeze the giant model, train two skinny matrices per layer. You get most of full
+          fine-tuning's quality for a tiny fraction of the trainable parameters, the memory, and the storage —
+          which is exactly why parameter-efficient fine-tuning powers most custom LLMs today.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Full fine-tuning updates every weight — expensive in memory and storage and prone to forgetting.
+          LoRA freezes the base model and learns a low-rank update <code class="inl">B·A</code> per matrix, with
+          a small rank <code class="inl">r</code>. That trains &lt;1% of params, produces tiny swappable adapters,
+          and (via the PEFT library) is only a few lines of code.
+        </div>
+      </section>
+
+      <!-- ===================== 4. WRAPPING UP THE COURSE ===================== -->
+      <section id="wrapping">
+        <h2><span class="sec-num">4</span> Wrapping up the course — where this all leads</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of everything you learned as LEGO bricks. Early on you got plain bricks (neurons). Then you
+          learned how to click them into walls (layers), how to fix a wobbly tower (backprop), special bricks
+          for pictures (CNNs) and for stories (RNNs), and finally a magic brick that lets every piece talk to
+          every other (attention). Today you snapped them all together into a real spaceship — a language model
+          you trained yourself. Now you know how to build almost anything.</p>
+        </div>
+
+        <p>You've reached the end of <strong>Neural Networks &amp; Computer Vision</strong>. Step back and see
+        how the pieces connect into the systems behind modern AI.</p>
+
+        <h3>How everything connects to modern LLMs</h3>
+        <p>A frontier model like GPT-4, Claude, or Gemini is <strong>not</strong> magic beyond what you now
+        understand — it's this course's ideas scaled enormously:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>What you learned</th><th>Where it lives in a modern LLM</th></tr></thead>
+            <tbody>
+              <tr><td>Neurons, MLPs, activations (Sessions 1–2)</td><td>The feed-forward block inside every transformer layer.</td></tr>
+              <tr><td>Backprop &amp; gradient descent (Sessions 3–4)</td><td>The exact algorithm that trains all of them.</td></tr>
+              <tr><td>Regularisation, dropout, normalisation (Sessions 7–8)</td><td>Keeps giant models stable and generalising.</td></tr>
+              <tr><td>Embeddings (Session 16-ish)</td><td>How tokens become vectors at the model's input.</td></tr>
+              <tr><td>Attention &amp; transformers (Sessions 17–19)</td><td>The core engine of every LLM.</td></tr>
+              <tr><td>Pretraining + fine-tuning + LoRA (today)</td><td>How the model is built, then specialised cheaply.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A frontier LLM is a transformer (Session 18) pretrained to predict the next token (today) on
+          internet-scale text, then aligned with techniques like instruction-tuning and RLHF, and adapted to
+          tasks with methods like LoRA. <strong>Every single layer of that stack is something you can now
+          explain.</strong></p>
+        </div>
+
+        <h3>Where to go next</h3>
+        <ul>
+          <li><strong>Scaling laws &amp; bigger pretraining</strong> — how model size, data, and compute trade off.</li>
+          <li><strong>Alignment</strong> — instruction tuning, RLHF, and DPO to make models helpful and safe.</li>
+          <li><strong>Retrieval (RAG) &amp; agents</strong> — giving models tools and fresh knowledge (covered in the GenAI track).</li>
+          <li><strong>Efficiency</strong> — quantization, distillation, and faster attention for cheaper inference.</li>
+          <li><strong>Multimodality</strong> — combining the vision skills (CNNs) you learned with language.</li>
+        </ul>
+
+        <h3>Final-project guidance</h3>
+        <p>Your capstone is to <strong>train and fine-tune a small language model end-to-end</strong>. A solid
+        submission:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📂</div><div class="s-t">Pick data</div><div class="s-d">A focused text corpus you find interesting</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏋️</div><div class="s-t">Pretrain</div><div class="s-d">A small GPT with nanoGPT; log train/val loss</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Fine-tune</div><div class="s-d">Specialise it with LoRA on a sub-task</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">Report</div><div class="s-d">Samples + loss curves + what you learned</div></div>
+        </div>
+        <p>Keep it small, get it <em>running</em> end to end, and document your loss curves and sample outputs.
+        See the class handout and the final-project guide (linked in References) for the full rubric.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Pro tip for the project</span>
+          <p>Resist the urge to go big. A 10M-parameter model that trains in an hour and clearly improves is a
+          far better project than a giant one that never finishes. Show the <strong>loss going down</strong> and
+          <strong>before/after samples</strong> — that's the story graders want.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Modern LLMs are this course's bricks scaled up: MLPs as feed-forward blocks, backprop as the trainer,
+          transformers as the engine, pretraining + LoRA as the build-and-specialise recipe. Next stops are
+          scaling, alignment, retrieval, efficiency, and multimodality. Your capstone: pretrain a small GPT,
+          fine-tune it with LoRA, and report your loss curves and samples.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session is where the whole course pays off. Here's the one-paragraph story tying it together:</p>
+        <div class="bigidea">
+          <p>You took your toy mini-transformer from Session 19 and stepped up to <strong>nanoGPT</strong>, which
+          is the same architecture with professional plumbing organised into <strong>data → config → train →
+          sample</strong>. You <strong>pretrained</strong> a small GPT from scratch — BPE-tokenizing text into a
+          binary token stream, choosing a small config, running the get-batch → forward → backward → step loop
+          while watching train and val loss, then sampling autoregressively. Then you specialised it cheaply with
+          <strong>LoRA</strong>, freezing the giant weights and learning only tiny low-rank adapter matrices —
+          under 1% of the parameters. And you saw that this <em>is</em> how modern LLMs are built: transformers,
+          pretraining, and parameter-efficient fine-tuning, scaled up.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">🎉 You finished the whole course!</span>
+          <p>Congratulations — you've completed <strong>Neural Networks &amp; Computer Vision</strong> from start
+          to finish. Look at the journey you made: from a single <strong>neuron and MLPs</strong>, to the
+          mechanics of <strong>backpropagation</strong>, to teaching machines to see with <strong>CNNs and computer
+          vision</strong>, to giving them memory with <strong>RNNs and LSTMs</strong>, to the breakthrough of
+          <strong>attention</strong>, into full <strong>transformers</strong>, and finally to building real
+          <strong>projects</strong> — training and fine-tuning your own language model. You started knowing none
+          of this. You now understand, end to end, how the most powerful AI systems in the world actually work.
+          That's a genuinely big deal. Be proud, keep building, and go make something. 🚀</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the four stages of a nanoGPT project?</summary>
+          <p class="ans">Data (tokenise text into a binary token stream), Config (set model size and training
+          knobs), Train (run the loop and watch loss fall), and Sample (load the checkpoint and generate text).</p>
+        </details>
+        <details class="quiz">
+          <summary>In the training loop, why is the label <code class="inl">y</code> just <code class="inl">x</code> shifted by one token?</summary>
+          <p class="ans">Because the objective is "predict the next token." Shifting the input by one position
+          makes every position's correct next token its label, giving supervision at every position at once.</p>
+        </details>
+        <details class="quiz">
+          <summary>What problem does BPE tokenization solve?</summary>
+          <p class="ans">It lets a fixed vocabulary represent any text by keeping frequent chunks whole and
+          splitting rare words into smaller known pieces — more efficient than characters, more flexible than
+          whole words (cross-ref Session 16).</p>
+        </details>
+        <details class="quiz">
+          <summary>How does LoRA cut the number of trainable parameters so drastically?</summary>
+          <p class="ans">It freezes the big weight matrix and represents the update as the product of two skinny
+          (low-rank) matrices B·A with rank r. For a 768×768 matrix at r=8 that's ~12K trainable params instead
+          of ~590K — under a few percent.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why initialise LoRA's B matrix to zero?</summary>
+          <p class="ans">So that at step 0 the adapter contributes nothing (B·A = 0) and the model behaves exactly
+          like the frozen pretrained original, then gradually learns the task-specific correction.</p>
+        </details>
+        <details class="quiz">
+          <summary>If training loss keeps dropping but validation loss rises, what's happening?</summary>
+          <p class="ans">Overfitting (Session 7) — the model is memorising the small training set. Use dropout,
+          more data, or stop training when validation loss bottoms out.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 20) — your course handout, including the course roadmap and the final-project guide.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning — course site (roadmap &amp; final-project guide)</a> — the online companion with the roadmap and capstone rubric for this session.</li>
+          <li><a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">Karpathy — nanoGPT (GitHub)</a> — the small, readable codebase we use today; clone it and read <code class="inl">model.py</code>.</li>
+          <li><a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021)</a> — the original paper behind the low-rank adapter trick.</li>
+          <li><a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">HuggingFace PEFT documentation</a> — the practical library for LoRA and other parameter-efficient fine-tuning methods.</li>
+          <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need (Vaswani et al., 2017)</a> — the transformer architecture every GPT is built on.</li>
+          <li><a href="https://github.com/openai/tiktoken" target="_blank" rel="noopener">OpenAI tiktoken</a> — the fast BPE tokenizer used in our data-prep step.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-19.html"><div class="dir">← Previous</div><div class="ttl">Session 19: Project — Mini-Transformer</div></a>
+        <a class="next disabled" href="#"><div class="dir">Next →</div><div class="ttl">End of subject 🎉</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 20 — Project Week: Train a Small LM · You finished the whole course 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

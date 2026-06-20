@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 14 — Case Study — Messaging Apps &amp; Video Streaming</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 14</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 14 · Case Study — Messaging &amp; Netflix</span>
+      <h1>How chat apps and Netflix actually work</h1>
+      <p class="lead">
+        Today we stop learning building blocks one at a time and instead <em>build two real systems</em>:
+        a messaging app like WhatsApp, and a video platform like Netflix. We assume you've studied
+        <em>none</em> of this before — every topic opens with a tiny "explain like I'm 5" story, then we
+        slowly go deeper with real data models, real diagrams, and the trade-offs an engineer actually
+        wrestles with. Take it slow; by the end you'll be able to sketch both systems on a whiteboard.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 40 min read</span><span class="badge-rt">📖 12 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#approach">The 5-step design approach</a></li>
+          <li><a href="#problem">Problem statement &amp; reasoning by analogy</a></li>
+          <li><a href="#fr">Functional requirements (MVP)</a></li>
+          <li><a href="#nfr">Non-functional requirements</a></li>
+          <li><a href="#scale">Scale estimation</a></li>
+          <li><a href="#idempotency">Idempotency &amp; message order</a></li>
+          <li><a href="#sharding">Sharding the data</a></li>
+          <li><a href="#consistency">The illusion of consistency</a></li>
+          <li><a href="#database">Choosing the right database</a></li>
+          <li><a href="#cache">The cache &amp; routing</a></li>
+          <li><a href="#streaming">Video streaming (Netflix)</a></li>
+          <li><a href="#live">Live broadcast to millions</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. THE 5-STEP APPROACH ===================== -->
+      <section id="approach">
+        <h2><span class="sec-num">1</span> The 5-step design approach</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before you build a sandcastle, you don't just start grabbing sand. You decide <em>what</em> you're
+          building (a castle? a tunnel?), <em>how big</em> it should be, <em>how strong</em> it has to be, and
+          <em>how much sand</em> you'll need. System design is the same: we ask a few simple questions in a fixed
+          order, every single time, so we never forget a step.</p>
+        </div>
+
+        <p>Whenever you're handed a "design X" question, follow the same recipe. The first four steps are about
+        <strong>understanding the problem</strong> (spend ~20–25 minutes here), and only then do you start the
+        actual <strong>system design</strong> (~20–25 minutes). Today we'll use the recipe to
+        <strong>design a messaging application</strong>.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">Problem statement</div><div class="s-d">What are we even building? Reason by analogy.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">Functional requirements</div><div class="s-d">Who does what, and what happens. The MVP features.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎚️</div><div class="s-t">Non-functional reqs</div><div class="s-d">Constraints: ordering, consistency, latency…</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📐</div><div class="s-t">Scale estimation</div><div class="s-d">How big? The numbers dictate the design.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏗️</div><div class="s-t">System design</div><div class="s-d">Now, and only now, draw the boxes.</div></div>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>The first four steps are pure thinking — no boxes, no arrows. Most interview failures come from
+          jumping straight to "I'll use Kafka and Cassandra" before anyone has agreed on <em>what</em> the system
+          must do or <em>how big</em> it is. Resist the urge. The scale and the requirements <em>dictate</em> the
+          design.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Five steps, always in order: <strong>Problem statement → Functional requirements → Non-functional
+          requirements → Scale estimation → System design.</strong> The first four are about understanding the
+          problem; only the last is drawing the architecture.
+        </div>
+      </section>
+
+      <!-- ===================== 2. PROBLEM STATEMENT ===================== -->
+      <section id="problem">
+        <h2><span class="sec-num">2</span> Problem statement &amp; reasoning by analogy</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If your friend says "build me a toy," you'd ask: a toy <em>car</em>? a <em>doll</em>? a
+          <em>kite</em>? They're all "toys" but wildly different to build. "Design a messaging app" is just as
+          vague — so first we list real apps that already exist and figure out which kind of messaging we mean.</p>
+        </div>
+
+        <p>Our prompt is <strong>"Design a messaging application."</strong> That's huge and vague. The trick is to
+        <span class="term">reason by analogy</span>: find existing companies/systems that offer a similar product,
+        which gives you an overview of the umbrella of different scopes you could pick from.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Anchor app</th><th>Similar to…</th><th>What it really is</th></tr></thead>
+            <tbody>
+              <tr><td>WhatsApp</td><td>Telegram, Signal, Hike, iMessage, Arattai</td><td>Mobile-first realtime chat, &lt; 3 sec for the other person to receive a message. Built as an SMS replacement.</td></tr>
+              <tr><td>Slack</td><td>MS Teams, Flock</td><td>B2B enterprise chat. Group/channel-centric — a channel can have 100k employees.</td></tr>
+              <tr><td>Facebook Messenger</td><td>Instagram Messages, Orkut messages</td><td>Messaging for social media. Primarily 1-1 messages.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>What <em>not</em> to build</h3>
+        <p>Just as important: scope <em>out</em> the things that look similar but are a different problem entirely.
+        Naming these shows you understand the boundary.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>App</th><th>Similar to…</th><th>Why it's a different problem</th></tr></thead>
+            <tbody>
+              <tr><td>Discord</td><td>—</td><td>Voice chat — needs ultra-low latency.</td></tr>
+              <tr><td>Orkut</td><td>—</td><td>Social media, not messaging.</td></tr>
+              <tr><td>Twitter</td><td>X, Threads (owned by Meta)</td><td>Social media.</td></tr>
+              <tr><td>Skype</td><td>FaceTime, Zoom</td><td>Video chat &amp; screen sharing.</td></tr>
+              <tr><td>Hangouts</td><td>Google Meet</td><td>Video calling.</td></tr>
+              <tr><td>Snapchat</td><td>—</td><td>Privacy-focused — disappearing messages.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          "Design a messaging app" is ambiguous. <strong>Reason by analogy</strong> to map out the scope:
+          WhatsApp (mobile-first 1-1 realtime chat), Slack (enterprise, huge groups), Messenger (social 1-1).
+          Explicitly exclude voice/video/social products like Discord, Zoom, Twitter, and Snapchat. We'll design
+          a WhatsApp-style app.
+        </div>
+      </section>
+
+      <!-- ===================== 3. FUNCTIONAL REQUIREMENTS ===================== -->
+      <section id="fr">
+        <h2><span class="sec-num">3</span> Functional requirements (the MVP)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A functional requirement is a thing the app can <em>do</em> for someone. Think about the
+          <strong>actors</strong> (the people and systems using the app) and ask "what can each of them do?"
+          A user can send a message, read a message, start a chat… each of those is a feature you write code for.</p>
+        </div>
+
+        <p>A <span class="term">functional requirement</span> is some feature/functionality you offer to the
+        client (a user, or another internal system). You explicitly expose an API / write code for each one. The
+        guiding sentence is: <em>"Who is doing what, and based on that, what happens?"</em></p>
+
+        <h3>Actors</h3>
+        <ul>
+          <li><strong>Users</strong> — the <em>sender</em> and the <em>receiver</em>.</li>
+          <li><strong>Organisation</strong> (only for enterprise software like Slack) — relationships like
+          <code class="inl">org ⇔ admin ⇔ HR</code>.</li>
+        </ul>
+        <p>Whenever you think of features, think of what things the actors can <em>do</em> in the app.</p>
+
+        <div class="callout key">
+          <span class="c-title">Keep the "minimal" in MVP</span>
+          <p>MVP features are <strong>not</strong> a feature-suggestion competition. Follow <span class="term">KISS</span>:
+          <em>keep it simple, silly</em>. And remember: <strong>practice makes perfect — but only <em>correct</em>
+          practice.</strong> Incorrect practice actively harms you.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><strong>MVP features (v0)</strong></td><td>Perfect for discussion — what you build now.</td></tr>
+              <tr><td><strong>Future scope (v1+)</strong></td><td>Good to have, but not absolutely necessary.</td></tr>
+              <tr><td><strong>Bad (v-never)</strong></td><td>Get yourself rejected in an interview.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>MVP feature 1 — A user can send messages to other users</h3>
+        <pre>sendMessage(
+  sender_id:    uuid,
+  recipient_id: uuid,
+  message:      json
+): ack | failure          <span class="cm"># user-facing</span></pre>
+        <div class="callout note">
+          <span class="c-title">Why is <code class="inl">message</code> just <code class="inl">json</code>?</span>
+          <p>At this moment it would be premature to nail down the exact contents of a message. Keep it as JSON
+          for now — the contents depend on how "fancy" we want the app to be, and they'll frequently change in the
+          future. So we make it <strong>schemaless</strong>.</p>
+        </div>
+
+        <h4>Message status</h4>
+        <p>Users should be able to see the status of the messages they've sent:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Status</th><th>Meaning</th><th>UI</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Sent</strong></td><td>Received by the backend server.</td><td>Single tick ✓</td></tr>
+              <tr><td><strong>Delivered</strong></td><td>Delivered to the recipient's app, but not read yet.</td><td>Double tick ✓✓</td></tr>
+              <tr><td><strong>Read</strong></td><td>The recipient has actually read the message.</td><td>Double tick ✓✓ (blue)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Rich messages</h4>
+        <ul>
+          <li>React to messages with Emojis</li>
+          <li>Videos / Images</li>
+          <li>Gifs</li>
+        </ul>
+
+        <h3>MVP feature 2 — Receive &amp; view past messages (most recent first)</h3>
+        <p>Users should be able to receive messages and view the past messages in a conversation, most recent
+        first. Users should <strong>only</strong> be able to view messages of a conversation they're a part of.</p>
+        <pre>getMessages(
+  user_id:          uuid,
+  conversation_id:  uuid,        <span class="cm"># identifies the conversation (Tarun+Sanjana, Harini+Pallavi, …)</span>
+  pagination_offset: int,
+  pagination_limit:  int
+): list of messages       <span class="cm"># user-facing</span></pre>
+        <p>Updating/deleting already-sent messages is <strong>extremely hard to do correctly</strong>, as is full
+        profile management — so they're future scope, not MVP.</p>
+
+        <h3>MVP feature 3 — View your conversations (most recent first)</h3>
+        <pre>getConversations(
+  user_id:          uuid,
+  pagination_offset: int,
+  pagination_limit:  int
+): list of conversation   <span class="cm"># each: {conversation_id, name, unread count,</span>
+                          <span class="cm">#        quick summary of the latest message}  -- user-facing</span></pre>
+
+        <h3>Future scope (v1+) — good to have, but not the MVP</h3>
+        <ul>
+          <li><strong>Notifications</strong> — in-app and push.</li>
+          <li><strong>Broadcast</strong> the same message to multiple people (batch processing).</li>
+          <li><strong>Groups</strong> — users can participate &amp; send messages inside groups. A single group can
+          potentially have <strong>100,000+ users</strong>:
+            <pre>sendMessageGroup(sender_id: uuid, group_id: uuid, message: json): ack | failure
+getMessagesGroup(user_id: uuid, group_id: uuid,
+                 pagination_offset: int, pagination_limit: int): list of messages</pre>
+          </li>
+          <li><strong>Multi-device support</strong> — extremely hard to do correctly (needs CRDTs).</li>
+          <li><strong>Group management</strong> — creating, adding people, permissions, group description.</li>
+          <li><strong>Contacts</strong> — suggest / load contacts from the user's phone.</li>
+          <li><strong>Message forwarding.</strong></li>
+          <li><strong>Start / delete a conversation</strong>, and <strong>mark as spam</strong> — start a new
+          conversation by selecting a recipient from contacts/friends.</li>
+          <li><strong>Syncing</strong> messages between the app cache &amp; the cloud.</li>
+          <li><strong>End-to-end encryption.</strong></li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Identify the <strong>actors</strong> (sender, receiver), then list features as APIs you'd write code for:
+          <code class="inl">sendMessage</code>, <code class="inl">getMessages</code>,
+          <code class="inl">getConversations</code>. Keep <code class="inl">message</code> schemaless JSON.
+          Message status is Sent (✓) / Delivered (✓✓) / Read (blue ✓✓). Keep MVP minimal (KISS); push groups,
+          notifications, multi-device, E2E encryption, etc. to future scope.
+        </div>
+      </section>
+
+      <!-- ===================== 4. NON-FUNCTIONAL REQUIREMENTS ===================== -->
+      <section id="nfr">
+        <h2><span class="sec-num">4</span> Non-functional requirements (design goals)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If functional requirements are "the app can send a message," non-functional requirements are "the
+          message must arrive <em>in the right order</em>, <em>quickly</em>, and must <em>never get lost</em>."
+          Same feature, but rules about <em>how well</em> it behaves.</p>
+        </div>
+
+        <p>A <span class="term">non-functional requirement</span> is an additional constraint/behavior you want the
+        system to adhere to — <em>not</em> a feature you offer the client. For a messaging app, three matter most:
+        <strong>message order</strong>, <strong>idempotency</strong>, and the
+        <strong>consistency / availability / latency</strong> trade-off.</p>
+
+        <h3>4.1 Message order</h3>
+        <p>Message ordering must be maintained: the recipient must see messages in the <strong>same order</strong>
+        the sender sent them.</p>
+        <div class="callout key">
+          <span class="c-title">Why is message order important?</span>
+          <p>The <em>meaning</em> of a conversation can change based on message order. "I'm going to kill it at the
+          interview" then "wish me luck" reads very differently if reversed. Communication is the backbone of human
+          society, and it needs order.</p>
+        </div>
+
+        <h3>4.2 Idempotency</h3>
+        <p>Messaging apps are typically <strong>mobile-first</strong>, and mobile users don't always have perfect
+        internet. So these apps frequently deal with network failures. In a lot of scenarios, the frontend is coded
+        to <strong>automatically retry</strong> sending if it fails — we don't want the user to re-type their whole
+        message.</p>
+        <pre>&lt;input id="message" type="text" placeholder="send a message" onkeydown="sendMessage" /&gt;
+&lt;script&gt;
+    function sendMessage() {
+        message = document.getElementById("message").text;
+        sendWithRetries(message);
+    }
+
+    function sendWithRetries(message) {
+        fetch("/backend-api-url/sendMessage", "POST", {
+            message: message
+        }).then(() =&gt; console.log("success"))
+          .error(() =&gt; {
+              // automatic retry after 1 second
+              setTimeout(() =&gt; sendWithRetries(message), 1)
+          })
+    }
+&lt;/script&gt;</pre>
+        <div class="callout warn">
+          <span class="c-title">Automatic retries can cause duplicates!</span>
+          <p>Consider this sequence: the request <strong>does</strong> reach the server, the server acts on it
+          (stores the message), and responds with an ACK — <em>but the ACK gets lost</em> and never reaches the
+          user. The frontend wrongly assumes the server never received the request and retries. Now the server
+          stores the message <strong>again</strong> → duplicates in the database.</p>
+        </div>
+
+        <p>The fix is to make the operation <span class="term">idempotent</span>.</p>
+        <div class="callout key">
+          <span class="c-title">What is idempotency?</span>
+          <p>A function <code class="inl">f(x)</code> is idempotent if and only if <code class="inl">f(x) = f(f(x))</code>
+          — repeated application does nothing more than a single application.</p>
+          <ul>
+            <li><code class="inl">f(x) = x²</code> is <strong>NOT</strong> idempotent: <code class="inl">f(4) = 16</code>
+            but <code class="inl">f(f(4)) = 256</code>.</li>
+            <li><code class="inl">f(x) = |x|</code> <strong>IS</strong> idempotent: <code class="inl">f(-5) = 5</code>
+            and <code class="inl">f(f(-5)) = 5</code>.</li>
+          </ul>
+        </div>
+        <p>Any <strong>WRITE</strong> (post/update/delete) API endpoint should be idempotent if your frontend can
+        retry.</p>
+        <div class="callout note">
+          <span class="c-title">Q: Does the backend engineer care whether the frontend used auto-retries?</span>
+          <p><strong>No — they don't care, and they shouldn't have to.</strong> Maybe the frontend doesn't retry
+          today, but someone adds auto-retries later. So <em>irrespective of what the frontend does</em>, always
+          try to make backend POST APIs idempotent whenever possible.</p>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Don't confuse duplicates with intentional repeats</span>
+          <p>If a user <em>purposely</em> resends the same message again and again, that must be allowed — when you
+          want to annoy your friends, sending "Hi" 20 times in a row should work! We only want to prevent
+          <strong>duplicates caused by automatic retries</strong>, not legitimate repeats.</p>
+        </div>
+
+        <h3>4.3 Consistency vs Availability vs Latency (PACELC)</h3>
+        <p>Don't jump to an answer. Reason it out by asking the right questions first.</p>
+        <p><strong>Q: What is "the data"?</strong> The messages that are being sent.</p>
+        <p><strong>Q: What does eventual consistency (stale reads) mean here?</strong> Messages out of order on the
+        recipient's side, or not being able to see the latest message. Two concrete cases:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Side</th><th>Scenario at t=0 / t=1</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Sender side</strong></td><td>Pujan sends to Minesh at t=0, server ACKs. Pujan reloads at t=1 and can't see his own message (stale read).</td><td>Pujan thinks the app deleted his message. (It's not lost — he'll see it eventually.) Solved by <span class="term">read-your-write</span> consistency.</td></tr>
+              <tr><td><strong>Receiver side</strong></td><td>Pujan sends to Minesh at t=0, server ACKs. At t=1 Minesh tries to load and can't see it.</td><td>Pujan says "I sent it," Minesh says "I didn't get it." (Not lost — arrives eventually.)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Q: Can we afford stale reads here?</strong> No, we cannot. <strong>Q: What does data loss
+        mean?</strong> Sender sent a message, the server ACK'd, but the message actually got lost by the backend.
+        <strong>Q: Can we afford data loss?</strong> Very, very bad. No.</p>
+
+        <div class="callout key">
+          <span class="c-title">Communication needs strong consistency</span>
+          <p>Communication is the backbone of human society — it needs <strong>strong consistency</strong>. But
+          <strong>availability</strong> and <strong>low latency</strong> also matter: we need realtime chat, so if
+          PersonA sends to PersonB and PersonB is online, PersonB should receive it within a few seconds.</p>
+        </div>
+        <p>Our latency requirement: <strong>Low latency &lt; 5 seconds</strong>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">But PACELC says we can't have all three!</span>
+          <p>The <span class="term">PACELC theorem</span> says we can't have high consistency together with high
+          availability and low latency. So is it possible to achieve all three? <strong>No — PACELC says it's
+          impossible.</strong> However, we can create the <em>illusion</em> of consistency with availability &amp;
+          low latency: in reality we give up on consistency just a little bit, but to the end user things still
+          appear consistent 99.xxx% of the time. (We build this illusion in Topic 8.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Three NFRs dominate: (1) <strong>Message order</strong> must be preserved (meaning depends on it);
+          (2) <strong>Idempotency</strong> — make WRITE APIs idempotent so frontend auto-retries don't create
+          duplicates (but allow intentional repeats); (3) We need <strong>strong consistency, availability, and
+          &lt;5s latency</strong> — which PACELC says is impossible together, so we'll build the <em>illusion</em>
+          of consistency instead.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SCALE ESTIMATION ===================== -->
+      <section id="scale">
+        <h2><span class="sec-num">5</span> Scale estimation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before building a bridge you guess how many cars will cross it each day — a footbridge and a highway
+          are totally different. Here we guess how many messages flow per second and how much storage we'll need
+          over 20 years. Those numbers decide whether one computer is enough (it won't be).</p>
+        </div>
+
+        <p><strong>The scale will dictate our design choices.</strong> Let's estimate.</p>
+
+        <h3>Users &amp; messages per second</h3>
+        <p>Assume <strong>total users = 2 billion</strong> (web/planet scale).</p>
+        <div class="callout note">
+          <span class="c-title">Daily Active Users (DAU)</span>
+          <p>Normally we apply the <strong>Pareto Principle</strong> (only ~20% of users active). Is that true for
+          WhatsApp? <strong>No!</strong> For a messaging app the number is much higher — say <strong>80% =
+          1.6 billion ≈ 2 billion DAU</strong>. (For FB Messenger it might still be as low as 20%.)</p>
+        </div>
+        <p>Assume average <strong>10–20 messages / active-user / day</strong>. Taking 20:</p>
+        <pre>Total messages/day  = 20 messages/user/day × 2 billion users
+                    = 40 billion messages / day
+
+Avg messages/second = 40 billion / day
+                    = 4 × 10¹⁰ messages / (10⁵ seconds)
+                    = 4 × 10⁵ messages / second
+                    = 400,000 messages / second</pre>
+
+        <h3>Per-API load</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>API</th><th>Avg load</th><th>Reasoning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">sendMessage</code></td><td><strong>400,000 / sec</strong></td><td>The base rate computed above.</td></tr>
+              <tr><td><code class="inl">getMessages</code></td><td><strong>800,000 / sec</strong> (≈ 2×)</td><td>A message is sent once but read a handful of times — assume each message read twice on average.</td></tr>
+              <tr><td><code class="inl">getConversations</code></td><td><strong>200,000 / sec</strong></td><td>Only when the user re-opens the app: ~10 reopens/user/day × 2B = 20B reopens/day.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Why reads aren't astronomically higher (and why groups differ)</span>
+          <p>On Stack Overflow / Twitter a post is made once and read thousands or millions of times. On WhatsApp a
+          message is sent once and read only a handful of times — so reads are only ~2× writes. <strong>Groups
+          change this:</strong> a message sent once in a large group is read by thousands. If 400,000 msg/sec were
+          each read 100,000 times, that's <strong>40 billion requests/sec</strong> — insane; no system (not even
+          Google with ~10 million servers) can handle that as of 2025. Luckily group participation is far smaller —
+          Slack has only <strong>42 million DAU</strong> vs WhatsApp's <strong>2 billion</strong>.</p>
+        </div>
+
+        <h3>Peak load</h3>
+        <p>Assume peak = <strong>5× average</strong> during global events (Covid, New Year): <strong>≈ 2 million
+        messages/second</strong>.</p>
+
+        <h3>Storage over 20 years</h3>
+        <p>What's the data in one message?</p>
+        <pre>message: {
+    sender_id:                            uuid (16b)
+    receiver_id / group_id / conversation_id: uuid (16b)
+    message_id:                           uuid (16b)
+    text:                                 string (200b avg)
+    when:                                 timestamp (8b)
+    where:                                geolocation (16b)
+    delivery_status:                      enum (1b)
+    attachment_url:                       string (200b avg)
+}</pre>
+        <div class="callout note">
+          <span class="c-title">Why one merged "conversation_id", not many tables</span>
+          <p>1:1 messages could have their own table (sender_id, receiver_id, message); group messages another
+          (sender_id, group_id, message). But what about 3-person chats? Ad-hoc 5-person chats? Another table each?
+          <strong>No.</strong> Instead, merge everything under a <strong>conversation_id</strong>: for 1:1 it's a
+          tuple of <code class="inl">(sender_id, receiver_id)</code>; for groups it's the group id; ad-hoc
+          conversations get a <code class="inl">conversation_participants(conversation_id, user_id)</code> table
+          that covers all scenarios (1:1, group, 1:any).</p>
+        </div>
+        <p>Average size ≈ <strong>500 bytes/message</strong>:</p>
+        <pre>Data/day  = 500 bytes/message × 40 billion messages/day
+          = 20 trillion bytes/day
+          = 20 TB / day
+
+Data/20yr = 20 TB/day × (20 × 365 days)
+          = 20 TB/day × ~10,000 days
+          = 200 Petabytes</pre>
+        <div class="callout warn">
+          <span class="c-title">Can this fit on one server?</span>
+          <p><strong>No.</strong> As of 2026 we can store up to ~3 PB on a single server, not 200 PB. Even if we
+          could, a single server can't handle 2 million messages/sec. <strong>We definitely need sharding!</strong></p>
+        </div>
+
+        <h3>Read-heavy or write-heavy?</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Average</th><th>Peak</th></tr></thead>
+            <tbody>
+              <tr><td>Writes (<code class="inl">sendMessage</code>)</td><td>400,000 / sec</td><td>2 million / sec</td></tr>
+              <tr><td>Reads (<code class="inl">getMessages</code>)</td><td>800,000 / sec</td><td>4 million / sec</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Neither reads nor writes are 10× the other — <strong>this is both read-heavy AND write-heavy</strong>,
+          with neither dominating. That's very challenging to design for, because no single database is optimized
+          for both. So we must turn it into <em>one or the other</em>. Can we reduce writes (batching/sampling)?
+          <strong>No.</strong> So we'll reduce the <em>reads</em> hitting the database by absorbing them in a
+          <strong>cache</strong> — and since messages are mostly immutable (edits/deletes are rare), caching works
+          well. The result: lots of cache, and a database optimized for <strong>writes</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ~2 billion DAU × ~20 msgs/day ≈ <strong>40 billion messages/day ≈ 400,000 writes/sec</strong> (peak ~2M),
+          with reads ≈ 2× (~800,000/sec). At ~500 bytes/message that's ~20 TB/day → <strong>~200 PB over 20
+          years</strong> — far too much for one server, so we <strong>need sharding</strong>. The system is both
+          read- and write-heavy, so we'll <strong>absorb reads in a cache</strong> and optimize the DB for writes.
+        </div>
+      </section>
+
+      <!-- ===================== 6. IDEMPOTENCY & MESSAGE ORDER ===================== -->
+      <section id="idempotency">
+        <h2><span class="sec-num">6</span> System design — idempotency &amp; message order</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Give every note a special sticker number so the post office can tell "I already have this exact note"
+          and not file it twice. And on each note, write "this comes right after note #7" — so your friend lays the
+          notes out in the right order, and waits if note #7 hasn't arrived yet.</p>
+        </div>
+
+        <p>Now we start the actual system design. Two NFRs get solved together on the <strong>client side</strong>:
+        idempotency and ordering.</p>
+
+        <h3>Client-generated message ids: UUID v7</h3>
+        <p>Each message gets a unique <code class="inl">message_id</code> <strong>generated on the client</strong>.
+        We use <span class="term">UUID v7</span>:</p>
+        <ul>
+          <li>universally unique, decentralized, sparse, and <strong>roughly sortable</strong> (time-ordered)</li>
+          <li>a widely accepted spec with popular implementations in every major language</li>
+          <li>128-bit, high performance</li>
+        </ul>
+
+        <h3>Idempotency via client-side id</h3>
+        <p>Whenever the backend receives a <code class="inl">sendMessage</code> call, it stores the message
+        <strong>only if</strong> the <code class="inl">message_id</code> isn't already in the DB. If it
+        <em>is</em> already there, it ignores the request but <strong>still returns a success response</strong> (so
+        the frontend stops retrying).</p>
+        <pre>&lt;input id="message" type="text" placeholder="send a message" onkeydown="sendMessage" /&gt;
+&lt;script&gt;
+    function sendMessage() {
+        var content = document.getElementById("message").text;
+        var message = {
+            id: uuid_v7(),     // this id stays UNCHANGED across retries
+            content: content,
+            timestamp: new Date(),
+        }
+        sendWithRetries(message);
+    }
+    function sendWithRetries(message) {
+        fetch("/backend-api-url/messages", "POST", {
+            message: message
+        }).then(() =&gt; console.log("success"))
+          .error(() =&gt; {
+              // automatic retry after 1 second
+              setTimeout(() =&gt; sendWithRetries(message), 1)
+          })
+    }
+&lt;/script&gt;</pre>
+        <p>Because the id is generated once (before any retry) and reused, a retried request carries the
+        <em>same</em> id — so the backend recognizes the duplicate and refuses to store it twice.</p>
+
+        <h3>Message order — why timestamps and backend queues fail</h3>
+        <div class="callout warn">
+          <span class="c-title">Sorting by <code class="inl">created_time</code> will NOT work</span>
+          <p>The recipient doesn't even know a message is <em>pending</em> until it arrives. By the time the
+          receiver's app realizes an intermediate message arrived late, it's already too late — it had already
+          shown the later messages to the user. And <strong>no backend-based solution</strong> (SQS / buffer / …)
+          works either, for the same reason: the backend doesn't know a message is pending until it arrives, so by
+          the time it realizes one came late, it has already put later messages in the queue.</p>
+        </div>
+
+        <h3>Solution: a message chain</h3>
+        <p>Every new message contains the <code class="inl">previous_message_id</code> inside it. On the
+        recipient's side, the app will <strong>not show a message until its previous message has also been received
+        &amp; shown</strong>. If a message appears out of order, the app shows <em>waiting-for-messages</em> until
+        all previous messages arrive.</p>
+        <pre>&lt;input id="message" type="text" placeholder="send a message" onkeydown="sendMessage" /&gt;
+&lt;script&gt;
+    var previous_id = null;
+    function sendMessage() {
+        var content = document.getElementById("message");
+        var id = uuid_v4()
+        var message = {
+            previous_id,         // id of the last message that I sent
+            id: id,
+            content: content,
+            timestamp: new Date(),
+        }
+        previous_id = id;
+        sendWithRetries(message);
+    }
+&lt;/script&gt;</pre>
+        <div class="callout note">
+          <span class="c-title">Q: What about multiple devices / multiple senders in a group chat?</span>
+          <p>Don't worry — we're <strong>not</strong> guaranteeing any ordering <em>across</em> senders. The intent
+          is only that all messages sent by "Subhadeep" appear in the correct order. Messages from different senders
+          can be interleaved in any way; we don't care, as long as <em>each individual sender's</em> messages stay
+          in order.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Generate a <strong>client-side UUID v7</strong> per message (unique, sortable). For
+          <strong>idempotency</strong>, the backend stores a message only if its id is new, but always returns
+          success so retries stop. For <strong>ordering</strong>, timestamps and backend queues fail (you can't
+          detect a late message in time), so each message carries its <code class="inl">previous_message_id</code>
+          — a <strong>message chain</strong> — and the recipient shows "waiting" until predecessors arrive. Order is
+          guaranteed per-sender, not across senders.
+        </div>
+      </section>
+
+      <!-- ===================== 7. SHARDING ===================== -->
+      <section id="sharding">
+        <h2><span class="sec-num">7</span> Sharding the data</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>200 petabytes won't fit in one box, so we split the data across thousands of boxes. The
+          <strong>rule</strong> for deciding which box a message goes into is the <em>sharding key</em>. Pick the
+          rule well and finding your messages means opening one box; pick badly and you open every box.</p>
+        </div>
+
+        <p>We need sharding (Topic 5). The big question is the <span class="term">sharding key</span>. Two
+        candidates: <code class="inl">user_id</code> and <code class="inl">conversation_id</code>.</p>
+
+        <h3>Option A — shard by <code class="inl">user_id</code></h3>
+        <p>All data (messages sent &amp; received) of a particular user lives within the same shard.</p>
+        <div class="callout note">
+          <span class="c-title">Q: 2 billion users → 2 billion servers?</span>
+          <p><strong>No!</strong> A single server holds the data for hundreds of thousands of users.</p>
+        </div>
+        <div class="callout note">
+          <span class="c-title">How do you shard a table that has no <code class="inl">user_id</code> column?</span>
+          <p>The raw <code class="inl">messages</code> table is just
+          <code class="inl">(id, sender_id, recipient_id, message)</code> — e.g. <code class="inl">(1, Jinesh,
+          Anika, "Hi")</code>. To shard by user, we <strong>duplicate the row under each participant</strong> with a
+          <code class="inl">user_id</code> column and store a copy on each user's shard:</p>
+          <pre>Jinesh's shard:
+  row_id  user_id  id  sender_id  recipient_id  message
+  123     Jinesh   1   Jinesh     Anika         Hi
+
+Anika's shard:
+  row_id  user_id  id  sender_id  recipient_id  message
+  321     Anika    1   Jinesh     Anika         Hi</pre>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>1:1 chat</th><th>Group chat</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">getMessages</code></td><td>Go only to the user's shard (all their messages are there).</td><td><strong>Store-in-sender:</strong> reads fan out (different senders' messages live in different shards). <strong>Store-in-all-participants:</strong> fast reads from any shard.</td></tr>
+              <tr><td><code class="inl">sendMessage</code></td><td>Go to <em>both</em> sender &amp; receiver's shard (data replication).</td><td><strong>Store-in-sender:</strong> store only in sender's shard. <strong>Store-in-all:</strong> fan-out writes.</td></tr>
+              <tr><td><code class="inl">recentConversations</code></td><td>Go only to the user's shard.</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Sharding by user_id does NOT work for groups</span>
+          <p>For group conversations, either reads fan out or writes fan out — there's no good middle ground.</p>
+        </div>
+
+        <h3>Option B — shard by <code class="inl">conversation_id</code></h3>
+        <p>For groups, <code class="inl">conversation_id = group_id</code>. For 1-1 chats,
+        <code class="inl">conversation_id</code> = a unique id assigned to a pair of users (just the pair
+        <code class="inl">(sender_id, receiver_id)</code>).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>1:1 chat</th><th>Group chat</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">getMessages</code></td><td>Go only to the conversation's shard.</td><td>Just go to the group's shard.</td></tr>
+              <tr><td><code class="inl">sendMessage</code></td><td>Go to the conversation's shard.</td><td>Just store in the group's shard.</td></tr>
+              <tr><td><code class="inl">recentConversations</code></td><td><strong>Fan-out → bad.</strong> Fix below.</td><td>Always a fan-out (a single group message updates the recent-conversation list for up to 100,000 users).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">The <code class="inl">recentConversations</code> DB</span>
+          <p>Because <code class="inl">recentConversations(user_id)</code> would fan out, we keep a
+          <strong>separate DB</strong> just to answer it. Now <code class="inl">sendMessage</code> must also update
+          this DB. Note: it actually holds info (last-message timestamp) about <em>all</em> conversations — it's
+          only <em>called</em> the recentConversations DB because we use it exclusively to answer that query.</p>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Groups: don't even provision recentConversations on the backend</span>
+          <p>For groups, a single message updates the recent conversation for potentially 100,000 users — always a
+          fan-out, no matter what. So you <strong>don't provision this API</strong> for groups on the backend.
+          Practically it happens only at the <strong>frontend</strong>: the client app maintains a cache of recent
+          conversations, updated via <strong>notifications</strong>.</p>
+        </div>
+
+        <h3>The schema</h3>
+        <pre>users                    (id, name, age, avatar_url)
+conversations            (id, title, description)
+conversation_participants (conversation_id, user_id)
+messages                 (id, sender_id, conversation_id, message)</pre>
+
+        <div class="bigidea">
+          <span class="c-title">What to choose?</span>
+          <p><strong>Facebook Messenger / WhatsApp:</strong> group size is limited → sharding by
+          <code class="inl">user_id</code> is ideal. <strong>Slack / MS Teams:</strong> groups are a core feature
+          and can get very large (100,000+ users) → sharding by <code class="inl">conversation_id</code> is ideal.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Two sharding keys. <strong>By <code class="inl">user_id</code></strong>: a user's data is co-located
+          (rows duplicated per participant), great for 1:1 and "all my messages," but groups force either fan-out
+          reads or fan-out writes. <strong>By <code class="inl">conversation_id</code></strong>: a conversation is
+          co-located, great for groups, but <code class="inl">recentConversations</code> fans out (use a separate
+          DB / frontend cache). WhatsApp/Messenger → shard by user_id; Slack/Teams → shard by conversation_id.
+        </div>
+      </section>
+
+      <!-- ===================== 8. CONSISTENCY ILLUSION ===================== -->
+      <section id="consistency">
+        <h2><span class="sec-num">8</span> The illusion of consistency</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You can't reliably hand a copy of a note to two friends at the exact same instant. But if you always
+          give it to the <em>receiver</em> first, the receiver is happy immediately; the sender already remembers
+          what they wrote (their app keeps a copy), so they're happy too. To both of them it <em>looks</em>
+          instant — even though the bookkeeping finishes a moment later.</p>
+        </div>
+
+        <p>PACELC says: if we want consistency, we give up availability &amp; latency. We <em>do</em> want
+        consistency. Assume we're sharding by <code class="inl">user_id</code> — then every write must go to
+        <strong>2 shards</strong> (sender &amp; receiver), and we must keep them consistent.</p>
+
+        <h3>Option 1 — Two-Phase Commit (2PC)</h3>
+        <p>Write to both shards atomically with 2PC. But it's <strong>extremely slow</strong> (low throughput, high
+        latency) and gives <strong>low availability</strong>. Rejected.</p>
+
+        <h3>Can we instead create an <em>illusion</em> of consistency?</h3>
+        <p>Instead of writing atomically, write the two shards <strong>one by one</strong>. Running example:</p>
+        <pre>Riya  – "bro can I copy your project submission?" → Aditya
+(sender)                                            (recipient)</pre>
+
+        <h4>Attempt: write to Sender shard first</h4>
+        <ul>
+          <li><strong>Failure</strong> (low latency): return failure immediately; client can retry. Fine.</li>
+          <li><strong>Success:</strong> Can we return "success" to the sender now? <strong>No!</strong> The data
+          isn't on the receiver shard yet — if the receiver does <code class="inl">getMessages</code>, they won't
+          see it, even though the sender thinks it's sent. <em>Inconsistency:</em> "bro, I sent it" / "bro, you
+          didn't!"
+            <ul>
+              <li>Then write to the Receiver shard. <strong>Success</strong> (low latency) → return success, done.</li>
+              <li><strong>Failure</strong> (high latency): now we're in an inconsistent state (on sender shard, not
+              receiver shard). <em>Retry</em> → sender waits until retry succeeds → very high latency.
+              <em>Rollback</em> → return an error, but the system stays inconsistent until the rollback completes, so
+              we must <strong>lock</strong> and block the sender's reads → high read latency for the sender.</li>
+            </ul>
+          </li>
+        </ul>
+        <div class="callout warn">
+          <span class="c-title">Writing to the sender first is bad</span>
+          <p>Either we lie about success, or we suffer high latency from retries/rollbacks and locks. Let's flip the
+          order.</p>
+        </div>
+
+        <h4>The fix: write to Receiver shard first</h4>
+        <ul>
+          <li><strong>Failure</strong> (low latency): return failure immediately; client (sender) can retry.</li>
+          <li><strong>Success:</strong> the message has <em>actually been sent</em> — if the recipient fetches now,
+          they see it. <strong>Return success immediately</strong> (without even writing the sender shard yet) →
+          very low latency.
+            <ul>
+              <li><strong>(Async) write to the Sender's shard.</strong> Success → done. Fails → just keep retrying
+              until it succeeds. The sender isn't waiting (already ACK'd), so <strong>no added latency</strong>.</li>
+            </ul>
+          </li>
+        </ul>
+        <div class="callout key">
+          <span class="c-title">The frontend cache closes the gap</span>
+          <p>If the receiver-shard write succeeds but the async sender-shard write hasn't landed, reloading the
+          sender's app via <code class="inl">getMessages</code> wouldn't show their own message → they'd think it
+          was deleted. Fix: a <strong>frontend cache</strong> inside the client app. The app already knows what it
+          sent and that the server ACK'd it, so it shows the message regardless. The <em>only</em> failure case is
+          if the sender's shard misbehaves <em>and</em> the user reinstalls / clears the app cache before the async
+          write lands — extremely rare, so not an issue. The message is never lost; it eventually replicates to the
+          sender shard from the receiver shard.</p>
+        </div>
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>By cleverly writing to the <strong>recipient's shard first</strong> and leaning on the
+          <strong>sender-side frontend cache</strong>, we create an <strong>illusion of immediate consistency</strong>.
+          It solves the practical problem without 2PC's cost.</p>
+        </div>
+
+        <h3>How this beats PACELC on availability &amp; latency</h3>
+        <p><strong>Consistency vs Availability — a network partition:</strong></p>
+        <pre>Harini ----- "Hi" -----> Srinidhi
+App Server 1 receives the request.
+It CAN reach Srinidhi's shard, but a network partition blocks Harini's shard.</pre>
+        <p>The app server just writes to Srinidhi's shard (recipient) and returns success to Harini. It also drops a
+        message in a <strong>task queue</strong> to add this to Harini's shard asynchronously. Even during the
+        partition, <code class="inl">sendMessage</code> &amp; <code class="inl">getMessages</code> stay available →
+        <strong>high availability</strong>. Srinidhi sees the message (written to her shard); Harini sees it via the
+        frontend cache → <strong>(illusion of) immediate consistency</strong>. (If the write to Srinidhi's shard
+        fails, return an error and let Harini retry.)</p>
+        <p><strong>Consistency vs Latency:</strong> because we're not trying to write both shards atomically, we
+        never wait for retry/rollback — we return success the moment the recipient shard is written →
+        <strong>low latency</strong>.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          2PC across sender + receiver shards is too slow / low-availability. Instead, <strong>write to the
+          receiver's shard first</strong>, return success immediately, then <strong>async-write the sender's
+          shard</strong> (retry until it lands). A <strong>sender-side frontend cache</strong> hides the gap, and a
+          <strong>task queue</strong> keeps things available through partitions. Net effect: an <em>illusion</em> of
+          immediate consistency with high availability and low latency.
+        </div>
+      </section>
+
+      <!-- ===================== 9. CHOOSING THE DATABASE ===================== -->
+      <section id="database">
+        <h2><span class="sec-num">9</span> Choosing the right database</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Different toy boxes are good at different things — one is great for stacking, another for sorting by
+          color. We list exactly what we need our "box" (database) to be good at, then pick the box that matches.</p>
+        </div>
+
+        <p>Recall the load: writes 400,000/sec avg (2M peak), reads 800,000/sec avg (4M peak) — <strong>both read
+        &amp; write heavy</strong>, and <strong>no database is optimized for both</strong>.</p>
+        <div class="callout note">
+          <span class="c-title">Optimize reads or writes?</span>
+          <p>Can we optimize <strong>writes</strong>? Only by <em>batching</em> (causes stale reads — but we want
+          low latency) or <em>sampling</em> (causes data loss — and we can't afford data loss). So no. Can we
+          optimize <strong>reads</strong>? Yes — absorb as many as possible in a <strong>cache</strong>. With most
+          reads absorbed, we can now optimize the database for <strong>writes</strong>.</p>
+        </div>
+
+        <h3>What the ideal database needs</h3>
+        <ul>
+          <li>High write throughput (400,000 writes/sec avg)</li>
+          <li>No joins needed — we only "find all messages of Akshay (within a conversation)," never "all messages
+          of all of Akshay's friends"</li>
+          <li>No search needed (if needed later, provision another DB in a separate microservice)</li>
+          <li>Paginated reads (by timestamp)</li>
+          <li>No transactions needed</li>
+          <li>Disk persistence</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>DB type</th><th>Strengths</th><th>Weaknesses / verdict</th></tr></thead>
+            <tbody>
+              <tr><td><strong>SQL</strong></td><td>ACID transactions, normalization, joins, schema</td><td>Low throughput, can't scale horizontally → ✗</td></tr>
+              <tr><td><strong>Key-Value</strong></td><td>High throughput, simplicity</td><td>No search, no joins, <strong>no pagination</strong> — but we need pagination → ✗</td></tr>
+              <tr><td><strong>Document</strong></td><td>Schemaless, search, local index on any attribute</td><td>No joins, <strong>no pagination</strong> — we need pagination, don't need search → ✗</td></tr>
+              <tr><td><strong>Column-Family</strong></td><td>Fast writes, time-based pagination, fast aggregate queries</td><td>No joins, no search — but that's exactly what we need → ✓</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bigidea">
+          <span class="c-title">The pick</span>
+          <p>The ideal database is a <strong>Wide-Column Database</strong> — <span class="term">HBase</span> /
+          <span class="term">Cassandra</span> / <span class="term">ScyllaDB</span>. Fast writes, time-based
+          pagination, no need for joins/search/transactions.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Both read- and write-heavy, but no DB does both. We can't batch/sample writes (stale reads / data loss),
+          so we <strong>cache reads</strong> and optimize the DB for <strong>writes</strong>. The need for high
+          write throughput + time-based pagination + no joins/search/transactions points to a <strong>wide-column
+          store: HBase / Cassandra / ScyllaDB</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 10. CACHE & ROUTING ===================== -->
+      <section id="cache">
+        <h2><span class="sec-num">10</span> The cache &amp; routing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of running to the big warehouse for every note, each clerk keeps the notes they handle on their
+          own desk. Reading is instant. And we always send the same person to the same clerk, so the right notes are
+          always on that clerk's desk.</p>
+        </div>
+
+        <p>We decided to absorb reads in a cache. Let's design it with the <strong>5-step cache design
+        process</strong>:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">1️⃣</div><div class="s-t">Need</div><div class="s-d">Establish the need for caching</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">2️⃣</div><div class="s-t">Type</div><div class="s-d">Local vs Global; Single vs Distributed (if global)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">3️⃣</div><div class="s-t">Invalidation</div><div class="s-d">Based on consistency + data/query complexity</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">4️⃣</div><div class="s-t">Eviction</div><div class="s-d">Just use LRU</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">5️⃣</div><div class="s-t">Load balancer</div><div class="s-d">Consistent hashing vs round robin</div></div>
+        </div>
+
+        <h3>Type — why a local cache wins</h3>
+        <ul>
+          <li>A single global cache? <strong>No</strong> — we need lots of cache, so it must be distributed
+          (local or global).</li>
+          <li>Network overhead per read? <code class="inl">getMessages</code> only reads a few messages →
+          <strong>low</strong> network overhead, so a global cache <em>could</em> work.</li>
+          <li>One cache server can't hold all the data → we'd need a <strong>distributed global cache</strong>.</li>
+          <li><strong>But:</strong> with a global cache, the app server for <code class="inl">getMessages</code>
+          does nothing but forward the request → we'd have 2× the servers (app + cache) with half doing nothing.
+          And read-your-write consistency becomes hard (it's trivial with a local cache, since local writes
+          succeed).</li>
+        </ul>
+        <div class="bigidea">
+          <span class="c-title">Use a local cache — app servers double as the cache</span>
+          <p>Instead of a global cache plus useless app servers, use a <strong>local cache</strong>: the app servers
+          <em>are</em> the cache.</p>
+        </div>
+
+        <h3>Invalidation — write-through, cheaply</h3>
+        <p>We want immediate consistency, but not the latency it usually costs. With a <em>separate</em> app server
+        and cache server, immediate consistency needs <strong>2PC</strong> (keep cache &amp; DB in sync — two
+        places). With a <strong>local cache</strong>, writing to the cache always succeeds, so no 2PC is needed.
+        Hence we get <strong>write-through invalidation (immediate consistency) without high latency</strong>.</p>
+
+        <h3>Eviction</h3>
+        <p><strong>LRU</strong> eviction.</p>
+
+        <h3>Routing — consistent hashing for stateful servers</h3>
+        <p>Our app servers are now <strong>stateful</strong>: if a server holds Harini's messages in cache, Harini's
+        requests must always go to <em>that</em> server. So we route with <span class="term">consistent
+        hashing</span>.</p>
+        <ul>
+          <li><code class="inl">getMessages(user_id, conversation_id)</code> → goes to <em>my</em> shard and
+          <em>my</em> app-server+cache, because all my messages are there.</li>
+          <li><code class="inl">sendMessage(sender_id, recipient_id)</code> → routed to the <strong>recipient</strong>
+          shard &amp; app-server+cache first (data written there), then (async, via a message queue) replicated to
+          the sender shard &amp; app-server+cache. (This is exactly the "recipient-first" trick from Topic 8.)</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — what happens when a cache server crashes?</span>
+          <p>The users that were routed to the crashed server get redirected to another server — which doesn't have
+          their messages cached. That's the <strong>cold cache problem</strong>: the data isn't in cache, so we
+          fetch it from the DB. So <em>some</em> of the time (when a cache server crashes), <em>some</em> users
+          (only those originally on the crashed server) see larger latency for their first few reads. That's
+          perfectly okay.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          5-step cache design → a <strong>local cache where app servers double as the cache</strong>. This gives
+          cheap <strong>write-through (immediate-consistency) invalidation</strong> with no 2PC,
+          <strong>LRU</strong> eviction, and <strong>consistent-hashing</strong> routing so each stateful server
+          keeps owning its users. <code class="inl">sendMessage</code> writes the recipient first, then async-
+          replicates to the sender. A crashed cache server just causes a brief <strong>cold-cache</strong> latency
+          bump for its users — acceptable.
+        </div>
+      </section>
+
+      <!-- ===================== 3. VIDEO STREAMING ===================== -->
+      <section id="streaming">
+        <h2><span class="sec-num">3</span> Video streaming, Netflix-style</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a library that keeps the <em>same</em> story printed in many sizes — a big picture book for
+          home, a pocket version for the bus. It also cuts each book into small chapters. When you read on a
+          weak signal, the library quietly hands you the pocket version; on strong wifi, the big beautiful one —
+          and it switches between them chapter by chapter so you never notice. Netflix is that library, but for
+          video, and it keeps copies in a branch <em>near your house</em> so you get them fast.</p>
+        </div>
+
+        <p>Netflix has to play video smoothly on a phone in a tunnel, a TV on gigabit fiber, and everything in
+        between — for hundreds of millions of people worldwide. The magic comes from four ideas working
+        together: <strong>many encodings</strong>, <strong>adaptive bitrate streaming</strong>,
+        <strong>chunking</strong>, and <strong>CDNs</strong>.</p>
+
+        <h3>Storing one video as many resolutions &amp; bitrates</h3>
+        <p>When a studio uploads a movie, Netflix doesn't keep one file. It runs the video through a
+        <span class="term">transcoding</span> pipeline that produces <em>many</em> versions of the same content
+        at different combinations of resolution (240p, 480p, 720p, 1080p, 4K…) and
+        <span class="term">bitrate</span> (how much data per second — higher bitrate = better quality, bigger
+        file). A single title might have a dozen or more such <span class="term">renditions</span>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Resolution vs bitrate — not the same thing</span>
+          <p><strong>Resolution</strong> = how many pixels (the picture's dimensions). <strong>Bitrate</strong> =
+          how much data per second is spent describing those pixels. You can have a 1080p stream at a low bitrate
+          (looks blocky in fast scenes) or a high bitrate (crisp). Netflix even tunes bitrate <em>per title</em> —
+          a cartoon compresses better than a fast action film, so it gets a lower bitrate for the same quality.</p>
+        </div>
+
+        <h3>Chunking — cut every rendition into tiny segments</h3>
+        <p>Each rendition is sliced into short <span class="term">segments</span> (a.k.a. chunks), typically
+        2–10 seconds long. So for one movie you end up with: <em>(many renditions) × (many little segments)</em>,
+        plus a small text file called a <span class="term">manifest</span> (the index that lists every segment
+        of every rendition and where to fetch it).</p>
+
+        <div class="callout example">
+          <span class="c-title">What a manifest actually looks like (HLS)</span>
+          <p>HLS uses <code class="inl">.m3u8</code> playlist files. The top-level "master" manifest just lists
+          the available quality levels:</p>
+          <pre><span class="cm">#EXTM3U</span>
+<span class="cm"># 480p stream, ~800 kbps</span>
+#EXT-X-STREAM-INF:BANDWIDTH=<span class="nm">800000</span>,RESOLUTION=<span class="nm">854x480</span>
+480p/index.m3u8
+<span class="cm"># 720p stream, ~2.8 Mbps</span>
+#EXT-X-STREAM-INF:BANDWIDTH=<span class="nm">2800000</span>,RESOLUTION=<span class="nm">1280x720</span>
+720p/index.m3u8
+<span class="cm"># 1080p stream, ~5 Mbps</span>
+#EXT-X-STREAM-INF:BANDWIDTH=<span class="nm">5000000</span>,RESOLUTION=<span class="nm">1920x1080</span>
+1080p/index.m3u8</pre>
+          <p>And each quality has its own playlist listing the actual 6-second segment files:</p>
+          <pre><span class="cm"># 720p/index.m3u8</span>
+#EXT-X-TARGETDURATION:<span class="nm">6</span>
+#EXTINF:<span class="nm">6.0</span>,
+seg_00001.ts
+#EXTINF:<span class="nm">6.0</span>,
+seg_00002.ts
+#EXTINF:<span class="nm">6.0</span>,
+seg_00003.ts</pre>
+          <p>The player downloads the master, picks a quality, then fetches segments one after another.</p>
+        </div>
+
+        <h3>Adaptive Bitrate Streaming (HLS / DASH)</h3>
+        <p><span class="term">Adaptive Bitrate Streaming (ABR)</span> is the trick that makes video "just work."
+        The player constantly measures your current network speed and, <strong>for each upcoming segment</strong>,
+        chooses the highest-quality rendition your connection can handle. Signal drops? Next segment comes from a
+        lower rendition — no spinning wheel. Signal recovers? It steps back up. Because all renditions are
+        chopped at the <em>same</em> segment boundaries, switching is seamless.</p>
+        <p>The two dominant protocols are <span class="term">HLS</span> (HTTP Live Streaming, from Apple) and
+        <span class="term">MPEG-DASH</span> (Dynamic Adaptive Streaming over HTTP). Both do the same job: a
+        manifest plus HTTP-fetched segments, with the <em>client</em> deciding which quality to grab.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Video streaming is "just" downloading lots of small files over ordinary HTTP. By pre-cutting every
+          quality into aligned chunks and letting the <strong>player choose the quality per chunk</strong>, we get
+          smooth playback over any network — and because it's plain HTTP, we can cache those chunks anywhere,
+          which sets up the CDN below.</p>
+        </div>
+
+        <h3>Thumbnails &amp; preview images</h3>
+        <p>Those little frames that appear when you scrub the timeline are <span class="term">thumbnail
+        sprites</span> — a grid of tiny still images generated during transcoding (e.g. one frame every 10
+        seconds), packed into a single image plus a tiny map of "time → which tile." Scrubbing just shows the
+        right tile; no video decoding needed. Box-art and hero images are likewise pre-generated stills served
+        from the CDN.</p>
+
+        <h3>The role of CDNs for global delivery</h3>
+        <p>A <span class="term">CDN (Content Delivery Network)</span> is a fleet of caching servers spread across
+        the globe, close to users. Instead of every viewer pulling video from one faraway data center, the
+        segments are copied to an <span class="term">edge</span> server near them. Netflix runs its own CDN
+        called <span class="term">Open Connect</span>, placing storage boxes <em>inside</em> internet providers'
+        networks — sometimes literally in your ISP's building. Result: your movie travels meters, not oceans.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🎬</div><div class="s-t">Upload</div><div class="s-d">Studio uploads master file</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">Transcode</div><div class="s-d">Make many renditions, cut into segments</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Store</div><div class="s-d">Segments + manifest in object storage (S3)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌍</div><div class="s-t">Distribute</div><div class="s-d">Push popular titles to edge CDN servers</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📺</div><div class="s-t">Play</div><div class="s-d">Player fetches manifest, then nearest segments via ABR</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a phone losing signal mid-scene</span>
+          <p>You're streaming 1080p on the train. The ABR logic, per segment, looks roughly like:</p>
+          <pre><span class="cm"># Client picks quality for the NEXT segment based on measured speed + buffer</span>
+<span class="kw">def</span> pick_rendition(measured_kbps, buffer_seconds):
+    <span class="kw">if</span> buffer_seconds &lt; <span class="nm">5</span>:             <span class="cm"># running low — play it safe</span>
+        <span class="kw">return</span> lower_rendition()
+    <span class="kw">if</span> measured_kbps &gt; <span class="nm">5000</span>:           <span class="cm"># plenty of room</span>
+        <span class="kw">return</span> rendition(<span class="st">"1080p"</span>)
+    <span class="kw">elif</span> measured_kbps &gt; <span class="nm">2800</span>:
+        <span class="kw">return</span> rendition(<span class="st">"720p"</span>)
+    <span class="kw">else</span>:
+        <span class="kw">return</span> rendition(<span class="st">"480p"</span>)</pre>
+          <p>Train enters a tunnel → measured speed drops → next segment comes back as 480p from the local edge
+          cache → picture softens for 6 seconds but never stalls → tunnel ends → it climbs back to 1080p. You
+          barely noticed.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Netflix <strong>transcodes</strong> each title into many resolution/bitrate <strong>renditions</strong>,
+          <strong>chunks</strong> them all into aligned 2–10s segments listed in a <strong>manifest</strong>, and
+          serves them over plain HTTP. <strong>Adaptive bitrate streaming (HLS/DASH)</strong> lets the player pick
+          quality per chunk for smooth playback, scrub-<strong>thumbnails</strong> are pre-baked sprites, and a
+          global <strong>CDN</strong> (Netflix's Open Connect) keeps the bytes physically close to you.
+        </div>
+      </section>
+
+      <!-- ===================== 4. LIVE BROADCAST ===================== -->
+      <section id="live">
+        <h2><span class="sec-num">4</span> Live broadcast to millions</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>On-demand video is like a library: each person checks out the book whenever they want, at their own
+          pace. A <strong>live broadcast</strong> is like a stadium concert: <em>everyone</em> watches the
+          <em>same moment together, right now</em>. You can't hand out a personal copy to each of ten million
+          fans from one stage — so you put up giant screens (speakers) around the city, and feed them all from
+          the stage. The "giant screens near the crowd" are the same CDN edges from Topic 3, but now everyone is
+          looking at the live feed at once.</p>
+        </div>
+
+        <p>A live event — a cricket final, a product launch, a streamer with millions watching — is the hardest
+        scaling problem in this session. The content is the <em>same</em> for everyone and it's being created
+        <em>this second</em>. The core challenge is <span class="term">fan-out</span>: one source, millions of
+        simultaneous viewers.</p>
+
+        <h3>How live differs from on-demand</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>On-demand (Netflix)</th><th>Live broadcast</th></tr></thead>
+            <tbody>
+              <tr><td>When is it watched?</td><td>Anytime, spread out</td><td>All at once (huge concurrency spike)</td></tr>
+              <tr><td>Is content ready?</td><td>Fully transcoded ahead of time</td><td>Created in real time — encode on the fly</td></tr>
+              <tr><td>Can you pre-cache it?</td><td>Yes, push popular titles to edges in advance</td><td>No — segments appear seconds before they're watched</td></tr>
+              <tr><td>What matters most?</td><td>Smoothness &amp; quality</td><td>Smoothness <em>and</em> low <span class="term">glass-to-glass latency</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The live pipeline</h3>
+        <p>It reuses the streaming machinery (chunks, manifests, ABR, CDN) but adds a real-time front end:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📹</div><div class="s-t">Capture</div><div class="s-d">Camera → encoder sends a feed (e.g. via RTMP/SRT)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">Encode</div><div class="s-d">Transcode live into renditions + tiny segments</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🪜</div><div class="s-t">Origin</div><div class="s-d">A few origin servers hold the newest segments</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌍</div><div class="s-t">Edge fan-out</div><div class="s-d">Thousands of CDN edges each serve their local crowd</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👥</div><div class="s-t">Millions</div><div class="s-d">Viewers pull from the nearest edge</div></div>
+        </div>
+
+        <h3>Edge caching is what makes the fan-out survivable</h3>
+        <p>Here's the saving grace: even though there are millions of viewers, they all want the
+        <strong>exact same segment</strong> right now. So an edge server fetches segment #4021 from the origin
+        <em>once</em>, then serves that one copy to the 200,000 viewers attached to it. This is the
+        <span class="term">cache hit ratio</span> doing heavy lifting — the origin sees thousands of requests, the
+        edges absorb millions. Without edge caching, the origin would melt instantly.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>You don't scale a live stream by making one server faster — you scale it by making sure
+          <strong>each unique segment is fetched from the origin as few times as possible</strong> and then
+          <strong>copied massively at the edges</strong>. The "shape" is a tree: one origin → many regional caches
+          → many edges → millions of viewers. Each level multiplies reach without multiplying load on the level
+          above.</p>
+        </div>
+
+        <h3>The latency trade-off</h3>
+        <p>Chunking creates a tension. Bigger segments (say 6s) are efficient and smooth but mean viewers are
+        always ~10–30 seconds <em>behind</em> real life (each player buffers a few segments for safety). For a
+        movie that's fine. For a live sports match where your neighbor cheers before your screen shows the goal,
+        it's painful.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Goal</th><th>Segment size</th><th>Approx latency</th><th>Cost</th></tr></thead>
+            <tbody>
+              <tr><td>Cheap &amp; smooth</td><td>Large (6–10s)</td><td>~20–45s behind live</td><td>Lowest, very cacheable</td></tr>
+              <tr><td>Low-latency HLS/DASH</td><td>Small (1–2s) + partial chunks</td><td>~3–8s</td><td>More requests, harder to cache</td></tr>
+              <tr><td>Ultra-low (interactive)</td><td>WebRTC (no chunking)</td><td>&lt;1s</td><td>Highest — hard to scale to millions</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The fundamental tension</span>
+          <p><strong>Lower latency fights against easy caching.</strong> To get closer to "live" you use tinier
+          segments and less buffering — but smaller, fresher segments are requested more often and harder for
+          edges to cache, raising cost and load. Engineering a live system is largely about choosing where to sit
+          on this latency-vs-cost-vs-scale curve. A massive sports broadcast happily accepts a few seconds of
+          delay to reach 50 million people; a two-person video call accepts huge cost for sub-second latency.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the fan-out math</span>
+          <p>Say 10,000,000 people watch a final, served by 1,000 edge servers (10,000 viewers each), with a new
+          6-second segment every 6 seconds.</p>
+          <ul>
+            <li>Viewer requests per segment: <strong>10,000,000</strong> — impossible for one origin.</li>
+            <li>But each edge fetches the segment from origin just <strong>once</strong> → origin sees only
+            <strong>1,000</strong> requests per segment. Totally manageable.</li>
+            <li>Cache hit ratio at the edge ≈ <code class="inl">(10,000 − 1) / 10,000 ≈ 99.99%</code>.</li>
+          </ul>
+          <p>That 99.99% is the whole game: edges turn 10 million requests into 1,000 at the source. (Compare to
+          Topic 3, where on-demand can pre-push content to edges <em>before</em> the rush; live can't, which is
+          why fresh-segment caching efficiency matters even more here.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Live broadcast is on-demand streaming plus a real-time encoder and a brutal <strong>fan-out</strong>
+          problem: one source, millions of simultaneous viewers. <strong>Edge caching</strong> saves it — every
+          viewer wants the same fresh segment, so edges fetch each one once and copy it to thousands, giving a
+          ~99.99% hit ratio. The defining trade-off is <strong>latency vs caching/cost</strong>: smaller, fresher
+          chunks get you closer to live but are harder and pricier to cache.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Two very different products, but look how many ideas they share — sharding for scale, persistent
+        connections and fan-out for delivery, and pushing data physically close to the user.</p>
+        <div class="bigidea">
+          <p>A <strong>messaging app</strong> is a write-heavy post office: model it as users/conversations/messages,
+          shard <strong>1:1 chats by conversation</strong> but large <strong>groups by per-user inbox</strong> to
+          dodge hot shards, store it in wide-column NoSQL, and deliver instantly over <strong>WebSockets</strong>
+          with a presence registry, backward-flowing <strong>ack receipts</strong>, and per-conversation ordering
+          that gets cheap <strong>immediate consistency</strong> because one chat lives on one shard.
+          <strong>Video streaming</strong> transcodes each title into many <strong>renditions</strong>, chunks
+          them into aligned segments, lets the player choose quality per chunk via <strong>adaptive bitrate
+          (HLS/DASH)</strong>, and serves everything from a global <strong>CDN</strong>.
+          <strong>Live broadcast</strong> reuses all of that but adds real-time encoding and solves a massive
+          <strong>fan-out</strong> via <strong>edge caching</strong>, forever trading <strong>latency against
+          caching cost</strong>. The recurring lesson: scale comes from <em>choosing the right key to split on</em>
+          and <em>copying data close to whoever needs it</em>.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why do 1:1 chats and large group chats often use different shard keys?</summary>
+          <p class="ans">1:1 chats shard cleanly by <code class="inl">conversation_id</code> (two people, modest
+          traffic, single-shard reads). A huge popular group sharded by conversation creates a <strong>hot
+          shard</strong>, so large groups lean on per-<code class="inl">user_id</code> inboxes (or fan-out on
+          read) to spread the load.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use WebSockets instead of polling for chat?</summary>
+          <p class="ans">A WebSocket is one persistent, two-way connection, so the server can <strong>push</strong>
+          a message the instant it arrives — no wasteful repeated "anything new?" requests and far lower latency.
+          Long polling is the fallback when WebSockets aren't available.</p>
+        </details>
+        <details class="quiz">
+          <summary>How do we get correct message order and immediate consistency cheaply?</summary>
+          <p class="ans">Each message gets a per-conversation sequence number (or a sortable Snowflake/ULID), and
+          because we shard by conversation, a whole chat lives on <strong>one shard</strong> — so that single shard
+          can enforce order and immediate consistency without slowing the global system.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is adaptive bitrate streaming, and why is chunking required for it?</summary>
+          <p class="ans">ABR lets the player pick the highest-quality rendition the current network can handle,
+          <em>per segment</em>. It needs chunking because all renditions are cut at the same segment boundaries,
+          so the player can switch quality seamlessly from one chunk to the next.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can a live stream reach 10 million viewers without melting the origin?</summary>
+          <p class="ans">Everyone wants the same fresh segment at once, so each edge server fetches it from the
+          origin <strong>once</strong> and serves its local crowd — a ~99.99% cache hit ratio. The origin sees
+          only a few thousand requests while edges absorb the millions.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the core trade-off in low-latency live streaming?</summary>
+          <p class="ans">Latency vs caching/cost. Smaller, fresher chunks (and less buffering) get viewers closer
+          to real time, but those segments are requested more often and are harder/pricier for edges to cache.</p>
+        </details>
+      </section>
+
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/document/d/13sJnV5Xj1ZPalJeA0uuiJqe0oJYZ0U4b-0IfXjxmJac/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+          <li>Class handout: "<em>[SST-2028] Case Study: Messaging Apps (FB Messenger, Whatsapp, Slack)</em>".</li>
+        </ul>
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li>📄 <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API" target="_blank" rel="noopener">MDN — The WebSocket API</a> — persistent two-way connections for real-time message push.</li>
+          <li>📄 <a href="https://developer.mozilla.org/en-US/docs/Web/Media/Audio_and_video_delivery/Live_streaming_web_audio_and_video" target="_blank" rel="noopener">MDN — Live streaming web audio and video (HLS / DASH)</a> — adaptive bitrate streaming fundamentals.</li>
+          <li>📄 <a href="https://netflixtechblog.com/" target="_blank" rel="noopener">The Netflix Tech Blog</a> — deep dives on Open Connect, transcoding, and global video delivery.</li>
+          <li>📄 <a href="https://cassandra.apache.org/doc/latest/cassandra/data_modeling/" target="_blank" rel="noopener">Apache Cassandra — Data Modeling</a> — partition/clustering keys behind wide-column message storage.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-13.html"><div class="dir">← Previous</div><div class="ttl">Session 13: Case Study — IRCTC</div></a>
+        <a class="next" href="session-15.html"><div class="dir">Next →</div><div class="ttl">Session 15: NoSQL Types &amp; Messaging 2</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 14 — Case Study — Messaging Apps &amp; Video Streaming · You designed two real systems today 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

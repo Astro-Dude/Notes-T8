@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 11 — Query Optimization</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 11</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 11 · Query Optimization</span>
+      <h1>How a database turns your SQL into the fastest possible plan</h1>
+      <p class="lead">
+        You write a short, simple SQL query — and behind the scenes the database has to <em>choose</em>
+        how to actually run it, out of thousands of possible ways. Some of those ways finish in a
+        millisecond; others would run for hours. The part of the database that makes this choice is the
+        <strong>query optimizer</strong>, and it's one of the most beautiful pieces of engineering in all
+        of computer science. We assume you've studied <em>none</em> of this before. Each topic starts with a
+        tiny everyday story, then we build up the real machinery with worked examples. Take it slow.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why optimization matters</a></li>
+          <li><a href="#cost">Cost estimation &amp; selectivity</a></li>
+          <li><a href="#joins">Join ordering</a></li>
+          <li><a href="#rules">Rule-based transformations</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why optimization matters</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you ask a friend: <em>"Can you bring me the red book, the blue pen, and my jacket?"</em>
+          You told them <strong>what</strong> you want, but not <strong>how</strong> to fetch it. A lazy friend might
+          walk to your room three separate times. A smart friend grabs all three in one trip, picking the
+          shortest route. Same request, very different effort. A database is the smart friend: you tell it
+          <em>what</em> data you want, and it figures out the cleverest route to get it.</p>
+        </div>
+
+        <p>In SQL you write <strong>what</strong> you want, not <strong>how</strong> to get it. SQL is a
+        <span class="term">declarative</span> language — you describe the result ("give me all customers in
+        London who spent over $1000"), and the database decides the actual steps. This is different from a
+        language like Python, where you'd write the exact loops and lookups yourself (that style is called
+        <span class="term">imperative</span>).</p>
+
+        <p>The catch: there are usually <strong>many different step-by-step procedures</strong> that all produce
+        the exact same answer. We call each one a <span class="term">plan</span> (or <span class="term">query
+        plan</span> / execution plan). Two plans can return identical rows yet differ in speed by factors of
+        <strong>thousands or millions</strong>. The piece of the database that picks a good plan is the
+        <span class="term">query optimizer</span>.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>One SQL query → <strong>many equivalent plans</strong> → wildly different costs. The optimizer's
+          whole job is to <em>search</em> through those plans and pick a fast one — <strong>without</strong> running
+          them. It estimates costs on paper and bets on the cheapest.</p>
+        </div>
+
+        <h3>Logical plans vs physical plans</h3>
+        <p>Optimization happens in two layers. First the database figures out <em>what operations</em> to do; then
+        it figures out <em>how</em> to do each one. These are two different kinds of plan:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Plan type</th><th>What it describes</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Logical plan</span></td><td>The <em>algebra</em>: which operations and in what order, expressed abstractly (join, filter, project). It says <strong>what</strong>, not <strong>how</strong>.</td><td>"Join Orders with Customers, then filter to London, then keep two columns."</td></tr>
+              <tr><td><span class="term">Physical plan</span></td><td>The concrete <em>algorithm</em> chosen for each logical step, plus access methods. It says <strong>how</strong>.</td><td>"Use a hash join, scan Orders with an index, filter with a sequential scan."</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>A logical operation like "join" can be carried out by several physical <span class="term">operators</span>
+        — a nested-loop join, a hash join, or a sort-merge join (you met these in <strong>Session 10: Query
+        Execution — Joins &amp; Sorting</strong>). The optimizer's job is to start from the logical plan and choose
+        the best physical operators <em>and</em> the best order, guided by cost estimates.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">SQL text</div><div class="s-d">Your declarative query</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌳</div><div class="s-t">Parse</div><div class="s-d">Build a logical plan (relational algebra)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Rewrite</div><div class="s-d">Apply equivalence rules to reshape it</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💰</div><div class="s-t">Cost</div><div class="s-d">Estimate cost of physical alternatives</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏆</div><div class="s-t">Pick</div><div class="s-d">Choose the cheapest physical plan</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">Execute</div><div class="s-d">Run it (Session 10)</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example — same answer, very different cost</span>
+          <p>Suppose <code class="inl">Orders</code> has 10,000,000 rows and only 50 of them belong to customers
+          in London. Consider this query:</p>
+          <pre><span class="kw">SELECT</span> c.name, o.total
+<span class="kw">FROM</span> Orders o
+<span class="kw">JOIN</span> Customers c <span class="kw">ON</span> o.customer_id = c.id
+<span class="kw">WHERE</span> c.city = <span class="st">'London'</span>;</pre>
+          <p><strong>Plan A (bad):</strong> join all 10,000,000 orders to all customers first, <em>then</em> throw away
+          everyone not in London. You built a giant intermediate result just to discard 99.99% of it.</p>
+          <p><strong>Plan B (good):</strong> first filter Customers down to the London ones, <em>then</em> join only
+          those to their orders. You touch a tiny fraction of the data. Same rows out — possibly
+          <strong>thousands of times faster</strong> in.</p>
+          <p>The optimizer's job is to notice that Plan B exists and choose it. We'll see <em>how</em> it does this
+          (predicate pushdown) in Topic 4.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why not just try every plan and time it?</span>
+          <p>Because running even one plan can take minutes, and there can be billions of candidate plans. The
+          optimizer must choose <em>before</em> executing, using cheap <strong>estimates</strong>. That's why the next
+          topic — cost estimation — is the heart of the whole system.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SQL is declarative: you say <em>what</em>, the database decides <em>how</em>. One query has many equivalent
+          <strong>plans</strong> with hugely different costs. The <strong>optimizer</strong> turns a query into a
+          <strong>logical plan</strong> (which operations), reshapes it, then chooses a <strong>physical plan</strong>
+          (which algorithms, what order) by estimating cost — all before running a single row.
+        </div>
+      </section>
+
+      <!-- ===================== 2. COST & SELECTIVITY ===================== -->
+      <section id="cost">
+        <h2><span class="sec-num">2</span> Cost estimation &amp; selectivity</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine planning a road trip <em>before</em> you drive it. You can't drive every possible route to see
+          which is fastest — that would take forever. Instead you <strong>guess</strong>: "this road is about 50 miles,
+          traffic is usually light, so maybe an hour." You use rough knowledge to estimate. The optimizer does
+          the same: it can't run every plan, so it <em>guesses</em> how much work each one will be, using little
+          summaries it keeps about your data.</p>
+        </div>
+
+        <p>To compare plans without running them, the optimizer assigns each one a <span class="term">cost</span> — a
+        single number estimating how much work it'll take (CPU + disk reads, roughly). The plan with the lowest
+        estimated cost wins. The hardest, most important input to that cost is: <strong>how many rows will each
+        step produce?</strong> Get the row counts right and the cost is usually right; get them wrong and the
+        optimizer can pick a disastrous plan.</p>
+
+        <h3>Statistics — what the database remembers about your data</h3>
+        <p>The database keeps <span class="term">statistics</span> about each table, gathered by periodically
+        scanning (or sampling) it. The optimizer never looks at the actual data while planning — only these
+        summaries. Common statistics:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Statistic</th><th>Meaning</th><th>Used for</th></tr></thead>
+            <tbody>
+              <tr><td>Row count (<span class="term">cardinality</span>)</td><td>How many rows the table has.</td><td>Scaling every estimate.</td></tr>
+              <tr><td>Number of distinct values (NDV)</td><td>How many different values a column holds.</td><td>Estimating equality filters &amp; joins.</td></tr>
+              <tr><td>Min / max</td><td>The smallest and largest value in a column.</td><td>Range filters (<code class="inl">&gt;</code>, <code class="inl">&lt;</code>).</td></tr>
+              <tr><td>Null fraction</td><td>What share of rows are NULL.</td><td>Adjusting counts.</td></tr>
+              <tr><td><span class="term">Histogram</span></td><td>A bar chart of how values are distributed across buckets.</td><td>Handling skewed / uneven data.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why histograms matter — skew</span>
+          <p>If you only know a column has 100 distinct values, you might assume each value is equally common.
+          But real data is <strong>skewed</strong>: a <code class="inl">status</code> column might be 95% "shipped" and
+          5% everything else. A <span class="term">histogram</span> records the true shape (e.g. "this bucket of
+          values holds 40% of rows"), so a filter on a rare value is estimated as small and a filter on a common
+          value as large. In PostgreSQL you refresh these with <code class="inl">ANALYZE</code>.</p>
+        </div>
+
+        <h3>Selectivity — what fraction survives a filter</h3>
+        <p>The <span class="term">selectivity</span> of a predicate (a condition in a <code class="inl">WHERE</code>
+        clause) is the fraction of rows that <em>pass</em> it — a number between 0 and 1. Multiply selectivity by
+        the table's row count and you get the estimated rows out. This estimated row count is called the
+        <span class="term">cardinality estimate</span>.</p>
+
+        <p>Rules of thumb the optimizer uses (when it has no better information):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Predicate</th><th>Default selectivity estimate</th><th>Reasoning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">col = value</code></td><td>1 / (number of distinct values)</td><td>Assume each distinct value is equally likely.</td></tr>
+              <tr><td><code class="inl">col &gt; value</code> (range)</td><td>fraction of the min–max span above <em>value</em></td><td>Use min/max or histogram buckets.</td></tr>
+              <tr><td><code class="inl">A AND B</code></td><td>sel(A) × sel(B)</td><td>Assume A and B are <em>independent</em>.</td></tr>
+              <tr><td><code class="inl">A OR B</code></td><td>sel(A) + sel(B) − sel(A)×sel(B)</td><td>Inclusion–exclusion.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — estimating rows step by step</span>
+          <p>Table <code class="inl">Customers</code> has <strong>1,000,000 rows</strong>. The optimizer's stats say
+          the <code class="inl">city</code> column has <strong>200 distinct values</strong>, and the
+          <code class="inl">country</code> column has <strong>50 distinct values</strong>. Query:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> Customers
+<span class="kw">WHERE</span> city = <span class="st">'London'</span> <span class="kw">AND</span> country = <span class="st">'UK'</span>;</pre>
+          <p><strong>Step 1 — selectivity of each predicate.</strong></p>
+          <ul>
+            <li><code class="inl">city = 'London'</code> → sel = 1 / 200 = <strong>0.005</strong></li>
+            <li><code class="inl">country = 'UK'</code> → sel = 1 / 50 = <strong>0.02</strong></li>
+          </ul>
+          <p><strong>Step 2 — combine (assume independence).</strong> sel(AND) = 0.005 × 0.02 =
+          <strong>0.0001</strong>.</p>
+          <p><strong>Step 3 — estimated rows out.</strong> 1,000,000 × 0.0001 = <strong>100 rows</strong>.</p>
+          <p>So the optimizer plans the rest of the query expecting roughly 100 rows here — which decides whether
+          to use an index, which join algorithm to choose, and so on.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why cardinality estimation is genuinely hard</span>
+          <p>That tidy "× 0.0001" hid a big assumption: that <code class="inl">city</code> and
+          <code class="inl">country</code> are <strong>independent</strong>. They obviously aren't —
+          <em>every</em> London customer is in the UK! The true selectivity of the combined filter is just 0.005
+          (the city already implies the country), so the real answer is ~5,000 rows, not 100. The optimizer is off
+          by <strong>50×</strong>. These <span class="term">correlation</span> errors compound through joins, and a
+          single bad estimate can make the optimizer pick a plan that's orders of magnitude too slow. This is the
+          single biggest source of real-world query-plan disasters, and decades of research still haven't fully
+          solved it.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Cost is driven by <strong>estimated row counts</strong>. Row counts come from
+          <strong>selectivity × table size</strong>, using <strong>statistics</strong> and
+          <strong>histograms</strong>. Estimation is hard because real data is <em>skewed</em> and columns are
+          <em>correlated</em> — and errors <strong>multiply</strong> as they flow up through a multi-table plan.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The optimizer scores plans by <strong>cost</strong>, whose main ingredient is the number of rows each
+          step yields. It estimates rows via <strong>selectivity</strong> (fraction passing a predicate) using stored
+          <strong>statistics</strong> and <strong>histograms</strong>. The estimate is fragile because of data skew
+          and column correlation — and small errors compound, which is why bad plans happen.
+        </div>
+      </section>
+
+      <!-- ===================== 3. JOIN ORDERING ===================== -->
+      <section id="joins">
+        <h2><span class="sec-num">3</span> Join ordering</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You have to introduce three friend-groups to each other at a party so everyone who should meet,
+          meets. You could introduce group A to B first, then bring in C — or A to C first, then B. The
+          <em>order</em> you do the introductions in changes how crowded each step gets. If you merge the two
+          biggest, loudest groups first, you get a giant mob to manage. Do the small introductions first and it
+          stays calm. Joining tables is exactly this: the <strong>order</strong> you combine them in decides how
+          big the in-between piles get.</p>
+        </div>
+
+        <p>Most real queries join several tables. A <span class="term">join</span> combines rows from two tables
+        on a matching condition. When you join three or more tables, you must pick an <strong>order</strong> — and
+        because joins produce intermediate results that feed the next join, the order massively changes how much
+        work happens. <strong>Join ordering is the single most important decision the optimizer makes</strong>,
+        because the intermediate result sizes can blow up.</p>
+
+        <h3>The combinatorial explosion</h3>
+        <p>How many orders are there? For <em>n</em> tables, the number of possible join orderings grows
+        terrifyingly fast — far faster than even factorial when you also count the different tree <em>shapes</em>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tables (n)</th><th>Left-deep orderings (n!)</th><th>All tree shapes (much larger)</th></tr></thead>
+            <tbody>
+              <tr><td>3</td><td>6</td><td>12</td></tr>
+              <tr><td>5</td><td>120</td><td>1,680</td></tr>
+              <tr><td>8</td><td>40,320</td><td>~17,000,000</td></tr>
+              <tr><td>12</td><td>~479,000,000</td><td>billions+</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>You can't enumerate all of these for a 15-table query. So the optimizer needs both a way to
+        <strong>limit the shapes</strong> it considers, and a clever <strong>search</strong> that avoids brute force.</p>
+
+        <h3>Left-deep trees — taming the shapes</h3>
+        <p>A join tree can be shaped many ways. The classic restriction is the <span class="term">left-deep
+        tree</span>: every join takes the running result so far on the left and joins in <em>one base table</em> on
+        the right. It looks like a staircase.</p>
+        <pre><span class="cm">Left-deep (preferred):        Bushy (more shapes, rarely needed):</span>
+
+        ⋈                              ⋈
+       / \                           /   \
+      ⋈   D                        ⋈     ⋈
+     / \                          / \   / \
+    ⋈   C                        A   B C   D
+   / \
+  A   B</pre>
+        <p>Why left-deep? Because it lets the optimizer <strong>pipeline</strong> nicely (feed one join's output
+        straight into the next without materializing huge tables) and it keeps the search space at <em>n!</em>
+        instead of the astronomically larger set of all "bushy" trees. System R, the original optimizer, restricted
+        itself to left-deep trees for exactly this reason.</p>
+
+        <h3>Dynamic programming — the System R approach</h3>
+        <p>The breakthrough from the 1979 <strong>System R</strong> paper (Selinger et al.) was to find the best
+        order without trying every order, using <span class="term">dynamic programming</span> (DP). The trick: the
+        best way to join a big set of tables is built from the best ways to join its smaller subsets. So compute
+        and remember the best plan for every subset, building up from small to large.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">1️⃣</div><div class="s-t">Single tables</div><div class="s-d">Best access path for each table alone</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">2️⃣</div><div class="s-t">Pairs</div><div class="s-d">Best plan for every 2-table subset</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">3️⃣</div><div class="s-t">Triples</div><div class="s-d">Reuse best pairs to build best triples</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏁</div><div class="s-t">All n</div><div class="s-d">Best plan for the full set</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — why order changes cost</span>
+          <p>Join three tables: <code class="inl">A</code> (1,000,000 rows), <code class="inl">B</code>
+          (1,000,000 rows), and <code class="inl">C</code> (100 rows). Suppose joining A⋈B produces
+          <strong>5,000,000 rows</strong> (they match many-to-many), but A⋈C produces only
+          <strong>500 rows</strong> (C is tiny and selective).</p>
+          <p><strong>Order 1: (A ⋈ B) ⋈ C</strong></p>
+          <ul>
+            <li>A ⋈ B → build a 5,000,000-row intermediate (expensive, memory-heavy).</li>
+            <li>Then ⋈ C → process 5,000,000 rows again. <strong>Total work ≈ 10,000,000 row-operations.</strong></li>
+          </ul>
+          <p><strong>Order 2: (A ⋈ C) ⋈ B</strong></p>
+          <ul>
+            <li>A ⋈ C → only 500 rows (tiny intermediate).</li>
+            <li>Then ⋈ B → join those 500 rows to B. <strong>Total work ≈ a few thousand row-operations.</strong></li>
+          </ul>
+          <p>Same final answer, but Order 2 is roughly <strong>1,000× cheaper</strong>. The whole game is: join
+          the <em>most selective</em> things first so intermediates stay small. (Notice this is exactly why the
+          cardinality estimates from Topic 2 are so important — the optimizer needs to <em>know</em> that A⋈C is
+          small to choose Order 2.)</p>
+        </div>
+
+        <h3>DP vs heuristics — when each is used</h3>
+        <p>DP gives the <em>provably</em> best order it considers, but its cost grows like 2<sup>n</sup>, so it
+        becomes too slow past roughly 10–15 tables. Beyond that, optimizers fall back to
+        <span class="term">heuristics</span> — fast rules of thumb that find a "good enough" order without
+        guaranteeing the best:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Approach</th><th>How it works</th><th>Pros / cons</th></tr></thead>
+            <tbody>
+              <tr><td>Dynamic programming (System R)</td><td>Build best plan for every subset, bottom-up.</td><td>Optimal among considered plans; cost ~2<sup>n</sup>, limited to ~12–15 tables.</td></tr>
+              <tr><td>Greedy heuristic</td><td>Repeatedly join the cheapest available pair next.</td><td>Very fast; may miss the true best order.</td></tr>
+              <tr><td>Genetic / randomized search</td><td>Evolve/mutate candidate orderings (PostgreSQL's GEQO does this for many-table joins).</td><td>Scales to huge joins; result is approximate and can vary.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">In practice</span>
+          <p>PostgreSQL uses DP by default, but once a query joins more than <code class="inl">geqo_threshold</code>
+          tables (12 by default) it switches to its <strong>Genetic Query Optimizer (GEQO)</strong> to keep planning
+          time reasonable. So the same database uses <em>both</em> strategies depending on query size.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Join order dominates query cost because it controls the size of intermediate results, and a bad order
+          can blow them up by orders of magnitude. The search space explodes combinatorially, so optimizers
+          restrict shapes (<strong>left-deep trees</strong>) and search smartly with <strong>dynamic
+          programming</strong> for small joins, falling back to <strong>heuristics</strong> for large ones.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          With many tables, the number of join orders explodes (n! just for left-deep, far more for bushy). Order
+          matters enormously because it sets intermediate-result sizes. <strong>System R</strong> solved this with
+          <strong>dynamic programming</strong> over <strong>left-deep trees</strong>; modern systems switch to
+          <strong>heuristic/genetic</strong> search when there are too many tables to enumerate.
+        </div>
+      </section>
+
+      <!-- ===================== 4. RULE-BASED TRANSFORMATIONS ===================== -->
+      <section id="rules">
+        <h2><span class="sec-num">4</span> Rule-based transformations</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're cleaning a giant bag of mixed LEGO to find just the red 2×4 bricks. The silly way:
+          carry the whole heavy bag to your room, dump it out, then pick the red ones. The smart way: pick the red
+          ones out <em>first</em>, right where the bag is, and only carry that tiny handful upstairs. Doing the
+          throwing-away as <strong>early as possible</strong> means you carry far less. Databases follow rules like
+          this to rearrange a query into a cheaper shape that gives the exact same answer.</p>
+        </div>
+
+        <p>Before (and during) cost-based search, the optimizer applies <span class="term">transformation
+        rules</span>: rewrites that change a plan's <em>shape</em> while guaranteeing the result stays
+        <strong>identical</strong>. These come from the algebra of relations — operations that are provably
+        equivalent. Unlike join ordering (which needs cost estimates), many of these are almost always good, so
+        they're applied as <strong>rules</strong>. Here are the classics:</p>
+
+        <h3>Predicate pushdown (filter early)</h3>
+        <p><span class="term">Predicate pushdown</span> moves <code class="inl">WHERE</code> filters as close to the
+        raw tables as possible — <em>before</em> joins instead of after. Filtering first shrinks the data that the
+        expensive joins have to chew through. This is the LEGO trick, and it's exactly the "Plan A vs Plan B" from
+        Topic 1.</p>
+
+        <h3>Projection pushdown (drop columns early)</h3>
+        <p><span class="term">Projection pushdown</span> moves column-trimming (the <code class="inl">SELECT</code>
+        list) down so the database stops carrying columns it doesn't need. Narrower rows mean less memory and less
+        data shuffled between operators. If you only need <code class="inl">name</code> and
+        <code class="inl">total</code>, there's no reason to drag along 30 other columns through a join.</p>
+
+        <h3>Constant folding (do the arithmetic once)</h3>
+        <p><span class="term">Constant folding</span> evaluates constant expressions at planning time instead of
+        once per row. <code class="inl">WHERE price &gt; 10 * 100</code> becomes <code class="inl">WHERE price &gt;
+        1000</code> — computed once, not a million times. Related simplifications drop always-true conditions like
+        <code class="inl">1 = 1</code> and short-circuit always-false ones.</p>
+
+        <h3>Using indexes (the right access path)</h3>
+        <p>An <span class="term">index</span> (covered in earlier sessions) is a sorted lookup structure, like a
+        book's index. Instead of a full <span class="term">sequential scan</span> (reading every row), the optimizer
+        can choose an <span class="term">index scan</span> to jump straight to matching rows — but only when the
+        filter is selective enough to be worth it. Choosing between a sequential scan and an index scan for each
+        table is the <strong>access-path selection</strong> that the System R paper is literally named after.</p>
+
+        <div class="callout warn">
+          <span class="c-title">An index isn't always the win</span>
+          <p>If a filter matches <em>most</em> of the table (low selectivity for filtering purposes — say 80% of
+          rows pass), an index scan can be <strong>slower</strong> than a plain sequential scan, because it jumps
+          around the disk randomly for nearly every row. This is precisely why the optimizer needs the
+          selectivity estimates from Topic 2 to decide. Rules reshape the plan; cost decides the access path.</p>
+        </div>
+
+        <h3>Before / after — a worked transformation</h3>
+        <div class="callout example">
+          <span class="c-title">Worked example — rewriting a plan</span>
+          <p>The query:</p>
+          <pre><span class="kw">SELECT</span> c.name, o.total
+<span class="kw">FROM</span> Orders o
+<span class="kw">JOIN</span> Customers c <span class="kw">ON</span> o.customer_id = c.id
+<span class="kw">WHERE</span> c.city = <span class="st">'London'</span>;</pre>
+          <p><strong>Before (naïve logical plan):</strong> join everything, then filter, then trim columns.</p>
+          <pre><span class="cm">π (name, total)              -- project: keep 2 columns  (LAST)</span>
+  └─ σ (city = 'London')     <span class="cm">-- filter                   (MIDDLE)</span>
+       └─ Orders ⋈ Customers <span class="cm">-- join ALL rows first      (FIRST, huge!)</span></pre>
+          <p><strong>After (optimized):</strong> push the filter down onto Customers, push projection down, then
+          join only what survives.</p>
+          <pre><span class="cm">π (name, total)</span>
+  └─ ( Orders )  ⋈  ( σ city='London' (Customers) )
+                          <span class="cm">↑ filter applied BEFORE the join</span></pre>
+          <p>Now the join only sees London customers (tiny), and only the needed columns flow through. Same rows
+          out, far less work in. The symbols above are relational algebra: <code class="inl">σ</code> (sigma) =
+          filter/select, <code class="inl">π</code> (pi) = project, <code class="inl">⋈</code> = join.</p>
+        </div>
+
+        <h3>Reading EXPLAIN — seeing the chosen plan</h3>
+        <p>You don't have to guess what the optimizer picked. The <code class="inl">EXPLAIN</code> command prints
+        the chosen physical plan as an indented tree. In PostgreSQL:</p>
+        <pre><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> c.name, o.total
+<span class="kw">FROM</span> Orders o
+<span class="kw">JOIN</span> Customers c <span class="kw">ON</span> o.customer_id = c.id
+<span class="kw">WHERE</span> c.city = <span class="st">'London'</span>;</pre>
+          <p>A typical output looks like this (read it <strong>inside-out</strong>: the most indented nodes run
+          first, feeding their parents):</p>
+        <pre>Hash Join  (cost=<span class="nm">15.50</span>..<span class="nm">320.75</span> rows=<span class="nm">50</span> width=<span class="nm">40</span>)
+  Hash Cond: (o.customer_id = c.id)
+  -&gt;  Seq Scan on orders o  (cost=<span class="nm">0.00</span>..<span class="nm">250.00</span> rows=<span class="nm">10000</span> width=<span class="nm">12</span>)
+  -&gt;  Hash  (cost=<span class="nm">15.00</span>..<span class="nm">15.00</span> rows=<span class="nm">50</span> width=<span class="nm">36</span>)
+        -&gt;  Index Scan using customers_city_idx on customers c
+              (cost=<span class="nm">0.42</span>..<span class="nm">15.00</span> rows=<span class="nm">50</span> Filter: (city = <span class="st">'London'</span>))</pre>
+        <p>How to read each node:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Piece</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">cost=15.50..320.75</code></td><td>Estimated startup cost .. total cost, in the planner's abstract cost units (not seconds).</td></tr>
+              <tr><td><code class="inl">rows=50</code></td><td>The <strong>estimated</strong> rows out of this node — the cardinality estimate from Topic 2.</td></tr>
+              <tr><td><code class="inl">width=40</code></td><td>Estimated average row size in bytes (smaller after projection pushdown).</td></tr>
+              <tr><td><code class="inl">Seq Scan</code></td><td>Reads the whole table — chosen for Orders (no useful index here).</td></tr>
+              <tr><td><code class="inl">Index Scan</code></td><td>Used the <code class="inl">customers_city_idx</code> to fetch only London rows — predicate pushdown + index access.</td></tr>
+              <tr><td><code class="inl">Hash Join</code></td><td>The physical join algorithm chosen (from Session 10).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">EXPLAIN vs EXPLAIN ANALYZE</span>
+          <p><code class="inl">EXPLAIN</code> shows the plan with <em>estimated</em> rows and cost without running
+          the query. <code class="inl">EXPLAIN ANALYZE</code> actually <strong>runs</strong> it and shows the
+          <em>real</em> times and real row counts too. The most powerful debugging trick in all of SQL tuning:
+          compare the estimated <code class="inl">rows=</code> against the actual <code class="inl">rows=</code> —
+          a big gap reveals a bad statistic or a correlation the optimizer missed (Topic 2), which is usually the
+          root cause of a slow query.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Rule-based transformations rewrite a plan into an equivalent but cheaper shape: <strong>predicate
+          pushdown</strong> (filter early), <strong>projection pushdown</strong> (drop columns early),
+          <strong>constant folding</strong> (precompute constants), and choosing <strong>indexes</strong> over full
+          scans when selective. You can see the optimizer's final choices — and spot bad estimates — by reading
+          <code class="inl">EXPLAIN</code> output inside-out.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a database secretly transforms your tidy little SQL query into a fast,
+        concrete execution plan. Here's the one-paragraph story connecting all four topics:</p>
+        <div class="bigidea">
+          <p>Because SQL is <strong>declarative</strong>, one query has <strong>many equivalent plans</strong> with
+          wildly different costs, and the <strong>optimizer</strong> must pick a good <strong>physical plan</strong>
+          from a <strong>logical plan</strong> without running anything (Topic 1). To compare plans it estimates
+          <strong>cost</strong>, driven mostly by row counts derived from <strong>selectivity</strong> and stored
+          <strong>statistics/histograms</strong> — an estimate made fragile by skew and correlation (Topic 2). The
+          most cost-critical decision is <strong>join order</strong>, where the search space explodes, so optimizers
+          restrict to <strong>left-deep trees</strong> and search with <strong>dynamic programming</strong> (System R)
+          or <strong>heuristics</strong> for big joins (Topic 3). Throughout, it applies always-good
+          <strong>rule-based transformations</strong> — predicate pushdown, projection pushdown, constant folding,
+          and index selection — and you can inspect the result with <code class="inl">EXPLAIN</code> (Topic 4). Then
+          the chosen plan is handed to the execution engine you met in Session 10.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What's the difference between a logical plan and a physical plan?</summary>
+          <p class="ans">A logical plan describes <em>which</em> operations to do (join, filter, project) abstractly;
+          a physical plan describes <em>how</em> — the concrete algorithm for each step (e.g. hash join vs nested-loop
+          join) and the access methods (seq scan vs index scan).</p>
+        </details>
+        <details class="quiz">
+          <summary>A column has 200 distinct values and the table has 1,000,000 rows. Roughly how many rows pass <code class="inl">col = 'X'</code>?</summary>
+          <p class="ans">Selectivity ≈ 1/200 = 0.005, so about 0.005 × 1,000,000 = <strong>5,000 rows</strong>
+          (assuming values are evenly distributed — a histogram would refine this if the data is skewed).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is cardinality estimation so error-prone?</summary>
+          <p class="ans">Real data is <em>skewed</em> (values aren't equally common) and columns are
+          <em>correlated</em> (e.g. city implies country), but the optimizer often assumes uniformity and
+          independence. Errors then <em>multiply</em> as they propagate up through joins, sometimes by orders of
+          magnitude.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do optimizers restrict join search to left-deep trees?</summary>
+          <p class="ans">The full space of join-tree shapes (including bushy trees) is astronomically large.
+          Left-deep trees keep the count at n!, pipeline efficiently, and were the search space used by System R's
+          dynamic-programming optimizer.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does predicate pushdown do, and why does it help?</summary>
+          <p class="ans">It moves <code class="inl">WHERE</code> filters down to run <em>before</em> joins, close to
+          the base tables. Filtering early shrinks the data the expensive joins must process, often making the query
+          dramatically faster while returning the exact same rows.</p>
+        </details>
+        <details class="quiz">
+          <summary>You run <code class="inl">EXPLAIN ANALYZE</code> and see estimated <code class="inl">rows=50</code> but actual <code class="inl">rows=50000</code>. What does that tell you?</summary>
+          <p class="ans">The optimizer's cardinality estimate is badly off (likely stale statistics or hidden column
+          correlation). That bad estimate may have led it to pick a poor plan — refresh stats (e.g.
+          <code class="inl">ANALYZE</code>) or help it estimate better.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 DBMS Session 11 — Query Optimization (class handout).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems</a> — the gold-standard free course; its query-planning and optimization lectures cover everything here in depth.</li>
+          <li><a href="https://dl.acm.org/doi/10.1145/582095.582099" target="_blank" rel="noopener">Selinger et al., "Access Path Selection in a Relational Database Management System" (1979)</a> — the foundational System R paper that introduced cost-based optimization and dynamic-programming join ordering.</li>
+          <li><a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener">PostgreSQL Documentation — Using EXPLAIN</a> — the official guide to reading query plans, costs, and row estimates in a real, widely-used database.</li>
+          <li><a href="https://www.postgresql.org/docs/current/planner-stats.html" target="_blank" rel="noopener">PostgreSQL Documentation — Statistics Used by the Planner</a> — how a production optimizer stores and uses statistics, histograms, and distinct-value counts.</li>
+          <li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Use The Index, Luke!</a> — a friendly, practical explainer on indexing and how the optimizer decides between index scans and full scans.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-10.html"><div class="dir">← Previous</div><div class="ttl">Session 10: Query Execution — Joins &amp; Sorting</div></a>
+        <a class="next" href="session-12.html"><div class="dir">Next →</div><div class="ttl">Session 12: Transactions</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 11 — Query Optimization · You learned how the optimizer thinks 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

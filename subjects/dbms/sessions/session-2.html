@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 2 — The Storage Engine — Pages &amp; Records</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 2</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 02 · Storage Engine</span>
+      <h1>The Storage Engine — Pages &amp; Records</h1>
+      <p class="lead">
+        In Session 1 we looked at the big picture: how a database is organised into layers, from
+        the query parser at the top down to the bits sitting on disk. Now we drop all the way to the
+        bottom and ask the most physical question of all: <em>how does a database actually store your
+        data on a disk?</em> We assume you've studied none of this before. Every topic starts with a
+        tiny "explain like I'm 5" story, then we build up slowly with byte-level diagrams and real
+        code. Take it slow — by the end you'll understand exactly how a single row of a table turns
+        into bytes on a page.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#pages">Why databases think in pages</a></li>
+          <li><a href="#page-structure">Anatomy of a page</a></li>
+          <li><a href="#slotted">Slotted pages</a></li>
+          <li><a href="#encoding">Byte-level record encoding</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. PAGES ===================== -->
+      <section id="pages">
+        <h2><span class="sec-num">1</span> Why databases think in pages</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you keep all your toys in a huge warehouse far away. Every time you want a toy,
+          a truck has to drive there and back — that takes ages. So instead of fetching <em>one</em> toy
+          at a time, the truck always brings back a whole <strong>box</strong> of toys at once. Even if
+          you only wanted one toy, you get the box, because driving the truck is the slow part. A
+          database does the same thing: the disk is far away and slow, so it always reads and writes a
+          whole <strong>box of data</strong> at a time, never a single item.</p>
+        </div>
+
+        <p>A database's job is to store more data than fits in memory, on a disk, and still answer
+        questions quickly. To do that it has to understand one harsh fact of hardware: <strong>disks
+        are slow, and they don't let you read one byte at a time</strong>. This single fact shapes the
+        entire design of a storage engine.</p>
+
+        <h3>The hardware reality: blocks, not bytes</h3>
+        <p>Storage hardware does not hand you individual bytes. It works in fixed-size chunks:</p>
+        <ul>
+          <li>A spinning <span class="term">hard disk drive (HDD)</span> is organised into
+          <span class="term">sectors</span> (classically 512 bytes, now often 4&nbsp;KB). To read anything,
+          the disk must physically spin the platter and move a read head to the right track — a slow,
+          mechanical <span class="term">seek</span>.</li>
+          <li>A <span class="term">solid-state drive (SSD)</span> has no moving parts, but it still reads
+          and writes in fixed units called <span class="term">pages</span> (typically 4&nbsp;KB) and erases
+          in larger <span class="term">blocks</span>. You cannot rewrite a single byte in place.</li>
+        </ul>
+
+        <p>So at the hardware level, the smallest amount you can usefully transfer is a block, not a
+        byte. The numbers behind this are dramatic:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Rough latency</th><th>Relative speed</th></tr></thead>
+            <tbody>
+              <tr><td>Read 1 byte from RAM</td><td>~100 nanoseconds</td><td>1× (baseline)</td></tr>
+              <tr><td>Read a block from an SSD</td><td>~100 microseconds</td><td>~1,000× slower</td></tr>
+              <tr><td>Read a block from an HDD (with a seek)</td><td>~10 milliseconds</td><td>~100,000× slower</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Reading from a disk is thousands to hundreds of thousands of times slower than reading from
+        memory. And crucially, most of that cost is the <em>setup</em> — the seek and rotation on an HDD,
+        or the controller round-trip on an SSD. Once the head is in place, grabbing the next few
+        kilobytes is almost free. This is the key insight:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Because the expensive part of disk I/O is <strong>finding</strong> the data, not
+          <strong>transferring</strong> it, the database amortises that cost by always moving a
+          fixed-size chunk — a <span class="term">page</span> — at a time. The page is the database's
+          fundamental unit of I/O.</p>
+        </div>
+
+        <h3>What is a page?</h3>
+        <p>A <span class="term">page</span> (sometimes called a <span class="term">block</span>) is a
+        fixed-size, contiguous region of the database file — the unit the storage engine reads from and
+        writes to disk as a single operation. Common sizes:</p>
+        <ul>
+          <li><strong>PostgreSQL</strong>: 8&nbsp;KB pages (default).</li>
+          <li><strong>MySQL / InnoDB</strong>: 16&nbsp;KB pages (default).</li>
+          <li><strong>SQLite</strong>: 4&nbsp;KB pages (default, configurable).</li>
+          <li><strong>SQL Server / Oracle</strong>: 8&nbsp;KB pages.</li>
+        </ul>
+        <p>The page size is chosen to be a multiple of the operating system's and hardware's block size
+        so that one logical page maps cleanly onto whole physical blocks — no wasted half-reads.</p>
+
+        <div class="callout note">
+          <span class="c-title">Page vs. block — a vocabulary warning</span>
+          <p>The words <span class="term">page</span> and <span class="term">block</span> are used almost
+          interchangeably, but pedantically: a <strong>block</strong> is the hardware/OS unit, and a
+          <strong>page</strong> is the database's logical unit (often the same size, often a multiple of
+          the block). When CMU lectures say "page," they mean the database's chunk.</p>
+        </div>
+
+        <h3>Why row-at-a-time disk access is too slow</h3>
+        <p>Suppose a table row (a <span class="term">tuple</span>) is 128 bytes. If the database fetched
+        one row per disk read, every single row would cost a full seek — ~10&nbsp;ms on an HDD. Reading a
+        million rows would take <strong>~10,000 seconds (almost 3 hours)</strong> just in seek time. By
+        contrast, packing those same rows into 8&nbsp;KB pages (about 60 rows per page) means ~16,000
+        page reads instead of a million — roughly 60× fewer disk trips.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: rows-per-read vs. total I/O</span>
+          <p>Table: 1,000,000 rows, each 128 bytes. Page size: 8&nbsp;KB (8,192 bytes).</p>
+          <ul>
+            <li>Rows per page ≈ 8,192 ÷ 128 ≈ <strong>64 rows</strong> (ignoring header overhead).</li>
+            <li>Pages needed ≈ 1,000,000 ÷ 64 ≈ <strong>15,625 page reads</strong>.</li>
+            <li>One-row-per-read would need <strong>1,000,000 reads</strong>.</li>
+            <li>That's a <strong>64× reduction</strong> in the number of slow disk operations — and a
+            full-table scan reads those 15,625 pages sequentially, which disks love.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The database never thinks in individual rows when talking to disk — it thinks in
+          <strong>pages</strong>. Memory and CPU are cheap; disk seeks are not. Every layer above
+          (records, indexes, the buffer pool) is built on top of the page abstraction. We'll see in
+          <strong>Session 3</strong> how pages are collected into heap files, and in later sessions how
+          a <span class="term">buffer pool</span> caches hot pages in RAM.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Disks are thousands of times slower than RAM, and the slow part is <em>finding</em> data, not
+          transferring it. So databases read and write in fixed-size <strong>pages</strong> (4–16&nbsp;KB)
+          rather than single rows. The page is the fundamental unit of database I/O, and packing many
+          rows per page slashes the number of slow disk trips.
+        </div>
+      </section>
+
+      <!-- ===================== 2. PAGE STRUCTURE ===================== -->
+      <section id="page-structure">
+        <h2><span class="sec-num">2</span> The anatomy of a page</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a page like a <strong>moving box</strong>. On the outside of the box you write a
+          label: what's inside, how full it is, which box comes next. Inside the box you pack the actual
+          stuff. A database page is exactly that: a little label area at the top (the
+          <strong>header</strong>) that describes the box, and the rest of the box where the real data
+          lives.</p>
+        </div>
+
+        <p>A page is just a fixed-size array of bytes — say 8,192 of them. The storage engine imposes
+        structure on those raw bytes. Almost every page is split into two regions: a small
+        <span class="term">page header</span> and a larger <span class="term">data region</span>.</p>
+
+        <h3>The page header</h3>
+        <p>The <span class="term">page header</span> is a small block of metadata at the start of the
+        page (often 20–100 bytes) that describes the page itself. It typically holds:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>What it stores</th><th>Why it's needed</th></tr></thead>
+            <tbody>
+              <tr><td>Page ID / number</td><td>This page's own identity within the file.</td><td>So pages can reference each other.</td></tr>
+              <tr><td>Page type</td><td>Data page? Index page? Free-space map?</td><td>The engine treats different page types differently.</td></tr>
+              <tr><td>Free-space pointers</td><td>Where the used data ends / free area begins.</td><td>To know where the next record can go.</td></tr>
+              <tr><td>Record / slot count</td><td>How many records this page currently holds.</td><td>To iterate over the page's contents.</td></tr>
+              <tr><td>Checksum / LSN</td><td>A checksum for corruption detection; a log sequence number for recovery.</td><td>Data integrity and crash recovery (later session).</td></tr>
+              <tr><td>Pointers to siblings</td><td>Next/previous page IDs (used by index pages).</td><td>To chain pages into ordered structures.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The header is small but mighty: without it, the engine couldn't tell where the data ends, how
+        many records are present, or whether the page is corrupted.</p>
+
+        <h3>The data region — where records live</h3>
+        <p>The rest of the page holds the actual <span class="term">records</span> (the serialized rows
+        / tuples). The big question is: <em>how do we lay records out, and how do we find a specific one
+        later?</em> The answer depends on whether records are all the same size or not.</p>
+
+        <h3>Fixed-length vs. variable-length records</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Fixed-length records</th><th>Variable-length records</th></tr></thead>
+            <tbody>
+              <tr><td>When it happens</td><td>Every column is a fixed size (e.g. <code class="inl">INT</code>, <code class="inl">CHAR(10)</code>, <code class="inl">DATE</code>).</td><td>At least one column varies (e.g. <code class="inl">VARCHAR</code>, <code class="inl">TEXT</code>, <code class="inl">BLOB</code>).</td></tr>
+              <tr><td>Finding the Nth record</td><td>Trivial: <code class="inl">offset = header_size + N × record_size</code>. Pure arithmetic.</td><td>Hard: you can't compute it — records have different lengths, so you must track each one's position.</td></tr>
+              <tr><td>Deleting a record</td><td>Leaves a fixed-size hole; easy to reuse or mark free.</td><td>Leaves a variable hole; causes fragmentation.</td></tr>
+              <tr><td>Layout strategy</td><td>Often a simple packed array of records.</td><td>Needs a <strong>slotted page</strong> (Topic 3).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a fixed-length page</span>
+          <p>Suppose every record is exactly 32 bytes, the header is 24 bytes, and the page is 8,192
+          bytes. To read record number 5 (0-indexed):</p>
+          <pre><span class="cm"># Fixed-length layout: records packed back-to-back after the header.</span>
+record_size = <span class="nm">32</span>
+header_size = <span class="nm">24</span>
+n           = <span class="nm">5</span>
+
+offset = header_size + n * record_size   <span class="cm"># 24 + 5*32 = 184</span>
+record = page_bytes[offset : offset + record_size]  <span class="cm"># bytes 184..216</span></pre>
+          <p>No searching, no extra bookkeeping — just multiply and slice. This <strong>O(1) random
+          access</strong> is the whole appeal of fixed-length records. The catch: most real tables have
+          a <code class="inl">VARCHAR</code> somewhere, so we rarely get this luxury.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The trap with variable-length data</span>
+          <p>You might think "just pack variable records back-to-back too." But then deleting a record in
+          the middle leaves a hole, and inserting a bigger one later forces you to shift everything after
+          it. Worse, any pointer that said "record 3 is at byte 412" instantly breaks when records move.
+          We need a layout that lets records move freely <em>without</em> invalidating their addresses —
+          which is exactly what slotted pages solve in Topic 3.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A page = a small <strong>header</strong> (metadata: page id, type, free-space pointers,
+          record count, checksum) + a <strong>data region</strong> full of records. Fixed-length records
+          give cheap arithmetic addressing; variable-length records need cleverer bookkeeping.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Every page splits into a metadata <strong>header</strong> and a <strong>data region</strong>.
+          Fixed-length records can be addressed by simple arithmetic (<code class="inl">offset = header +
+          N × size</code>), but variable-length records can't — they need a layout that tolerates records
+          changing size and moving around. That layout is the slotted page.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SLOTTED PAGES ===================== -->
+      <section id="slotted">
+        <h2><span class="sec-num">3</span> Slotted pages</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a cloakroom at a theatre. You hand over your coat and get a little numbered ticket.
+          The attendant can hang your coat <em>anywhere</em> on the rack, and even move it around to make
+          space — but your <strong>ticket number never changes</strong>. When you come back, you show
+          ticket #7, the attendant looks up where coat #7 is hanging right now, and fetches it. A slotted
+          page works exactly like this: each record gets a permanent "ticket" (a slot number), while the
+          record itself can be moved around inside the page freely.</p>
+        </div>
+
+        <p>The <span class="term">slotted page</span> is the standard layout for variable-length records,
+        used by PostgreSQL, SQLite, SQL Server, and most others. It solves the two problems from Topic 2
+        at once: it handles variable sizes, and it lets records move without breaking their addresses.</p>
+
+        <h3>The layout: grow from both ends</h3>
+        <p>A slotted page grows from <strong>both ends toward the middle</strong>:</p>
+        <ul>
+          <li>Right after the header sits the <span class="term">slot array</span> (also called the
+          <em>slot directory</em> or <em>line pointer array</em>). It grows <strong>downward</strong>
+          from the top. Each <span class="term">slot</span> is a small fixed-size entry — typically a
+          <strong>(offset, length)</strong> pair — that points to one record.</li>
+          <li>The actual record data is packed from the <strong>bottom of the page upward</strong>.</li>
+          <li>The <span class="term">free space</span> is the gap in the middle, shrinking from both
+          sides as the page fills.</li>
+        </ul>
+
+        <p>Here's the picture. The slot array grows down from the header; records grow up from the end;
+        free space is squeezed in between:</p>
+
+        <pre><span class="cm">  byte 0 ─────────────────────────────────────────────── byte 8191</span>
+┌────────────┬───────────────────────┬─────────────────┬──────────────┐
+│   HEADER   │  SLOT ARRAY  ───────►  │   free space    │ ◄─── RECORDS │
+│ (metadata) │  [s0][s1][s2]...       │   (the gap)     │  ...R2 R1 R0 │
+└────────────┴───────────────────────┴─────────────────┴──────────────┘
+   grows →       grows downward →        shrinks            ◄ grows upward
+
+   slot s0 ─┐                                          ┌── record R0
+   slot s1 ─┼──── each slot = (offset, length) ───────►├── record R1
+   slot s2 ─┘        points to a record                └── record R2</span></pre>
+
+        <p>Each slot is tiny and <strong>fixed-size</strong> (e.g. 4 bytes: a 2-byte offset + 2-byte
+        length). So even though records vary in size, the slot array is a neat fixed-stride array — and
+        that gives us back the cheap arithmetic addressing we lost in Topic 2, but at the
+        <em>slot</em> level instead of the record level.</p>
+
+        <h3>The Record ID — a stable address</h3>
+        <p>A record is identified not by its byte position, but by its <span class="term">Record ID
+        (RID)</span>: the pair <strong>(page number, slot number)</strong>. PostgreSQL calls this the
+        <span class="term">tuple ID (TID/ctid)</span>. Because the RID names a <em>slot</em>, not a byte
+        offset, the engine can shuffle records around inside the page and the RID still works — it just
+        updates the offset stored in the slot.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The slot array adds <strong>one level of indirection</strong>. Outsiders (indexes, other
+          pages) hold the stable RID <code class="inl">(page, slot)</code>. Only the slot knows the
+          record's real byte offset. Move the record, update the slot — and every reference stays valid.
+          This is the same trick that powers virtual memory, file systems, and pointers everywhere in
+          computing.</p>
+        </div>
+
+        <h3>Insert, delete, and move — without breaking RIDs</h3>
+        <p>Let's walk through the operations on a page with three records R0, R1, R2 in slots 0, 1, 2.</p>
+
+        <div class="callout example">
+          <span class="c-title">Walkthrough: insert → delete → compact</span>
+          <p><strong>Step 1 — Insert a record.</strong> The engine writes the record bytes at the top of
+          the free space (just above the highest record), then adds a new slot pointing at it.</p>
+          <pre><span class="cm"># Insert record R3 of length L</span>
+free_end   = header.free_space_end       <span class="cm"># top of the record area</span>
+new_offset = free_end - L                 <span class="cm"># carve L bytes off the free gap</span>
+page[new_offset : free_end] = R3_bytes
+slots.append( (offset=new_offset, length=L) )   <span class="cm"># this is slot 3 → RID (page, 3)</span>
+header.free_space_end = new_offset</pre>
+
+          <p><strong>Step 2 — Delete R1.</strong> We do <em>not</em> shift other records (that would be
+          expensive and break offsets). Instead we just mark slot 1 as empty — typically by setting its
+          length to a tombstone value (e.g. length = 0, or offset = a special "dead" marker):</p>
+          <pre><span class="cm"># Delete the record in slot 1</span>
+slots[<span class="nm">1</span>] = (offset=<span class="nm">0</span>, length=<span class="nm">0</span>)   <span class="cm"># tombstone: slot now points to nothing</span></pre>
+          <p>RID <code class="inl">(page, 1)</code> is now invalid, but RIDs of R0 and R2
+          (<code class="inl">(page, 0)</code> and <code class="inl">(page, 2)</code>) are untouched. The
+          slot number is <strong>not reused immediately</strong>, so old references fail safely instead
+          of silently pointing at a different record.</p>
+
+          <p><strong>Step 3 — Compact (vacuum) to reclaim the hole.</strong> When the page gets
+          fragmented, the engine can slide the live records together to merge the free space — and
+          because RIDs point at slots, it just rewrites each slot's offset afterward:</p>
+          <pre><span class="cm"># Compaction: rewrite live records contiguously, fix up slot offsets</span>
+write_ptr = end_of_page
+<span class="kw">for</span> slot <span class="kw">in</span> slots:
+    <span class="kw">if</span> slot.is_live():
+        write_ptr -= slot.length
+        move record bytes to write_ptr
+        slot.offset = write_ptr          <span class="cm"># RID (page, i) unchanged — only the offset moved</span>
+header.free_space_end = write_ptr</pre>
+          <p>After compaction the records sit in different byte positions, but every RID still resolves
+          correctly because the lookup is always "slot → current offset." That's the magic.</p>
+        </div>
+
+        <p><strong>Updating a record</strong> to a larger size is the interesting case: if it still fits
+        in the page's free space, the engine rewrites it (possibly moving it and updating its slot). If
+        it no longer fits, the engine places it on another page and leaves a small
+        <span class="term">forwarding pointer</span> (a redirect) in the original slot — so the RID still
+        works, it just hops once. PostgreSQL's <span class="term">HOT</span> updates and SQL Server's
+        forwarded records are real-world versions of this.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why the indirection is worth a tiny cost</span>
+          <p>To find a record you do two lookups instead of one: read the slot, then read the record at
+          the slot's offset. That's one extra memory access — utterly negligible since the whole page is
+          already in RAM. In exchange you get free movement, easy deletes, and stable addresses. A great
+          trade.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A slotted page = header + a <strong>fixed-stride slot array growing down</strong> + variable
+          <strong>records growing up</strong> + free space between them. Records are addressed by
+          <strong>RID = (page, slot)</strong>, never by raw byte offset, so inserts, deletes, moves, and
+          compaction never break existing references.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The slotted page handles variable-length records by separating <em>identity</em> from
+          <em>location</em>: a fixed-size slot array (growing down) maps each record's stable slot number
+          to its current byte offset, while records pack upward from the page end. Insert appends a slot,
+          delete tombstones a slot, and compaction slides records and rewrites offsets — all without
+          invalidating the RID <code class="inl">(page, slot)</code> that indexes and other pages rely on.
+        </div>
+      </section>
+
+      <!-- ===================== 4. ENCODING ===================== -->
+      <section id="encoding">
+        <h2><span class="sec-num">4</span> Byte-level record encoding</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When you mail a present, you can't just throw the toy, the card, and the candy loose into an
+          envelope — the postman wouldn't know where one thing ends and the next begins. So you wrap each
+          item and write a little packing slip saying what's inside and in what order. A database does the
+          same to a row: it carefully wraps each column into bytes, in a fixed order, with little notes
+          (like "this field is empty" or "the name is 5 letters long") so it can be unwrapped perfectly
+          later.</p>
+        </div>
+
+        <p>Inside a slot's region sits the actual record — a single row turned into a flat stream of
+        bytes. Turning a structured row into bytes is called <span class="term">serialization</span>
+        (and turning it back is <span class="term">deserialization</span>). Let's see exactly what those
+        bytes are.</p>
+
+        <h3>The pieces of a serialized record</h3>
+        <p>A typical record is laid out as: a small <strong>record header</strong>, then the
+        <strong>fixed-length fields</strong>, then the <strong>variable-length fields</strong>. The
+        header usually contains:</p>
+        <ul>
+          <li>A <span class="term">null bitmap</span> — one bit per column, set to 1 if that column is
+          <code class="inl">NULL</code>. This is how the engine stores "this field has no value" without
+          wasting space on the value itself.</li>
+          <li>Sometimes a count of columns, a version tag, or visibility info for concurrency (we'll
+          meet that in a later session on transactions).</li>
+        </ul>
+
+        <h3>Fixed-length fields are easy; variable-length need offsets</h3>
+        <p><strong>Fixed-length fields</strong> (like <code class="inl">INT</code> = 4 bytes,
+        <code class="inl">BIGINT</code> = 8 bytes) are placed first, back-to-back, so the deserializer
+        knows each one's position by simple arithmetic.</p>
+        <p><strong>Variable-length fields</strong> (like <code class="inl">VARCHAR</code>) are the
+        problem: their length isn't known in advance. Two common solutions:</p>
+        <ul>
+          <li><strong>Length prefix</strong>: store the length right before the data
+          (e.g. <code class="inl">[len=5]["Medha"]</code>). To skip to the next field, read the length,
+          then jump that far.</li>
+          <li><strong>Offset array</strong>: keep an array of offsets at the start of the record, one per
+          variable field, pointing to where each field's data begins. This gives O(1) access to any
+          variable field without scanning earlier ones.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why put fixed fields before variable ones?</span>
+          <p>If the fixed-length columns come first, their offsets are constant for every row — the
+          engine can read an <code class="inl">INT</code> column with a hard-coded offset. The unpredictable
+          variable-length data is pushed to the end, where its messiness doesn't disturb the tidy fixed
+          part. Real engines (PostgreSQL, InnoDB) physically reorder columns on disk for exactly this
+          reason, even though you wrote them in a different order in <code class="inl">CREATE TABLE</code>.</p>
+        </div>
+
+        <h3>A concrete byte-layout example</h3>
+        <p>Let's serialize one real row. Take this table and row:</p>
+        <pre><span class="kw">CREATE TABLE</span> users (
+    id     <span class="kw">INT</span>,           <span class="cm">-- 4 bytes, fixed</span>
+    age    <span class="kw">SMALLINT</span>,      <span class="cm">-- 2 bytes, fixed</span>
+    name   <span class="kw">VARCHAR</span>,       <span class="cm">-- variable length</span>
+    email  <span class="kw">VARCHAR</span>        <span class="cm">-- variable length</span>
+);
+
+<span class="cm">-- The row we want to store:</span>
+<span class="kw">INSERT INTO</span> users <span class="kw">VALUES</span> (<span class="nm">7</span>, <span class="nm">30</span>, <span class="st">'Medha'</span>, <span class="kw">NULL</span>);</pre>
+
+        <p>So <code class="inl">id = 7</code>, <code class="inl">age = 30</code>,
+        <code class="inl">name = 'Medha'</code> (5 characters), and <code class="inl">email = NULL</code>.
+        Here is one reasonable byte layout (little-endian integers, a 1-byte null bitmap, length-prefixed
+        strings). Byte offsets are shown on the left:</p>
+
+        <pre><span class="cm">offset  bytes (hex)        meaning</span>
+─────────────────────────────────────────────────────────────
+  <span class="nm">0</span>     <span class="nm">04</span>                 null bitmap = 0000 0100b
+                            └─ bit0 id=present, bit1 age=present,
+                               bit2 name=present, bit3 email=<span class="kw">NULL</span> (the set bit)
+─────────────── fixed-length fields ─────────────────────────
+  <span class="nm">1</span>     <span class="nm">07 00 00 00</span>        id    = <span class="nm">7</span>   (INT, 4 bytes, little-endian)
+  <span class="nm">5</span>     <span class="nm">1E 00</span>              age   = <span class="nm">30</span>  (SMALLINT, 2 bytes; 0x1E = 30)
+─────────────── variable-length fields ──────────────────────
+  <span class="nm">7</span>     <span class="nm">05</span>                 name length = <span class="nm">5</span>  (1-byte length prefix)
+  <span class="nm">8</span>     <span class="nm">4D 65 64 68 61</span>     name data   = <span class="st">'M' 'e' 'd' 'h' 'a'</span>  (ASCII)
+        <span class="cm">(email is NULL → bit 3 set in the bitmap → no bytes stored at all)</span>
+─────────────────────────────────────────────────────────────
+total record size = <span class="nm">13</span> bytes</pre>
+
+        <p>Walk through it the way the database would when reading the row back:</p>
+        <ol>
+          <li>Read byte 0 → the <strong>null bitmap</strong> <code class="inl">0x04</code> = binary
+          <code class="inl">00000100</code>. Bit 3 is set, so <code class="inl">email</code> is
+          <code class="inl">NULL</code> and will occupy <em>zero</em> bytes later — we skip it entirely.</li>
+          <li>Read 4 bytes at offset 1 → <code class="inl">id = 7</code>.</li>
+          <li>Read 2 bytes at offset 5 → <code class="inl">age = 30</code>.</li>
+          <li>Read 1 length byte at offset 7 → <code class="inl">5</code>, then read 5 bytes → the string
+          <code class="inl">"Medha"</code> for <code class="inl">name</code>.</li>
+          <li><code class="inl">email</code> was flagged NULL by the bitmap, so there is nothing more to
+          read. Done — 13 bytes total.</li>
+        </ol>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: deserializing in code</span>
+          <p>Here's the read path in pseudo-Python, mirroring the steps above:</p>
+          <pre><span class="kw">def</span> read_user(rec):
+      null_bitmap = rec[<span class="nm">0</span>]
+      pos = <span class="nm">1</span>
+
+      <span class="cm"># id: INT, 4 bytes, little-endian</span>
+      id = int_from_bytes(rec[pos:pos+<span class="nm">4</span>])   <span class="cm"># 0x07000000 → 7</span>
+      pos += <span class="nm">4</span>
+
+      <span class="cm"># age: SMALLINT, 2 bytes</span>
+      age = int_from_bytes(rec[pos:pos+<span class="nm">2</span>])  <span class="cm"># 0x1E00 → 30</span>
+      pos += <span class="nm">2</span>
+
+      <span class="cm"># name: length-prefixed VARCHAR</span>
+      n = rec[pos]; pos += <span class="nm">1</span>             <span class="cm"># length = 5</span>
+      name = rec[pos:pos+n].decode(); pos += n   <span class="cm"># "Medha"</span>
+
+      <span class="cm"># email: check the null bitmap (bit 3) before reading anything</span>
+      <span class="kw">if</span> null_bitmap &amp; (<span class="nm">1</span> &lt;&lt; <span class="nm">3</span>):
+          email = <span class="kw">None</span>                   <span class="cm"># NULL → no bytes consumed</span>
+      <span class="kw">else</span>:
+          m = rec[pos]; pos += <span class="nm">1</span>
+          email = rec[pos:pos+m].decode()
+
+      <span class="kw">return</span> (id, age, name, email)</pre>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Real engines add alignment &amp; overhead</span>
+          <p>Real systems are fussier than our tidy example. They often <span class="term">pad</span>
+          fields so multi-byte values start on aligned addresses (a 4-byte <code class="inl">INT</code>
+          aligned to a 4-byte boundary), which speeds up CPU reads but wastes a few bytes. PostgreSQL adds
+          a 23-byte tuple header per row; InnoDB stores its own record header and hidden columns (a row
+          id, transaction id, rollback pointer). So a "tiny" row is never quite as tiny on disk as the raw
+          column bytes suggest.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A record is bytes laid out as: <strong>null bitmap → fixed-length fields → variable-length
+          fields</strong> (the variable ones found via length prefixes or an offset array). The null
+          bitmap lets NULLs cost almost nothing, and putting fixed fields first makes their positions
+          constant and cheap to read.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Serializing a row means flattening it to bytes: a <strong>null bitmap</strong> records which
+          columns are NULL (so they take zero space), <strong>fixed-length fields</strong> go first at
+          constant offsets, and <strong>variable-length fields</strong> go last, located by length
+          prefixes or an offset array. Our 13-byte <code class="inl">(7, 30, 'Medha', NULL)</code> row
+          showed the whole encode/decode round-trip — and real engines add alignment padding and
+          per-row headers on top.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just followed your data all the way down to the bits. Here's the one-paragraph story that
+        connects all four topics:</p>
+        <div class="bigidea">
+          <p>Because disks are far slower than memory and the slow part is <em>finding</em> data, a
+          database always reads and writes a fixed-size <strong>page</strong> (4–16&nbsp;KB) instead of a
+          single row. Each page has a small <strong>header</strong> of metadata and a
+          <strong>data region</strong> of records; fixed-length records can be addressed by arithmetic,
+          but variable-length records need the <strong>slotted page</strong> layout — a fixed-stride
+          <strong>slot array</strong> growing down, records growing up, and a stable
+          <strong>RID = (page, slot)</strong> that survives inserts, deletes, moves, and compaction. Each
+          record in a slot is itself a serialized stream of bytes: a <strong>null bitmap</strong>, then
+          <strong>fixed-length fields</strong>, then <strong>variable-length fields</strong> located by
+          length prefixes or offsets. Master this and you understand the literal, physical foundation
+          every higher database layer is built on.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does a database read a whole page instead of a single row?</summary>
+          <p class="ans">Because disk I/O is dominated by the cost of <em>finding</em> the data (seek /
+          controller round-trip), not transferring it. Reading a whole page amortises that fixed cost
+          over many rows, so packing ~60 rows per page can mean ~60× fewer slow disk trips.</p>
+        </details>
+        <details class="quiz">
+          <summary>What two regions make up a typical page, and what's in the smaller one?</summary>
+          <p class="ans">A page header and a data region. The header holds metadata: page id, page type,
+          free-space pointers, record/slot count, and a checksum or log sequence number for integrity and
+          recovery.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't you address a variable-length record with <code class="inl">offset = header + N × size</code>?</summary>
+          <p class="ans">Because each record is a different length, so there is no constant size to
+          multiply by. You must track each record's individual position — which is what the slot array in
+          a slotted page does.</p>
+        </details>
+        <details class="quiz">
+          <summary>In a slotted page, why does deleting or moving a record not break references to it from indexes?</summary>
+          <p class="ans">References use the Record ID <code class="inl">(page, slot)</code>, not a raw
+          byte offset. Only the slot stores the record's current offset. Move the record and you update
+          the slot's offset; the RID stays the same, so every external reference still resolves.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does a record store a NULL column without wasting space on it?</summary>
+          <p class="ans">Via the null bitmap in the record header — one bit per column. If the bit is set,
+          the column is NULL and <em>no</em> bytes are stored for its value; the deserializer simply skips
+          it.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do storage engines place fixed-length fields before variable-length ones?</summary>
+          <p class="ans">So the fixed fields sit at constant offsets in every row and can be read with
+          hard-coded arithmetic. The unpredictable variable-length data is pushed to the end, located via
+          length prefixes or an offset array, where it doesn't disturb the tidy fixed part.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 2 — Storage Engine (the class handout for this session).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445/645 — Database Systems (course site)</a> — the gold-standard university course; the "Database Storage" lectures cover pages, slotted pages, and tuple layout exactly as in this session, with free video lectures and slides.</li>
+          <li><a href="https://www.postgresql.org/docs/current/storage-page-layout.html" target="_blank" rel="noopener">PostgreSQL Docs — Database Page Layout</a> — the canonical, real-world reference: the page header, the line-pointer (slot) array, item layout, and the heap tuple header described byte by byte.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Silberschatz, Korth &amp; Sudarshan — <em>Database System Concepts</em></a> — the classic textbook; the storage and file-structure chapters formally cover fixed vs. variable-length records and slotted pages.</li>
+          <li><a href="https://www.postgresql.org/docs/current/storage-toast.html" target="_blank" rel="noopener">PostgreSQL Docs — TOAST</a> — what happens when a record is too big to fit on one page: oversized variable-length fields are compressed and moved out-of-line, a real-world extension of Topic 4.</li>
+          <li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html" target="_blank" rel="noopener">MySQL Docs — InnoDB Row Formats</a> — how a different production engine encodes records (COMPACT/DYNAMIC formats, null bitmaps, hidden columns), great for comparing against PostgreSQL.</li>
+          <li><a href="https://www.databass.dev/" target="_blank" rel="noopener">Alex Petrov — <em>Database Internals</em></a> — a modern, approachable book whose first chapters walk through page structure, slotted pages, and record encoding in depth.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-1.html"><div class="dir">← Previous</div><div class="ttl">Session 1: DBMS Architecture</div></a>
+        <a class="next" href="session-3.html"><div class="dir">Next →</div><div class="ttl">Session 3: Storage Engine — Heap Files</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 2 — The Storage Engine — Pages &amp; Records · You followed your data down to the bytes 💾</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

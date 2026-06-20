@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 5 — Caching — Case Studies</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 5</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 05 · Caching Case Studies</span>
+      <h1>Putting caching to work on real systems</h1>
+      <p class="lead">
+        In Sessions 3 and 4 we built up the <em>theory</em> of caching — what to keep, when to throw it away,
+        and how to keep it honest. This session is the fun part: we take those tools off the shelf and design
+        real-ish products with them — a code judge, a leaderboard, and a social newsfeed. We assume you've
+        studied <em>none</em> of this before, so every topic starts with a tiny everyday story before we go deep.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#toolkit">Our caching toolkit (recap)</a></li>
+          <li><a href="#design">Do we always want a cache? &amp; the 5-step process</a></li>
+          <li><a href="#judge">Case study: Scaler Code Judge</a></li>
+          <li><a href="#leaderboard">Case study: Scaler Leaderboard</a></li>
+          <li><a href="#redis">Deep dive: Redis &amp; naming tech in interviews</a></li>
+          <li><a href="#newsfeed">Case study: Social Media Newsfeed</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. TOOLKIT ===================== -->
+      <section id="toolkit">
+        <h2><span class="sec-num">1</span> Our caching toolkit — a quick recap</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your toy box is too small to hold every toy in the house, so you keep only the toys you
+          play with most right next to you. That's a <strong>cache</strong>. But two questions follow you around:
+          when the box is full, <em>which toy do you put back</em> to make room? And if Mum buys a newer version of
+          a toy, <em>how do you make sure the old broken one isn't still in your box</em>? Those two questions are
+          our whole toolkit — and today we use it to build real things.</p>
+        </div>
+
+        <p>A <span class="term">cache</span> is a small, fast store that keeps copies of data so we don't have to
+        re-fetch or re-compute it from a slow source (like a database) every time. We've spent two sessions on the
+        details; here we line up the tools we'll reach for today so the case studies read smoothly.</p>
+
+        <h3>Tool 1 — Eviction (from Session 3)</h3>
+        <p>A cache has limited memory, so when it fills up it must <span class="term">evict</span> (kick out)
+        something to make room. The rule it uses is an <span class="term">eviction policy</span>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Policy</th><th>Kicks out…</th><th>Best when…</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">LRU</span> (Least Recently Used)</td><td>the item untouched for the longest time</td><td>recent things are likely to be used again (the usual default)</td></tr>
+              <tr><td><span class="term">LFU</span> (Least Frequently Used)</td><td>the item with the fewest total hits</td><td>some items are perennial favourites</td></tr>
+              <tr><td>FIFO</td><td>the oldest inserted item, regardless of use</td><td>simple, order-of-arrival fairness</td></tr>
+              <tr><td><span class="term">TTL</span> (Time To Live)</td><td>any item older than a set age, automatically</td><td>data that goes stale on a clock (prices, sessions)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Rule of thumb from class</span>
+          <p>For the eviction step, <strong>just use LRU</strong> unless you have a specific reason not to. It's the
+          sensible default and almost always the right answer in an interview.</p>
+        </div>
+
+        <h3>Tool 2 — Write &amp; invalidation strategies (from Session 4)</h3>
+        <p>The second half of caching is keeping the cache <em>honest</em> when the underlying data changes. If we
+        update the database but the cache still serves the old copy, we've served <span class="term">stale</span>
+        data. The strategies:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>How it works</th><th>Trade-off</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Cache-aside</span> (lazy loading)</td><td>App checks cache first; on a miss it reads the DB and fills the cache.</td><td>Simple &amp; popular; first read after a miss is slow.</td></tr>
+              <tr><td><span class="term">Write-through</span></td><td>Every write goes to the cache <em>and</em> the DB together, synchronously.</td><td>Cache always fresh (immediate consistency); writes are a little slower.</td></tr>
+              <tr><td><span class="term">Write-back</span> (write-behind)</td><td>Write to cache now, flush to DB later in the background.</td><td>Fast writes; risk of data loss if the cache dies before flushing.</td></tr>
+              <tr><td><span class="term">Write-around</span></td><td>Write straight to the DB (or recompute on a schedule), skip the cache; let reads/CRON populate it later.</td><td>Eventual consistency; avoids caching data nobody reads.</td></tr>
+              <tr><td><span class="term">TTL</span></td><td>Cache entries expire after a set age and are re-fetched.</td><td>Eventual consistency; choosing the right TTL is the hard part.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>And to fight staleness directly, we <span class="term">invalidate</span> — explicitly delete or refresh
+        a cache entry when its source changes — or we lean on TTL to let entries expire on their own. We also met
+        the classic dangers: the <span class="term">thundering herd</span> (many requests stampede the DB the moment
+        a hot key expires) and the <span class="term">hot key</span> problem (one key so popular it overloads a
+        single cache node). Remember the consistency mapping: <strong>write-through → immediate consistency</strong>;
+        <strong>TTL / write-around → eventual consistency</strong>.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Every caching decision is really two questions glued together: <strong>"what do I drop when I'm full?"</strong>
+          (eviction) and <strong>"how do I avoid serving a lie?"</strong> (writes + invalidation). Hold those two
+          questions in your head and the case studies below almost design themselves.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Our toolkit: eviction policies (LRU, LFU, FIFO, TTL) decide what to drop — default to LRU; write strategies
+          (cache-aside, write-through, write-back, write-around, TTL) decide how writes flow and which consistency you
+          get; and invalidation/TTL keeps data fresh while we dodge the thundering-herd and hot-key traps. Now we apply
+          all of it.
+        </div>
+      </section>
+
+      <!-- ===================== 2. DESIGN PROCESS ===================== -->
+      <section id="design">
+        <h2><span class="sec-num">2</span> Do we always want a cache? &amp; the 5-step design process</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Keeping your favourite snacks on your desk instead of the kitchen means you grab them <em>fast</em> —
+          most of the time. But now you have two places snacks can live, so sometimes you check the desk, find
+          nothing, and <em>still</em> have to walk to the kitchen — that trip is now <em>slower</em> than if you'd
+          never had a desk stash. And every time Mum buys new snacks she has to restock <em>two</em> places. A cache
+          is great, but it's never free.</p>
+        </div>
+
+        <h3>Do we always want to cache? Not always.</h3>
+        <p>A cache is not a free win you sprinkle on everything. It is a deliberate design decision with real
+        trade-offs. Let's be honest about both sides.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pros of caching</th><th>Cons of caching</th></tr></thead>
+            <tbody>
+              <tr><td>Improves read <span class="term">throughput</span> (assuming a high hit rate)</td><td>Adds complexity — it has to be designed</td></tr>
+              <tr><td>Improves best/average-case read latency…</td><td>…but <strong>worsens worst-case</strong> read latency (a miss now checks 2 places: cache, then DB)</td></tr>
+              <tr><td>Offloads the database on the read path</td><td>Extra infrastructure to maintain</td></tr>
+              <tr><td>&nbsp;</td><td>Caching logic gets mixed into business logic in the app server (mitigate by moving caching into <strong>middleware</strong>)</td></tr>
+              <tr><td>&nbsp;</td><td>Can worsen write throughput — now you may write to 2 places (DB + cache)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Definition: throughput</span>
+          <p><span class="term">Throughput</span> = the average number of tasks completed per unit time. High
+          throughput is good. Caching raises read throughput when the hit rate is high, but always raises the
+          <em>worst-case</em> latency because a miss means checking the cache <em>and</em> the DB.</p>
+        </div>
+
+        <h3>The 5-step process for designing a cache</h3>
+        <p>Whenever a system-design question calls for a cache, walk these five steps in order. Every case study below
+        is just this checklist applied.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">1️⃣</div><div class="s-t">Establish the need</div><div class="s-d">Do we actually need a cache here?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">2️⃣</div><div class="s-t">Type of cache</div><div class="s-d">Local vs Global; Single vs Distributed (global only)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">3️⃣</div><div class="s-t">Eviction</div><div class="s-d">Just use LRU</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">4️⃣</div><div class="s-t">Invalidation</div><div class="s-d">Driven by consistency needs + data/query complexity</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">5️⃣</div><div class="s-t">Load balancer</div><div class="s-d">Consistent hashing vs round robin</div></div>
+        </div>
+        <ol>
+          <li><strong>Establish the need for caching.</strong> Don't cache reflexively — show why the slow path hurts.</li>
+          <li><strong>Determine the type of cache.</strong> <span class="term">Local</span> (lives on each app server)
+          vs <span class="term">Global</span> (a separate shared cache tier). If global, then also decide
+          <span class="term">Single</span> vs <span class="term">Distributed</span>. (Single/Distributed is only a
+          question for global caches — a local cache is automatically "distributed" across your app servers.)</li>
+          <li><strong>Identify the eviction algorithm.</strong> Just use LRU.</li>
+          <li><strong>Identify the invalidation algorithm</strong>, based on (a) your consistency requirements and
+          (b) the complexity of the data/query.</li>
+          <li><strong>Think about the load balancer</strong> — consistent hashing vs round robin.</li>
+        </ol>
+
+        <div class="callout key">
+          <span class="c-title">LB mental model (used in every case study)</span>
+          <p>Always ask: <strong>"why do we have more than one server?"</strong></p>
+          <ul>
+            <li>Because the <strong>data</strong> was too large to fit on one server → data is <em>sharded</em> →
+            you MUST use <span class="term">consistent hashing</span>.</li>
+            <li>Because the <strong>request/compute load</strong> was too much for one server → servers hold the same
+            data (<em>replication</em>) → you can just use <span class="term">round robin</span>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Caching is not free: it boosts read throughput and average latency but worsens worst-case latency, adds
+          infra, and can slow writes. Design it in 5 steps — establish the need, choose type (local/global, then
+          single/distributed for global), pick eviction (LRU), pick invalidation (from consistency + data complexity),
+          and choose the LB (consistent hashing if data is sharded, round robin if load-balanced replicas).
+        </div>
+      </section>
+
+      <!-- ===================== 3. CODE JUDGE ===================== -->
+      <section id="judge">
+        <h2><span class="sec-num">3</span> Case study: the Scaler Code Judge</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a teacher who grades your homework against a giant answer book that lives in a locked library
+          across town. Hundreds of students hand in the <em>same</em> problem. Fetching that heavy answer book from
+          the library every single time would take forever. So the teacher photocopies it once and keeps the copy in
+          a drawer on the desk — grading is now fast. If the library later prints a corrected answer book, the teacher
+          throws away the old desk copy and fetches the new one. That desk drawer is our <em>local</em> cache.</p>
+        </div>
+
+        <p>The <span class="term">Code Judge</span> is a service that "judges" your code submission. When you submit a
+        solution for a DSA problem on Scaler, it takes your code and runs it through hundreds of test cases to decide
+        whether it's correct. Let's design its cache with the 5-step process.</p>
+
+        <h3>Step 1 — Establish the need</h3>
+        <h4>What does the app server need to evaluate a submission?</h4>
+        <ul>
+          <li><strong>User info</strong> — auth, whether they've already solved this, whether they're part of the course, …</li>
+          <li><strong>Problem info</strong> — topic, total score, memory limit, time limit, number of test cases, …</li>
+          <li><strong>The code submission</strong> made by the user</li>
+          <li><strong>Test case data</strong> — the input file and the expected output file</li>
+        </ul>
+
+        <h4>How large can this data be?</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Data</th><th>Size (avg/worst)</th><th>Where it lives</th></tr></thead>
+            <tbody>
+              <tr><td>User info / Problem info</td><td>a few KBs</td><td>SQL database (Amazon RDS)</td></tr>
+              <tr><td>Test case data</td><td>1 to 2 GB</td><td>File storage (Amazon S3)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout example">
+          <span class="c-title">Worked example: why test cases are ~1 GB</span>
+          <p>For one problem we run your code through 100 test cases. Imagine the problem is "sort the array." Each
+          test case is a large array (N = 10⁶ integers), and each expected output is also a large array (N = 10⁶).</p>
+          <pre>100 testcases × (10^6 integers / testcase) × (8 bytes / integer)
+  = 100 × 10^6 × 8 bytes
+  = 800 MB
+  ≈ 1 GB        (for the input file; the output file is similar)</pre>
+          <p>And the total test-case storage across Scaler's catalogue:</p>
+          <pre>Scaler has ~3,000 problems
+  3000 problems × (1 GB testcase data / problem)
+  = 3 TB of testcase data in S3</pre>
+          <p>Is 3 TB too large? Not really — storage is cheap. It's too large to fit entirely in RAM, but it fits
+          easily on an HDD.</p>
+        </div>
+        <p>How many problems are solved on a given day? Around <strong>100–200 different problems</strong> — we run
+        multiple batches in parallel, each solving the current (or last) class's problems, and the batches overlap in
+        timeline.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Interview trap: "Should we store these test cases in a CDN?"</span>
+          <p><strong>No!</strong> Backend services never access data from the CDN. CDNs are <em>client-facing</em> —
+          they reduce latency for the <em>user</em> by serving from an edge server close to them. Our app servers
+          fetching test cases is a backend-to-backend concern, not a CDN use case.</p>
+        </div>
+
+        <p><strong>The need:</strong> do we want to transfer 1 GB of test-case data over the network for <em>every</em>
+        submission request? Absolutely not. Hence — we need a cache.</p>
+
+        <h3>Step 2 — Type of cache: Local vs Global</h3>
+        <div class="callout warn">
+          <span class="c-title">Why a Global cache does NOT solve our problem</span>
+          <p>A global cache <em>would</em> be available to all app servers (keeping them stateless), and the data is
+          large so "global" feels right. But it doesn't help at all: we'd <strong>still</strong> have to transfer 1 GB
+          of test-case data for each request — just from the cache server instead of S3. We swapped an expensive
+          S3→app-server transfer for an equally expensive cache→app-server transfer. No win.</p>
+        </div>
+        <p><strong>Local cache wins.</strong> Each app server caches some test cases on its <em>own local HDD</em>:</p>
+        <ul>
+          <li>The request comes to the app server.</li>
+          <li>It hits SQL to fetch user/problem info (small data).</li>
+          <li>If the problem's test cases are already on this server's HDD, use them — no network overhead.</li>
+          <li>If not cached, download from S3, save locally on the HDD, then use them.</li>
+          <li>Any subsequent request for the same problem now reads from the HDD.</li>
+        </ul>
+        <pre>POST /evaluate-submission
+
+fn check_solution(request):
+    pid = request.solution.problem_id
+    uid = request.auth_token.uid
+    user_info, problem_info = fetch_from_SQL(user_id, pid)
+
+    if not file_exists(`{pid}_in.txt`):          // caching logic
+        download_from_s3(url='s3.hld-bucket-com/testcases/{pid}_in.txt',
+                         save_to='/users/scaler/testcases/{pid}_in.txt')
+        download_from_s3(url='s3.hld-bucket-com/testcases/{pid}_out.txt',
+                         save_to='/users/scaler/testcases/{pid}_out.txt')
+        // saves the files on the local HDD
+
+    // these reads are from the local HDD
+    inputs = read_file(`/users/scaler/testcases/{pid}_in.txt`)
+    expected_outputs = read_file(`/users/scaler/testcases/{pid}_out.txt`)
+
+    return evaluate(solution.code, inputs, expected_outputs)</pre>
+
+        <h4>Single vs Distributed?</h4>
+        <p>N/A — single vs distributed only applies to <em>global</em> caches. A local cache is automatically
+        "distributed," because there are multiple app servers each holding their own slice.</p>
+
+        <h3>Step 4 — Invalidation algorithm</h3>
+        <p>(We'll cover eviction in Step 3 below; invalidation is the meaty part here.) Invalidation is only relevant
+        <em>when the data changes</em>. So: can test cases change?</p>
+        <ul>
+          <li>Adding a new problem is not a data <em>update</em>.</li>
+          <li>But test-case data for an <em>existing</em> problem can absolutely be updated — our problem setters aren't
+          gods. The editorial solution might have been wrong (fix the solution + the expected output), or the test
+          cases weren't "tight enough" (e.g. the problem needed O(n log n) but the tests let O(n²) pass), so we fix
+          both the input and expected-output files.</li>
+        </ul>
+        <p>How often? <strong>Extremely rarely</strong> — say one update per problem per year on average. So can we
+        just ignore this edge case?</p>
+        <div class="callout warn">
+          <span class="c-title">Absolutely NOT — build the infrastructure anyway</span>
+          <p>If we discover bad test cases <em>during a live contest</em>, we can't shrug and say "I thought it'd be
+          so rare I didn't implement it." The logic and infrastructure must be in place. Rare ≠ ignorable when the
+          stakes are high.</p>
+        </div>
+
+        <h4>What consistency do we need?</h4>
+        <p>Imagine that mid-contest we realise some test cases are wrong. The problem setters create new test cases,
+        upload them to S3, and we announce to all participants: "test cases for P3 are updated — please resubmit."</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Consistency</th><th>What it means here</th><th>Acceptable?</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Eventual</span></td><td>After the update + announcement, for some time (next ~10 min) resubmissions to P3 still use the <em>old</em> test cases.</td><td>❌ Not good enough</td></tr>
+              <tr><td><span class="term">Immediate</span></td><td>After the update, any submission to P3 uses the new test cases right away.</td><td>✅ Required</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>So we need <strong>immediate consistency</strong>, which points straight at <strong>write-through</strong>.
+        But let's explore the other options first — just for learning.</p>
+
+        <h4>Why TTL fails here</h4>
+        <p>With TTL, each downloaded file gets an expiry. If a request comes before expiry, use the cached copy;
+        otherwise delete it and re-fetch from S3.</p>
+        <pre>fn check_solution(solution):
+    pid = solution['problem_id']
+    user_info, problem_info = fetch_from_rds(pid)
+
+    if file_exists(`{pid}_in.txt`):
+         if read_last_updated_at(`{pid}_in.txt`) < now() - (1 hour):
+              // downloaded more than 1 hour ago — stale!
+              delete_file(`{pid}_in.txt`)     // TTL invalidation
+
+    if not file_exists(`{pid}_in.txt`):          // caching logic
+        download_from_s3([`{pid}_in.txt`, `{pid}_out.txt`])
+        // saves on the local HDD
+
+    inputs = read_file(`{pid}_in.txt`)           // reads from local HDD
+    expected_outputs = read_file(`{pid}_out.txt`)
+
+    return evaluate(solution.code, inputs, expected_outputs)</pre>
+        <p>What's the ideal TTL? Walk the options:</p>
+        <ul>
+          <li><strong>1 week / 1 day / 10 hours</strong> — by the time the TTL expires the contest is over; the updated
+          test cases never took effect.</li>
+          <li><strong>1 hour / 10 min / 1 min</strong> — for the few minutes after the announcement the old test cases
+          are still in use. Bad user experience.</li>
+          <li><strong>10 s / 1 s</strong> — every minute the TTL expires and each app server re-downloads 5–10 GB from
+          S3. With 1,000 code-judge app servers that's <strong>5 TB of data transfer per minute</strong>. The miss rate
+          is too high — it defeats the entire purpose of caching.</li>
+        </ul>
+        <p>Surely there's a sweet spot? <strong>No</strong> — there is absolutely no sweet spot. Every value is a bad
+        experience in some way.</p>
+
+        <h4>Why write-around and write-back also fail</h4>
+        <ul>
+          <li><strong>Write-around:</strong> same problem as TTL — you'd have to decide how often the CRON job runs,
+          and again there's no ideal value.</li>
+          <li><strong>Write-back:</strong> stupid here — it leads to data loss, and with a local cache you'd have to
+          write to all 1,000 app servers on every write.</li>
+        </ul>
+
+        <h4>Write-through… but cleverly (versioned filenames)</h4>
+        <p>Can we update 1 GB files across hundreds of app servers + S3 <em>atomically</em>? Absolutely not.
+        Maintaining atomicity across 2 servers is already insanely hard and slow; across 100s it's impossible — at
+        least one will fail and you'd have to roll back the other 99, and you'd be limited by the slowest server
+        (brutally slow writes). So we do something smarter:</p>
+        <ul>
+          <li><strong>Version the test-case files by putting a timestamp in the filename:</strong>
+          <code class="inl">p1_input.txt</code> ⇒ <code class="inl">p1_input_2025-03-16_08:00.txt</code>.</li>
+          <li>The normal cache works as before, with one change: when a request arrives, the SQL DB (queried for user
+          + problem info anyway) <em>also</em> returns the current input/output filenames for this problem. If those
+          files are on the HDD, use them; if not, fetch from S3 and use them.</li>
+          <li><strong>For invalidation</strong>, the problem setter uploads the new files (new timestamp) to S3, then
+          updates the filename in the SQL DB. These two writes <em>don't</em> have to be atomic — upload to S3 first,
+          and only if that succeeds update the filename in SQL. (If the new file is in S3 but SQL isn't updated yet,
+          no harm — the new file simply isn't used yet.)</li>
+          <li>Any request after the SQL entry is updated gets the new filename, the app server sees it lacks those
+          files on its HDD, fetches them from S3, and uses them. <strong>Immediate consistency, achieved.</strong></li>
+        </ul>
+        <pre>fn check_solution(request):
+    pid = request.solution.problem_id
+    uid = request.uid
+    user_info, problem_info = fetch_from_rds(uid, pid)
+
+    input_file_name  = problem_info.input_file_name    // version comes from SQL
+    output_file_name = problem_info.output_file_name
+
+    if not file_exists(input_file_name):               // caching logic
+        download_from_s3([input_file_name, output_file_name])
+        // saves on the local HDD
+
+    inputs           = read_file(input_file_name)      // reads from local HDD
+    expected_outputs = read_file(output_file_name)
+
+    return evaluate(solution.code, inputs, expected_outputs)</pre>
+        <div class="callout key">
+          <span class="c-title">The clever bit</span>
+          <p>We cache the <strong>test cases</strong>, but we do <em>not</em> cache the version id — the version id is
+          fetched from the DB every time, so it can never be stale. Because we never modify existing files (we upload a
+          <em>new version</em> instead), the test-case files are <span class="term">immutable</span>. Immutable data
+          never changes, so it never needs invalidation!</p>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Who actually does the invalidation?</span>
+          <p>The app server is only doing <strong>eviction</strong>, not invalidation. The <em>problem setter</em> does
+          invalidation — by "invalidating" the old test-case filenames and replacing them with the new filenames in the
+          SQL database.</p>
+        </div>
+
+        <h3>Step 3 — Eviction algorithm</h3>
+        <p><strong>LRU eviction</strong>, on each app server. The operating system already maintains read/write
+        timestamps for every file, so we just use those: find all files in the folder, and when we're out of space,
+        delete the least-recently-used one.</p>
+        <pre>fn check_solution(solution):
+    pid = solution['problem_id']
+    user_info, problem_info = fetch_from_rds(pid)
+
+    file_name = problem_info['file_name']    // version from the SQL DB
+
+    if not file_exists(`{file_name}_in.txt`):              // caching logic
+        if get_folder_size('.') > 100GB:
+             delete(get_oldest_accessed_at_file('.'))     // LRU eviction
+        download_from_s3([`{file_name}_in.txt`, `{file_name}_out.txt`])
+        // saves on the local HDD
+
+    inputs           = read_file(`{file_name}_in.txt`)    // reads from local HDD
+    expected_outputs = read_file(`{file_name}_out.txt`)
+
+    return evaluate(solution.code, inputs, expected_outputs)</pre>
+
+        <h3>Step 5 — Load balancer</h3>
+        <p>Recall the mental model: <em>why do we have more than one server?</em> Here it's because evaluation is heavy
+        compute, not because the working set must be sharded — so <strong>round robin</strong> is the answer, with each
+        app server acting independently. But let's prove the alternatives are worse.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>LB strategy</th><th>What happens</th></tr></thead>
+            <tbody>
+              <tr><td>Round robin</td><td>Any request → any app server. Every server ends up caching all ~100 problems being solved today. Looks wasteful, but isn't.</td></tr>
+              <tr><td>Consistent hashing by user_id</td><td>Same outcome — any user can solve any problem and users are spread across servers, so every server still caches all of today's problems.</td></tr>
+              <tr><td>Consistent hashing by problem_id</td><td>P1→server 1, P2→server 2, … so only server 1 caches P1's tests. <strong>But this is a bad design.</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Why routing by problem_id is a bad design</span>
+          <p>During a contest, 100k people are solving just 5 problems. Out of 100 app servers, only 5 would receive
+          <em>all</em> the load — terribly uneven distribution. And in our case a single server can't even handle
+          multiple requests at the same time.</p>
+        </div>
+
+        <h4>Why we can't just multi-thread the code judge</h4>
+        <p>Normally you handle concurrent requests with multi-threading. Is that a good idea here? <strong>No — we
+        cannot multi-thread the code judge</strong>, because code evaluation is a <span class="term">CPU-bound</span>
+        task.</p>
+        <div class="callout example">
+          <span class="c-title">What multi-threading actually does</span>
+          <p>Most programs are <span class="term">I/O-bound</span> — they spend their time waiting for I/O (a keystroke,
+          a network download, a file read, the printer…). CPUs are millions of times faster than disks/networks, so for
+          ~99.99% of the time the CPU is idle. Multi-threading lets you do several things "at once" by
+          <strong>context switching</strong>: start task 1, and when it blocks on I/O, switch to task 2; when task 2
+          blocks, switch back; and so on.</p>
+          <p>But for <span class="term">CPU-bound</span> tasks (video processing, heavy computation, analytics, ML, SHA
+          calculation, …) context switching <em>worsens</em> performance — the CPU is already 100% busy, so breaking its
+          loop to multi-task just slows everything down. This is <span class="term">thrashing</span>.</p>
+          <p><strong>Moral:</strong> only multi-thread / async-IO your <em>I/O-bound</em> processes. Never multi-thread
+          <em>CPU-bound</em> processes.</p>
+        </div>
+        <p>In the code judge, evaluating a single request takes ~5 seconds, during which the app server is fully
+        occupied and can't take another request. Therefore we want each request to go to the <em>next available
+        server</em> — which is exactly <strong>round robin</strong> routing.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The code judge needs a <strong>local</strong> cache (test cases on each server's HDD) — a global cache would
+          still force a 1 GB transfer per request. Test cases live in S3 (~3 TB total), never in a CDN (CDNs are
+          client-facing). We need immediate consistency, achieved with a <strong>write-through-via-versioned-filenames</strong>
+          trick: SQL holds the current filename (never cached → never stale), files are immutable so they need no
+          invalidation, and the app server only does <strong>LRU eviction</strong>. The LB uses <strong>round robin</strong>
+          because evaluation is CPU-bound (no multi-threading) and routing by problem_id would overload a few servers.
+        </div>
+      </section>
+
+      <!-- ===================== 4. LEADERBOARD ===================== -->
+      <section id="leaderboard">
+        <h2><span class="sec-num">4</span> Case study: the Scaler Contest Leaderboard</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a class race where everyone checks the scoreboard constantly to see who's winning. Working out the
+          full ranking — adding up every student's points and sorting everyone — takes the teacher a few minutes. If
+          the teacher recomputed it from scratch every single time a kid asked "what's my rank?", she'd never finish.
+          So instead she recomputes the whole board once every half hour and pins it to the wall; everyone just reads
+          the pinned copy. It's a tiny bit out of date, and that's totally fine.</p>
+        </div>
+
+        <p>The <span class="term">leaderboard</span> is a paginated rank list. For each rank it shows the user's
+        details and, for each contest problem, the problem details plus the user's score and submission details. Users
+        ask two things: "show me page 23" and "show me my rank." Let's run the 5-step process.</p>
+
+        <h3>The situation &amp; the numbers</h3>
+        <p>A <strong>3-hour contest</strong>, <strong>100,000 participants</strong>, <strong>5 problems</strong>.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: submission rate</span>
+          <p>Assume on average 1 submission per participant per problem.</p>
+          <pre>Total submissions
+  = 1 submission / (participant × problem) × 5 problems × 100,000 participants
+  = 500,000 submissions during the entire contest
+
+Average submissions per second
+  = 500,000 / 3 hours
+  = 500,000 / (3 × 3600 s)
+  = 500,000 / 10,000 s
+  = 50 submissions / second
+
+Peak load (start & end of contest run hotter)
+  = 2× average
+  = 100 submissions / second</pre>
+        </div>
+        <p>Those 100 submissions/sec are evaluated by the code judge (previous case study). For each one, the code
+        judge writes the final verdict/score to SQL. From that collective data we must compute and show the
+        leaderboard.</p>
+
+        <h3>Step 1 — Establish the need</h3>
+        <h4>How do we compute the rank list?</h4>
+        <p>We gather, by joining ~10 tables:</p>
+        <ul>
+          <li>What contest is running (<code class="inl">contests</code> table)</li>
+          <li>Which users participate (join of <code class="inl">users</code>, <code class="inl">contests</code>,
+          <code class="inl">contest_participants</code>)</li>
+          <li>Which problems are in the contest (join of <code class="inl">problems</code>,
+          <code class="inl">contests</code>, <code class="inl">contest_problems</code>)</li>
+          <li>What submissions users made (join of <code class="inl">users</code>,
+          <code class="inl">user_submissions</code>, <code class="inl">problems</code>,
+          <code class="inl">contest_problems</code>)</li>
+        </ul>
+        <p>Then we <code class="inl">GROUP BY</code> user_id, compute each user's final score (from individual
+        submission scores, number of incorrect attempts, time taken, …), and sort by final score. The sorted list is
+        our rank list.</p>
+        <div class="callout note">
+          <span class="c-title">Homework</span>
+          <p>Do the LLD for this and figure out the basic DB schema for these tables — columns, indexes, foreign-key
+          constraints, not-null constraints, etc.</p>
+        </div>
+
+        <h4>How much data, and how slow?</h4>
+        <pre>500,000 submissions, each ~100 bytes (problem id, score, time taken, verdict, user id, contest id, …)
+  total = 100 bytes × 500,000 = 50 MB</pre>
+        <p>50 MB isn't "large" as storage, but it's a lot to pull in a single query — and we're joining 10s of tables.
+        Even with indexes, that fetch takes 1–2 seconds. Since this is heavy compute, say it takes
+        <strong>~5 seconds</strong> to fetch + compute the rank list once.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: read rate vs compute cost</span>
+          <p>Assume each user views the rank list ~20 times during the contest (once every 10 min).</p>
+          <pre>Requests / second
+  = (20 views / user / 3 hours) × 100,000 users
+  = 2,000,000 views / 3 hours
+  = 2,000,000 / 10,000 s
+  = 200 views / second</pre>
+          <p>Can we compute the rank list <strong>200 times/second</strong> when it takes <strong>5 seconds</strong> to
+          compute once? That's stupid. The request rate is high and the computation is heavy — so we cache it.</p>
+        </div>
+
+        <h3>Step 2 — Type of cache</h3>
+        <h4>Local vs Global</h4>
+        <p>What does a result look like? A simple JSON page:</p>
+        <pre>[
+    {rank: 1, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] },
+    {rank: 2, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] },
+    {rank: 3, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] },
+    {rank: 4, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] }
+]</pre>
+        <p>How large is one page? <code class="inl">(100 bytes / entry) × (10 entries / page) = 1 KB / page</code>.
+        Since each request only needs to fetch ~1 KB, we can happily use a <strong>global</strong> cache (unlike the
+        code judge, where each request needed 1 GB).</p>
+
+        <h4>Single vs Distributed</h4>
+        <pre>Total rank-list data
+  = (100 bytes / entry) × 100,000 users
+  = 10 MB        ← tiny!</pre>
+        <p>10 MB fits on a single cache server. 200 queries/sec is nothing — a single Redis server can handle up to
+        <strong>100,000 read requests/sec</strong>. The per-request network transfer is just 1 KB (≈ 200 Kbps of
+        bandwidth total). So the ideal here is a <strong>single global cache server</strong> (e.g. Redis).</p>
+        <div class="callout note">
+          <span class="c-title">Scale-of-data definitions</span>
+          <p><strong>Low scale:</strong> data that fits on 1 server (≤ ~10 GB in RAM, ≤ ~1 TB on disk).
+          <strong>High scale:</strong> data that can't fit on 1 server.</p>
+        </div>
+
+        <h3>Step 4 — Invalidation algorithm</h3>
+        <h4>What consistency do we need?</h4>
+        <p>Immediate consistency is always nice to have, but is it <em>critical</em> here? When a user submits, their
+        "true" rank changes. Eventual consistency would mean the leaderboard shows old ranks for some time (say 10 min)
+        even though the true ranks moved. Is that the end of the world? <strong>No.</strong> It won't cause a bad user
+        experience. So <strong>eventual consistency is good enough</strong>.</p>
+        <div class="callout key">
+          <span class="c-title">…and immediate consistency is actually impossible here</span>
+          <p>How often does the true ranking change? With every submission — at peak, <strong>100 times/second</strong>.
+          But computing the rank list takes <strong>~5 seconds</strong>. By the time you've finished computing it, it
+          has already changed ~500 times. Chasing immediate consistency is futile.</p>
+        </div>
+
+        <h4>How long is "eventual"?</h4>
+        <p>How much delay can we afford — 10 hours? 1 hour? 10 min? 1 min? 10 s? 100 ms? In practice,
+        <strong>Scaler invalidates the rank list every 30 minutes, and nobody has ever complained.</strong></p>
+        <p>Both <strong>TTL</strong> and <strong>write-around</strong> give eventual consistency. Which to use?</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>Verdict for the leaderboard</th></tr></thead>
+            <tbody>
+              <tr><td>TTL</td><td>Easy to implement (Redis supports TTL natively), <strong>but</strong> on a miss the user's request must wait ~5 s for the heavy recompute. TTL is best when re-fetching from the DB is cheap — it isn't here.</td></tr>
+              <tr><td>Write-around</td><td>✅ A separate app server runs periodically (every 10 min): fetch all submission scores → compute the rank list → store it in Redis. No user request ever pays the 5 s compute.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Cold start: what about the first requests?</span>
+          <p>Before the CRON job has run, the cache has no rank list. Two options: (1) return an error — "rank list not
+          available yet, it'll appear after 10 minutes"; or (2) <strong>warm up</strong> the cache before the contest
+          starts so everyone shows rank 1 (or random ranks) at kickoff.</p>
+        </div>
+
+        <h4>What exactly does Redis store? (the schema)</h4>
+        <p>Two query types: "show me page 23" and "show me my rank." So we store the data twice — keyed by page and
+        keyed by user:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key (string)</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">contest:3:page:1</code></td><td>JSON array of 10 entries (ranks 1–10)</td></tr>
+              <tr><td><code class="inl">contest:3:page:2</code></td><td>JSON array of 10 entries (ranks 11–20)</td></tr>
+              <tr><td>…</td><td>…</td></tr>
+              <tr><td><code class="inl">contest:3:page:10000</code></td><td>JSON array of 10 entries</td></tr>
+              <tr><td><code class="inl">contest:3:user:377</code></td><td><code class="inl">{rank: 1, user_id: 377, …}</code></td></tr>
+              <tr><td><code class="inl">contest:3:user:123</code></td><td><code class="inl">{rank: 50, user_id: 123, …}</code></td></tr>
+              <tr><td><code class="inl">contest:3:user:58</code></td><td><code class="inl">{rank: 2, user_id: 58, …}</code></td></tr>
+              <tr><td>… (100,000 user entries)</td><td>one per participant</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre>contest:3:page:1  →  "[
+    {rank: 1, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] },
+    {rank: 2, user_id: ..., user_name: ..., problems: [{1: ...}, {...}, ...] },
+    ... 10 entries
+]"
+
+contest:3:user:377  →  {rank: 1, user_id: 377, user_name: ..., problems: [...] }</pre>
+        <p>Total data in Redis = 10 MB (pages) + 10 MB (per-user) = <strong>20 MB</strong> — each user's entry is
+        stored twice. Serving a request for user 1234 on page 23:</p>
+        <pre>pageEntries = redisClient.get("contest:3:page:23")
+myRank      = redisClient.get("contest:3:user:1234")
+return MakeLeaderboardTable(pageEntries, myRank)</pre>
+        <div class="callout example">
+          <span class="c-title">Worked example: filtering by institution</span>
+          <p>To support "show me the IIT-B leaderboard," add another key family:</p>
+          <pre>contest:3:institution:IIT-B  →  {institute_name: ..., users: [{rank: 1, user_id, ...}, {...}, ...]}</pre>
+        </div>
+
+        <h3>Step 3 — Eviction algorithm</h3>
+        <p>20 MB of data per contest — <strong>no eviction needed.</strong> We store this for every <em>live</em>
+        contest. How many run in parallel at once? Max ~10 (usually 1–2). That's ~200 MB total — still no eviction.</p>
+        <p>Once a contest ends the rank list can't change (no new submissions), so we just dump it into the SQL DB and
+        stop caching it (post-contest views drop and nothing needs recomputing). <strong>Eviction rule:</strong> once
+        the contest ends (after ~24 hours), dump the leaderboard data into SQL.</p>
+
+        <h3>Step 5 — Load balancer (for the cache)</h3>
+        <p>There's <strong>no LB for the cache</strong> — it's a single Redis server. And if it crashes, there's no
+        data loss, because the cache holds no "real" data. We just restart it; the CRON job runs automatically after
+        10 minutes (or we force it to run once the cache is back up).</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The leaderboard is heavy to compute (~5 s) but tiny to store (10 MB → 20 MB doubled), read ~200×/s. So:
+          a <strong>single global</strong> Redis cache; eventual consistency is fine (and immediate is impossible since
+          ranks change 100×/s); use <strong>write-around</strong> — a CRON job recomputes every ~10–30 min and stores
+          per-page and per-user keys in Redis. <strong>No eviction</strong> needed (dump to SQL when the contest ends),
+          and <strong>no LB</strong> (single server, no data loss on crash).
+        </div>
+      </section>
+
+      <!-- ===================== 5. REDIS DEEP DIVE ===================== -->
+      <section id="redis">
+        <h2><span class="sec-num">5</span> Deep dive: Redis &amp; naming technologies in interviews</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Redis is like a super-fast notebook you keep on your desk (in your head, really) instead of a filing
+          cabinet in the basement. Looking something up is instant because it's all right there in front of you — but
+          if you spill coffee on the desk, the notes are gone, so anything important also lives in the basement.</p>
+        </div>
+
+        <h3>What is Redis?</h3>
+        <p><span class="term">Redis</span> is by far the most popular solution for caches (and key-value databases). It
+        is a very fast, in-memory, key-value database.</p>
+        <ul>
+          <li><strong>Fast</strong> because: it's written in C; it's <em>single-threaded</em> (uses async-IO instead of
+          threads — threads need locks, which are extremely slow, and threads have high overhead because context
+          switching is slow); and it has lots of low-level optimizations.</li>
+          <li><strong>In-memory</strong>: uses RAM; by default stores nothing on disk. RAM is ~100,000× faster than disk
+          for random access. (Optional, off by default: disk persistence — which reduces write speed.)</li>
+          <li><strong>Key-value</strong>: no complex joins, no indexes, no complex queries, no search. Think of it as a
+          hashmap in memory.</li>
+          <li><strong>Powerful primitives</strong>: complex datatypes (sorted sets, bloom filters, custom types) and
+          powerful <em>atomic</em> operations (e.g. increment).</li>
+          <li><strong>Database</strong>: technically a database, but mostly used as a global cache (single or
+          distributed).</li>
+        </ul>
+
+        <div class="callout key">
+          <span class="c-title">Interview rule: never name a specific technology</span>
+          <p>Even though we said "use Redis" above, <strong>you</strong> should never name a specific technology in an
+          interview. Don't say Kafka, Redis, or Postgres — say <em>persistent message queue</em>, <em>in-memory
+          key-value cache</em>, or <em>relational database</em>.</p>
+          <p>Why? Naming a tech opens the door for the interviewer to deep-dive <em>their</em> way: "Why Kafka and not
+          RabbitMQ or SQS?" Now you must justify the choice and know several technologies cold. Deep-diving is good —
+          but <em>you</em> want to choose where you deep-dive (to your strengths), not let the interviewer pick.</p>
+        </div>
+        <p>So what should you actually say? Something like: <em>"We'll use a single global cache server here — a fast,
+        in-memory key-value cache, something like Redis or Memcached or similar."</em> And if pushed to "choose one /
+        how would you choose":</p>
+        <ul>
+          <li>"I've worked with Redis before, so I might prefer that."</li>
+          <li>"But I'd check what other teams/projects use — if my team already uses X extensively, I'd use X to benefit
+          from their expertise and existing infra."</li>
+          <li>"I'd weigh cost (maybe Memcached is ~2× cheaper than Redis), the load each can handle, and the features
+          each offers."</li>
+          <li>"I'd research before choosing one."</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Reading list from class</span>
+          <p><strong>Mandatory (everyone):</strong> try Redis online at onecompiler.com/redis; the Redis quick-start;
+          the Redis cheatsheet. <strong>Optional (mandatory for SDE-2+):</strong> the Redis University tutorial, the
+          Redis docs, and the eviction-policies &amp; cluster-mode doc.</p>
+        </div>
+
+        <h3>Bonus: a leaderboard with Redis sorted sets</h3>
+        <p>Beyond the CRON/write-around design above, Redis's <span class="term">sorted set</span> (type
+        <code class="inl">ZSET</code>) is a classic alternative for "always-sorted" rankings — it keeps members ordered
+        by a numeric score with O(log N) inserts and rank lookups. The commands all start with <code class="inl">Z</code>:</p>
+        <pre># Add or update a player's score
+ZADD leaderboard 980 user:42
+ZINCRBY leaderboard 20 user:42       # bump user 42 by 20
+
+# Top 10, highest first, with scores
+ZREVRANGE leaderboard 0 9 WITHSCORES
+
+# What is user 42's rank? (0-based; REV = highest is rank 0)
+ZREVRANK leaderboard user:42
+
+# One player's score
+ZSCORE leaderboard user:42
+
+# Page 2 (ranks 11-20)
+ZREVRANGE leaderboard 10 19 WITHSCORES</pre>
+        <p>This turns "give me the top N" and "what's my rank?" into single O(log N) commands instead of an O(N) DB
+        scan — handy when you want immediate updates rather than a 30-minute CRON recompute.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Redis is a fast, single-threaded, in-memory key-value store (RAM ≈ 100,000× faster than disk), popular as a
+          global cache, with powerful atomic ops and datatypes like sorted sets. In interviews, describe the
+          <em>category</em> ("in-memory key-value cache") rather than naming Redis/Kafka/Postgres, so you control where
+          the conversation deep-dives. Sorted sets (<code class="inl">ZADD</code>/<code class="inl">ZREVRANGE</code>/<code class="inl">ZREVRANK</code>)
+          give an O(log N) always-sorted leaderboard when you want one.
+        </div>
+      </section>
+
+      <!-- ===================== 6. NEWSFEED ===================== -->
+      <section id="newsfeed">
+        <h2><span class="sec-num">6</span> Case study: the Social Media Newsfeed</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a school where everyone has a mailbox. When your friend draws a picture, there are two ways you
+          could see it. Way one: your friend runs around and drops a copy into every friend's mailbox right away — so
+          when you open your box, the picture is already there. Way two: nobody copies anything; instead, when you
+          want to look, you run to all your friends' desks and gather their latest drawings yourself. Both work — but
+          which is better depends on how many friends are drawing and how many mailboxes need a copy.</p>
+        </div>
+
+        <p>A <span class="term">newsfeed</span> (Twitter/X timeline, Instagram feed) shows a user the recent posts of
+        everyone they follow, newest first. The central design question is <strong>when do we assemble each user's
+        feed</strong> — at the moment a post is created, or at the moment a user opens the app? These are the two
+        <span class="term">fan-out</span> strategies.</p>
+
+        <h3>Fan-out on write (push model)</h3>
+        <p><span class="term">Fan-out on write</span> means: the instant a user posts, we <em>push</em> a copy of that
+        post into the precomputed feed (a cached timeline) of <strong>every follower</strong>. When a follower opens
+        the app, their feed is already built — just read it.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">Alice posts</div><div class="s-d">One new tweet</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📣</div><div class="s-t">Look up followers</div><div class="s-d">Alice's 300 followers</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📬</div><div class="s-t">Push to each</div><div class="s-d">Prepend to 300 cached feeds</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">Bob opens app</div><div class="s-d">Feed already built — instant read</div></div>
+        </div>
+        <ul>
+          <li><strong>Reads are blazing fast</strong> — the feed is precomputed and cached, so opening the app is one
+          cheap lookup. This matters because reads vastly outnumber writes (people scroll far more than they post).</li>
+          <li><strong>Writes are expensive</strong> — one post triggers many cache writes (one per follower).</li>
+        </ul>
+
+        <h3>Fan-out on read (pull model)</h3>
+        <p><span class="term">Fan-out on read</span> means: do nothing special when posting. When a user opens the app,
+        <em>pull</em> the latest posts from everyone they follow and merge them on the fly.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">Alice posts</div><div class="s-d">Just save it once</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📲</div><div class="s-t">Bob opens app</div><div class="s-d">Request feed</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">Gather</div><div class="s-d">Fetch recent posts of all Bob follows</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Merge &amp; sort</div><div class="s-d">Build feed at read time</div></div>
+        </div>
+        <ul>
+          <li><strong>Writes are cheap</strong> — a post is saved once, full stop.</li>
+          <li><strong>Reads are expensive</strong> — every feed open must gather and merge posts from possibly hundreds
+          of followees, every time.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th></tr></thead>
+            <tbody>
+              <tr><td>Work happens at…</td><td>post time</td><td>feed-open time</td></tr>
+              <tr><td>Read speed</td><td>⚡ instant (precomputed)</td><td>🐢 slow (assemble live)</td></tr>
+              <tr><td>Write cost</td><td>high (one write per follower)</td><td>low (save once)</td></tr>
+              <tr><td>Storage</td><td>more (a copy in every follower's feed)</td><td>less (single source post)</td></tr>
+              <tr><td>Great for…</td><td>normal users with modest follower counts</td><td>users who follow many but post rarely; inactive users</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The celebrity / hot-key problem</h3>
+        <div class="callout warn">
+          <span class="c-title">Where pure fan-out-on-write breaks</span>
+          <p>A celebrity has <strong>50 million followers</strong>. With pure fan-out on write, one tweet means 50
+          million cache writes — a single post causes a write storm that can take minutes and hammer the system. This
+          is the <span class="term">hot key</span> problem from Session 4 wearing a costume: one super-popular producer
+          whose every action triggers enormous fan-out work.</p>
+        </div>
+        <p>The reverse is also bad: if we used pure fan-out on read for everyone, every single feed-open would have to
+        pull from the celebrity (and everyone else) live — slow reads for the entire platform. Neither pure strategy
+        wins alone.</p>
+
+        <h3>The hybrid approach (what real systems do)</h3>
+        <p>Production systems (this is famously roughly how Twitter's timeline works) <strong>combine both</strong>:</p>
+        <ul>
+          <li><strong>Normal users → fan-out on write.</strong> A user with a few hundred followers can afford to push
+          their post into all those cached feeds cheaply.</li>
+          <li><strong>Celebrities / hot accounts → fan-out on read.</strong> We do <em>not</em> push their posts. We mark
+          them as "celebrity" once their follower count crosses a threshold.</li>
+          <li><strong>At read time, merge.</strong> When you open the app, you read your precomputed feed (full of
+          normal-user posts pushed to you) <em>and</em> pull-in the recent posts of the few celebrities you follow,
+          merging them by time.</li>
+        </ul>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📬</div><div class="s-t">Precomputed feed</div><div class="s-d">Pushed posts from normal followees</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">🌟</div><div class="s-t">Celebrity posts</div><div class="s-d">Pulled live at read time</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Merge by time</div><div class="s-d">Your final timeline</div></div>
+        </div>
+        <p>This gives us the best of both: cheap reads for the common case (no 50-million-write storms when a celebrity
+        posts), and fast feeds because only a handful of celebrity pulls are merged in at read time, not hundreds of
+        ordinary followees.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: caching the timelines</span>
+          <p>We store each user's precomputed feed as a capped, ordered cache entry — a Redis list or sorted set holding
+          just the most recent ~800 post IDs (we cap it; nobody scrolls back forever, and capping bounds memory).</p>
+          <pre># Fan-out on write: a normal user "alice" posts (id 9001)
+for follower in followers(alice):          # skip if alice is a celebrity
+    LPUSH feed:{follower} 9001             # prepend the new post id
+    LTRIM feed:{follower} 0 799            # cap the cached feed at 800
+
+# Read time: build Bob's timeline (hybrid merge)
+ids   = LRANGE feed:bob 0 49              # precomputed page (normal followees)
+celeb = recent_posts_of(celebrities_followed_by(bob))   # pulled live
+feed  = merge_by_time(ids, celeb)[:50]   # combine &amp; sort newest-first</pre>
+          <p>The post <em>bodies</em> (text, images) are cached separately by post ID with <strong>cache-aside</strong>,
+          so storing IDs in each feed keeps feeds tiny and avoids duplicating post content 50 million times. We hydrate
+          the IDs into full posts only for the page the user actually views.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>There is no single "right" fan-out strategy — the right answer is to <strong>split your users by their
+          fan-out cost</strong>. Push for the many cheap producers, pull for the few expensive ones, and merge at read
+          time. That hybrid is the standard cure for the celebrity hot-key problem.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Fan-out on write precomputes feeds → fast reads, costly writes. Fan-out on read assembles feeds live → cheap
+          writes, slow reads. Pure write-fan-out explodes on celebrities (the hot-key problem), so real systems go
+          <strong>hybrid</strong>: push normal users' posts into cached, capped timelines (storing post IDs), pull
+          celebrities' posts live, and merge by time at read. Bodies are cached separately by ID with cache-aside.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Three very different products, one toolkit and one 5-step process. Here's the one-paragraph story tying them
+        together:</p>
+        <div class="bigidea">
+          <p>Caching is never about memorising one trick — it's about asking <strong>"what do I drop when full?"</strong>
+          (eviction) and <strong>"how do I stay honest when data changes?"</strong> (writes + invalidation), then
+          walking the 5 steps: establish the need, choose the type, pick eviction (LRU), pick invalidation (from your
+          consistency needs), and choose the load balancer. The <strong>code judge</strong> needs a <em>local</em>
+          cache (1 GB test cases on each server's HDD), achieves immediate consistency with a
+          <em>write-through-via-versioned-filenames</em> trick (immutable files, version id read fresh from SQL), evicts
+          with LRU, and routes <em>round robin</em> because evaluation is CPU-bound. The <strong>leaderboard</strong> is
+          heavy to compute but tiny to store, so it uses a <em>single global</em> Redis cache, <em>write-around</em> via
+          a CRON recompute (eventual consistency is fine, immediate is impossible), and no LB. The <strong>newsfeed</strong>
+          trades read vs write cost via <em>fan-out</em>, going <em>hybrid</em> to dodge the celebrity <em>hot-key</em>
+          problem. Same toolkit, three answers.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does a <em>global</em> cache fail to help the code judge, when a <em>local</em> cache works?</summary>
+          <p class="ans">Each request needs ~1 GB of test-case data. A global cache would still force a 1 GB transfer
+          over the network (cache → app server) per request — just as expensive as fetching from S3. A local cache on
+          each app server's HDD avoids the network transfer entirely after the first download.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does the code judge get immediate consistency without atomic writes across 1,000 servers?</summary>
+          <p class="ans">Version the test-case files by timestamp in the filename and store the current filename in SQL.
+          On upload, write the new file to S3 first, then update the filename in SQL (non-atomic is fine). The version
+          id is always read fresh from SQL (never cached → never stale), and the files themselves are immutable, so they
+          need no invalidation — the app server only does LRU eviction.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does the code judge use round-robin and refuse to multi-thread?</summary>
+          <p class="ans">Code evaluation is CPU-bound, and multi-threading only helps I/O-bound work — context switching
+          a busy CPU causes thrashing. Each evaluation occupies a server for ~5 s, so requests should go to the next
+          available server: round robin. Routing by problem_id would overload the few servers holding a contest's 5
+          problems.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is immediate consistency impossible for the leaderboard, and what do we use instead?</summary>
+          <p class="ans">The true ranking changes ~100 times/second (every submission), but computing the rank list
+          takes ~5 seconds — by the time you finish it's changed ~500 times. So eventual consistency is the only option
+          (and it's fine). We use write-around: a CRON job recomputes the rank list every ~10–30 min and stores it in
+          Redis.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why store the leaderboard twice in Redis (by page and by user)?</summary>
+          <p class="ans">There are two query types — "show page 23" and "show my rank." Keying by
+          <code class="inl">contest:3:page:N</code> answers paging in one GET, and <code class="inl">contest:3:user:ID</code>
+          answers "my rank" in one GET. It doubles storage (10 MB → 20 MB), which is trivial.</p>
+        </details>
+        <details class="quiz">
+          <summary>In an interview, why shouldn't you say "I'll use Redis"?</summary>
+          <p class="ans">Naming a specific tech lets the interviewer deep-dive where <em>they</em> choose ("why Redis not
+          Memcached?"), forcing you to defend it. Instead describe the category — "an in-memory key-value cache" — so you
+          control where the conversation goes deep.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the celebrity problem, and which earlier concept is it really an instance of?</summary>
+          <p class="ans">With fan-out on write, one celebrity post means a copy must be pushed to tens of millions of
+          follower feeds — a write storm. It's the hot-key problem from Session 4: one super-popular key/producer
+          overwhelming the system. The hybrid (push for normal users, pull for celebrities) fixes it.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/13GogwThXSMBB5lXPKAuoMm3lNKx4Yn0NZcOEVaQ2IpQ/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Caching Case Studies</em>".</li>
+  </ul>
+  <h4>Redis — mandatory reading (everyone)</h4>
+  <ul>
+    <li><a href="https://onecompiler.com/redis" target="_blank" rel="noopener">Try Redis online (onecompiler.com/redis)</a> — run Redis commands in the browser.</li>
+    <li><a href="https://redis.io/learn/howtos/quick-start" target="_blank" rel="noopener">Redis quick start</a>.</li>
+    <li><a href="https://redis.io/learn/howtos/quick-start/cheat-sheet" target="_blank" rel="noopener">Redis cheatsheet</a>.</li>
+  </ul>
+  <h4>Redis — optional (mandatory for SDE-2+)</h4>
+  <ul>
+    <li><a href="https://redis.io/university/" target="_blank" rel="noopener">Redis University tutorial</a>.</li>
+    <li><a href="https://redis.io/docs/latest/" target="_blank" rel="noopener">Redis docs</a>.</li>
+    <li><a href="https://docs.google.com/document/d/1k4nzubvtX_yLctUT4VWK8ZJt4KCcOEdRJdxQgWCaiU8/" target="_blank" rel="noopener">Eviction policies &amp; Cluster mode (Google Doc)</a>.</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li><a href="https://redis.io/docs/latest/develop/data-types/sorted-sets/" target="_blank" rel="noopener">Redis Sorted Sets documentation</a> — the data structure for an always-sorted leaderboard (ranked, range queries by score).</li>
+    <li><a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">System Design Primer — Facebook newsfeed / fan-out</a> — push vs pull fan-out patterns behind the social media newsfeed.</li>
+    <li><a href="https://pages.cs.wisc.edu/~akella/CS744/F17/838-CloudPapers/Kafka.pdf" target="_blank" rel="noopener">Kafka: a Distributed Messaging System for Log Processing (original paper)</a> — the log/queue model underpinning newsfeed fan-out pipelines.</li>
+    <li><a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis key eviction policies (LRU/LFU)</a> — how the caching layer decides what to drop, tying back to the toolkit recap.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-4.html"><div class="dir">← Previous</div><div class="ttl">Session 4: Caching 2</div></a>
+        <a class="next" href="session-6.html"><div class="dir">Next →</div><div class="ttl">Session 6: Microservices &amp; Chat App</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 5 — Caching — Case Studies · You applied the whole caching toolkit 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

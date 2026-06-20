@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 9 — Convolutions</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 9</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 09 · Convolutions</span>
+      <h1>Convolutions — Seeing with Neural Networks</h1>
+      <p class="lead">
+        Welcome to the start of the <strong>Computer Vision</strong> part of the course. So far our networks
+        have been plain stacks of fully-connected layers (the <span class="term">MLP</span> from Sessions 2–8).
+        Those are wonderful for tidy rows of numbers, but they fall apart on <em>images</em>. In this session
+        we'll discover <em>why</em> images break an MLP, then build — from scratch — the single idea that fixed
+        it: the <strong>convolution</strong>. As always, every topic opens with a tiny "explain like I'm 5"
+        story, then we go deep with real math, code, and diagrams. Take it slow; by the end you'll understand
+        exactly what happens when a network "looks at" a picture.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why-not-mlp">Why an MLP fails on images</a></li>
+          <li><a href="#convolution">The convolution operation</a></li>
+          <li><a href="#hyperparams">Conv layer hyperparameters</a></li>
+          <li><a href="#sharing">Local connectivity &amp; weight sharing</a></li>
+          <li><a href="#pooling">Pooling &amp; a full conv block</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY NOT MLP ===================== -->
+      <section id="why-not-mlp">
+        <h2><span class="sec-num">1</span> Why not just use an MLP for images?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you had to describe a photo of a cat to a friend, but the only thing you're allowed to say
+          is the brightness of every single dot, one by one, in order: "dot 1 is grey, dot 2 is grey, dot 3 is
+          orange…" for a <em>million</em> dots. That's exhausting, and worse — if the cat slides one step to the
+          left, every dot changes and your whole description is useless! That's exactly the trouble a plain
+          network has with pictures. We need a smarter way to look that notices <strong>shapes</strong>, not
+          just dots-in-a-row.</p>
+        </div>
+
+        <p>Recall from the earlier sessions that an <span class="term">MLP</span> (multi-layer perceptron) is a
+        stack of <span class="term">fully-connected layers</span>: every neuron in a layer is wired to
+        <em>every</em> value coming in. That's fine for, say, 10 features describing a house. But an image is a
+        grid of numbers, and the moment we flatten that grid into one long list to feed an MLP, three serious
+        problems appear.</p>
+
+        <h3>An image is a grid of numbers</h3>
+        <p>A grayscale image is a 2-D grid of <span class="term">pixels</span>, each a brightness value
+        (often 0–255). A colour image is three such grids stacked — one each for Red, Green, Blue — which we
+        call <span class="term">channels</span>. So a colour image has shape
+        <code class="inl">height × width × channels</code>. A small phone photo might be
+        <code class="inl">224 × 224 × 3</code>.</p>
+
+        <h3>Problem 1 — parameter explosion</h3>
+        <p>To feed an image into an MLP we must <span class="term">flatten</span> it into one long vector. A
+        <code class="inl">224 × 224 × 3</code> image flattens to <strong>150,528</strong> numbers. If the first
+        hidden layer has just 1,000 neurons, every one of them connects to all 150,528 inputs:</p>
+
+        <pre><span class="cm"># Parameters in the FIRST layer alone</span>
+inputs  = 224 * 224 * 3      <span class="cm"># = 150,528 pixel values</span>
+neurons = 1000
+weights = inputs * neurons   <span class="cm"># = 150,528,000  (~150 million)</span>
+biases  = neurons            <span class="cm"># = 1,000</span>
+total   = weights + biases   <span class="cm"># &gt; 150 MILLION weights — for ONE layer</span></pre>
+
+        <p>Over <strong>150 million</strong> parameters before we've done anything useful. That's slow to train,
+        hungry for memory, and almost guaranteed to <span class="term">overfit</span> (memorise the training
+        images instead of learning general patterns — see Session 6).</p>
+
+        <h3>Problem 2 — it throws away spatial structure</h3>
+        <p>Flattening destroys geometry. In the grid, two pixels that sit side by side are <em>neighbours</em>;
+        once flattened, that pixel and the one directly below it end up 224 slots apart in the list. The MLP
+        has no idea they were ever close. But in vision, <strong>nearby pixels are everything</strong> — edges,
+        corners, and textures are all <em>local</em> patterns. An MLP starts blind to locality.</p>
+
+        <h3>Problem 3 — it isn't translation-invariant</h3>
+        <p>If the network learned to spot a cat's ear in the top-left corner, an MLP has learned a separate set
+        of weights for that exact location. Move the same ear to the bottom-right and those weights are useless
+        — it must learn the "ear detector" all over again for every position. We say the MLP is <strong>not
+        <span class="term">translation-invariant</span></strong>: shifting the object around the frame breaks it.
+        Real objects move around, so this is fatal.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: the wandering "7"</span>
+          <p>Train an MLP on handwritten digits that always sit dead-centre, and it does fine. Now show it a "7"
+          shoved into the corner. To the MLP, almost every input value is different, so it may confidently call
+          it a "1" or nonsense — even though <em>you</em> instantly see it's still a 7. The shape is the same; only
+          the position changed. The MLP never learned "a 7 is a 7 wherever it is."</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea (the fix we're about to build)</span>
+          <p>What if, instead of one neuron staring at the whole image, we used a <strong>small detector</strong>
+          that looks at one little patch at a time and then <strong>slides across the whole image</strong> reusing
+          the <em>same</em> weights everywhere? That detector would be tiny (few parameters), respect locality
+          (it sees neighbours), and find its pattern <em>anywhere</em> (translation-invariant). That detector is a
+          <span class="term">convolution</span> — the subject of this entire session.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">So are MLPs useless now?</span>
+          <p>Not at all. We still use fully-connected layers at the <em>end</em> of a vision network to make the
+          final decision. The trick is to let convolutions do the heavy "looking" first, and let an MLP do the
+          small "deciding" last. We'll see exactly this layering in Session 10 on CNN architectures.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An MLP on raw images suffers from <strong>parameter explosion</strong> (millions of weights in layer
+          one), <strong>loses spatial structure</strong> (flattening hides which pixels are neighbours), and is
+          <strong>not translation-invariant</strong> (it must relearn a pattern for every position). Convolutions
+          fix all three with a small, sliding, weight-sharing detector.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CONVOLUTION OPERATION ===================== -->
+      <section id="convolution">
+        <h2><span class="sec-num">2</span> The convolution operation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a little magnifying glass that can only see a 3×3 square at a time. You slide it across a
+          picture, square by square, and at every stop it asks one question: "How much does <em>this</em> little
+          patch look like the thing I'm hunting for?" — say, a vertical line. It writes down a score at each
+          stop. When you've covered the whole picture, your scores form a new little map showing
+          <strong>where</strong> the vertical lines are. That magnifying glass is a <strong>filter</strong>, and
+          sliding it around is a <strong>convolution</strong>.</p>
+        </div>
+
+        <h3>Filters / kernels</h3>
+        <p>A <span class="term">filter</span> (also called a <span class="term">kernel</span>) is a small grid of
+        learnable weights — commonly 3×3 or 5×5. Each filter is a pattern detector. One might respond strongly
+        to vertical edges, another to a blob of colour, another to a corner. Crucially, the network
+        <strong>learns these weights</strong> during training (Session 5's backpropagation) — we don't hand-design
+        them.</p>
+
+        <h3>The operation: slide, multiply, sum</h3>
+        <p>At every position the filter visits, we do a <span class="term">dot product</span>: multiply each
+        filter weight by the pixel it's sitting on, then add all those products into a single number. That number
+        is one output value. Slide the filter over by one position and repeat. The grid of all these output
+        numbers is called a <span class="term">feature map</span> (or activation map): a map of "how strongly was
+        this pattern found here?"</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">1. Place filter</div><div class="s-d">Lay the kernel over a patch</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✖️</div><div class="s-t">2. Multiply</div><div class="s-d">Each weight × the pixel under it</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">3. Sum</div><div class="s-d">Add the products → one number</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➡️</div><div class="s-t">4. Slide</div><div class="s-d">Move over, repeat</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗺️</div><div class="s-t">5. Feature map</div><div class="s-d">All scores form a new grid</div></div>
+        </div>
+
+        <h3>The math, written out</h3>
+        <p>For an input image <code class="inl">I</code> and a kernel <code class="inl">K</code> of size
+        <code class="inl">k × k</code>, the output value at row <code class="inl">i</code>, column
+        <code class="inl">j</code> is the sum of element-wise products over the patch:</p>
+
+        <pre><span class="cm"># Output at position (i, j) — a single dot product</span>
+S(i, j) = sum over m, n of:  I(i + m, j + n) * K(m, n)
+
+         where m, n range from 0 .. k-1</pre>
+
+        <div class="callout note">
+          <span class="c-title">"Convolution" vs "cross-correlation" — a tiny honesty note</span>
+          <p>Strictly, true mathematical convolution <em>flips</em> the kernel first. What deep-learning libraries
+          actually compute (and what we show here) is <span class="term">cross-correlation</span> — the same thing
+          <em>without</em> the flip. Since the kernel weights are learned anyway, the flip makes no practical
+          difference, so everyone just calls it "convolution." Don't let the terminology trip you up.</p>
+        </div>
+
+        <h3>A tiny numeric example, fully worked</h3>
+        <p>Let's convolve a 4×4 image with a 3×3 vertical-edge detector (a famous classic kernel). With no padding
+        and a step of 1, a 3×3 filter fits in a 4×4 image in a 2×2 set of positions, so the output is 2×2.</p>
+
+        <pre><span class="cm"># INPUT image (4x4)            # KERNEL (3x3): vertical-edge detector</span>
+  3   0   1   2                 1   0  -1
+  5   4   2   1                 1   0  -1
+  1   2   3   4                 1   0  -1
+  0   1   2   3
+
+<span class="cm"># --- Top-left position: overlay kernel on the top-left 3x3 patch ---</span>
+patch =  3  0  1        kernel = 1  0 -1
+         5  4  2                 1  0 -1
+         1  2  3                 1  0 -1
+
+<span class="cm"># dot product = (1*3 + 0*0 + -1*1)   = 3 + 0 - 1 = 2</span>
+<span class="cm">#             + (1*5 + 0*4 + -1*2)   = 5 + 0 - 2 = 3</span>
+<span class="cm">#             + (1*1 + 0*2 + -1*3)   = 1 + 0 - 3 = -2</span>
+<span class="cm"># total at (0,0) = 2 + 3 + (-2) = 3</span>
+
+<span class="cm"># Sliding the kernel to all 2x2 valid positions gives the feature map:</span>
+OUTPUT (2x2) =   3    -2
+                 6    -2</pre>
+
+        <p>Notice the kernel's left column is <code class="inl">+1</code> and right column is
+        <code class="inl">-1</code>. So it lights up (a big positive or negative number) wherever the left side of
+        the patch is brighter than the right — i.e. wherever there's a <strong>vertical brightness change</strong>,
+        which is exactly an edge. Flat regions (left ≈ right) give values near zero. The filter <em>is</em> an edge
+        detector, purely from its weights.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the same code in Python/NumPy</span>
+          <p>Here is the entire operation written out by hand so you can see there's no magic — just loops,
+          multiplies, and adds:</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+image = np.array([
+    [<span class="nm">3</span>, <span class="nm">0</span>, <span class="nm">1</span>, <span class="nm">2</span>],
+    [<span class="nm">5</span>, <span class="nm">4</span>, <span class="nm">2</span>, <span class="nm">1</span>],
+    [<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">4</span>],
+    [<span class="nm">0</span>, <span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>],
+])
+
+kernel = np.array([
+    [<span class="nm">1</span>, <span class="nm">0</span>, -<span class="nm">1</span>],
+    [<span class="nm">1</span>, <span class="nm">0</span>, -<span class="nm">1</span>],
+    [<span class="nm">1</span>, <span class="nm">0</span>, -<span class="nm">1</span>],
+])
+
+k = kernel.shape[<span class="nm">0</span>]                          <span class="cm"># 3</span>
+out_h = image.shape[<span class="nm">0</span>] - k + <span class="nm">1</span>           <span class="cm"># 4 - 3 + 1 = 2</span>
+out_w = image.shape[<span class="nm">1</span>] - k + <span class="nm">1</span>           <span class="cm"># 2</span>
+out = np.zeros((out_h, out_w))
+
+<span class="kw">for</span> i <span class="kw">in</span> range(out_h):
+    <span class="kw">for</span> j <span class="kw">in</span> range(out_w):
+        patch = image[i:i+k, j:j+k]       <span class="cm"># the 3x3 window</span>
+        out[i, j] = np.sum(patch * kernel) <span class="cm"># multiply + sum = dot product</span>
+
+print(out)
+<span class="cm"># [[ 3. -2.]</span>
+<span class="cm">#  [ 6. -2.]]   <-- matches our hand calculation above</span></pre>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A convolution is just one tiny operation — <strong>overlay, multiply, sum</strong> — repeated at every
+          location as the filter slides. The output, a <strong>feature map</strong>, records where the filter's
+          pattern was found. Stack many filters and you get many feature maps, one per pattern the layer hunts for.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>filter/kernel</strong> is a small grid of learned weights. The convolution slides it over the
+          image and takes a <strong>dot product</strong> at every stop, producing a <strong>feature map</strong> of
+          match scores. Our 3×3 edge detector lit up on vertical brightness changes — a real, working edge
+          detector built from nine numbers.
+        </div>
+      </section>
+
+      <!-- ===================== 3. HYPERPARAMETERS ===================== -->
+      <section id="hyperparams">
+        <h2><span class="sec-num">3</span> Conv layer hyperparameters</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When you use your sliding magnifying glass, you get to choose a few things: How big is the glass
+          (do you peek at a 3×3 patch or a 5×5 one)? How far do you hop between peeks (every step, or skip
+          some)? And do you put a little cardboard frame around the picture so the glass can still reach the
+          very edges? Those choices are the <strong>settings</strong> of a convolution, and they decide how big
+          your new score-map turns out.</p>
+        </div>
+
+        <p>A convolutional layer has a handful of <span class="term">hyperparameters</span> — knobs <em>you</em>
+        set before training (unlike weights, which the network learns). Get comfortable with these four; you'll
+        choose them in every CNN you ever build.</p>
+
+        <h3>Kernel size</h3>
+        <p>The <span class="term">kernel size</span> is the filter's width and height, e.g. 3×3 or 5×5. Small
+        kernels (3×3) see a tiny area but are cheap and, when stacked, can cover large regions — which is why
+        modern networks favour them. Larger kernels see more at once but cost more parameters.</p>
+
+        <h3>Stride</h3>
+        <p>The <span class="term">stride</span> is how many pixels the filter jumps each step. A stride of 1
+        slides one pixel at a time (lots of overlap, big detailed output). A stride of 2 hops two pixels at a
+        time, skipping positions — this <strong>downsamples</strong>, roughly halving the output's height and
+        width and cutting computation.</p>
+
+        <h3>Padding (valid vs same)</h3>
+        <p>Notice in Topic 2 that a 4×4 image gave only a 2×2 output — the image <em>shrank</em>, and edge pixels
+        were visited fewer times than central ones. <span class="term">Padding</span> fixes this by adding a
+        border of zeros around the image so the filter can reach the edges:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Padding mode</th><th>What it does</th><th>Effect on output size</th></tr></thead>
+            <tbody>
+              <tr><td><strong>valid</strong></td><td>No padding at all — only "valid" full overlaps are used.</td><td>Output <em>shrinks</em> (the 4×4 → 2×2 case).</td></tr>
+              <tr><td><strong>same</strong></td><td>Add just enough zero-border so the output is the <em>same</em> H×W as the input (for stride 1).</td><td>Output keeps the input's size.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Depth / number of channels</h3>
+        <p>Two "depth" ideas live here, so let's be precise:</p>
+        <ul>
+          <li><strong>Input depth (channels in):</strong> each filter must be as deep as its input. For an RGB
+          image (3 channels), a 3×3 filter is really <code class="inl">3 × 3 × 3</code> and sums across all three
+          colour channels into <em>one</em> feature map.</li>
+          <li><strong>Output depth (channels out):</strong> a layer has <em>many</em> filters — say 32. Each
+          produces its own feature map, so the layer's output is a stack of 32 maps. That stack's depth is the
+          number of filters.</li>
+        </ul>
+
+        <h3>The output-size formula</h3>
+        <p>This is the formula you'll reach for constantly. For an input of size <code class="inl">W</code> (one
+        dimension), kernel size <code class="inl">K</code>, padding <code class="inl">P</code> (zeros added on
+        each side), and stride <code class="inl">S</code>:</p>
+
+        <pre><span class="cm"># Output side length along one dimension</span>
+out = floor( (W - K + 2P) / S ) + 1</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: plug in the numbers</span>
+          <p>Input <code class="inl">32×32</code>, kernel <code class="inl">5×5</code>, with two common setups:</p>
+          <pre><span class="cm"># Case A: valid padding (P=0), stride 1</span>
+out = floor((32 - 5 + 0) / 1) + 1 = 27 + 1 = <span class="nm">28</span>   <span class="cm"># → 28x28 (shrank)</span>
+
+<span class="cm"># Case B: same padding (P=2), stride 1</span>
+out = floor((32 - 5 + 4) / 1) + 1 = 31 + 1 = <span class="nm">32</span>   <span class="cm"># → 32x32 (preserved)</span>
+
+<span class="cm"># Case C: same kernel, stride 2 (downsampling), P=2</span>
+out = floor((32 - 5 + 4) / 2) + 1 = floor(15.5) + 1 = 15 + 1 = <span class="nm">16</span>  <span class="cm"># → 16x16</span></pre>
+          <p>Tip: for a <code class="inl">k×k</code> kernel with stride 1, "same" padding is
+          <code class="inl">P = (k-1)/2</code> — so 1 for a 3×3 kernel, 2 for a 5×5. That's why odd kernel sizes
+          are popular: the padding comes out symmetric.</p>
+        </div>
+
+        <h3>Receptive fields</h3>
+        <p>The <span class="term">receptive field</span> of an output value is the region of the <em>original</em>
+        input that influenced it. One 3×3 conv has a 3×3 receptive field. But stack a second 3×3 conv on top and
+        each new value depends on a 3×3 patch of the first map — which itself each came from 3×3 of the input — so
+        the second layer "sees" a 5×5 region. Stack a third and it sees 7×7.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why this matters</span>
+          <p>This is the secret to depth: <strong>stacking small kernels grows the receptive field cheaply</strong>.
+          Early layers (small receptive field) catch tiny features like edges; deeper layers (large receptive
+          field) combine them into bigger concepts like eyes, then faces. Two 3×3 convs see a 5×5 region using far
+          fewer parameters than one 5×5 conv — a key insight we'll see exploited by real architectures in
+          Session 10.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The knobs are <strong>kernel size</strong> (how big the patch), <strong>stride</strong> (how far it
+          hops — bigger stride downsamples), <strong>padding</strong> (<em>valid</em> shrinks, <em>same</em>
+          preserves size), and <strong>depth</strong> (input channels per filter, and number of filters =
+          output channels). Output size is
+          <code class="inl">floor((W − K + 2P)/S) + 1</code>. Stacking small kernels grows the
+          <strong>receptive field</strong>, letting deep layers see larger patterns.
+        </div>
+      </section>
+
+      <!-- ===================== 4. LOCAL CONNECTIVITY & WEIGHT SHARING ===================== -->
+      <section id="sharing">
+        <h2><span class="sec-num">4</span> Local connectivity &amp; weight sharing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Suppose you want to find every red apple in a giant orchard photo. You could hire a million tiny
+          helpers, each memorising one exact spot — wildly wasteful. Or you could train <em>one</em> "apple
+          spotter" and let that single expert walk the whole orchard, using the same trained eyes everywhere.
+          One expert, reused over and over, finds apples wherever they are. Convolutions are that one reused
+          expert — and that's why they're so cheap and so clever.</p>
+        </div>
+
+        <p>Two design choices make convolutions special, and they're the direct cure for the three MLP problems
+        from Topic 1.</p>
+
+        <h3>Local connectivity</h3>
+        <p><span class="term">Local connectivity</span> means each output neuron looks at only a <em>small local
+        patch</em> of the input (the kernel-sized window), not the entire image. This respects spatial structure:
+        the neuron only ever combines pixels that are actually near each other. It directly fixes MLP Problem 2.</p>
+
+        <h3>Weight sharing</h3>
+        <p><span class="term">Weight sharing</span> (also called <span class="term">parameter sharing</span>) is the
+        big one: the <em>same</em> filter weights are reused at <em>every</em> position as it slides. The network
+        doesn't learn a separate detector per location — it learns one detector and applies it everywhere. This
+        gives <span class="term">translation invariance</span> almost for free (fixes Problem 3) <em>and</em>
+        slashes the parameter count (fixes Problem 1).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: count the parameters</span>
+          <p>Take the same <code class="inl">224×224×3</code> image and compare two layers that each produce a
+          rich representation:</p>
+          <pre><span class="cm"># MLP layer: 1000 fully-connected neurons</span>
+mlp_params = (224*224*3) * 1000 + 1000
+           = 150,528,000 + 1,000
+           = <span class="nm">150,529,000</span>           <span class="cm"># ~150 MILLION</span>
+
+<span class="cm"># Conv layer: 32 filters, each 3x3 over 3 input channels</span>
+conv_params = 32 * (3 * 3 * 3) + 32   <span class="cm"># weights per filter = 3*3*3 = 27</span>
+            = 32 * 27 + 32
+            = 864 + 32
+            = <span class="nm">896</span>                   <span class="cm"># under 900!</span></pre>
+          <p>Roughly <strong>900 parameters versus 150 million</strong> — about <strong>168,000× fewer</strong> —
+          and the conv layer produces 32 feature maps that scan the <em>entire</em> image. The parameter count of a
+          conv layer doesn't even depend on the image's height and width; it depends only on kernel size and
+          channel counts.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Property</th><th>MLP / fully-connected</th><th>Convolution</th></tr></thead>
+            <tbody>
+              <tr><td>Connectivity</td><td>Every neuron sees all inputs (global)</td><td>Each neuron sees a small local patch</td></tr>
+              <tr><td>Weights</td><td>Unique weight per connection</td><td>Same filter reused at every position</td></tr>
+              <tr><td>Parameters</td><td>Explode with image size</td><td>Independent of image size</td></tr>
+              <tr><td>Translation</td><td>Must relearn per location</td><td>Invariant — finds patterns anywhere</td></tr>
+              <tr><td>Spatial structure</td><td>Lost when flattened</td><td>Preserved (operates on the grid)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Local connectivity + weight sharing are why CNNs are both <strong>tiny</strong> (few parameters,
+          so easier to train and less prone to overfit) and <strong>powerful</strong> (a learned feature detector
+          automatically works across the whole image). It's the same assumption a human makes: an edge is an edge
+          no matter where in the picture it appears.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out: invariance has limits</span>
+          <p>Convolutions are robust to <em>small shifts</em>, but a single conv layer isn't magically invariant to
+          big rotations, scaling, or flips. We help with those using <span class="term">data augmentation</span>
+          (randomly shifting/rotating training images) and pooling. Don't oversell "invariance" — it's mostly about
+          translation.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Local connectivity</strong> means each neuron sees only a small patch (keeps spatial structure);
+          <strong>weight sharing</strong> means one filter is reused everywhere (gives translation invariance and
+          collapses parameters from ~150 million to under 900 in our example). That combination is what makes CNNs
+          both efficient and effective.
+        </div>
+      </section>
+
+      <!-- ===================== 5. POOLING & FULL CONV BLOCK ===================== -->
+      <section id="pooling">
+        <h2><span class="sec-num">5</span> Pooling &amp; a full conv block</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a huge, detailed map and you want a smaller summary. You chop it into little 2×2
+          tiles and, for each tile, keep just the most important fact — say, the tallest building. Now your map
+          is a quarter of the size but still tells you where the big stuff is. That shrinking-while-keeping-the-
+          gist trick is <strong>pooling</strong>. It makes the picture smaller and cheaper to work with, and it
+          stops the network from fussing over the exact pixel a feature sat on.</p>
+        </div>
+
+        <h3>What pooling does</h3>
+        <p><span class="term">Pooling</span> (also called <span class="term">subsampling</span> or
+        <span class="term">downsampling</span>) shrinks a feature map's height and width by summarising small
+        regions. It has <strong>no learnable weights</strong> — it's a fixed rule. The two common kinds:</p>
+        <ul>
+          <li><span class="term">Max pooling</span> — take the <em>maximum</em> value in each window. Keeps the
+          strongest activation, i.e. "was the feature present <em>anywhere</em> in this region?" Most popular.</li>
+          <li><span class="term">Average pooling</span> — take the <em>mean</em> of the window. Smoother; common
+          near the end of networks as <em>global average pooling</em>.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: 2×2 max vs average pooling, stride 2</span>
+          <pre><span class="cm"># INPUT feature map (4x4)</span>
+  1   3 | 2   4
+  5   6 | 1   0
+  -----+-----
+  2   1 | 0   3
+  7   8 | 4   2
+
+<span class="cm"># Split into four non-overlapping 2x2 windows (stride 2):</span>
+<span class="cm">#   top-left {1,3,5,6}  top-right {2,4,1,0}</span>
+<span class="cm">#   bot-left {2,1,7,8}  bot-right {0,3,4,2}</span>
+
+MAX POOL (2x2):          AVERAGE POOL (2x2):
+   6    4                  3.75   1.75
+   8    4                  4.50   2.25
+<span class="cm"># max of {1,3,5,6}=6     # mean of {1,3,5,6}=3.75</span></pre>
+          <p>The 4×4 map became 2×2 — a 4× reduction in values — while max pooling kept the strongest signal in
+          each region.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why pool at all?</span>
+          <p>Three reasons: (1) it <strong>reduces computation</strong> for later layers; (2) it gives a little
+          extra <strong>translation tolerance</strong> — if the feature shifts by one pixel, the max of the window
+          often doesn't change; (3) it gradually grows the receptive field so deeper layers see more of the image.
+          Note: many modern networks instead use <em>strided convolutions</em> to downsample, but pooling remains a
+          clear, classic tool you must know.</p>
+        </div>
+
+        <h3>A typical conv block: Conv → ReLU → Pool</h3>
+        <p>Convolutions are linear (just multiplies and adds). To learn non-linear patterns we add an
+        <span class="term">activation function</span> after each conv — almost always <span class="term">ReLU</span>
+        (from Session 3): <code class="inl">ReLU(x) = max(0, x)</code>, which simply zeros out negatives. The
+        classic building block of a CNN is therefore:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🖼️</div><div class="s-t">Input</div><div class="s-d">image / feature maps</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">Conv</div><div class="s-d">filters detect patterns</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">ReLU</div><div class="s-d">add non-linearity</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔽</div><div class="s-t">Pool</div><div class="s-d">downsample</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">Repeat</div><div class="s-d">stack more blocks</div></div>
+        </div>
+
+        <p>Stack several of these blocks and the spatial size keeps shrinking while the number of channels grows
+        — the network trades "where" (resolution) for "what" (rich features). At the very end, the small feature
+        stack is flattened and fed to a couple of fully-connected layers (the MLP returns!) to produce the final
+        class scores. That whole pipeline is a <span class="term">Convolutional Neural Network (CNN)</span>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a conv block in PyTorch</span>
+          <p>Here's a real, runnable conv block using <code class="inl">nn.Conv2d</code>, with the shapes printed
+          so you can trace the math from Topic 3:</p>
+          <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+<span class="cm"># A fake batch: 1 image, 3 channels (RGB), 32x32 pixels</span>
+x = torch.randn(<span class="nm">1</span>, <span class="nm">3</span>, <span class="nm">32</span>, <span class="nm">32</span>)   <span class="cm"># shape (N, C, H, W)</span>
+
+<span class="cm"># One conv block: Conv -> ReLU -> MaxPool</span>
+conv = nn.Conv2d(
+    in_channels=<span class="nm">3</span>,      <span class="cm"># RGB input</span>
+    out_channels=<span class="nm">32</span>,    <span class="cm"># 32 filters -> 32 feature maps</span>
+    kernel_size=<span class="nm">3</span>,
+    stride=<span class="nm">1</span>,
+    padding=<span class="nm">1</span>,         <span class="cm"># "same" padding for a 3x3 kernel -> H,W preserved</span>
+)
+relu = nn.ReLU()
+pool = nn.MaxPool2d(kernel_size=<span class="nm">2</span>, stride=<span class="nm">2</span>)  <span class="cm"># halves H and W</span>
+
+out = pool(relu(conv(x)))
+
+print(<span class="st">"after conv:"</span>, conv(x).shape)   <span class="cm"># [1, 32, 32, 32]  (padding kept 32x32)</span>
+print(<span class="st">"after pool:"</span>, out.shape)        <span class="cm"># [1, 32, 16, 16]  (pool halved to 16x16)</span>
+
+<span class="cm"># Learnable parameters in this conv layer:</span>
+<span class="cm"># 32 filters * (3 channels * 3 * 3) + 32 biases = 864 + 32 = 896</span>
+print(<span class="st">"params:"</span>, sum(p.numel() <span class="kw">for</span> p <span class="kw">in</span> conv.parameters()))  <span class="cm"># 896</span></pre>
+          <p>Note PyTorch's tensor order is <code class="inl">(N, C, H, W)</code> — batch, channels, height,
+          width. The output went from <code class="inl">3×32×32</code> to <code class="inl">32×16×16</code>: more
+          channels, smaller spatial size — exactly the "trade where for what" pattern.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Pooling</strong> (max or average) downsamples feature maps with no learnable weights, cutting
+          computation and adding shift tolerance. The classic CNN unit is <strong>Conv → ReLU → Pool</strong>,
+          stacked repeatedly so spatial size shrinks while channel count grows, then capped with fully-connected
+          layers for the final decision. In PyTorch, <code class="inl">nn.Conv2d</code> +
+          <code class="inl">nn.ReLU</code> + <code class="inl">nn.MaxPool2d</code> builds exactly this block.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just built the entire foundation of computer vision with neural networks. Here's the one-paragraph
+        story that connects all five topics:</p>
+        <div class="bigidea">
+          <p>A plain <strong>MLP</strong> drowns on images — it has a <strong>parameter explosion</strong>, it
+          <strong>loses spatial structure</strong> when you flatten the grid, and it's <strong>not
+          translation-invariant</strong>. The cure is the <strong>convolution</strong>: a small learned
+          <strong>filter/kernel</strong> that slides over the image taking a <strong>dot product</strong> at each
+          stop, producing a <strong>feature map</strong> of where its pattern appears. We tune it with
+          <strong>kernel size</strong>, <strong>stride</strong>, <strong>padding</strong> (valid vs same) and
+          <strong>depth</strong>, predicting the output with
+          <code class="inl">floor((W−K+2P)/S)+1</code>, while stacking layers grows the
+          <strong>receptive field</strong>. Because of <strong>local connectivity</strong> and <strong>weight
+          sharing</strong>, a conv layer has a tiny, image-size-independent parameter count yet finds features
+          anywhere. We add <strong>ReLU</strong> for non-linearity and <strong>pooling</strong> to downsample,
+          giving the classic <strong>Conv → ReLU → Pool</strong> block that — stacked and finished with a small MLP
+          head — forms a <strong>CNN</strong>. Next session we'll assemble these blocks into the famous
+          architectures.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Name the three reasons a plain MLP struggles with images.</summary>
+          <p class="ans">(1) Parameter explosion — flattening a big image gives millions of weights in layer one;
+          (2) it loses spatial structure — flattening hides which pixels are neighbours; (3) it's not
+          translation-invariant — it must relearn a pattern for each position.</p>
+        </details>
+        <details class="quiz">
+          <summary>What exactly is computed at each position when a filter slides over an image?</summary>
+          <p class="ans">A dot product: multiply each kernel weight by the pixel beneath it and sum all the
+          products into a single number. Collecting these numbers over all positions gives a feature map.</p>
+        </details>
+        <details class="quiz">
+          <summary>An input is 28×28, kernel 3×3, padding 1, stride 1. What is the output size?</summary>
+          <p class="ans">floor((28 − 3 + 2×1)/1) + 1 = floor(27) + 1 = 28. So 28×28 — "same" padding preserved
+          the size (P = (k−1)/2 = 1 for a 3×3 kernel).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a conv layer have far fewer parameters than a fully-connected layer?</summary>
+          <p class="ans">Weight sharing: the same small filter is reused at every position instead of a unique
+          weight per connection. A conv layer's parameter count depends only on kernel size and channel counts,
+          not on the image's height and width.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does max pooling do, and what are its benefits?</summary>
+          <p class="ans">It takes the maximum value in each small window, downsampling the feature map (e.g. 2×2
+          stride 2 quarters the values). Benefits: less computation later, mild translation tolerance, and a
+          growing receptive field. It has no learnable weights.</p>
+        </details>
+        <details class="quiz">
+          <summary>What are the layers in a classic CNN building block, and why is each there?</summary>
+          <p class="ans">Conv (detect patterns with learned filters) → ReLU (add non-linearity so the network can
+          model complex shapes) → Pool (downsample, cut cost, add shift tolerance). Stacked repeatedly, then a
+          fully-connected head makes the final decision.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 9) — your course handout for this session (covers convolutions,
+          conv hyperparameters, weight sharing, and pooling).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning handout (online)</a> — the class handout for Session 9, hosted online for quick reference.</li>
+          <li><a href="https://cs231n.github.io/convolutional-networks/" target="_blank" rel="noopener">CS231n — Convolutional Neural Networks</a> — Stanford's gold-standard notes; the clearest explanation of filters, stride, padding, the output-size formula, and pooling anywhere.</li>
+          <li><a href="https://arxiv.org/abs/1603.07285" target="_blank" rel="noopener">A guide to convolution arithmetic for deep learning (Dumoulin &amp; Visin, 2016)</a> — the definitive, diagram-rich reference for exactly how kernel size, stride, and padding determine output shapes.</li>
+          <li><a href="http://yann.lecun.com/exdb/lenet/" target="_blank" rel="noopener">LeNet (LeCun et al.)</a> — the original convolutional network for digit recognition; the historical origin of the Conv→Pool→FC design we built here.</li>
+          <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html" target="_blank" rel="noopener">PyTorch <code class="inl">nn.Conv2d</code> documentation</a> — official reference for every argument (in_channels, out_channels, kernel_size, stride, padding) used in our code example.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-8.html"><div class="dir">← Previous</div><div class="ttl">Session 8: Hands-on Project — ANN</div></a>
+        <a class="next" href="session-10.html"><div class="dir">Next →</div><div class="ttl">Session 10: CNN Architectures</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 9 — Convolutions · You taught a network to see 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

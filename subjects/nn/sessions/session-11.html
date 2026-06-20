@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 11 — Transfer Learning &amp; CNN Applications</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 11</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 11 · Transfer Learning &amp; Applications</span>
+      <h1>Standing on the shoulders of giant models</h1>
+      <p class="lead">
+        In Session 10 we built powerful CNN architectures. But training one from scratch needs millions of
+        images and weeks of GPU time — luxuries you probably don't have. This session is the good news:
+        you can <em>borrow</em> a model someone else trained and adapt it to your own task in an afternoon.
+        Then we'll tour what CNNs do beyond "what's in this picture?" — drawing boxes around objects,
+        colouring every pixel, recognising faces, reading X-rays, and even generating brand-new images.
+        As always, we start each topic with a tiny story, then build up the real detail with code and diagrams.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 18 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#transfer">Transfer learning</a></li>
+          <li><a href="#detection">Object detection</a></li>
+          <li><a href="#segmentation">Semantic &amp; instance segmentation</a></li>
+          <li><a href="#applications">Other CV applications</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. TRANSFER LEARNING ===================== -->
+      <section id="transfer">
+        <h2><span class="sec-num">1</span> Transfer learning — borrowing a trained brain</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine someone spent ten years learning to draw — they got really good at hands, faces, light,
+          and shadow. Now <em>you</em> want to learn to draw cartoon cats. Do you start from scratch with a
+          crayon? No! You ask that expert to teach you, and because they already know <strong>edges, curves,
+          and shapes</strong>, you only need to show them a few cats and they pick it up fast. Transfer
+          learning is exactly this: take a model that already learned to "see," and teach it your new thing
+          with just a little practice.</p>
+        </div>
+
+        <p>In Session 10 we saw that training a deep CNN like <span class="term">ResNet</span> on a giant
+        dataset takes enormous data and compute. <span class="term">Transfer learning</span> is the trick of
+        reusing a model that was already <span class="term">pre-trained</span> on a big dataset and adapting it
+        to your own, usually much smaller, task.</p>
+
+        <h3>The standard pre-training dataset: ImageNet</h3>
+        <p>The most common starting point is a model pre-trained on <span class="term">ImageNet</span> — a
+        dataset of about <strong>1.2 million labelled images</strong> across <strong>1,000 categories</strong>
+        (dogs, cars, mushrooms, guitars…). A model that has learned to tell those 1,000 classes apart has, as
+        a side effect, learned to recognise an enormous vocabulary of visual patterns. We reuse <em>that</em>.</p>
+
+        <h3>Why early features are general</h3>
+        <p>Recall from Session 10 that a CNN learns features in <strong>layers</strong>, and they get more
+        abstract the deeper you go. This is the key insight that makes transfer learning work:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Layer depth</th><th>What it learns</th><th>How task-specific?</th></tr></thead>
+            <tbody>
+              <tr><td>Early layers</td><td>Edges, colours, simple textures, gradients.</td><td><strong>Very general</strong> — every image task needs these. An edge is an edge whether it's a cat or an X-ray.</td></tr>
+              <tr><td>Middle layers</td><td>Corners, blobs, repeating patterns, simple parts (an eye, a wheel).</td><td>Fairly general — reusable across many tasks.</td></tr>
+              <tr><td>Late layers</td><td>Whole-object concepts ("this looks like a dog's face").</td><td><strong>Very specific</strong> to the original task's classes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The early layers of <em>any</em> vision model learn the same generic building blocks — edges and
+          textures. Those are exactly what your new task needs too. So instead of relearning "what is an edge"
+          from scratch, you <strong>keep the borrowed early layers and only retrain the task-specific end</strong>.</p>
+        </div>
+
+        <p>This isn't just hand-waving — <span class="term">Yosinski et al. (2014)</span> measured it directly,
+        showing that features in the first layers transfer almost perfectly between tasks, while the last layers
+        are specialised and transfer poorly. The deeper you go, the less general the features.</p>
+
+        <h3>Two flavours: feature extraction vs fine-tuning</h3>
+        <p>There are two main ways to do transfer learning, differing in <strong>how much of the borrowed model
+        you let change</strong>.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Feature extraction</th><th>Fine-tuning</th></tr></thead>
+            <tbody>
+              <tr><td>Idea</td><td>Freeze the pre-trained layers; use them as a fixed "feature factory." Train only a new head.</td><td>Start from pre-trained weights, but let some (or all) of them keep learning on your data.</td></tr>
+              <tr><td>What's trainable</td><td>Only the new final classifier layer(s).</td><td>The new head <em>plus</em> some upper layers of the backbone.</td></tr>
+              <tr><td>Best when</td><td>Small dataset, or your task is similar to ImageNet.</td><td>Larger dataset, or your task differs a lot from ImageNet.</td></tr>
+              <tr><td>Speed / risk</td><td>Fast, little risk of overfitting.</td><td>Slower; can overfit on tiny datasets, so use a <strong>small learning rate</strong>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The two words to remember</span>
+          <p>We call the borrowed network (minus its final classifier) the <span class="term">backbone</span> or
+          <em>feature extractor</em>. The small new piece you bolt on for your task is the
+          <span class="term">head</span>. Transfer learning = keep the backbone, replace the head.</p>
+        </div>
+
+        <h3>A simple recipe for choosing</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🪶</div><div class="s-t">Small + similar</div><div class="s-d">Freeze backbone, train head only</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Big + similar</div><div class="s-d">Fine-tune a few top layers</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌍</div><div class="s-t">Big + different</div><div class="s-d">Fine-tune most layers, low LR</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — pretrained ResNet for your own classes</span>
+          <p>Say you want to classify <strong>5 kinds of flowers</strong> with only ~2,000 photos. Far too few to
+          train a deep CNN from scratch. Here's the standard PyTorch pattern using a ResNet-18 pre-trained on
+          ImageNet. The whole trick is in two lines: <strong>freeze the backbone</strong>, then
+          <strong>replace the final layer</strong> so it outputs 5 classes instead of 1,000.</p>
+<pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">from</span> torchvision <span class="kw">import</span> models
+
+<span class="cm"># 1. Load a model pre-trained on ImageNet</span>
+model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+<span class="cm"># 2. FEATURE EXTRACTION: freeze every borrowed parameter</span>
+<span class="kw">for</span> param <span class="kw">in</span> model.parameters():
+    param.requires_grad = <span class="kw">False</span>
+
+<span class="cm"># 3. Replace the head. resnet18's classifier is `model.fc`,</span>
+<span class="cm">#    a Linear(512 -&gt; 1000). Swap in a fresh Linear(512 -&gt; 5).</span>
+<span class="cm">#    New layers default to requires_grad=True, so ONLY these train.</span>
+num_features = model.fc.in_features         <span class="cm"># 512</span>
+model.fc = nn.Linear(num_features, <span class="nm">5</span>)   <span class="cm"># 5 flower classes</span>
+
+<span class="cm"># 4. Only the new head's params reach the optimizer</span>
+optimizer = torch.optim.Adam(model.fc.parameters(), lr=<span class="nm">1e-3</span>)
+criterion = nn.CrossEntropyLoss()
+
+<span class="cm"># 5. Train as usual — but it's fast: few params, few epochs.</span>
+<span class="kw">for</span> images, labels <span class="kw">in</span> train_loader:
+    optimizer.zero_grad()
+    loss = criterion(model(images), labels)
+    loss.backward()
+    optimizer.step()</pre>
+          <p>To switch from feature extraction to <strong>fine-tuning</strong>, you'd simply set
+          <code class="inl">requires_grad = True</code> on the top layers too and pass <em>their</em> parameters to
+          the optimizer with a small learning rate (e.g. <code class="inl">1e-5</code>), so the precious
+          pre-trained weights only nudge gently rather than getting wrecked.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Two gotchas</span>
+          <p><strong>1. Match the preprocessing.</strong> A pretrained model expects inputs normalised exactly
+          how it was trained (ImageNet's mean/std, a specific input size like 224×224). Feed it raw differently
+          scaled images and accuracy tanks. <strong>2. Don't fine-tune with a big learning rate</strong> — you'll
+          blow away the very knowledge you borrowed. Always go gentle when unfreezing.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Transfer learning reuses a model pre-trained on a big dataset (usually ImageNet) for your smaller task.
+          It works because early layers learn <strong>general</strong> features (edges, textures) that every vision
+          task needs. <strong>Feature extraction</strong> freezes the backbone and trains only a new head;
+          <strong>fine-tuning</strong> also lets upper layers keep learning at a small learning rate. In PyTorch:
+          load a pretrained model, freeze its params, and replace <code class="inl">model.fc</code> with a fresh
+          layer sized to your number of classes.
+        </div>
+      </section>
+
+      <!-- ===================== 2. OBJECT DETECTION ===================== -->
+      <section id="detection">
+        <h2><span class="sec-num">2</span> Object detection — not just "what," but "where"</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Classification is like asking "Is there a dog in this photo?" and getting a yes/no. Object
+          detection is like handing a friend a highlighter and saying <strong>"draw a box around every dog,
+          every cat, and every person, and label each box."</strong> Now you don't just know <em>what's</em> in the
+          picture — you know <em>where</em> each thing is and <em>how many</em> there are.</p>
+        </div>
+
+        <p>So far our CNNs answered "which single class is this image?" <span class="term">Object detection</span>
+        goes further: it finds <strong>multiple objects</strong> in one image and, for each, predicts both a class
+        label <em>and</em> a <span class="term">bounding box</span> — a rectangle (x, y, width, height) that frames
+        the object.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🏷️</div><div class="s-t">Classification</div><div class="s-d">"This is a cat"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📍</div><div class="s-t">Localization</div><div class="s-d">"…and it's right here" (1 box)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Detection</div><div class="s-d">Many objects, each boxed + labelled</div></div>
+        </div>
+
+        <h3>Two families of detectors</h3>
+        <p>Almost every detector falls into one of two camps, trading <strong>accuracy vs speed</strong>.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Two-stage (R-CNN family)</th><th>One-stage (YOLO, SSD)</th></tr></thead>
+            <tbody>
+              <tr><td>How it works</td><td>Stage 1: propose regions that <em>might</em> hold an object. Stage 2: classify + refine each box.</td><td>Look once: a single network predicts all boxes and classes directly across a grid.</td></tr>
+              <tr><td>Members</td><td>R-CNN → Fast R-CNN → Faster R-CNN.</td><td><span class="term">YOLO</span> ("You Only Look Once"), <span class="term">SSD</span> ("Single Shot Detector").</td></tr>
+              <tr><td>Speed</td><td>Slower — two passes.</td><td><strong>Fast — real-time</strong> (great for video, robots, self-driving).</td></tr>
+              <tr><td>Accuracy</td><td>Historically a bit higher, especially small objects.</td><td>Very competitive now, and far faster.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">How the R-CNN family evolved</span>
+          <p><strong>R-CNN</strong> ran a CNN on ~2,000 cropped region proposals — accurate but painfully slow.
+          <strong>Fast R-CNN</strong> ran the CNN once over the whole image and shared the features. <strong>Faster
+          R-CNN</strong> added a learned <span class="term">Region Proposal Network</span> so even the
+          "where to look" step became a neural net. Each step made it faster.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The YOLO idea, in one breath</span>
+          <p>YOLO divides the image into a grid. Each grid cell predicts a few boxes, the class in them, and a
+          confidence score — all in <strong>one forward pass</strong>. That's why it's fast enough to run on live
+          video. It's the go-to when latency matters.</p>
+        </div>
+
+        <h3>How do we measure "is this box correct?" — IoU</h3>
+        <p>A predicted box is rarely pixel-perfect. <span class="term">IoU (Intersection over Union)</span>
+        measures overlap between the predicted box and the true box:</p>
+        <pre>IoU = area(overlap)  /  area(union)</pre>
+        <ul>
+          <li><strong>IoU = 1.0</strong> — perfect overlap (boxes identical).</li>
+          <li><strong>IoU = 0</strong> — no overlap at all.</li>
+          <li>A common rule: a detection "counts as correct" if its IoU with a true box is ≥ <strong>0.5</strong>.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — computing IoU</span>
+          <p>Say the true box is the square from (0,0) to (10,10) — area 100. The predicted box is (5,0) to
+          (15,10) — also area 100. They overlap in the strip (5,0)–(10,10), area = 5×10 = <strong>50</strong>.</p>
+          <p>Union = 100 + 100 − 50 = <strong>150</strong>. So <strong>IoU = 50 / 150 ≈ 0.33</strong> — below 0.5,
+          so this prediction would <em>not</em> count as a correct detection.</p>
+<pre><span class="kw">def</span> <span class="nm">iou</span>(boxA, boxB):  <span class="cm"># boxes as (x1, y1, x2, y2)</span>
+    <span class="cm"># intersection rectangle</span>
+    xi1, yi1 = max(boxA[<span class="nm">0</span>], boxB[<span class="nm">0</span>]), max(boxA[<span class="nm">1</span>], boxB[<span class="nm">1</span>])
+    xi2, yi2 = min(boxA[<span class="nm">2</span>], boxB[<span class="nm">2</span>]), min(boxA[<span class="nm">3</span>], boxB[<span class="nm">3</span>])
+    inter = max(<span class="nm">0</span>, xi2 - xi1) * max(<span class="nm">0</span>, yi2 - yi1)
+    areaA = (boxA[<span class="nm">2</span>]-boxA[<span class="nm">0</span>]) * (boxA[<span class="nm">3</span>]-boxA[<span class="nm">1</span>])
+    areaB = (boxB[<span class="nm">2</span>]-boxB[<span class="nm">0</span>]) * (boxB[<span class="nm">3</span>]-boxB[<span class="nm">1</span>])
+    <span class="kw">return</span> inter / (areaA + areaB - inter)   <span class="cm"># overlap / union</span></pre>
+        </div>
+
+        <h3>Scoring a whole detector — mAP</h3>
+        <p>To grade a detector across a whole dataset we use <span class="term">mAP (mean Average Precision)</span>.
+        At a high level: for each class you plot how <em>precise</em> (few false boxes) and how complete (found all
+        objects) the detector is, summarise that curve into one number called Average Precision, then
+        <strong>average it across all classes</strong>. Higher mAP = better detector. You'll see scores like
+        "mAP@0.5" meaning "AP computed using the IoU ≥ 0.5 rule."</p>
+
+        <div class="callout warn">
+          <span class="c-title">Why one extra cleanup step is needed</span>
+          <p>Detectors often fire <em>several</em> overlapping boxes on the same object. A step called
+          <span class="term">Non-Maximum Suppression (NMS)</span> keeps the highest-confidence box and deletes
+          its near-duplicates (those with high IoU to it). Without NMS you'd "detect" the same dog five times.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Object detection finds <strong>multiple</strong> objects, giving each a class label and a bounding box.
+          <strong>Two-stage</strong> detectors (R-CNN → Fast → Faster) propose regions then classify them — accurate
+          but slower. <strong>One-stage</strong> detectors (YOLO, SSD) predict everything in a single pass — fast,
+          real-time. We measure box quality with <strong>IoU</strong> (overlap ÷ union), grade a whole model with
+          <strong>mAP</strong>, and clean up duplicate boxes with <strong>NMS</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SEGMENTATION ===================== -->
+      <section id="segmentation">
+        <h2><span class="sec-num">3</span> Segmentation — labelling every single pixel</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A bounding box is a rough rectangle around an object — it includes a lot of background in the
+          corners. Segmentation is like giving the picture to a careful kid with coloured crayons and saying
+          <strong>"colour every road pixel grey, every car pixel blue, every tree pixel green."</strong> No
+          rectangles — you trace the <em>exact</em> shape of everything. That's pixel-level labelling.</p>
+        </div>
+
+        <p>Detection gives you boxes; <span class="term">segmentation</span> goes finer and assigns a label to
+        <strong>every pixel</strong>. There are two important kinds:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>What it does</th><th>Three dogs in a photo →</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Semantic segmentation</span></td><td>Labels each pixel by <em>class</em>. All dogs are just "dog."</td><td>One big "dog" coloured region (they're not told apart).</td></tr>
+              <tr><td><span class="term">Instance segmentation</span></td><td>Labels each pixel <em>and</em> separates individual objects.</td><td>Three separately coloured dogs: dog-1, dog-2, dog-3.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The encoder–decoder shape (and U-Net)</h3>
+        <p>Classification CNNs keep shrinking the image down to a tiny feature map, then output one label. But
+        segmentation needs an output that's the <strong>same size as the input</strong> (one label per pixel). So
+        we use an <span class="term">encoder–decoder</span> architecture: first squeeze the image down to learn
+        <em>what's there</em>, then expand it back up to recover <em>where</em> exactly.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🖼️</div><div class="s-t">Input</div><div class="s-d">Full image</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔻</div><div class="s-t">Encoder</div><div class="s-d">Downsample: learn "what"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔺</div><div class="s-t">Decoder</div><div class="s-d">Upsample: recover "where"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎨</div><div class="s-t">Output</div><div class="s-d">Per-pixel label map</div></div>
+        </div>
+
+        <p>The classic example is <span class="term">U-Net</span> (Ronneberger et al., 2015), born in medical
+        imaging. Drawn out, it makes a <strong>U shape</strong>: the encoder going down the left, the decoder
+        climbing the right. Its signature trick is <span class="term">skip connections</span> that hand the
+        sharp, high-resolution details from each encoder level straight across to the matching decoder level —
+        so fine edges aren't lost during the squeeze.</p>
+
+        <pre>  input
+    │  ┌──────────────── skip ───────────────┐
+    ▼  │                                      ▼
+ [enc1] ──────────── skip ──────────────► [dec1] ─► output map
+    │  ┌──────── skip ────────┐              ▲
+    ▼  │                       ▼             │
+ [enc2] ──── skip ────► [dec2]───────────────┘
+    │                      ▲
+    ▼                      │
+ [enc3] ──────────────► [dec3]
+    │                      ▲
+    └──── bottleneck ──────┘
+   (encoder down)     (decoder up)
+            the "U" shape</pre>
+
+        <div class="callout note">
+          <span class="c-title">What is "upsampling"?</span>
+          <p>The decoder has to <em>grow</em> a small feature map back to full resolution. It does this with
+          operations like <span class="term">transposed convolution</span> (sometimes loosely called
+          "deconvolution") or simple interpolation followed by a normal conv. Think of it as the reverse of the
+          pooling that shrank the image on the way down.</p>
+        </div>
+
+        <h3>Instance segmentation: Mask R-CNN</h3>
+        <p>For <em>instance</em> segmentation, the most famous model is <span class="term">Mask R-CNN</span>
+        (He et al., 2017). The idea is beautifully simple: take Faster R-CNN (the two-stage detector from Topic 2)
+        and add a <strong>third output branch</strong> that, for each detected box, predicts a small binary
+        <span class="term">mask</span> — a per-pixel "object / not object" map inside that box.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Detect box</div><div class="s-d">Faster R-CNN finds objects</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏷️</div><div class="s-t">Classify</div><div class="s-d">What is it?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎭</div><div class="s-t">+ Mask branch</div><div class="s-d">Per-pixel shape inside the box</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — running Mask R-CNN in PyTorch</span>
+          <p>torchvision ships a Mask R-CNN pre-trained on the COCO dataset. With transfer learning (Topic 1!)
+          you load it and run instance segmentation in a few lines:</p>
+<pre><span class="kw">import</span> torch
+<span class="kw">from</span> torchvision.models.detection <span class="kw">import</span> maskrcnn_resnet50_fpn
+
+<span class="cm"># Pretrained on COCO (80 everyday object classes)</span>
+model = maskrcnn_resnet50_fpn(weights=<span class="st">"DEFAULT"</span>)
+model.eval()                              <span class="cm"># inference mode</span>
+
+<span class="kw">with</span> torch.no_grad():
+    out = model([image_tensor])[<span class="nm">0</span>]   <span class="cm"># one image in, dict out</span>
+
+<span class="cm"># out["boxes"]  -&gt; bounding boxes  (N, 4)</span>
+<span class="cm"># out["labels"] -&gt; class id per object</span>
+<span class="cm"># out["scores"] -&gt; confidence per object</span>
+<span class="cm"># out["masks"]  -&gt; per-pixel masks (N, 1, H, W)</span>
+keep = out[<span class="st">"scores"</span>] &gt; <span class="nm">0.7</span>      <span class="cm"># keep confident detections</span></pre>
+          <p>Notice the output bundles <strong>boxes + labels + masks</strong> together — that's detection and
+          segmentation in one model. To adapt it to your own classes, you'd replace its box and mask
+          <em>heads</em> (exactly the transfer-learning move from Topic 1) and fine-tune.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Segmentation labels <strong>every pixel</strong>. <strong>Semantic</strong> segmentation labels by class
+          (all dogs = "dog"); <strong>instance</strong> segmentation also separates each object (dog-1, dog-2…).
+          The standard architecture is an <strong>encoder–decoder</strong> that squeezes the image then expands it
+          back to full size; <strong>U-Net</strong> adds skip connections to keep fine detail and rules medical
+          imaging. <strong>Mask R-CNN</strong> does instance segmentation by adding a per-object mask branch onto
+          Faster R-CNN.
+        </div>
+      </section>
+
+      <!-- ===================== 4. OTHER CV APPLICATIONS ===================== -->
+      <section id="applications">
+        <h2><span class="sec-num">4</span> A tour of other computer-vision applications</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Once a machine can "see" — finding edges, shapes, and objects — you can point that skill at almost
+          anything. Unlock your phone with your face, let a game read your dance moves, help a doctor spot
+          something on an X-ray, or even ask a computer to <em>paint</em> a picture that never existed. Same CNN
+          superpowers, aimed at different jobs.</p>
+        </div>
+
+        <p>The same convolutional machinery — often via transfer learning from a big pretrained backbone — powers
+        a huge range of real applications. Here's a quick guided tour of four major areas.</p>
+
+        <h3>Face recognition</h3>
+        <p>The trick here isn't to classify "which of 1,000 fixed people is this" — you can't retrain every time a
+        new person joins. Instead, a CNN turns each face into an <span class="term">embedding</span>: a vector of
+        numbers where <strong>the same person's faces sit close together and different people sit far apart</strong>
+        (recall embeddings give similar things similar codes). Recognition then becomes "is this new face's vector
+        close to a stored one?"</p>
+        <div class="callout example">
+          <span class="c-title">Example</span>
+          <p>Phone face-unlock stores <em>one</em> embedding of your face at setup. Each unlock attempt is embedded
+          and compared by distance — close enough → unlock. Models like <em>FaceNet</em> are trained with a
+          <span class="term">triplet loss</span> that explicitly pulls same-person faces together and pushes
+          different-person faces apart.</p>
+        </div>
+
+        <h3>Pose estimation</h3>
+        <p><span class="term">Pose estimation</span> locates a person's <strong>keypoints</strong> — joints like
+        elbows, knees, wrists, and shoulders — and connects them into a stick-figure skeleton. The model predicts a
+        <span class="term">heatmap</span> for each joint (where is it most likely?), then links them up.</p>
+        <div class="callout example">
+          <span class="c-title">Example</span>
+          <p>This powers fitness apps that count your squats, motion capture in films, sign-language reading,
+          and gesture controls. <em>OpenPose</em> and the keypoint variant of Mask R-CNN are well-known examples.</p>
+        </div>
+
+        <h3>Medical imaging</h3>
+        <p>CNNs (and U-Net especially, from Topic 3) read X-rays, CT and MRI scans, and microscope slides — detecting
+        tumours, segmenting organs, or flagging fractures. The encoder–decoder shape is ideal because doctors often
+        need the <em>exact outline</em> of a region, not just a box.</p>
+        <div class="callout warn">
+          <span class="c-title">Why this needs extra care</span>
+          <p>Medical data is scarce and privacy-sensitive, so <strong>transfer learning</strong> is essential — you
+          rarely have millions of labelled scans. And mistakes carry real-world cost, so these models <em>assist</em>
+          clinicians rather than replace them, and demand careful validation.</p>
+        </div>
+
+        <h3>Generative vision</h3>
+        <p><span class="term">Generative</span> models don't classify images — they <strong>create</strong> them.
+        Two families dominate: <span class="term">GANs (Generative Adversarial Networks)</span>, where a "generator"
+        tries to fool a "discriminator" that judges real vs fake, and <span class="term">diffusion models</span>,
+        which learn to turn random noise into an image step by step (the engine behind tools like Stable Diffusion).</p>
+        <div class="callout example">
+          <span class="c-title">Example</span>
+          <p>Text-to-image tools ("a cat astronaut, oil painting"), photo super-resolution, removing objects from
+          photos, and style transfer are all generative vision. We won't go deep here — generative models get their
+          own treatment later — but know they share the same convolutional roots.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">The common thread</span>
+          <p>Every application above reuses the same idea: a CNN backbone that has learned to see, adapted with a
+          task-specific head — classification, boxes, masks, keypoints, embeddings, or pixel generation. Master the
+          backbone-plus-head pattern and the whole field opens up.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          CNNs reach far beyond classification: <strong>face recognition</strong> uses embeddings so matching is a
+          distance check; <strong>pose estimation</strong> finds body keypoints via heatmaps; <strong>medical
+          imaging</strong> leans on U-Net segmentation and transfer learning; and <strong>generative vision</strong>
+          (GANs, diffusion) creates brand-new images. All of them are the same "see-then-head" recipe pointed at a
+          different goal.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was about <em>using</em> the CNNs you built in Session 10 — not training from scratch, and
+        not just classifying. Here's the one-paragraph story connecting all four topics:</p>
+        <div class="bigidea">
+          <p>Because a CNN's <strong>early layers learn general features</strong> (edges, textures) and only its late
+          layers are task-specific, you can <strong>transfer-learn</strong>: take a model pre-trained on
+          <strong>ImageNet</strong>, keep the <strong>backbone</strong>, and swap in a new <strong>head</strong> —
+          freezing for <em>feature extraction</em> or gently unfreezing for <em>fine-tuning</em>. That same
+          backbone-plus-head recipe scales up: bolt on a detection head and you get <strong>object detection</strong>
+          (two-stage R-CNN vs one-stage YOLO/SSD), scored with <strong>IoU</strong> and <strong>mAP</strong>; bolt on
+          an encoder–decoder (<strong>U-Net</strong>) and you get pixel-level <strong>segmentation</strong>; add a mask
+          branch (<strong>Mask R-CNN</strong>) and you separate every <em>instance</em>. Point that "see-then-head"
+          machinery anywhere and you get <strong>face recognition, pose estimation, medical imaging, and generative
+          vision</strong>. Next session we leave images behind and learn to model <em>sequences</em> with RNNs.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why do the early layers of a CNN transfer well to a new task?</summary>
+          <p class="ans">Because they learn generic, low-level features — edges, colours, simple textures — that
+          almost every vision task needs. Only the late layers are specialised to the original task's classes.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between feature extraction and fine-tuning?</summary>
+          <p class="ans">Feature extraction freezes the pretrained backbone and trains only a new head. Fine-tuning
+          also lets some/all backbone layers keep learning (at a small learning rate). Use extraction for small or
+          similar datasets; fine-tuning for larger or more different ones.</p>
+        </details>
+        <details class="quiz">
+          <summary>In transfer learning code, why do we replace <code class="inl">model.fc</code>?</summary>
+          <p class="ans">The pretrained final layer outputs the original 1,000 ImageNet classes. We swap it for a
+          fresh Linear layer sized to <em>our</em> number of classes, and (for feature extraction) it's the only
+          part that trains.</p>
+        </details>
+        <details class="quiz">
+          <summary>One-stage vs two-stage detectors — which is faster and why?</summary>
+          <p class="ans">One-stage (YOLO, SSD) is faster because it predicts all boxes and classes in a single
+          forward pass. Two-stage (R-CNN family) first proposes regions, then classifies them — two passes, slower
+          but historically a touch more accurate.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does IoU measure, and what's a typical "correct" threshold?</summary>
+          <p class="ans">IoU = area of overlap ÷ area of union between a predicted and true box. It ranges 0 (no
+          overlap) to 1 (perfect). A detection is commonly counted correct at IoU ≥ 0.5.</p>
+        </details>
+        <details class="quiz">
+          <summary>Semantic vs instance segmentation — three dogs in one photo?</summary>
+          <p class="ans">Semantic segmentation paints all three as one "dog" region. Instance segmentation
+          separates them into dog-1, dog-2, dog-3. Mask R-CNN does the instance version.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does U-Net use skip connections?</summary>
+          <p class="ans">The encoder loses fine spatial detail as it downsamples. Skip connections pass the
+          high-resolution features straight from each encoder level to the matching decoder level, so sharp edges
+          and precise locations are recovered in the output.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 11) — your course handout for this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning handout (online)</a> — the companion notes for this course, covering transfer learning and CNN applications.</li>
+          <li><a href="https://arxiv.org/abs/1411.1792" target="_blank" rel="noopener">Yosinski et al. — "How transferable are features in deep neural networks?"</a> — the paper that measured exactly why early layers transfer and late layers don't.</li>
+          <li><a href="https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html" target="_blank" rel="noopener">PyTorch transfer learning tutorial</a> — hands-on official walkthrough of feature extraction and fine-tuning, mirroring the code in Topic 1.</li>
+          <li><a href="https://arxiv.org/abs/1506.02640" target="_blank" rel="noopener">Redmon et al. — "You Only Look Once" (YOLO)</a> — the original one-stage, real-time object detection paper.</li>
+          <li><a href="https://arxiv.org/abs/1505.04597" target="_blank" rel="noopener">Ronneberger et al. — "U-Net"</a> — the encoder–decoder with skip connections that defined modern segmentation.</li>
+          <li><a href="https://arxiv.org/abs/1703.06870" target="_blank" rel="noopener">He et al. — "Mask R-CNN"</a> — adds a per-object mask branch to Faster R-CNN for instance segmentation.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-10.html"><div class="dir">← Previous</div><div class="ttl">Session 10: CNN Architectures</div></a>
+        <a class="next" href="session-12.html"><div class="dir">Next →</div><div class="ttl">Session 12: Sequence Modeling — RNNs</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 11 — Transfer Learning &amp; CNN Applications · You can now borrow a giant model and aim it anywhere 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

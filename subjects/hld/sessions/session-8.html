@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 8 — Master–Slave Replication &amp; Tunable Consistency</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 8</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 08 · Master-Slave Replication</span>
+      <h1>One writer, many readers — and how strict we want to be about it</h1>
+      <p class="lead">
+        Last session we met the <strong>CAP theorem</strong> and the idea that data gets <em>copied</em> across
+        machines. Today we zoom right in on the most common copy-pattern in the real world:
+        <strong>master–slave replication</strong> (one machine you write to, several you read from). We'll see
+        why copies fall behind, what happens when the master dies, and a beautiful little arithmetic trick —
+        <strong>quorums</strong> — that lets you dial consistency up or down per query. We assume you've studied
+        <em>none</em> of this; every idea starts with a tiny story before we go deep.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 34 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#master-slave">Master–slave replication</a></li>
+          <li><a href="#setup">Basic setup &amp; replication factor</a></li>
+          <li><a href="#lag">Replication lag: async vs sync</a></li>
+          <li><a href="#failover">Failover &amp; promotion</a></li>
+          <li><a href="#configs">The four consistency configurations</a></li>
+          <li><a href="#quorums">Tunable consistency &amp; quorums</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. MASTER-SLAVE ===================== -->
+      <section id="master-slave">
+        <h2><span class="sec-num">1</span> Master–slave (leader–follower) replication</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine one teacher with the <strong>master notebook</strong>. Whenever something new happens, only
+          the teacher is allowed to write it in. But thirty kids each have their own <strong>copy</strong> of the
+          notebook, and the teacher keeps reading the new lines aloud so every kid can copy them down. If you just
+          want to <em>read</em> something, you ask any nearby kid — fast, no queue. But if you want to <em>add</em>
+          something new, you must go to the one teacher. One writer, many readers.</p>
+        </div>
+
+        <p>That teacher is the <span class="term">master</span> (modern docs say <span class="term">leader</span>
+        or <span class="term">primary</span>). The kids are the <span class="term">slaves</span> (modern term:
+        <span class="term">followers</span>, <span class="term">replicas</span>, or <span class="term">secondaries</span>).
+        We'll use "master/slave" because that's still the most common interview phrasing, but know the kinder,
+        clearer words too — they mean the same thing.</p>
+
+        <div class="callout note">
+          <span class="c-title">A note on the names</span>
+          <p>The words "master" and "slave" carry a lot of <strong>historical baggage</strong>, and many communities
+          deliberately avoid them. You'll see the exact same relationship described as <strong>Leader–Follower</strong>,
+          <strong>Active–Passive</strong>, or <strong>Primary–Secondary</strong>. They are all the same pattern: one
+          node that owns writes, others that mirror it.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>In master–slave replication there is <strong>exactly one node that accepts writes</strong> (the master),
+          and one or more <strong>read-only copies</strong> (the slaves) that constantly try to mirror it. All
+          changes flow in one direction: master → slaves. This single rule is what makes the whole thing simple to
+          reason about.</p>
+        </div>
+
+        <h3>Why copy data at all? (recall Session 7)</h3>
+        <p>In <a href="session-7.html">Session 7</a> we said replication buys us three things. Master–slave gives
+        all three:</p>
+        <ul>
+          <li><strong>Read scaling</strong> — the headline benefit today. Most apps read far more than they write
+          (think: 100 page-views per 1 comment posted). Spread reads across many slaves and you serve more traffic.</li>
+          <li><strong>High availability</strong> — if the master dies, a slave can be promoted to take over (Topic 3).</li>
+          <li><strong>Geography &amp; backups</strong> — keep a slave in another data centre for disaster recovery,
+          or one nearby your users for low-latency reads.</li>
+        </ul>
+
+        <h3>How a write propagates</h3>
+        <p>When the master accepts a write, it doesn't just change its own data and forget about it. It records
+        the change in an ordered log and ships that log to every slave. The log has different names in different
+        systems but the same job:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>System</th><th>Name of the replication log</th></tr></thead>
+            <tbody>
+              <tr><td>MySQL</td><td><span class="term">binary log</span> (binlog)</td></tr>
+              <tr><td>PostgreSQL</td><td><span class="term">Write-Ahead Log</span> (WAL)</td></tr>
+              <tr><td>MongoDB</td><td><span class="term">oplog</span> (operations log)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The key word is <strong>ordered</strong>: every slave applies the changes in the <em>same sequence</em> the
+        master did. Apply them out of order and the copies would disagree. So a slave is really just a machine
+        replaying the master's diary, line by line, forever.</p>
+
+        <div class="callout note">
+          <span class="c-title">Statement vs row replication</span>
+          <p>There are two flavours of what the log actually contains. <strong>Statement-based</strong> ships the SQL
+          command itself (<code class="inl">UPDATE accounts SET balance = balance - 10 ...</code>). It's compact but
+          dangerous: a command like <code class="inl">NOW()</code> or <code class="inl">RAND()</code> would produce
+          different results on each replica! <strong>Row-based</strong> ships the actual changed rows ("row 42's
+          balance is now 90"), which is bigger but deterministic. Most modern systems prefer row-based for safety.</p>
+        </div>
+
+        <h3>The topology, drawn out</h3>
+        <p>Your app talks to the cluster through a layer that decides where each query goes. Writes go to the one
+        master; reads fan out to the slaves:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📱</div><div class="s-t">App</div><div class="s-d">Sends reads &amp; writes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚦</div><div class="s-t">Router</div><div class="s-d">Splits read vs write</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">Master</div><div class="s-d">All writes land here</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📖</div><div class="s-t">Slaves ×N</div><div class="s-d">Replay log, serve reads</div></div>
+        </div>
+
+        <h3>Read/write splitting — how reads actually scale</h3>
+        <p>The trick that scales reads is <span class="term">read/write splitting</span>: the application (or a proxy
+        in front of the database) sends every <code class="inl">INSERT</code>/<code class="inl">UPDATE</code>/<code class="inl">DELETE</code>
+        to the master, and load-balances every <code class="inl">SELECT</code> across the pool of slaves.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — splitting in application code</span>
+          <p>A tiny router that routes by query type. The reads round-robin across three replicas; writes always
+          hit the master:</p>
+          <pre><span class="cm"># db_router.py — toy read/write splitter</span>
+master   = connect(<span class="st">"db-master:5432"</span>)
+replicas = [connect(<span class="st">"db-replica-1:5432"</span>),
+            connect(<span class="st">"db-replica-2:5432"</span>),
+            connect(<span class="st">"db-replica-3:5432"</span>)]
+
+<span class="kw">def</span> run(sql):
+    <span class="kw">if</span> sql.strip().upper().startswith((<span class="st">"INSERT"</span>, <span class="st">"UPDATE"</span>, <span class="st">"DELETE"</span>)):
+        <span class="kw">return</span> master.execute(sql)        <span class="cm"># writes → the one master</span>
+    <span class="kw">else</span>:
+        replica = random.choice(replicas)  <span class="cm"># reads → spread across slaves</span>
+        <span class="kw">return</span> replica.execute(sql)</pre>
+          <p>Now imagine the master can handle <span class="nm">5,000</span> reads/sec on its own. Add three
+          equally-powered replicas and your <em>read</em> capacity jumps to roughly <span class="nm">20,000</span>/sec
+          (master + 3 slaves), while writes stay capped at the single master's <span class="nm">5,000</span>/sec.
+          That asymmetry is the whole point: <strong>reads scale horizontally, writes do not.</strong></p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The catch (sets up Topic 2)</span>
+          <p>The slaves are always <em>slightly behind</em> the master — they're replaying a log that arrives a beat
+          late. So a read from a slave might return data that's a few milliseconds (or, on a bad day, seconds) out of
+          date. That gap is called <strong>replication lag</strong>, and it's the headache we tackle next.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Master–slave works brilliantly for <strong>read-heavy</strong> workloads. It does <em>nothing</em> for
+          write-heavy ones — there's still only one master taking writes. When writes themselves become the
+          bottleneck, you need <strong>sharding</strong> (splitting data across many masters), which is the headline
+          topic of <a href="session-9.html">Session 9</a>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          One <strong>master</strong> accepts all writes and records them in an ordered log (binlog/WAL/oplog).
+          One or more <strong>slaves</strong> replay that log and serve <strong>read-only</strong> queries.
+          <strong>Read/write splitting</strong> sends writes to the master and spreads reads across slaves, which
+          scales reads — but never writes.
+        </div>
+      </section>
+
+      <!-- ===================== 2. BASIC SETUP & REPLICATION FACTOR ===================== -->
+      <section id="setup">
+        <h2><span class="sec-num">2</span> Basic setup &amp; the replication factor</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>How many copies of the class notebook should exist? If there's only <em>one</em>, and it gets lost, the
+          notes are gone forever — useless. So you keep a few copies. And you usually keep an <strong>odd</strong>
+          number of kids (plus the teacher) in the room, because when they have to <em>vote</em> on something — like
+          "who's the new teacher?" — an odd number means there's never a tie. There's always a clear winner.</p>
+        </div>
+
+        <p>The <span class="term">replication factor</span>, written <code class="inl">X</code>, is the
+        <strong>number of total copies of the same data</strong>:</p>
+        <div class="bigidea">
+          <span class="c-title">The formula</span>
+          <p><strong>X = 1 master + (X−1) slaves.</strong> So X = 3 means 1 master + 2 slaves; X = 5 means 1 master +
+          4 slaves; X = 2 means 1 master + 1 slave. Typical values are <strong>X = 3</strong> or <strong>X = 5</strong>.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Replication factor ≠ total servers</span>
+          <p>X is the number of <em>copies</em>, not the number of machines in your whole database. If the database is
+          <span class="term">sharded</span>, you have shards <em>and</em> replicas. A database can have
+          <code class="inl">S = 100</code> shards, each shard keeping <code class="inl">X = 3</code> copies, for a
+          total of <code class="inl">N = 300</code> servers. (Sharding is Session 9 — here we focus on one shard's
+          copies.)</p>
+        </div>
+
+        <h3>Why an odd number of servers?</h3>
+        <p>Typically we use an <strong>odd number of total servers</strong> (the master plus an even number of slaves).
+        This is <em>not</em> mandatory — you can have an even number — but odd gives you a <strong>clear majority</strong>,
+        which makes tie-breaking trivial when the cluster has to vote (during master election, or during a quorum
+        read/write). With an even number, a split vote can deadlock.</p>
+
+        <h3>How many copies do you actually need?</h3>
+        <ul>
+          <li><strong>At least X = 2</strong> (1 master + 1 slave). With only 1 copy there's no replication at all, so
+          any disk failure means data loss.</li>
+          <li><strong>X = 3 is the typical default</strong> (1 master + 2 slaves).</li>
+          <li><strong>X = 5</strong> for critical data where you cannot tolerate any data loss. Going above 5 buys almost
+          nothing — it's already astronomically unlikely that 5 servers in the same shard fail at once.</li>
+          <li><strong>Very high X (e.g. 100)</strong> only when you're using replicas purely to scale <em>read</em>
+          throughput. This is normally done for a <span class="term">cache</span>, not the whole database, and it's
+          usually fine for such a cache to be eventually consistent.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why not strict consistency with 100 replicas?</span>
+          <p>If you had 100 read replicas and demanded immediate consistency, your choices are both bad:
+          <strong>write-everywhere</strong> means every write must touch all ~100 servers (only acceptable if writes are
+          extremely rare), and <strong>quorum</strong> means every read must touch ~50 servers (which kills your read
+          performance — the very thing you added the replicas for). So at huge replica counts you settle for eventual
+          consistency: just write to master + 1 slave.</p>
+        </div>
+
+        <h3>Common operational questions</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+            <tbody>
+              <tr><td>What if the master goes down?</td><td>A <strong>re-election</strong> happens; one slave becomes the new master.</td></tr>
+              <tr><td>What if the old master comes back?</td><td>It rejoins the cluster as a <strong>new slave</strong>.</td></tr>
+              <tr><td>What if a slave crashes?</td><td>Nobody cares — slaves die all the time. Reads just go to a different slave.</td></tr>
+              <tr><td>How does master election happen?</td><td>Usually via a <strong>distributed configuration management system</strong> (e.g. <span class="term">Zookeeper</span>); other algorithms exist too.</td></tr>
+              <tr><td>How do slaves sync with the master?</td><td><strong>Asynchronously</strong>, using the <span class="term">Write-Ahead Log</span>.</td></tr>
+              <tr><td>Where do writes happen?</td><td>Always <em>at least</em> at the master (some configs also write to a subset of slaves).</td></tr>
+              <tr><td>Where do reads happen?</td><td>In a subset of the slaves.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The <strong>replication factor X</strong> is the number of copies: <strong>X = 1 master + (X−1) slaves</strong>,
+          typically 3 or 5. It is <em>not</em> the total server count — a sharded DB has S shards × X copies. Prefer an
+          <strong>odd</strong> total so there's always a clear majority for voting. Need ≥2 copies to avoid data loss; go
+          to 5 for critical data; go very high only to scale cache reads (eventually consistent).
+        </div>
+      </section>
+
+      <!-- ===================== 3. REPLICATION LAG ===================== -->
+      <section id="lag">
+        <h2><span class="sec-num">3</span> Replication lag &amp; async vs sync replication</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back to the teacher reading new lines aloud. There's always a tiny delay between the teacher writing a
+          line and a kid in the back row finishing copying it. If you ask that kid right away, he might say "I don't
+          have that yet!" — even though the teacher already wrote it. That little delay is <strong>replication lag</strong>.
+          And the teacher has a choice: <em>wait</em> until everyone finishes copying before moving on (slow but
+          everyone's in sync), or <em>charge ahead</em> and let the kids catch up whenever (fast but some fall behind).</p>
+        </div>
+
+        <p><span class="term">Replication lag</span> is the time gap between a write committing on the master and that
+        same write becoming visible on a given slave. The big design decision is <em>when</em> the master considers a
+        write "done" — and that gives us three replication modes.</p>
+
+        <h3>Asynchronous replication — fast, possibly lossy</h3>
+        <p>In <span class="term">asynchronous (async) replication</span>, the master writes locally, immediately tells
+        the client "done!", and ships the change to slaves <em>afterwards</em>, in the background. The client never
+        waits for the slaves.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">1. Master writes</div><div class="s-d">Commits locally</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">2. Acks client</div><div class="s-d">"Done!" instantly</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">3. Ships log</div><div class="s-d">To slaves, later</div></div>
+        </div>
+        <ul>
+          <li><strong>Pro:</strong> very low write latency — the client only waits for the master.</li>
+          <li><strong>Con:</strong> if the master crashes <em>after</em> step 2 but <em>before</em> step 3 reaches any
+          slave, that write is <strong>gone</strong>. The client was told "saved" but it never propagated. This is
+          <span class="term">data loss</span>.</li>
+        </ul>
+
+        <h3>Synchronous replication — safe, slow</h3>
+        <p>In <span class="term">synchronous (sync) replication</span>, the master waits for the slave(s) to confirm
+        they've received and stored the change <em>before</em> telling the client "done."</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">1. Master writes</div><div class="s-d">Commits locally</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">2. Ships log</div><div class="s-d">Waits for slave ack</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🤝</div><div class="s-t">3. Slave acks</div><div class="s-d">"Got it &amp; stored"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">4. Acks client</div><div class="s-d">Now "done!"</div></div>
+        </div>
+        <ul>
+          <li><strong>Pro:</strong> no data loss for an acknowledged write — at least one other node has it.</li>
+          <li><strong>Con:</strong> the client waits for the slowest slave on every write. And if a synchronous slave
+          goes down or gets slow, writes <strong>stall</strong> — you've coupled the master's availability to the
+          slave's. Pure full-sync (wait for <em>all</em> slaves) is rare for exactly this reason.</li>
+        </ul>
+
+        <h3>Semi-synchronous — the practical middle</h3>
+        <p><span class="term">Semi-synchronous replication</span> is the popular compromise: the master waits for
+        <strong>at least one</strong> slave to confirm, then acks the client. The rest catch up asynchronously.</p>
+        <p>This means at least one backup copy always exists (so a single master crash loses nothing), but you don't
+        pay the cost of waiting for <em>every</em> replica. MySQL's semi-sync and PostgreSQL's
+        <code class="inl">synchronous_commit</code> with one sync standby both work this way. As you'll see in
+        Topic 4, "wait for at least K of N" is exactly a <strong>quorum</strong> — the same idea generalised.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Mode</th><th>Master waits for…</th><th>Write latency</th><th>Data loss on master crash?</th></tr></thead>
+            <tbody>
+              <tr><td>Asynchronous</td><td>nothing (acks immediately)</td><td>Lowest</td><td>Possible — unshipped writes lost</td></tr>
+              <tr><td>Semi-synchronous</td><td>≥1 slave to confirm</td><td>Medium</td><td>No (at least one copy exists)</td></tr>
+              <tr><td>Synchronous (full)</td><td>all slaves to confirm</td><td>Highest</td><td>No, but writes stall if a slave is down</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — how big is the lag, really?</span>
+          <p>Suppose your master commits a write at <code class="inl">t = 0 ms</code>. With async replication on a
+          healthy network:</p>
+          <ul>
+            <li>Network hop to slave: ~<span class="nm">2 ms</span></li>
+            <li>Slave applies the log entry: ~<span class="nm">3 ms</span></li>
+            <li><strong>Total lag ≈ 5 ms</strong> — invisible to humans, almost always fine.</li>
+          </ul>
+          <p>But now the master gets a burst of <span class="nm">50,000</span> writes/sec and a slave on slow disks
+          can only apply <span class="nm">40,000</span>/sec. It falls behind by <span class="nm">10,000</span> writes
+          every second. Within a minute the lag is <strong>minutes</strong> deep — a read from that slave shows data
+          from a minute ago. Lag is usually tiny, but under load it can blow up. Always <strong>monitor it</strong>
+          (e.g. MySQL's <code class="inl">Seconds_Behind_Master</code>).</p>
+        </div>
+
+        <h3>The read-your-own-writes problem</h3>
+        <p>Here's the classic bug async replication causes. A user updates their profile photo (write → master), then
+        the page reloads and reads their profile (read → a slave that hasn't caught up yet). They see their
+        <em>old</em> photo and think the save failed. They saved successfully — they just can't see their own write.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Why this is so confusing</span>
+          <p>The guarantee the user expects is <span class="term">read-your-own-writes consistency</span> (also called
+          <em>read-after-write</em>): "after I write something, <em>I</em> should immediately see it." Async master–slave
+          breaks it because your write and your follow-up read may hit different machines that disagree for a moment.</p>
+        </div>
+
+        <p>Common fixes — you'll be expected to name at least one:</p>
+        <ul>
+          <li><strong>Read from the master</strong> for data the user themselves just changed (e.g. read their own
+          profile from the master for the next 30 seconds after an edit).</li>
+          <li><strong>Sticky / monotonic reads</strong> — pin a given user's reads to one specific replica so they at
+          least don't bounce backward in time between replicas.</li>
+          <li><strong>Wait for the replica to catch up</strong> — remember the log position of the user's write, and
+          only let a replica serve them once it has applied up to that position.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Connecting back to CAP (Session 7)</span>
+          <p>Async replication is the everyday face of choosing <strong>availability over strict consistency</strong>.
+          The slaves are <span class="term">eventually consistent</span>: stop all writes and wait, and every replica
+          will eventually converge to the same data. "Eventually" is doing a lot of work — the lag is exactly the
+          window where the system is inconsistent.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Replication lag</strong> is how far a slave trails the master. <strong>Async</strong> = fast but can
+          lose unshipped writes on a crash; <strong>sync</strong> = no loss but slow and stalls if a slave is down;
+          <strong>semi-sync</strong> = wait for one slave (the practical middle). Async breaks
+          <strong>read-your-own-writes</strong>, fixed by reading from the master, sticky reads, or waiting for catch-up.
+        </div>
+      </section>
+
+      <!-- ===================== 4. FAILOVER ===================== -->
+      <section id="failover">
+        <h2><span class="sec-num">4</span> Failover &amp; promotion</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The one teacher with the master notebook goes home sick. Now <em>nobody</em> can add new lines — the
+          class is stuck. So the kids quickly pick the kid whose copy is most up-to-date and say "you're the teacher
+          now." From this moment, new lines go to <em>that</em> kid. Picking a new teacher when the old one
+          disappears is <strong>failover</strong>. But there's a scary failure: what if the old teacher comes back and
+          <em>also</em> thinks she's still in charge? Now there are two teachers and two different notebooks.</p>
+        </div>
+
+        <p>Because only the master accepts writes, the master is a <span class="term">single point of failure</span> for
+        writes. If it dies, reads can still be served by slaves, but <strong>no new writes can happen</strong> until a
+        new master exists. <span class="term">Failover</span> is the process of detecting the dead master and promoting
+        a slave to replace it. <span class="term">Promotion</span> is the act of turning a read-only slave into the new
+        writable master.</p>
+
+        <h3>The failover sequence</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">💔</div><div class="s-t">1. Detect</div><div class="s-d">Master stops responding to heartbeats</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗳️</div><div class="s-t">2. Elect</div><div class="s-d">Choose the best slave</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👑</div><div class="s-t">3. Promote</div><div class="s-d">Make it writable</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">4. Reconfigure</div><div class="s-d">Point others &amp; clients at new master</div></div>
+        </div>
+
+        <h4>1. Detecting the death</h4>
+        <p>The cluster uses <span class="term">heartbeats</span>: nodes ping each other on a timer. If the master misses
+        several heartbeats in a row (say, no reply for 10 seconds), it's <em>presumed</em> dead. Note "presumed" — we
+        can't actually tell a crashed master apart from a master that's merely slow or behind a broken network link.
+        That uncertainty is the root of all the danger below.</p>
+
+        <h4>2. Electing the new master</h4>
+        <p>You don't pick a slave at random. You want the slave that is <strong>most caught up</strong> — the one whose
+        replicated log position is furthest along — because any writes it's missing are lost forever once it becomes
+        master. Many systems use a consensus algorithm such as <span class="term">Raft</span> or
+        <span class="term">Paxos</span> to elect a leader safely (we treat these as black boxes here; their whole job is
+        to make sure the cluster agrees on exactly one leader).</p>
+
+        <h4>3. Promotion</h4>
+        <p>The chosen slave flips from read-only to read-write. The other slaves are told to start replicating from
+        the <em>new</em> master instead of the dead one.</p>
+
+        <h4>4. Reconfiguration</h4>
+        <p>Clients and the router must learn the new master's address. This is often done with a stable hostname or a
+        <span class="term">virtual IP</span> that gets re-pointed, or via a service-discovery layer, so apps don't need
+        to hard-code which box is master.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a write lost during failover</span>
+          <p>Async cluster, master M with two slaves A and B.</p>
+          <ul>
+            <li>M commits write #105 and acks the client "saved."</li>
+            <li>M ships #105 to slave A, but <strong>crashes before</strong> it reaches slave B. So A has #105, B does not.</li>
+            <li>Failover runs. Suppose it accidentally elects <strong>B</strong> (less caught-up).</li>
+            <li>B becomes master at log position #104. Write #105 is now <strong>gone</strong>, even though the client was
+            told it succeeded — and when A reconnects to B it will be forced to <em>discard</em> #105 to match B.</li>
+          </ul>
+          <p>Lesson: always elect the <strong>most up-to-date</strong> replica (A), and understand that async failover
+          can still lose the very last unshipped writes. This is the data-loss risk from Topic 2 made concrete.</p>
+        </div>
+
+        <h3>Split-brain — the nightmare</h3>
+        <p><span class="term">Split-brain</span> happens when a network partition (recall the "P" in CAP from
+        Session 7) makes part of the cluster <em>think</em> the master is dead and promote a new one — while the old
+        master is actually alive and still taking writes on the other side of the partition. Now you have
+        <strong>two masters</strong>, each accepting conflicting writes, with no idea the other exists.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">Partition</div><div class="s-d">Network splits in two</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👑</div><div class="s-t">Old master</div><div class="s-d">Still alive, taking writes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👑</div><div class="s-t">New master</div><div class="s-d">Promoted, also taking writes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💥</div><div class="s-t">Conflict</div><div class="s-d">Two truths, must merge</div></div>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why split-brain is so bad</span>
+          <p>When the partition heals, both halves have accepted writes the other never saw — and they may
+          <strong>contradict</strong> (both masters sold "the last ticket"). There's no clean automatic answer; you're
+          stuck reconciling conflicting data, sometimes by hand. Prevention beats cure.</p>
+        </div>
+
+        <p>How systems prevent split-brain:</p>
+        <ul>
+          <li><strong>Quorum / majority rule</strong> — a node may only act as master if it can talk to a
+          <em>majority</em> of nodes. In a partition, only one side can hold the majority, so the minority side
+          refuses writes. (This is why clusters favour an <strong>odd</strong> number of nodes — 3, 5, 7 — so a
+          majority always exists.)</li>
+          <li><strong>Fencing / STONITH</strong> (<em>"Shoot The Other Node In The Head"</em>) — before promoting a new
+          master, forcibly disable the old one (cut its power or network) so it physically cannot keep serving writes.</li>
+          <li><strong>Leases / tokens</strong> — a master holds a time-limited lease; if it can't renew it (because it's
+          partitioned away), it must stop accepting writes on its own.</li>
+        </ul>
+
+        <h3>A word on multi-master</h3>
+        <p>So far there's exactly one writer. <span class="term">Multi-master</span> (also
+        <span class="term">multi-leader</span>) replication intentionally allows <strong>several nodes to accept
+        writes</strong> at once — handy for writing locally in multiple data centres. The price is that the same row can
+        be edited in two places simultaneously, so you <em>must</em> have a <span class="term">conflict-resolution</span>
+        strategy (last-write-wins by timestamp, version vectors, CRDTs, or app-defined merges). Master–slave sidesteps
+        all of that by having one writer; multi-master trades that simplicity for write availability and locality.
+        Leaderless systems (Dynamo-style) push this even further — which leads us straight to quorums.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The master is a single point of failure for writes. <strong>Failover</strong> detects the dead master
+          (heartbeats), <strong>elects</strong> the most caught-up slave (often via Raft/Paxos), <strong>promotes</strong>
+          it, and reconfigures clients. The big danger is <strong>split-brain</strong> (two masters during a partition),
+          prevented by majority quorums, fencing/STONITH, and leases. <strong>Multi-master</strong> allows many writers
+          but demands conflict resolution.
+        </div>
+      </section>
+
+      <!-- ===================== 5. CONSISTENCY CONFIGURATIONS ===================== -->
+      <section id="configs">
+        <h2><span class="sec-num">5</span> The four consistency configurations</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You can choose how careful to be when you save a new phone number into your address books. Save it into
+          just one book? Super fast, but you might lose it if that book burns. Save into two books? Safer. Save into
+          <em>every</em> book before you tell anyone "done"? Safest, but you have to wait for the slowest friend to
+          finish writing. Each level of carefulness is a different <strong>configuration</strong>, and each one trades
+          speed for safety in its own way.</p>
+        </div>
+
+        <p>Master–slave is not one fixed thing — by choosing <strong>how many places a read touches (R)</strong> and
+        <strong>how many places a write touches (W)</strong>, you pick a point on the consistency spectrum. Below are
+        the four classic configurations, from least to most consistent. In every one, reads use <code class="inl">R = 1</code>
+        (one random slave, chosen fresh each time via <span class="term">round-robin</span>); what changes is the
+        writes.</p>
+
+        <h3>Config A — No consistency (data loss possible)</h3>
+        <p><strong>R = 1, W = 1.</strong> Reads go to any 1 random slave; writes go only to the master.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Where</th><th>Availability</th><th>Latency</th></tr></thead>
+            <tbody>
+              <tr><td>Reads (R = 1)</td><td>Any 1 random slave (round-robin)</td><td>Very High — if a slave dies, just use another</td><td>Very Low — reading one place</td></tr>
+              <tr><td>Writes (W = 1)</td><td>Only at the master</td><td>Very High — if master dies, re-elect</td><td>Very Low — writing one place</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Writes going only to the master doesn't mean slaves have no data — they sync up periodically, so the master
+        always has the latest data and the slaves usually lag a bit.</p>
+        <ul>
+          <li><strong>Can there be data loss?</strong> <strong>Yes.</strong> If the master's HDD fails with unsynced
+          changes, those changes are lost forever.</li>
+          <li><strong>Can stale reads happen?</strong> Yes — slaves sync only periodically. But here we don't even care
+          about stale reads, because <em>data loss is worse</em> and this config already allows it.</li>
+        </ul>
+
+        <h3>Config B — Eventual consistency</h3>
+        <p><strong>R = 1, W = 2.</strong> Use this when eventual consistency is good enough. Reads go to any 1 random
+        slave; writes go to the <strong>master + 1 random slave, atomically</strong> (random slave chosen round-robin).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Where</th><th>Availability</th><th>Latency</th></tr></thead>
+            <tbody>
+              <tr><td>Reads (R = 1)</td><td>Any 1 random slave</td><td>Very High</td><td>Very Low</td></tr>
+              <tr><td>Writes (W = 2)</td><td>Master + 1 random slave (at least 2 places)</td><td>Decent — re-elect master, or pick another slave</td><td>Decent — must write 2 places at once (2PC)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>How do we write to two places at once?</strong> Using <span class="term">Two-Phase Commit (2PC)</span>:
+          acquire distributed locks so the write to (master + 1 slave) is atomic. If it doesn't succeed in both places,
+          we roll back the partial write and return an error; the client can retry.</li>
+          <li><strong>Can there be data loss?</strong> <strong>No</strong> — the data is in at least 2 places. (If both
+          those HDDs fail before any other slave syncs, sure — but that's astronomically rare; HDDs fail maybe once
+          every 2–3 years. Want fewer losses? Write to more places.)</li>
+          <li><strong>Can stale reads happen?</strong> <strong>Yes.</strong> The latest write went to Master + Slave A,
+          but a read went to Slave B which hasn't synced yet → stale read.</li>
+        </ul>
+
+        <h3>Config C — Immediate consistency: Write-Everywhere</h3>
+        <p><strong>R = 1, W = X.</strong> Use this when you need immediate consistency and writes are rare (read-heavy
+        system). Reads go to any 1 random slave; every write goes to <strong>all X nodes (master + all slaves)
+        atomically</strong>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Where</th><th>Availability</th><th>Latency</th></tr></thead>
+            <tbody>
+              <tr><td>Reads (R = 1)</td><td>Any 1 random slave</td><td>Very High</td><td>Very Low</td></tr>
+              <tr><td>Writes (W = X)</td><td>All X servers, atomically</td><td>Very Low — if even 1 replica fails to ack, the write is denied and others roll back</td><td>Very High — wait for the slowest server, plus any retry/rollback</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">All X, not "all that are alive"</span>
+          <p>The protocol says write to <strong>all X nodes</strong> — not "all replicas currently alive." In
+          write-everywhere, if even <em>one</em> replica is down, writes must be <strong>denied</strong>. Here the
+          master's role is blurred: there's basically no difference between master and slave.</p>
+        </div>
+        <ul>
+          <li><strong>Can there be data loss?</strong> No — every write is replicated everywhere; all copies stay in sync.</li>
+          <li><strong>Can stale reads happen?</strong> No — all copies are always in sync.</li>
+        </ul>
+
+        <h3>Config D — Immediate consistency: Quorum</h3>
+        <p><strong>R = W = (X+1)/2.</strong> Use this when you need immediate consistency and writes are frequent
+        (write-heavy or balanced system). The idea: <strong>improve writes at the cost of reads</strong>. Write-everywhere
+        has lightning reads but glacial writes; trade a little off each and <em>both</em> become decent.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Where</th><th>Availability</th><th>Latency</th></tr></thead>
+            <tbody>
+              <tr><td>Reads R = (X+1)/2</td><td>A majority — more than half the replicas (any random copies)</td><td>Decent — at least half must go down to deny a request</td><td>Decent</td></tr>
+              <tr><td>Writes W = (X+1)/2</td><td>A majority, atomically (master + a random half of slaves)</td><td>Decent</td><td>Decent</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bigidea">
+          <span class="c-title">Majority math</span>
+          <p><strong>Majority = more than half the total.</strong> If replication factor is X, the majority is
+          <code class="inl">ceil((X+1)/2)</code>. Example: X = 5 → any read or write must succeed at <strong>at least
+          3</strong> nodes to count as successful.</p>
+        </div>
+        <ul>
+          <li><strong>Can there be data loss?</strong> No — we write to a majority, and a majority is at least 2.</li>
+          <li><strong>Can stale reads happen?</strong> No — you always read the latest data, because a read-majority and
+          a write-majority must <strong>overlap in at least 1 server</strong>, and that server has the latest write.</li>
+        </ul>
+        <p>Since different replicas can hold different values, every write stamps a <strong>timestamp</strong>; on read,
+        we return the value with the latest timestamp.</p>
+        <div class="callout note">
+          <span class="c-title">Two common quorum questions</span>
+          <p><strong>Do we need synchronized clocks across replicas for the timestamp?</strong> No — the timestamp is
+          generated at the <span class="term">coordinator</span> (the database app server coordinating the write across
+          replicas), so a single clock is used.</p>
+          <p><strong>What if some servers are down — does X change?</strong> No. <code class="inl">X</code> is a
+          configuration parameter (the minimum copies you must maintain), not the live server count. Quorum always
+          requires success at <code class="inl">ceil((X+1)/2)</code> replicas regardless of crashes. Example: X = 7
+          → majority = 4. If 4 servers crash, only 3 remain, so <strong>no reads or writes can happen</strong> until
+          enough recover. (It's the DB's job to keep the live count at ≥ X most of the time.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          All four configs read from 1 random slave; they differ in writes. <strong>No-consistency</strong>
+          (W=1, master only) is fastest but loses data. <strong>Eventual</strong> (W=2, master + 1 slave via 2PC) avoids
+          data loss but allows stale reads. <strong>Write-everywhere</strong> (W=X) gives immediate consistency with
+          fast reads but brittle, slow writes (1 dead node blocks writes). <strong>Quorum</strong> (R=W=ceil((X+1)/2))
+          balances both via a guaranteed majority overlap — immediate consistency with decent reads <em>and</em> writes.
+        </div>
+      </section>
+
+      <!-- ===================== 6. QUORUMS ===================== -->
+      <section id="quorums">
+        <h2><span class="sec-num">6</span> Tunable consistency &amp; quorums</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You and your friends keep three copies of the same address book. To be <em>sure</em> a phone number is
+          current, you don't have to check all three books — you just need a clever rule. If you always <strong>write</strong>
+          a new number into at least <em>two</em> books, and always <strong>read</strong> by checking at least <em>two</em>
+          books, then any read is guaranteed to peek into at least one book that has the newest write. Two-plus-two on
+          three books always overlap! That overlap is the whole magic trick.</p>
+        </div>
+
+        <p>Instead of the rigid "one master, slaves are read-only" model, many distributed databases let you treat all
+        replicas more equally and <strong>tune consistency per query</strong> using three numbers:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symbol</th><th>Name</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><strong>N</strong></td><td>Replication factor</td><td>How many copies of each piece of data exist.</td></tr>
+              <tr><td><strong>W</strong></td><td>Write quorum</td><td>How many replicas must confirm a write before it counts as successful.</td></tr>
+              <tr><td><strong>R</strong></td><td>Read quorum</td><td>How many replicas you query and compare on each read.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea — the quorum rule</span>
+          <p>If <strong>W + R &gt; N</strong>, then your read set and your write set are <em>guaranteed to overlap</em> in
+          at least one replica — so any read is certain to see the latest acknowledged write. This single inequality
+          buys you <strong>strong consistency</strong>. If <strong>W + R ≤ N</strong>, the sets can miss each other and
+          you may read stale data (but reads/writes are faster and more available).</p>
+        </div>
+
+        <h3>Why the overlap is guaranteed (the intuition)</h3>
+        <p>Picture N=3 replicas as three boxes. A write lands in W of them; a read inspects R of them. By the
+        <em>pigeonhole principle</em>, if W + R is bigger than the total N, the two groups can't be completely
+        separate — at least one box must be in both. That shared box holds the freshest value, and the reader picks the
+        most recent (each value carries a version/timestamp), so it always sees the latest write.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — N=3, W=2, R=2 (the classic)</span>
+          <p>Three replicas hold a key, call them R1, R2, R3. We require 2 to confirm writes and read from 2.</p>
+          <ul>
+            <li><strong>Write</strong> <code class="inl">x = 5</code>: it commits on R1 and R2 (W=2 satisfied), so the
+            write is acknowledged. R3 may still hold the old value for a moment.</li>
+            <li><strong>Read</strong> <code class="inl">x</code>: we query any 2 replicas. The possible pairs are
+            {R1,R2}, {R1,R3}, {R2,R3}. Check each: every single pair contains R1 <em>or</em> R2 — the up-to-date
+            ones!</li>
+            <li>So the reader always sees at least one replica with <code class="inl">x = 5</code>, compares versions,
+            and returns the newest. <strong>Strongly consistent.</strong></li>
+          </ul>
+          <p>Check the rule: W + R = 2 + 2 = 4, and N = 3. Since 4 &gt; 3, overlap is guaranteed. ✅</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Counter-example — N=3, W=1, R=1 (fast but stale)</span>
+          <p>Now we only require 1 replica for each.</p>
+          <ul>
+            <li><strong>Write</strong> <code class="inl">x = 5</code> commits on R1 only (W=1).</li>
+            <li><strong>Read</strong> happens to hit R3, which never got the update — it returns the old
+            <code class="inl">x = 4</code>. Stale! 😱</li>
+          </ul>
+          <p>Check the rule: W + R = 1 + 1 = 2, and N = 3. Since 2 ≤ 3, <strong>no overlap is guaranteed</strong>. This
+          is the fastest, most available, most write-friendly setting — and only <em>eventually</em> consistent.</p>
+        </div>
+
+        <h3>Unlocking the full spectrum</h3>
+        <p>Here's the deeper insight from the four configs above: for immediate consistency, R and W <strong>don't have
+        to be equal</strong>. All that matters is that the read set and write set <em>overlap</em>. Three knobs control
+        everything:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Knob</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><strong>X</strong> (= N)</td><td>Replication factor — minimum copies maintained for each piece of data at all times.</td></tr>
+              <tr><td><strong>R</strong></td><td>Number of reads — minimum servers that must respond with data for a read to succeed.</td></tr>
+              <tr><td><strong>W</strong></td><td>Number of writes — minimum servers that must acknowledge for a write to succeed.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The four configurations of Topic 5 are just special points in this space:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Setting</th><th>Equals</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>R = 1, W = 1</td><td>Master-slave, no consistency</td><td>Write at master, read 1 random slave — no consistency, perfect availability</td></tr>
+              <tr><td>R = 1, W = 2</td><td>Master-slave, eventual consistency</td><td>Write master + 1 slave, read 1 slave — eventual consistency, high availability</td></tr>
+              <tr><td>R = 1, W = X</td><td>Write-everywhere</td><td>Immediate consistency</td></tr>
+              <tr><td>R = W = (X+1)/2</td><td>Quorum</td><td>Immediate consistency, balanced</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The consistency rule, restated</span>
+          <p><strong>R + W ≤ X (and W &gt; 1)</strong> → eventual consistency.<br/>
+          <strong>R + W &gt; X</strong> → the servers written to + servers read from exceeds the total available, so by
+          the <em>pigeonhole principle</em> at least one server is both written to and read from — there's an
+          <strong>overlap</strong> → <strong>immediate consistency</strong>.</p>
+        </div>
+
+        <p>Because we can choose <em>any</em> R and W, we get tremendous power:</p>
+        <ul>
+          <li>If <strong>R is low</strong> → reads are faster and more available (touch fewer servers).</li>
+          <li>If <strong>W is low</strong> → writes are faster and more available.</li>
+          <li>If <strong>R + W &gt; X</strong> → the system is immediately consistent.</li>
+        </ul>
+        <p>As <strong>R + W increases</strong>: availability drops and latency rises (more servers must be alive for
+        requests to succeed), while consistency rises (more likely to find an overlap holding the latest write). So we
+        can not only choose our consistency level — we can also <strong>tune the system for read-heavy or write-heavy</strong>
+        operation. We're no longer stuck picking just "availability" or "consistency"; we can land on <em>any</em> point
+        on the spectrum.</p>
+
+        <h3>Tuning the dials for different goals</h3>
+        <p>The beauty is you can slide W and R to favour reads, writes, or safety — sometimes <em>per query</em>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Setting (N=3)</th><th>W + R vs N</th><th>Behaviour</th><th>Good for</th></tr></thead>
+            <tbody>
+              <tr><td>W=3, R=1</td><td>4 &gt; 3 ✅</td><td>Slow writes (all copies), super-fast reads</td><td>Read-heavy data that rarely changes</td></tr>
+              <tr><td>W=1, R=3</td><td>4 &gt; 3 ✅</td><td>Super-fast writes, slow reads (read all)</td><td>Write-heavy logging/metrics</td></tr>
+              <tr><td>W=2, R=2</td><td>4 &gt; 3 ✅</td><td>Balanced, still strongly consistent</td><td>The sensible default</td></tr>
+              <tr><td>W=1, R=1</td><td>2 ≤ 3 ❌</td><td>Fastest &amp; most available, eventually consistent</td><td>When stale reads are tolerable</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">There's still a trade-off (CAP again, Session 7)</span>
+          <p>A higher W means more replicas must be <em>up</em> to accept a write — so strong consistency reduces write
+          availability during failures. With W=3 on N=3, a single replica being down blocks <em>all</em> writes.
+          Quorums don't escape CAP; they just give you a precise knob to choose your point on the spectrum.</p>
+        </div>
+
+        <h3>How real systems expose this</h3>
+        <p>This model comes from Amazon's 2007 <span class="term">Dynamo</span> paper and lives on in
+        <span class="term">Apache Cassandra</span>, Amazon DynamoDB, Riak, and others. They're
+        <span class="term">leaderless</span> — no single master; you talk to a <span class="term">coordinator</span> node
+        that fans the request out to N replicas and waits for W or R of them.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — Cassandra consistency levels</span>
+          <p>In Cassandra you set N once (the <code class="inl">replication_factor</code> per keyspace) and then choose
+          a <span class="term">consistency level</span> per statement, which sets W or R for that query:</p>
+          <pre><span class="cm">-- Keyspace pins N = 3 copies per row</span>
+<span class="kw">CREATE KEYSPACE</span> shop <span class="kw">WITH</span> replication = {
+  <span class="st">'class'</span>: <span class="st">'SimpleStrategy'</span>, <span class="st">'replication_factor'</span>: <span class="nm">3</span> };
+
+<span class="cm">-- A write that needs W = 2 (QUORUM of 3 = 2)</span>
+<span class="kw">INSERT INTO</span> shop.orders (id, total) <span class="kw">VALUES</span> (<span class="nm">42</span>, <span class="nm">99</span>)
+  <span class="kw">USING CONSISTENCY</span> QUORUM;
+
+<span class="cm">-- A read that also needs R = 2 → W+R = 4 > 3 → strong</span>
+<span class="kw">SELECT</span> total <span class="kw">FROM</span> shop.orders <span class="kw">WHERE</span> id = <span class="nm">42</span>
+  <span class="kw">USING CONSISTENCY</span> QUORUM;</pre>
+          <p>Cassandra's named levels map straight onto W and R: <code class="inl">ONE</code> = 1,
+          <code class="inl">QUORUM</code> = majority (⌊N/2⌋+1 = 2 when N=3), <code class="inl">ALL</code> = N. Use
+          <code class="inl">QUORUM</code> for both reads and writes and you've satisfied W + R &gt; N — strong
+          consistency, tuned by you, no master required.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two repair mechanisms (bonus)</span>
+          <p>What about the replicas that <em>missed</em> the write (like R3 above)? Leaderless systems heal them with
+          <span class="term">read repair</span> (when a read notices a replica is stale, it pushes the fresh value back
+          to it) and <span class="term">anti-entropy / hinted handoff</span> (background processes that catch laggards up).
+          So "eventually consistent" really does converge — these are the gears that make "eventually" happen.</p>
+        </div>
+
+        <h3>How do you write to more than one place atomically?</h3>
+        <p>Whenever a config requires writing to several servers at once (W = 2, quorum, or write-everywhere), those
+        writes must be <strong>atomic</strong> — all-or-nothing. The standard mechanism is <span class="term">Two-Phase
+        Commit (2PC)</span>: a <em>prepare</em> phase where every participant locks and votes "ready," followed by a
+        <em>commit</em> phase where the coordinator tells everyone to commit (or, if anyone voted no, to abort and roll
+        back). If it can't succeed everywhere, the partial write is rolled back and the client retries.</p>
+        <div class="callout note">
+          <span class="c-title">2PC — videos from the handout</span>
+          <ul>
+            <li>Theory: <a href="https://www.youtube.com/watch?v=-_rdWB9hN1c" target="_blank" rel="noopener">youtube.com/watch?v=-_rdWB9hN1c</a></li>
+            <li>Explanation 1: <a href="https://www.youtube.com/watch?v=eltn4x788UM" target="_blank" rel="noopener">youtube.com/watch?v=eltn4x788UM</a></li>
+            <li>Explanation 2: <a href="https://www.youtube.com/watch?v=7FgU1D4EnpQ" target="_blank" rel="noopener">youtube.com/watch?v=7FgU1D4EnpQ</a></li>
+            <li>Implementation: <a href="https://www.youtube.com/watch?v=oMhESvU87jM" target="_blank" rel="noopener">youtube.com/watch?v=oMhESvU87jM</a></li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Tune consistency with three numbers: <strong>N</strong> copies, <strong>W</strong> replicas to confirm a write,
+          <strong>R</strong> replicas to read. The rule <strong>W + R &gt; N</strong> guarantees the read and write sets
+          overlap, giving <strong>strong consistency</strong>; W + R ≤ N is faster but only eventually consistent. With
+          N=3, W=2/R=2 is the strong-yet-balanced sweet spot. <strong>Cassandra/Dynamo</strong> expose this via
+          per-query consistency levels (ONE / QUORUM / ALL).
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Four topics, one storyline: how to keep copies of your data, and how strict to be about them.</p>
+        <div class="bigidea">
+          <p>In <strong>master–slave replication</strong> a single <strong>master</strong> takes all writes and ships an
+          ordered log to read-only <strong>slaves</strong>, so <strong>read/write splitting</strong> scales reads
+          (never writes). Because slaves replay that log a beat late, they suffer <strong>replication lag</strong>; the
+          master chooses to wait for slaves (<strong>sync</strong>, safe but slow), not wait at all (<strong>async</strong>,
+          fast but can lose writes and breaks <strong>read-your-own-writes</strong>), or wait for one
+          (<strong>semi-sync</strong>, the middle). When the master dies, <strong>failover</strong> elects and
+          <strong>promotes</strong> the most caught-up slave — while guarding against <strong>split-brain</strong> with
+          majority quorums and fencing. And if you drop the single master entirely, <strong>tunable consistency</strong>
+          lets every query pick its own safety level with <strong>N</strong>, <strong>W</strong>, and <strong>R</strong>,
+          where <strong>W + R &gt; N</strong> is the line between strong and eventual consistency — exactly the CAP
+          trade-off from <a href="session-7.html">Session 7</a>, now with a precise dial.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>In master–slave replication, which operations can the slaves handle, and which must go to the master?</summary>
+          <p class="ans">Slaves serve <strong>reads</strong> (SELECTs). All <strong>writes</strong>
+          (INSERT/UPDATE/DELETE) must go to the single master. That's read/write splitting, and it's why reads scale
+          but writes don't.</p>
+        </details>
+        <details class="quiz">
+          <summary>A user updates their avatar then immediately sees the old one. What's happening and how do you fix it?</summary>
+          <p class="ans">Their write went to the master but their follow-up read hit a slave that hadn't caught up yet
+          (replication lag) — the read-your-own-writes problem. Fix by reading the user's own recently-changed data
+          from the master, using sticky reads, or waiting until the replica reaches the write's log position.</p>
+        </details>
+        <details class="quiz">
+          <summary>Which is safer against data loss on a master crash: async or semi-sync? Why?</summary>
+          <p class="ans">Semi-sync. It waits for at least one slave to confirm before acking the client, so an
+          acknowledged write always exists on a second node. Pure async acks immediately, so writes not yet shipped to
+          any slave are lost if the master dies.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is split-brain and what's the simplest way to prevent it?</summary>
+          <p class="ans">During a network partition, two nodes both believe they're master and accept conflicting
+          writes. Prevent it by requiring a node to hold a <strong>majority quorum</strong> to act as master (so only
+          one side of a partition can write) — which is why clusters use an odd number of nodes — backed by fencing/STONITH.</p>
+        </details>
+        <details class="quiz">
+          <summary>With N=3, you set W=2 and R=2. Is this strongly consistent? Show the rule.</summary>
+          <p class="ans">Yes. W + R = 2 + 2 = 4, which is greater than N = 3, so the write set and read set must
+          overlap in at least one replica — and that replica has the latest value. Strong consistency.</p>
+        </details>
+        <details class="quiz">
+          <summary>You want the fastest, most available writes and can tolerate stale reads. Roughly where do you set W and R (N=3)?</summary>
+          <p class="ans">W=1 and R=1. Then W + R = 2 ≤ N = 3, so overlap isn't guaranteed — reads may be stale — but
+          both reads and writes succeed by touching just one replica, maximising speed and availability. That's an
+          eventually-consistent configuration.</p>
+        </details>
+        <details class="quiz">
+          <summary>If the replication factor is X = 5, how many servers form the master/slave split, and what's the quorum majority?</summary>
+          <p class="ans">X = 5 means 1 master + 4 slaves (5 total copies). The majority is ceil((X+1)/2) = ceil(6/2) = 3,
+          so any quorum read or write must succeed at <strong>at least 3</strong> nodes.</p>
+        </details>
+        <details class="quiz">
+          <summary>In a write-everywhere (W = X) config, one of the slaves is down. Can a write succeed?</summary>
+          <p class="ans">No. Write-everywhere requires the write to land on <strong>all X nodes</strong>, not just the
+          ones alive. If even one replica is down or fails to acknowledge, the write is denied and the others roll back.
+          That's why write-everywhere is reserved for rare-write, read-heavy systems.</p>
+        </details>
+        <details class="quiz">
+          <summary>Does the replication factor X shrink when a replica crashes? How does quorum handle a crash with X = 7?</summary>
+          <p class="ans">No — X is a configuration parameter (minimum copies to maintain), not the live server count.
+          With X = 7 the majority is 4. If 4 servers crash, only 3 remain, so neither reads nor writes can succeed
+          (quorum needs 4) until enough replicas recover.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/10oYoc-Jnzj0B_mowFyp8DtIGT6d99V7Ni7UJpWXtvm8/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Master Slave</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li><a href="https://www.postgresql.org/docs/current/high-availability.html" target="_blank" rel="noopener">PostgreSQL — High Availability, Load Balancing &amp; Replication</a> — real-world leader/follower replication, sync vs async, and failover.</li>
+    <li><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Amazon Dynamo (SOSP 2007)</a> — quorum reads/writes (N, R, W) behind tunable consistency.</li>
+    <li><a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications (Kleppmann) — Replication chapter</a> — replication lag, read-your-writes, and promotion in depth.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-7.html"><div class="dir">← Previous</div><div class="ttl">Session 7: CAP &amp; Replication</div></a>
+        <a class="next" href="session-9.html"><div class="dir">Next →</div><div class="ttl">Session 9: SQL vs NoSQL &amp; Sharding</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 8 — Master–Slave Replication &amp; Tunable Consistency · One writer, many readers 📖</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

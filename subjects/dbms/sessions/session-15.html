@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 15 — Modern Architectures — LSM, Columnar &amp; DuckDB</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 15</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 15 · Modern Architectures</span>
+      <h1>How modern databases store and scan data fast</h1>
+      <p class="lead">
+        For most of this course we treated a database as one kind of thing — tables on disk, a B+ tree
+        index, transactions. But the engines powering real systems today (RocksDB, Cassandra, DuckDB,
+        ClickHouse) made very different design choices, on purpose. This session unpacks four of them
+        from scratch: <em>LSM trees</em> for fast writes, <em>columnar storage</em> for fast analytics,
+        the <em>DuckDB</em> engine, and how <em>RocksDB compaction</em> works. We assume you've studied
+        none of this — every topic starts with a tiny story.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#lsm">LSM trees — write-optimized storage</a></li>
+          <li><a href="#columnar">Row vs columnar storage</a></li>
+          <li><a href="#duckdb">DuckDB internals</a></li>
+          <li><a href="#rocksdb">RocksDB &amp; compaction</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. LSM TREES ===================== -->
+      <section id="lsm">
+        <h2><span class="sec-num">1</span> LSM trees — write-optimized storage</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're taking notes super fast during a lecture. You don't carefully file each note
+          into the right binder while the teacher is talking — that would be way too slow. Instead you
+          scribble everything onto a fresh notepad as it comes, in order. Later, when you have a quiet
+          moment, you tidy the scribbles into neat, sorted folders. An <strong>LSM tree</strong> works
+          exactly like that: write fast and messy now, tidy up later.</p>
+        </div>
+
+        <p>An <span class="term">LSM tree (Log-Structured Merge-tree)</span> is a way of organising data on
+        disk that is built to make <strong>writes extremely fast</strong>. The name has three parts:
+        <em>log-structured</em> (new data is appended like a log, never overwritten in place),
+        <em>merge</em> (sorted pieces get merged together over time), and <em>tree</em> (the merged pieces
+        form layers, loosely like a tree of levels). It is the storage engine behind
+        <span class="term">RocksDB</span>, <span class="term">Cassandra</span>, <span class="term">LevelDB</span>,
+        ScyllaDB, and many others.</p>
+
+        <div class="callout note">
+          <span class="c-title">Where you've seen the pieces before</span>
+          <p>Recall the <strong>write-ahead log (WAL)</strong> from Session 14 (Logging &amp; Recovery) —
+          append-only, sequential, crash-safe. LSM trees take that "appending is cheap and safe" idea and
+          make it the <em>whole</em> storage strategy, not just the recovery log. The HLD subject also covers
+          LSM trees from a systems-design angle; here we keep the <strong>database-engine</strong> lens.</p>
+        </div>
+
+        <h3>The three moving parts</h3>
+        <p>An LSM engine has three core components. Let's define each.</p>
+        <ul>
+          <li><span class="term">MemTable</span> — an in-memory, sorted structure (often a skip list or
+          balanced tree) that absorbs all incoming writes. It's fast because RAM is fast and it stays sorted
+          so it can be flushed in order.</li>
+          <li><span class="term">SSTable (Sorted String Table)</span> — an immutable file on disk holding
+          key→value pairs <em>in sorted order</em>. "Immutable" means once written it is never edited — only
+          replaced by a later merge. This is the on-disk home of your data.</li>
+          <li><span class="term">Compaction</span> — a background job that merges several SSTables into fewer,
+          larger, still-sorted SSTables, throwing away stale/overwritten entries. This is the "tidy up later"
+          step (covered in depth in Topic 4).</li>
+        </ul>
+
+        <h3>The write path, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">1. WAL append</div><div class="s-d">Write to log for crash safety</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">2. MemTable</div><div class="s-d">Insert into sorted RAM table</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">3. Flush</div><div class="s-d">When full, write out as an SSTable</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧹</div><div class="s-t">4. Compact</div><div class="s-d">Merge SSTables in the background</div></div>
+        </div>
+
+        <p>The magic is that every write is just an <strong>append</strong>: into the WAL (sequential disk
+        write) and into the MemTable (in-memory). There is no hunting around the disk to find the exact spot
+        to overwrite. Sequential writes are <em>dramatically</em> faster than random writes on both spinning
+        disks and SSDs, which is why LSM engines shine at write-heavy workloads (logging, time-series,
+        messaging, metrics).</p>
+
+        <div class="callout note">
+          <span class="c-title">How do updates and deletes work if files are immutable?</span>
+          <p>You never edit an SSTable. To <strong>update</strong> a key, you just write the new value — it lands
+          in the MemTable and a newer SSTable, and reads always take the newest version. To <strong>delete</strong>,
+          you write a special marker called a <span class="term">tombstone</span> that says "this key is gone."
+          The old value still physically exists until compaction finally drops both it and the tombstone. So
+          even deletes are writes!</p>
+        </div>
+
+        <h3>The read path — and why it's harder</h3>
+        <p>Reading is the trade-off. A key might live in the MemTable, or in any of several SSTables across
+        several levels. A read must check them <strong>newest-first</strong> until it finds the key:</p>
+        <ol>
+          <li>Check the MemTable (RAM — fast).</li>
+          <li>Check each SSTable, newest to oldest, until found.</li>
+        </ol>
+        <p>To avoid touching every file, LSM engines use two tricks. A <span class="term">Bloom filter</span>
+        per SSTable — a tiny probabilistic structure that can say "this key is <em>definitely not</em> here"
+        (so you skip the file entirely) or "maybe here." And a <span class="term">sparse index</span> /
+        block index that maps key ranges to file offsets so a lookup reads only one small block. Because
+        each SSTable is sorted, a binary search inside the right block finishes the job.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a tiny LSM key-value store</span>
+          <p>Watch the same key get written, updated, and read. Operations arrive top to bottom:</p>
+          <pre><span class="cm"># Writes arrive (each is just an append):</span>
+PUT user:42 = "Ann"      <span class="cm"># goes to MemTable</span>
+PUT user:99 = "Bo"       <span class="cm"># goes to MemTable</span>
+<span class="cm"># MemTable fills up → flushed to disk as SSTable-1 (sorted):</span>
+SSTable-1 = { user:42 -&gt; "Ann", user:99 -&gt; "Bo" }
+
+PUT user:42 = "Annie"    <span class="cm"># NEW value, just appended to MemTable</span>
+DELETE user:99           <span class="cm"># writes a tombstone, not an erase</span>
+<span class="cm"># MemTable flushed again → SSTable-2 (newer):</span>
+SSTable-2 = { user:42 -&gt; "Annie", user:99 -&gt; &lt;tombstone&gt; }
+
+<span class="cm"># READ user:42  → check MemTable (miss), then SSTable-2 (newest)</span>
+<span class="cm">#   → finds "Annie". Stops. Never even looks at SSTable-1.</span>
+<span class="cm"># READ user:99  → SSTable-2 has a tombstone → returns "not found".</span>
+
+<span class="cm"># Later, COMPACTION merges SSTable-1 + SSTable-2 into one:</span>
+SSTable-3 = { user:42 -&gt; "Annie" }   <span class="cm"># old "Ann" &amp; the tombstone are dropped</span></pre>
+          <p>Notice: nothing was ever overwritten in place. New facts simply shadow old ones, and compaction
+          eventually reclaims the space. That is the whole LSM philosophy in one example.</p>
+        </div>
+
+        <h3>LSM vs B+ tree — write-optimized vs read-optimized</h3>
+        <p>Recall the <span class="term">B+ tree</span> from our indexing session: a balanced tree kept sorted
+        and updated <em>in place</em>. It's the classic engine behind PostgreSQL, MySQL/InnoDB, and most
+        traditional databases. Here's the fundamental contrast:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>B+ tree (read-optimized)</th><th>LSM tree (write-optimized)</th></tr></thead>
+            <tbody>
+              <tr><td>Writes</td><td>Update a page <em>in place</em> → often a <strong>random</strong> disk write; may split pages.</td><td>Append to log + MemTable → <strong>sequential</strong>, very fast.</td></tr>
+              <tr><td>Point reads</td><td>One tree traversal, data lives in exactly one place. Predictable, fast.</td><td>May check MemTable + several SSTables (mitigated by Bloom filters).</td></tr>
+              <tr><td>Range scans</td><td>Excellent — leaves are linked in sorted order.</td><td>Good, but must merge sorted runs from multiple files.</td></tr>
+              <tr><td>Space</td><td>Compact; some fragmentation from page splits.</td><td>Temporary duplicates (old + new) until compaction; tombstones linger.</td></tr>
+              <tr><td>Best for</td><td>Read-heavy, mixed OLTP, predictable latency.</td><td>Write-heavy: logs, metrics, time-series, high ingest.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The catch: amplification</span>
+          <p>LSM's "write now, tidy later" isn't free. Compaction <em>re-writes</em> data multiple times as it
+          moves down the levels — this is <span class="term">write amplification</span>. And one logical read
+          may touch several files — <span class="term">read amplification</span>. We unpack these trade-offs and
+          how to tune them in Topic 4.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An LSM tree turns every write into a cheap append: into a WAL and an in-memory <strong>MemTable</strong>,
+          flushed to immutable sorted <strong>SSTables</strong>, with background <strong>compaction</strong> merging
+          and cleaning them. Updates shadow old values; deletes write tombstones. It trades slightly harder reads
+          (helped by Bloom filters) for blazing-fast writes — the opposite balance from an in-place B+ tree.
+        </div>
+      </section>
+
+      <!-- ===================== 2. ROW VS COLUMNAR ===================== -->
+      <section id="columnar">
+        <h2><span class="sec-num">2</span> Row vs columnar storage</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a big class register. You could store it as one card per student with all their info on
+          it (name, age, grade, address) — grab a card and you know everything about one kid. Or you could
+          store it as separate lists: a list of all names, a list of all ages, a list of all grades. If the
+          teacher asks "what's the <em>average</em> age?", the second way is way easier — just read the ages
+          list and ignore everything else. <strong>Row storage</strong> is one-card-per-kid;
+          <strong>columnar storage</strong> is one-list-per-thing.</p>
+        </div>
+
+        <p>How a database physically lays bytes on disk decides what it's good at. There are two layouts.</p>
+        <ul>
+          <li><span class="term">Row storage (row-oriented)</span> — all the columns of one row are stored
+          together, then the next row, and so on. Great when you want whole records.</li>
+          <li><span class="term">Columnar storage (column-oriented)</span> — all the values of one column are
+          stored together, then the next column. Great when you want one column across many rows.</li>
+        </ul>
+
+        <h3>OLTP vs OLAP — two different jobs</h3>
+        <p>This connects to two workload types you should know cold:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>OLTP</th><th>OLAP</th></tr></thead>
+            <tbody>
+              <tr><td>Stands for</td><td><span class="term">Online Transaction Processing</span></td><td><span class="term">Online Analytical Processing</span></td></tr>
+              <tr><td>Typical query</td><td>"Fetch / update <em>this one order</em>."</td><td>"Sum revenue by month across 2 billion rows."</td></tr>
+              <tr><td>Touches</td><td>Few rows, <em>all</em> their columns.</td><td>Few columns, <em>huge</em> number of rows.</td></tr>
+              <tr><td>Pattern</td><td>Many small reads/writes.</td><td>Big scans &amp; aggregations, mostly read-only.</td></tr>
+              <tr><td>Best layout</td><td><strong>Row</strong> (e.g. PostgreSQL, MySQL).</td><td><strong>Columnar</strong> (e.g. DuckDB, ClickHouse, Snowflake).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Why analytics scans favour columnar — the picture</h3>
+        <p>Imagine a <code class="inl">sales</code> table with columns <code class="inl">id, customer, region,
+        amount</code> and millions of rows. Here's how the two layouts store the same first three rows on disk:</p>
+        <pre><span class="cm"># ROW layout — fields of a row are adjacent:</span>
+[ 1, "Ann", "EU", 50 ] [ 2, "Bo", "US", 80 ] [ 3, "Cy", "EU", 20 ] ...
+
+<span class="cm"># COLUMNAR layout — same field across rows is adjacent:</span>
+id:       [ 1, 2, 3, ... ]
+customer: [ "Ann", "Bo", "Cy", ... ]
+region:   [ "EU", "US", "EU", ... ]
+amount:   [ 50, 80, 20, ... ]</pre>
+
+        <p>Now run <code class="inl">SELECT SUM(amount) FROM sales;</code>. The database reads data off disk in
+        fixed-size blocks. In the <strong>row</strong> layout, every block you read is stuffed with
+        <code class="inl">id</code>, <code class="inl">customer</code>, and <code class="inl">region</code> bytes
+        you don't care about — you drag the whole row in just to grab one number. In the <strong>columnar</strong>
+        layout, the <code class="inl">amount</code> values sit packed together, so you read <em>only</em> that
+        column and nothing else. On a billion-row table that's the difference between reading 4 columns' worth of
+        bytes and reading 1 — often a 5–50× reduction in I/O.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Analytics queries are <strong>narrow but deep</strong>: a few columns, billions of rows. Columnar
+          layout reads only the columns a query touches, so it moves far less data off disk. That single property
+          — <strong>I/O proportional to columns used, not columns stored</strong> — is the heart of every analytical
+          database.</p>
+        </div>
+
+        <h3>Bonus 1: compression gets way better</h3>
+        <p>When values of the <em>same type and meaning</em> sit next to each other, they compress
+        spectacularly — far better than a jumble of mixed-type row data. Two classic schemes:</p>
+        <ul>
+          <li><span class="term">Run-Length Encoding (RLE)</span> — replace a run of repeated values with
+          (value, count). A <code class="inl">region</code> column that's sorted into long stretches of "EU"
+          becomes <code class="inl">("EU", 1_000_000)</code> instead of a million copies.</li>
+          <li><span class="term">Dictionary encoding</span> — build a small dictionary of distinct values and
+          store cheap integer codes instead of the full values. Great for low-cardinality columns (few distinct
+          values) like <code class="inl">region</code>, <code class="inl">status</code>, or country codes.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — dictionary + RLE on a region column</span>
+          <pre><span class="cm"># Raw region column (lots of repetition):</span>
+["EU","EU","EU","US","US","EU","EU","EU","EU","ASIA"]
+
+<span class="cm"># Step 1 — Dictionary encoding (map strings → small ints):</span>
+dict   = { 0: "EU", 1: "US", 2: "ASIA" }
+codes  = [0,0,0,1,1,0,0,0,0,2]      <span class="cm"># tiny ints instead of strings</span>
+
+<span class="cm"># Step 2 — Run-Length Encode the codes:</span>
+rle    = [(0,3), (1,2), (0,4), (2,1)]   <span class="cm"># (value, run-length)</span>
+
+<span class="cm"># 10 strings  →  4 little pairs. And a filter like</span>
+<span class="cm"># WHERE region = 'EU' becomes "where code == 0" — integer compares, fast.</span></pre>
+          <p>Less disk read, less memory, <em>and</em> faster comparisons. Compression here isn't just about
+          saving space — smaller data means fewer bytes to move, which directly speeds up the scan.</p>
+        </div>
+
+        <h3>Bonus 2: vectorized execution</h3>
+        <p>The second columnar superpower is how the data gets processed. Traditional row engines use the
+        <span class="term">Volcano / tuple-at-a-time model</span>: ask for one row, process it, ask for the next
+        — one row through the whole pipeline at a time, with a function call per row. That's a lot of overhead
+        per value.</p>
+        <p>Columnar engines instead use <span class="term">vectorized execution</span>: process data in
+        <strong>batches (vectors) of a few thousand values from one column at a time</strong>. One tight loop
+        runs over a whole batch. This is cache-friendly, branch-predictor-friendly, and lets the CPU use
+        <span class="term">SIMD</span> (Single Instruction, Multiple Data — one CPU instruction adds many numbers
+        at once). The overhead per row collapses.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why vectorized + columnar are a perfect match</span>
+          <p>Columnar storage hands you a contiguous array of one column's values — exactly the shape a tight
+          vectorized loop (and SIMD) wants. Row storage would force you to gather one field out of each scattered
+          row first. So columnar layout and vectorized execution reinforce each other: the storage format feeds
+          the execution model. DuckDB (next topic) is built on precisely this pairing.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Don't use columnar for OLTP</span>
+          <p>The flip side: fetching or updating <em>one whole row</em> in a columnar store means touching every
+          column file separately, and inserting a single row is awkward when data is packed and compressed by
+          column. For "give me order #12345" or "update this user's email," a row store wins easily. Pick the
+          layout that matches the workload — there's no universally best answer.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Row storage keeps a record's fields together (great for OLTP — whole rows); columnar storage keeps a
+          column's values together (great for OLAP — scan a few columns over billions of rows). Columnar reads
+          only the columns a query needs, compresses brilliantly with <strong>RLE</strong> and
+          <strong>dictionary encoding</strong>, and pairs naturally with <strong>vectorized execution</strong>
+          and SIMD for big analytical speedups.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DUCKDB ===================== -->
+      <section id="duckdb">
+        <h2><span class="sec-num">3</span> DuckDB internals — the "SQLite for analytics"</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Most databases are like a restaurant: you (the app) phone in your order, a separate kitchen
+          (the database server) cooks it, and a waiter carries the food back and forth over the network.
+          <strong>DuckDB</strong> is like having a tiny chef living <em>inside your own kitchen</em> — no phone
+          call, no waiter, no separate building. You hand it a question and it answers right there in your
+          program. And this chef specialises in big number-crunching meals (analytics), fast.</p>
+        </div>
+
+        <p><span class="term">DuckDB</span> is an open-source analytical database often described as
+        <strong>"SQLite for analytics."</strong> SQLite proved you don't always need a big client–server
+        database — sometimes you want a fast database that just runs <em>inside</em> your application as a
+        library. SQLite is row-oriented and aimed at transactional, embedded use. DuckDB takes the same
+        embedded idea but builds it for <strong>analytics</strong> instead. Three design pillars define it:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔌</div><div class="s-t">In-process</div><div class="s-d">Runs as a library, no server</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">📊</div><div class="s-t">Columnar</div><div class="s-d">Column-oriented storage</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">Vectorized</div><div class="s-d">Batch (vector) execution engine</div></div>
+        </div>
+
+        <h3>Pillar 1 — In-process (embedded)</h3>
+        <p>DuckDB runs <em>in the same process</em> as your application — there is no separate server to install,
+        configure, start, or connect to over a network. You just <code class="inl">import duckdb</code> (or link
+        the C++ library) and go. Because there's no client–server boundary, query results don't have to be
+        serialised and shipped over a socket — DuckDB can hand data straight to your program's memory. For data
+        scientists this is huge: it reads directly from Pandas/Polars DataFrames, Parquet, and CSV files with
+        almost zero copying.</p>
+
+        <h3>Pillar 2 — Columnar storage</h3>
+        <p>From Topic 2, you already know why this matters: analytical queries scan a few columns over many rows,
+        and columnar layout reads only those columns and compresses them well. DuckDB stores data column-by-column
+        (and reads Parquet, itself a columnar file format, natively).</p>
+
+        <h3>Pillar 3 — Vectorized execution</h3>
+        <p>Also from Topic 2: DuckDB processes data in vectors (batches of ~1–2 thousand values) rather than one
+        row at a time, keeping the CPU cache hot and enabling SIMD. This is what makes its big
+        <code class="inl">GROUP BY</code> and aggregation queries fly on a single laptop.</p>
+
+        <div class="callout key">
+          <span class="c-title">Why DuckDB is fast for analytics</span>
+          <p>It's not one trick — it's the <strong>combination</strong>: columnar storage means it reads only the
+          needed columns (low I/O); compression means fewer bytes to move; vectorized execution means the CPU
+          chews through those columns in tight, SIMD-friendly batches (low CPU overhead); and being in-process
+          means no network or serialization tax. Each pillar removes a different bottleneck of an analytical scan.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — DuckDB querying a Parquet file directly</span>
+          <pre><span class="kw">import</span> duckdb
+
+<span class="cm"># No server, no setup, no loading step — query a file in place:</span>
+result = duckdb.sql(<span class="st">"""
+    SELECT region, SUM(amount) AS revenue
+    FROM 'sales.parquet'      -- read the columnar file directly
+    WHERE year = 2025
+    GROUP BY region
+    ORDER BY revenue DESC
+"""</span>)
+result.show()
+
+<span class="cm"># It scans ONLY the region, amount, and year columns (columnar),</span>
+<span class="cm"># skipping every other column in the file, and processes them in</span>
+<span class="cm"># vectorized batches — all inside your Python process.</span></pre>
+          <p>Notice you query a file as if it were a table, with no import step. DuckDB pushes the column
+          selection and the <code class="inl">WHERE year = 2025</code> filter down into the Parquet reader, so it
+          never even reads the columns or row-groups it doesn't need.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">📝 The written assignment — "analyze DuckDB vs PostgreSQL"</span>
+          <p>Your written assignment for this session is to <strong>analyze DuckDB vs PostgreSQL</strong>. The
+          point isn't "which is better" — it's "which fits which job," and <em>why</em>, grounded in everything
+          above. A good answer frames it as OLAP vs OLTP:</p>
+          <ul>
+            <li><strong>Architecture:</strong> PostgreSQL is a client–server system (a running server you connect
+            to, supporting many concurrent users); DuckDB is in-process/embedded (a library inside one app).</li>
+            <li><strong>Storage:</strong> PostgreSQL is row-oriented (great for fetching/updating individual rows);
+            DuckDB is columnar (great for scanning a few columns over millions of rows).</li>
+            <li><strong>Execution:</strong> PostgreSQL uses largely tuple-at-a-time execution tuned for OLTP;
+            DuckDB uses vectorized execution tuned for OLAP scans.</li>
+            <li><strong>Concurrency &amp; writes:</strong> PostgreSQL handles many concurrent transactional
+            writers with full MVCC (recall our transactions/isolation sessions); DuckDB is built mainly for
+            read-heavy analytics, typically a single writer.</li>
+            <li><strong>When to use each:</strong> PostgreSQL for the transactional system of record (orders,
+            users, payments — many small reads/writes); DuckDB for fast local analytics over that data
+            (dashboards, ad-hoc aggregation, data-science notebooks). They're complementary, not rivals — many
+            teams use Postgres as the source of truth and DuckDB to crunch extracts of it.</li>
+          </ul>
+          <p>Tip: run the <em>same</em> aggregation query on a large table in both and report the timings and why
+          they differ — that turns the theory above into evidence.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          DuckDB is the "SQLite for analytics": an <strong>in-process</strong> (embedded, no server),
+          <strong>columnar</strong>, <strong>vectorized</strong> database. Those three pillars each kill a
+          different bottleneck of an analytical scan, which is why it's so fast on a single machine. For the
+          assignment, contrast it with PostgreSQL as <strong>OLAP (DuckDB) vs OLTP (Postgres)</strong>: columnar
+          vs row, vectorized vs tuple-at-a-time, embedded analytics vs concurrent transactional server.
+        </div>
+      </section>
+
+      <!-- ===================== 4. ROCKSDB & COMPACTION ===================== -->
+      <section id="rocksdb">
+        <h2><span class="sec-num">4</span> RocksDB &amp; compaction</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back to your messy lecture notes. Over the day you fill up notepad after notepad. If you never
+          tidy them, finding one fact means flipping through <em>every</em> pad — slow. So you have a cleanup
+          rule. One option: every evening, merge all small pads into a few big sorted binders (tidy, but a lot
+          of recopying). Another: just stack pads of similar size and only merge when you have a whole pile of
+          them (less recopying, but messier to search). <strong>Compaction</strong> is that cleanup rule, and
+          the two options are <em>leveled</em> vs <em>tiered</em>.</p>
+        </div>
+
+        <p><span class="term">RocksDB</span> is Facebook/Meta's high-performance embedded key-value store, built
+        on the LSM tree from Topic 1 (it grew out of Google's LevelDB). It's a <em>library</em> embedded in your
+        app — much like DuckDB is embedded, but RocksDB is a transactional key-value engine, not an analytics
+        engine. It powers the storage layer of countless systems (Kafka Streams, CockroachDB, TiKV, MySQL's
+        MyRocks, and more). The single most important thing to tune in an LSM engine is
+        <strong>compaction</strong>, so let's go deep.</p>
+
+        <h3>Why compaction exists</h3>
+        <p>Every MemTable flush creates a new SSTable. Without cleanup you'd accumulate thousands of small,
+        overlapping files — reads would have to check too many of them, and stale values/tombstones would waste
+        space forever. <span class="term">Compaction</span> merges SSTables into fewer, larger, sorted files and
+        drops obsolete entries. The <em>strategy</em> for doing this is a fundamental trade-off.</p>
+
+        <h3>Leveled compaction</h3>
+        <p><span class="term">Leveled compaction</span> (LevelDB's and RocksDB's default) organises SSTables into
+        levels L0, L1, L2, … Each level is roughly <strong>10× larger</strong> than the one above. Crucially,
+        <strong>within each level (from L1 down) the key ranges of SSTables do not overlap</strong> — each level
+        is effectively one sorted run split into files. When a level gets too big, some of its data is merged
+        <em>down</em> into the next level.</p>
+        <ul>
+          <li><strong>Reads are good:</strong> below L0, a given key can be in at most one file per level, so a
+          point lookup checks few files.</li>
+          <li><strong>Space is good:</strong> aggressive merging keeps duplicates/tombstones from piling up, so
+          wasted space is low.</li>
+          <li><strong>Writes cost more:</strong> moving data down a level rewrites overlapping data repeatedly →
+          higher <em>write amplification</em>.</li>
+        </ul>
+
+        <h3>Tiered compaction</h3>
+        <p><span class="term">Tiered compaction</span> (also called size-tiered, the default in Cassandra) instead
+        lets several SSTables of <em>similar size</em> accumulate in a tier, and only merges them once you have
+        enough — producing one bigger file that joins the next tier. It rewrites data far less often.</p>
+        <ul>
+          <li><strong>Writes are cheap:</strong> data is merged fewer times → low <em>write amplification</em>.</li>
+          <li><strong>Reads cost more:</strong> several overlapping files can hold the same key range, so a lookup
+          may check more files → higher <em>read amplification</em>.</li>
+          <li><strong>Space costs more:</strong> multiple un-merged copies of overlapping data coexist → higher
+          <em>space amplification</em>.</li>
+        </ul>
+
+        <h3>The three amplifications — the core trade-off</h3>
+        <p>You cannot optimize all three at once; this is the famous <span class="term">RUM trade-off</span> of
+        LSM tuning. Define them precisely:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Term</th><th>Definition</th><th>Plain English</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Write amplification</span></td><td>Bytes actually written to disk ÷ bytes of logical data written by the user.</td><td>How many times your data gets re-written by compaction.</td></tr>
+              <tr><td><span class="term">Read amplification</span></td><td>Number of disk reads (files/blocks checked) per logical read.</td><td>How many places you must look to answer one query.</td></tr>
+              <tr><td><span class="term">Space amplification</span></td><td>Bytes stored on disk ÷ bytes of live logical data.</td><td>How much extra disk is wasted on stale copies &amp; tombstones.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — same workload, two strategies</span>
+          <p>Suppose you ingest data and it eventually settles across several SSTables. Compare the two
+          strategies on the three amplifications (lower is better):</p>
+          <pre><span class="cm"># LEVELED compaction (RocksDB default)</span>
+write_amp  = HIGH    <span class="cm"># data rewritten as it cascades L0→L1→L2…</span>
+read_amp   = LOW     <span class="cm"># ≤1 file per level below L0 for a key</span>
+space_amp  = LOW     <span class="cm"># duplicates aggressively merged away</span>
+<span class="cm"># → choose for READ-heavy &amp; space-sensitive workloads</span>
+
+<span class="cm"># TIERED (size-tiered) compaction (Cassandra default)</span>
+write_amp  = LOW     <span class="cm"># data merged far fewer times</span>
+read_amp   = HIGH    <span class="cm"># several overlapping files may hold the key</span>
+space_amp  = HIGH    <span class="cm"># un-merged copies coexist</span>
+<span class="cm"># → choose for WRITE-heavy / high-ingest workloads</span></pre>
+          <p>The rule of thumb: <strong>leveled trades write amplification for low read &amp; space
+          amplification; tiered trades read &amp; space amplification for low write amplification.</strong> Pick
+          based on whether your workload is read-heavy (leveled) or write-heavy (tiered).</p>
+        </div>
+
+        <h3>Tuning knobs you'll actually meet</h3>
+        <ul>
+          <li><strong>Compaction style</strong> — leveled vs tiered (RocksDB calls the latter "universal"), the
+          biggest lever, set by your read/write ratio.</li>
+          <li><strong>MemTable size &amp; count</strong> — bigger MemTables = fewer, larger flushes = less
+          compaction churn, at the cost of more RAM and longer recovery.</li>
+          <li><strong>Level size multiplier</strong> (default ~10) and <strong>L0 file trigger</strong> — control
+          how aggressively data cascades down.</li>
+          <li><strong>Bloom filter bits per key</strong> — more bits = fewer wasted file reads (lower read
+          amplification) for a little extra memory.</li>
+          <li><strong>Block size &amp; compression</strong> (e.g. LZ4, Zstd per level) — trade CPU for disk I/O
+          and space.</li>
+        </ul>
+
+        <h3>Comparison of engines</h3>
+        <p>Pulling this session together, here's how the engines we've discussed line up:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Engine</th><th>Core structure</th><th>Layout</th><th>Deploy</th><th>Sweet spot</th></tr></thead>
+            <tbody>
+              <tr><td><strong>RocksDB</strong></td><td>LSM tree</td><td>Row / key-value</td><td>Embedded library</td><td>Write-heavy KV: state stores, metadata, high ingest.</td></tr>
+              <tr><td><strong>Cassandra</strong></td><td>LSM tree (tiered)</td><td>Wide-column (row-ish)</td><td>Distributed server</td><td>Massive write-heavy, horizontally scaled.</td></tr>
+              <tr><td><strong>PostgreSQL / InnoDB</strong></td><td>B+ tree</td><td>Row</td><td>Client–server</td><td>OLTP system of record, mixed read/write.</td></tr>
+              <tr><td><strong>DuckDB</strong></td><td>Vectorized engine</td><td>Columnar</td><td>Embedded library</td><td>Local OLAP analytics, data science.</td></tr>
+              <tr><td><strong>ClickHouse</strong></td><td>MergeTree (LSM-like)</td><td>Columnar</td><td>Client–server</td><td>Large-scale OLAP at server scale.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">There's no free lunch</span>
+          <p>Every choice here is a trade-off, not an upgrade. LSM buys fast writes by paying in read &amp; write
+          amplification. Columnar buys fast scans by making single-row OLTP awkward. Leveled compaction buys read
+          performance by paying write amplification. Good database engineering is choosing which cost you can
+          afford for <em>your</em> workload.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          RocksDB is an embedded LSM key-value engine, and compaction is its key tuning lever.
+          <strong>Leveled</strong> compaction keeps non-overlapping levels (low read &amp; space amplification,
+          high write amplification — good for reads); <strong>tiered</strong> compaction merges similar-sized
+          files less often (low write amplification, high read &amp; space amplification — good for writes). You
+          can't minimise write, read, and space amplification all at once — you tune the balance to your workload.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>Every topic this session was really one lesson seen from different angles: <strong>the right data
+        structure depends entirely on the workload.</strong> Here's the one-paragraph story tying it together:</p>
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Traditional databases use in-place <strong>B+ trees</strong> — read-optimized, great for OLTP. When
+          you need to ingest writes blindingly fast, you flip the trade-off with an <strong>LSM tree</strong>:
+          append to a <strong>MemTable</strong>, flush immutable <strong>SSTables</strong>, and clean up later via
+          <strong>compaction</strong> — the design behind <strong>RocksDB</strong> and Cassandra, whose
+          <strong>leveled vs tiered</strong> compaction lets you trade <strong>write / read / space
+          amplification</strong>. When instead you need to <em>scan</em> a few columns over billions of rows
+          (OLAP), you change the <em>layout</em> to <strong>columnar</strong>, which reads only the columns you
+          touch, compresses them with <strong>RLE</strong> and <strong>dictionary encoding</strong>, and processes
+          them with <strong>vectorized execution</strong> and SIMD. <strong>DuckDB</strong> packages exactly that —
+          in-process, columnar, vectorized — into the "SQLite for analytics," the natural OLAP counterpart to a
+          row-oriented OLTP database like PostgreSQL.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why are writes so fast in an LSM tree compared to a B+ tree?</summary>
+          <p class="ans">LSM turns every write into a sequential append (to the WAL and the in-memory MemTable),
+          which is much faster than a B+ tree's in-place, often-random page update. The cost is paid later, in the
+          background, by compaction.</p>
+        </details>
+        <details class="quiz">
+          <summary>If SSTables are immutable, how does an LSM tree handle a delete?</summary>
+          <p class="ans">It writes a <em>tombstone</em> — a marker saying the key is deleted. The old value still
+          physically exists until compaction merges the files and finally drops both the old value and the
+          tombstone.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a query like <code class="inl">SELECT SUM(amount)</code> run faster on columnar storage?</summary>
+          <p class="ans">Columnar storage packs each column's values together, so the engine reads only the
+          <code class="inl">amount</code> column off disk instead of dragging in every other column of every row.
+          Far less I/O, plus better compression and vectorized processing.</p>
+        </details>
+        <details class="quiz">
+          <summary>What do RLE and dictionary encoding do, and why does columnar help them?</summary>
+          <p class="ans">RLE replaces runs of repeated values with (value, count); dictionary encoding replaces
+          values with small integer codes from a lookup table. Columnar storage puts same-type, often-repetitive
+          values next to each other, which is exactly the pattern these schemes compress best.</p>
+        </details>
+        <details class="quiz">
+          <summary>What are DuckDB's three design pillars, and why is each fast for analytics?</summary>
+          <p class="ans">In-process (no network/server tax), columnar (reads only needed columns, compresses well),
+          and vectorized execution (batch processing with SIMD, low per-row overhead). Together they remove the
+          main bottlenecks of an analytical scan.</p>
+        </details>
+        <details class="quiz">
+          <summary>Compare leveled vs tiered compaction in terms of the three amplifications.</summary>
+          <p class="ans">Leveled = low read &amp; space amplification but high write amplification (good for
+          read-heavy/space-sensitive). Tiered = low write amplification but high read &amp; space amplification
+          (good for write-heavy). You can't minimise all three at once — that's the RUM trade-off.</p>
+        </details>
+        <details class="quiz">
+          <summary>You're building the transactional store for an e-commerce checkout. Row or columnar? Why?</summary>
+          <p class="ans">Row storage (e.g. PostgreSQL). Checkout is OLTP: many small reads/writes of whole records
+          (one order, one user). Row layout keeps a record's fields together, which is ideal for fetching and
+          updating individual rows.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 15 — Modern Architectures"</strong>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 Database Systems</a> — the gold-standard course; its storage-models and modern-systems lectures cover row vs columnar, LSM trees, and vectorized execution in depth.</li>
+          <li><a href="https://stratos.seas.harvard.edu/files/stratos/files/columnstoresfntdbs.pdf" target="_blank" rel="noopener">The Design and Implementation of Modern Column-Oriented Database Systems (Abadi et al.)</a> — the definitive survey of columnar storage, compression, and vectorized execution.</li>
+          <li><a href="https://duckdb.org/docs/" target="_blank" rel="noopener">DuckDB Documentation</a> — official docs for the in-process analytical database; great for the DuckDB-vs-PostgreSQL assignment.</li>
+          <li><a href="https://github.com/facebook/rocksdb/wiki" target="_blank" rel="noopener">RocksDB Wiki</a> — the authoritative reference on LSM internals, compaction styles (leveled/universal), and tuning.</li>
+          <li><a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf" target="_blank" rel="noopener">The Log-Structured Merge-Tree (O'Neil et al., 1996)</a> — the original LSM tree paper that started it all.</li>
+          <li><a href="https://duckdb.org/2021/06/25/querying-parquet.html" target="_blank" rel="noopener">Querying Parquet with Precision using DuckDB</a> — official write-up showing column/row-group pushdown in action.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-14.html"><div class="dir">← Previous</div><div class="ttl">Session 14: Logging &amp; Recovery</div></a>
+        <a class="next" href="session-16.html"><div class="dir">Next →</div><div class="ttl">Session 16: Distributed Databases</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 15 — Modern Architectures · You learned how real engines store and scan data 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

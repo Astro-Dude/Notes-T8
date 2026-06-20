@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 14 — Logging &amp; Recovery (ARIES)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 14</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 14 · Logging &amp; Recovery</span>
+      <h1>What happens to your data when the database crashes?</h1>
+      <p class="lead">
+        Power cuts out. The server reboots. A process gets killed in the middle of moving money between
+        two bank accounts. Somehow, when the database comes back up, everything is still correct — your
+        money didn't vanish into thin air. This session is the story of <em>how</em> that magic works.
+        We assume you've studied <em>none</em> of this before. Every topic starts with a tiny "explain
+        like I'm 5" story, then we build up the real machinery — write-ahead logging, checkpoints, and
+        the famous ARIES recovery algorithm — one careful step at a time.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 24 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#durability">The durability problem</a></li>
+          <li><a href="#wal">Write-Ahead Logging (WAL)</a></li>
+          <li><a href="#checkpoints">Checkpoints</a></li>
+          <li><a href="#aries">ARIES recovery</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. DURABILITY ===================== -->
+      <section id="durability">
+        <h2><span class="sec-num">1</span> The durability problem</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're doing homework on a whiteboard because it's quick to write on. Every now and then
+          you copy the finished bits into your notebook, because the notebook is what you keep forever — the
+          whiteboard gets wiped clean every night. Now: what if the lights go out <em>while</em> you're
+          half-way through copying? Did your work survive? A database has the exact same problem. It does
+          fast work on a "whiteboard" in memory, and slowly copies it to a "notebook" on disk. A crash can
+          strike at the worst possible moment — and the database still has to come back perfectly correct.</p>
+        </div>
+
+        <p>Back in <strong>Session 12</strong> we met the <span class="term">ACID</span> properties that a
+        transaction must guarantee. Two of those letters are the whole reason this session exists:</p>
+        <ul>
+          <li><span class="term">Atomicity</span> — a transaction is <strong>all-or-nothing</strong>. Either
+          every change it makes happens, or none of them do. A crash must never leave us with "half a
+          transaction" (money debited from one account but never credited to the other).</li>
+          <li><span class="term">Durability</span> — once a transaction is reported as <strong>committed</strong>,
+          its changes survive <em>forever</em>, even if the machine loses power one millisecond later.</li>
+        </ul>
+
+        <p>The job of the <span class="term">recovery manager</span> — the component we study this whole
+        session — is to guarantee Atomicity and Durability <strong>even in the face of crashes</strong>.</p>
+
+        <h3>Two places your data can live</h3>
+        <p>To see the problem clearly, you must understand the two layers of storage a database juggles. This
+        is the single most important picture in the whole session.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">Buffer pool</div><div class="s-d">In RAM — fast but <strong>volatile</strong> (wiped on crash)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">Disk</div><div class="s-d">On the drive — slow but <strong>non-volatile</strong> (survives crashes)</div></div>
+        </div>
+
+        <p>The <span class="term">buffer pool</span> is a chunk of main memory (RAM) where the database keeps
+        copies of <span class="term">pages</span> — fixed-size blocks (often 4&nbsp;KB or 8&nbsp;KB) of the
+        data file. When a transaction reads or writes a row, it actually reads/writes the in-memory copy in
+        the buffer pool, because RAM is roughly a <em>hundred thousand times</em> faster than a disk seek.
+        We covered the buffer pool's mechanics in <strong>Session 3</strong>; here we care about one fact:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>RAM is <strong>volatile</strong> — when the power dies, everything in the buffer pool vanishes
+          instantly. Disk is <strong>non-volatile</strong> — it survives. So the eternal question is:
+          <em>at the moment of the crash, which changes had reached disk, and which were still only in RAM?</em>
+          Recovery is entirely about answering that question and fixing up the difference.</p>
+        </div>
+
+        <h3>Dirty pages</h3>
+        <p>When a transaction modifies a page in the buffer pool but that change hasn't yet been written back
+        to disk, we call that page <span class="term">dirty</span>. A dirty page is dangerous: the new data
+        exists <em>only</em> in volatile memory. If we crash now, that change is gone unless we did something
+        clever beforehand (we did — it's called logging, Topic 2).</p>
+
+        <p>Eventually the database <em>flushes</em> dirty pages to disk (writes them out), making them
+        "clean" again. But <strong>when</strong> it is allowed to flush, and <strong>when</strong> it is
+        forced to flush, is governed by two policy decisions.</p>
+
+        <h3>The two policy knobs: STEAL and FORCE</h3>
+        <p>These two policies define the relationship between committing a transaction and writing its pages
+        to disk. They sound abstract, so we'll pin each one down precisely.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Policy</th><th>The question it answers</th><th>The two choices</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="term">STEAL</span> vs <span class="term">NO-STEAL</span></td>
+                <td>Can a dirty page from an <em>uncommitted</em> transaction be written to disk?</td>
+                <td><strong>STEAL</strong> = yes, the buffer manager may "steal" the frame and flush an
+                uncommitted page anytime it needs the memory. <strong>NO-STEAL</strong> = no, uncommitted
+                changes are pinned in RAM until commit.</td>
+              </tr>
+              <tr>
+                <td><span class="term">FORCE</span> vs <span class="term">NO-FORCE</span></td>
+                <td>Must <em>all</em> a transaction's dirty pages be on disk <em>before</em> we report
+                "committed"?</td>
+                <td><strong>FORCE</strong> = yes, flush everything at commit time. <strong>NO-FORCE</strong>
+                = no, commit can return while the pages are still only in RAM.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Each choice creates a problem that recovery must solve:</p>
+        <ul>
+          <li><strong>STEAL</strong> means an <em>uncommitted</em> change might already be sitting on disk
+          when we crash. If that transaction never commits (it has to be aborted), we must be able to
+          <span class="term">UNDO</span> it — reach onto disk and erase a change that should never have been
+          permanent.</li>
+          <li><strong>NO-FORCE</strong> means a <em>committed</em> change might <em>not</em> have reached
+          disk yet when we crash. To honour Durability, we must be able to <span class="term">REDO</span>
+          it — re-apply a committed change that got lost in the wiped buffer pool.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why every real system picks STEAL + NO-FORCE</span>
+          <p>STEAL and NO-FORCE are the <em>hardest</em> pair to recover from (they require both UNDO and
+          REDO), but they give the <strong>best runtime performance</strong>: the buffer manager is free to
+          flush whenever convenient, and commits are fast because they don't wait for slow random disk
+          writes. So virtually every serious database — PostgreSQL, MySQL/InnoDB, Oracle, SQL Server — uses
+          <strong>STEAL + NO-FORCE</strong> and pays for it with a smart logging-and-recovery scheme. That
+          scheme is the rest of this session.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the classic bank transfer</span>
+          <p>Transaction <code class="inl">T1</code> transfers $100 from account A to account B:</p>
+          <pre><span class="cm">-- both rows currently live as pages in the buffer pool</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="nm">100</span> <span class="kw">WHERE</span> id = <span class="st">'A'</span>;  <span class="cm">-- page P_A now dirty</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="nm">100</span> <span class="kw">WHERE</span> id = <span class="st">'B'</span>;  <span class="cm">-- page P_B now dirty</span>
+<span class="kw">COMMIT</span>;</pre>
+          <p>Now imagine three different crash timings, all real possibilities under STEAL + NO-FORCE:</p>
+          <ul>
+            <li><strong>Crash before COMMIT, but P_A was already stolen to disk.</strong> Disk shows A is
+            $100 poorer, B unchanged — $100 vanished! We must <strong>UNDO</strong> P_A on restart.</li>
+            <li><strong>Crash just after COMMIT, but neither page reached disk yet (NO-FORCE).</strong> Disk
+            shows the <em>old</em> balances — the committed transfer is invisible! We must
+            <strong>REDO</strong> both updates on restart.</li>
+            <li><strong>Crash long after, both pages flushed.</strong> Nothing to do — disk is already
+            correct.</li>
+          </ul>
+          <p>The point: <em>we cannot control crash timing</em>, so we need a mechanism that lets us
+          correctly UNDO or REDO any change regardless of when the lights go out. Enter the log.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Data lives in a fast, <strong>volatile</strong> buffer pool (RAM) and a slow, <strong>non-volatile</strong>
+          disk. Modified-but-not-flushed pages are <strong>dirty</strong>. Real databases use
+          <strong>STEAL + NO-FORCE</strong> for speed, which means uncommitted changes can reach disk (needs
+          UNDO) and committed changes can be missing from disk (needs REDO). Guaranteeing Atomicity and
+          Durability through arbitrary crashes is the recovery manager's job.
+        </div>
+      </section>
+
+      <!-- ===================== 2. WAL ===================== -->
+      <section id="wal">
+        <h2><span class="sec-num">2</span> Write-Ahead Logging (WAL)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before you do anything risky, you write down what you're <em>about</em> to do in a little
+          diary — "I am moving the toy from the red box to the blue box." You write in the diary
+          <strong>first</strong>, then move the toy. If you forget halfway (you got distracted), you can read
+          the diary later and either finish the move or put the toy back. The diary is tiny and quick to
+          write; moving toys around is slow. A database keeps exactly this kind of diary, called the
+          <strong>log</strong>, and the golden rule is: <em>write in the diary before you touch the toys</em>.</p>
+        </div>
+
+        <p>The central trick of recovery is the <span class="term">log</span> (also called the
+        <span class="term">transaction log</span> or <span class="term">redo log</span>): an
+        <strong>append-only</strong> file on disk where, before changing any data page, the database records
+        a description of the change. Because the log is appended sequentially, writing to it is fast (disks
+        love sequential writes), unlike the slow random writes that scatter data pages all over the drive.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The golden rule — Write-Ahead Logging</span>
+          <p><span class="term">Write-Ahead Logging (WAL)</span>: the log record describing a change must be
+          flushed to <strong>stable storage</strong> (disk) <em>before</em> the corresponding dirty data page
+          is allowed to be written to disk. In short: <strong>log before you write</strong>. And a corollary:
+          all of a transaction's log records — especially its <code class="inl">COMMIT</code> record — must
+          be on disk before we tell the user "committed."</p>
+        </div>
+
+        <p>Why does this rule make everything work? Because it guarantees the log <em>always knows at least
+        as much as the disk</em>. If a data change made it to disk, its log record is <em>definitely</em>
+        already there too — so on restart we can always find out what happened and how to undo/redo it. The
+        log becomes the <strong>single source of truth</strong>.</p>
+
+        <h3>What's inside a log record?</h3>
+        <p>Each log record describes one event. The most important kind is the <span class="term">update
+        record</span>, which records a modification to a page. Its key fields:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">LSN</span></td><td><strong>Log Sequence Number</strong> — a unique, monotonically increasing ID for this record. Think of it as the diary's line number; bigger LSN = later in time.</td></tr>
+              <tr><td>TransID</td><td>Which transaction made the change.</td></tr>
+              <tr><td>Type</td><td>UPDATE, COMMIT, ABORT, BEGIN, CHECKPOINT, etc.</td></tr>
+              <tr><td>PageID</td><td>Which data page was modified.</td></tr>
+              <tr><td><span class="term">Before-image</span> (UNDO info)</td><td>The <em>old</em> value, so we can roll the change back.</td></tr>
+              <tr><td><span class="term">After-image</span> (REDO info)</td><td>The <em>new</em> value, so we can re-apply the change.</td></tr>
+              <tr><td>prevLSN</td><td>The LSN of this transaction's <em>previous</em> log record — links one transaction's records into a backward chain (used during UNDO).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Notice each update record carries <strong>both</strong> a before-image and an after-image. That's
+        what makes STEAL + NO-FORCE possible:</p>
+        <ul>
+          <li>The <strong>before-image</strong> gives us the <strong>UNDO</strong> information — to erase an
+          uncommitted change that leaked to disk (STEAL).</li>
+          <li>The <strong>after-image</strong> gives us the <strong>REDO</strong> information — to re-apply a
+          committed change that never reached disk (NO-FORCE).</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: log records for the bank transfer</span>
+          <p>Here is what the log might look like for our $100 transfer from A to B (with another transaction
+          T2 interleaved, to show LSNs are shared across all transactions). Read it top to bottom — the log
+          is the true history of the database:</p>
+          <pre><span class="cm">LSN  | Txn | Type    | Page | Before → After          | prevLSN</span>
+<span class="nm">10</span>   | T1  | BEGIN   |  --  |  --                     |  --
+<span class="nm">11</span>   | T1  | UPDATE  |  P_A | A: <span class="nm">500</span> → <span class="nm">400</span>           |  <span class="nm">10</span>
+<span class="nm">12</span>   | T2  | BEGIN   |  --  |  --                     |  --
+<span class="nm">13</span>   | T1  | UPDATE  |  P_B | B: <span class="nm">300</span> → <span class="nm">400</span>           |  <span class="nm">11</span>
+<span class="nm">14</span>   | T2  | UPDATE  |  P_C | C: <span class="nm">900</span> → <span class="nm">950</span>           |  <span class="nm">12</span>
+<span class="nm">15</span>   | T1  | COMMIT  |  --  |  --                     |  <span class="nm">13</span>
+<span class="cm">                                          ↑ once LSN 15 is safely on disk,</span>
+<span class="cm">                                            T1 is officially committed/durable</span></pre>
+          <p>Follow the <code class="inl">prevLSN</code> chain for T1: 15&nbsp;→&nbsp;13&nbsp;→&nbsp;11&nbsp;→&nbsp;10.
+          That backward chain lets recovery walk all of T1's changes in reverse to undo them if needed. The
+          before-images (500, 300) are everything we'd need to UNDO; the after-images (400, 400) are
+          everything we'd need to REDO.</p>
+        </div>
+
+        <h3>Where the LSN also lives: on the page itself</h3>
+        <p>Each data page stores, in its header, the LSN of the <em>most recent</em> log record whose change
+        is reflected on that page. This is called the <span class="term">pageLSN</span>. It's a small but
+        brilliant idea: by comparing a page's <code class="inl">pageLSN</code> on disk against the LSN of a
+        log record, recovery can instantly tell <strong>"has this change already been applied to this
+        page?"</strong> — and thus avoid applying it twice. We'll use this constantly in ARIES (Topic 4).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Gotcha: "flushing the log" is not free, but it's worth it</span>
+          <p>Every <code class="inl">COMMIT</code> must wait for the log to be physically on disk
+          (<span class="term">log force</span>), which is a real disk write and the main cost of durability.
+          Systems soften this with <strong>group commit</strong> — batching many transactions' commit
+          records into one disk write. But you can never skip the log force entirely: if you reported a
+          commit and the COMMIT record wasn't durable, a crash could lose a "committed" transaction, breaking
+          Durability.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>WAL flips the order of operations: <strong>describe the change in the log and flush that
+          description first, then change the data later.</strong> Because the log is always at least as
+          up-to-date as the disk, and because each record carries both before- and after-images, the log
+          alone contains everything needed to reconstruct a perfectly consistent database after any crash.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The <strong>log</strong> is an append-only, on-disk diary of every change. The
+          <strong>WAL rule</strong> says log records (especially the before-image) reach disk
+          <em>before</em> the data page, and the COMMIT record reaches disk before we report success. Each
+          update record holds an <strong>LSN</strong>, <strong>before-image</strong> (UNDO) and
+          <strong>after-image</strong> (REDO), plus a <strong>prevLSN</strong> chain; each page stores a
+          <strong>pageLSN</strong> so we know what's already applied. The log is the source of truth.
+        </div>
+      </section>
+
+      <!-- ===================== 3. CHECKPOINTS ===================== -->
+      <section id="checkpoints">
+        <h2><span class="sec-num">3</span> Checkpoints</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your diary has been running for ten years and fills a whole library. If something goes
+          wrong, you really don't want to re-read ten years of diary to figure out where you are. So every
+          so often you jot a summary note: <em>"As of today, here's exactly where everything stands."</em>
+          Now if disaster strikes, you only re-read from the last summary onward. A database does the same:
+          a <strong>checkpoint</strong> is a "you-are-here" marker in the log that bounds how much we ever
+          have to re-read after a crash.</p>
+        </div>
+
+        <p>Without checkpoints, recovery would have to scan the log all the way back to the <em>very
+        beginning of time</em> — every change ever made — to be sure it didn't miss something. That's
+        impossibly slow for a database that's been running for months. A <span class="term">checkpoint</span>
+        is a special log record that captures a snapshot of system state, so recovery can start from a recent,
+        known point instead.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A checkpoint <strong>bounds the work of recovery</strong>. It tells the recovery manager: "you
+          don't need to look at the log before this point; everything earlier was already safely captured."
+          More frequent checkpoints = faster recovery but more runtime overhead; it's a tunable trade-off.</p>
+        </div>
+
+        <h3>The naive checkpoint (and why it hurts)</h3>
+        <p>A simple "blocking" checkpoint would: (1) stop accepting new transactions, (2) wait for active
+        ones to pause, (3) flush <em>all</em> dirty pages to disk, (4) write a CHECKPOINT record, then
+        (5) resume. It's correct, but it <strong>freezes the whole database</strong> while it flushes — a
+        terrible hiccup for a busy system.</p>
+
+        <h3>Fuzzy checkpoints — the practical version</h3>
+        <p>A <span class="term">fuzzy checkpoint</span> avoids the freeze. Instead of stopping everything and
+        flushing all dirty pages, it just <strong>records a snapshot of two small tables</strong> describing
+        the current state, and lets normal work continue (it's "fuzzy" because transactions keep modifying
+        pages while the checkpoint is being taken). Those two tables are the heart of ARIES bookkeeping, so
+        learn them now:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Table</th><th>What it tracks</th><th>Key columns</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="term">Transaction Table (ATT)</span><br /><small>"Active Transaction Table"</small></td>
+                <td>Every transaction currently <strong>running</strong> (not yet committed or aborted).</td>
+                <td>TransID, status (running/committing), and <span class="term">lastLSN</span> — the LSN of that transaction's most recent log record.</td>
+              </tr>
+              <tr>
+                <td><span class="term">Dirty Page Table (DPT)</span></td>
+                <td>Every page that is currently <strong>dirty</strong> in the buffer pool (modified but not yet flushed).</td>
+                <td>PageID and <span class="term">recLSN</span> ("recovery LSN") — the LSN of the <em>earliest</em> log record that dirtied this page since it was last clean.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The <code class="inl">recLSN</code> in the Dirty Page Table is the secret weapon. It marks the
+        <em>oldest</em> change to a page that might not be on disk yet. The smallest <code class="inl">recLSN</code>
+        across all dirty pages tells recovery exactly how far back in the log it must go to be safe — no
+        further. That point is where Redo will begin (Topic 4).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a fuzzy checkpoint in the log</span>
+          <p>Continuing our log, suppose at LSN 16 the system takes a fuzzy checkpoint. It writes the current
+          contents of both tables right into the log:</p>
+          <pre><span class="cm">LSN  | Type        | Contents</span>
+<span class="nm">16</span>   | CHECKPOINT  | ATT = { T2: lastLSN=<span class="nm">14</span> }            <span class="cm"># T1 already committed at 15</span>
+     |             | DPT = { P_B: recLSN=<span class="nm">13</span>,           <span class="cm"># T1's change to B may not be flushed</span>
+     |             |         P_C: recLSN=<span class="nm">14</span> }           <span class="cm"># T2's change to C may not be flushed</span></pre>
+          <p>Reading this snapshot, a recovery process knows: T2 was still running, and pages P_B and P_C had
+          un-flushed changes starting at LSNs 13 and 14. The <strong>smallest recLSN is 13</strong>, so if we
+          crashed right after this checkpoint, Redo would only need to start at LSN 13 — never earlier. The
+          checkpoint just bounded our work.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Begin and end checkpoint records</span>
+          <p>Because the checkpoint is fuzzy (the world keeps moving while we snapshot), ARIES actually writes
+          two records: a <code class="inl">begin_checkpoint</code> and a later <code class="inl">end_checkpoint</code>
+          containing the table snapshots. A separate, known location on disk — the <span class="term">master
+          record</span> — stores the LSN of the most recent successful checkpoint so restart can find it
+          instantly.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off to remember</span>
+          <p>Checkpoint <em>often</em> → recovery is fast (little log to replay) but you pay steady runtime
+          overhead and more frequent flushing. Checkpoint <em>rarely</em> → cheap at runtime but recovery
+          after a crash can take a long time. Real systems checkpoint on a timer and/or after a certain
+          volume of log has accumulated.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>checkpoint</strong> is a marker that bounds recovery work so we never re-scan the whole
+          log. A <strong>fuzzy checkpoint</strong> avoids freezing the system by just snapshotting two tables:
+          the <strong>Transaction Table (ATT)</strong> of in-progress transactions (with each one's
+          <em>lastLSN</em>) and the <strong>Dirty Page Table (DPT)</strong> of un-flushed pages (with each
+          one's <em>recLSN</em>). The smallest recLSN tells recovery where Redo must begin.
+        </div>
+      </section>
+
+      <!-- ===================== 4. ARIES ===================== -->
+      <section id="aries">
+        <h2><span class="sec-num">4</span> ARIES recovery — the three phases</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The power came back on after the storm. You pick up your diary and do three passes. <strong>First
+          pass:</strong> skim from your last summary note to the end, just to figure out <em>what was going
+          on</em> when the lights went out — which chores were finished, which were half-done.
+          <strong>Second pass:</strong> go back and <em>redo every single chore exactly as the diary says</em>,
+          even ones you already finished, so the room definitely matches the diary — "repeat history."
+          <strong>Third pass:</strong> for the chores that were only half-done and will never be finished,
+          carefully <em>undo</em> them so no mess is left behind. That's ARIES.</p>
+        </div>
+
+        <p><span class="term">ARIES</span> (Algorithms for Recovery and Isolation Exploiting Semantics) is the
+        recovery algorithm published by C. Mohan and colleagues at IBM in 1992. It's the gold standard,
+        implemented in spirit by most real databases. ARIES recovers with <strong>three passes over the
+        log</strong>, in this exact order:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">1. Analysis</div><div class="s-d">Figure out who was running &amp; which pages were dirty</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">2. Redo</div><div class="s-d">Repeat history — re-apply ALL changes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">↩️</div><div class="s-t">3. Undo</div><div class="s-d">Roll back the "loser" transactions</div></div>
+        </div>
+
+        <p>ARIES rests on <strong>three principles</strong> that explain why the phases are shaped this way:</p>
+        <ul>
+          <li><strong>Write-ahead logging</strong> (Topic 2) — the log is always at least as current as disk.</li>
+          <li><strong>Repeat history during Redo</strong> — ARIES first reconstructs the <em>exact</em> state
+          the database was in at the moment of the crash, including changes made by transactions that will
+          later be undone. Recover first, then sort out winners and losers.</li>
+          <li><strong>Log changes during Undo</strong> — even the undo actions are logged (with special
+          <span class="term">CLR</span> records, below), so a crash <em>during</em> recovery doesn't redo
+          work we already undid.</li>
+        </ul>
+
+        <h3>Phase 1 — Analysis: who and what?</h3>
+        <p>Start at the most recent checkpoint (found via the master record) and scan <strong>forward</strong>
+        to the end of the log. The goal is to rebuild two things as they were at crash time:</p>
+        <ul>
+          <li>The <strong>Transaction Table (ATT)</strong> — so we know which transactions were still active.
+          Any transaction in the ATT at the end <em>without</em> a COMMIT record is a <span class="term">loser</span>
+          (must be undone). Transactions that committed are <span class="term">winners</span>.</li>
+          <li>The <strong>Dirty Page Table (DPT)</strong> — so we know which pages might have un-flushed
+          changes. The smallest <code class="inl">recLSN</code> in the final DPT is the
+          <span class="term">RedoLSN</span>: the point where Phase 2 will start.</li>
+        </ul>
+        <p>As Analysis scans, it updates these tables: a BEGIN/UPDATE adds the txn to the ATT; a COMMIT/ABORT
+        end-record removes it (or marks it); an UPDATE to a page not already in the DPT adds it with
+        <code class="inl">recLSN</code> = that record's LSN.</p>
+
+        <h3>Phase 2 — Redo: repeat history</h3>
+        <p>Start at the <code class="inl">RedoLSN</code> and scan <strong>forward</strong> to the end. For
+        <em>every</em> update record (winners <strong>and</strong> losers alike — yes, even doomed
+        transactions), <strong>re-apply the after-image</strong> to the page... unless the change is already
+        there. How do we know it's already there? The <code class="inl">pageLSN</code> from Topic 2:</p>
+        <div class="callout note">
+          <span class="c-title">The Redo test (when to skip)</span>
+          <p>A change is re-applied only if <strong>all</strong> hold: the page is in the DPT, the record's
+          LSN ≥ the page's <code class="inl">recLSN</code>, and the page's on-disk
+          <code class="inl">pageLSN</code> &lt; the record's LSN. If the page's <code class="inl">pageLSN</code>
+          is already ≥ the record's LSN, the change made it to disk before the crash — skip it. This is what
+          makes Redo <span class="term">idempotent</span>: replaying it twice does no harm.</p>
+        </div>
+        <p>After Redo, the database is in the <em>exact</em> state it was in the instant before the crash —
+        warts and all, including half-finished loser transactions. That's the "repeat history" philosophy.</p>
+
+        <h3>Phase 3 — Undo: roll back the losers</h3>
+        <p>Now scan <strong>backward</strong>, undoing every change made by the loser transactions, using the
+        <strong>before-images</strong> and following each loser's <code class="inl">prevLSN</code> chain. As
+        each change is undone, ARIES writes a <span class="term">Compensation Log Record (CLR)</span> recording
+        that the undo happened. A CLR also stores an <span class="term">UndoNextLSN</span> pointer to the next
+        record that still needs undoing.</p>
+        <div class="callout key">
+          <span class="c-title">Why CLRs matter</span>
+          <p>Suppose we crash <em>again</em> in the middle of recovery. Without CLRs, on the next restart we
+          might re-undo a change we already undid (corrupting data). Because CLRs are logged (and are
+          <strong>redo-only</strong> — they're never themselves undone), the next recovery's Redo phase
+          replays the undos we'd already done and the <code class="inl">UndoNextLSN</code> pointer tells Undo
+          exactly where to resume. ARIES recovery is therefore <strong>restartable</strong> — crash-safe even
+          while recovering.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a full crash-recovery walkthrough</span>
+          <p>Here's a complete log up to a crash. T1 committed; T2 did <em>not</em> (it's a loser). Pages
+          P_A, P_B (T1) and P_C (T2) were modified. Assume the crash happens right after LSN&nbsp;17.</p>
+          <pre><span class="cm">LSN | Txn | Type    | Page | Before → After  | prevLSN</span>
+<span class="nm">16</span>  | --  | CHECKPT | --   | ATT={T2:14}, DPT={P_B:13, P_C:14}
+<span class="nm">17</span>  | T2  | UPDATE  | P_D  | D: <span class="nm">70</span> → <span class="nm">90</span>    | <span class="nm">14</span>
+<span class="cm">          ════════════  💥 CRASH  ════════════</span>
+
+<span class="cm">Earlier records (for reference):</span>
+<span class="nm">10</span> T1 BEGIN · <span class="nm">11</span> T1 UPDATE P_A 500→400 · <span class="nm">12</span> T2 BEGIN
+<span class="nm">13</span> T1 UPDATE P_B 300→400 · <span class="nm">14</span> T2 UPDATE P_C 900→950 · <span class="nm">15</span> T1 COMMIT</pre>
+
+          <p><strong>① Analysis</strong> — start at checkpoint LSN 16, scan forward:</p>
+          <pre>ATT after scan : { T2 : lastLSN=<span class="nm">17</span> }     <span class="cm"># T1 committed (LSN 15) → winner, removed</span>
+                                       <span class="cm"># T2 never committed → LOSER</span>
+DPT after scan : { P_B:recLSN=<span class="nm">13</span>, P_C:recLSN=<span class="nm">14</span>, P_D:recLSN=<span class="nm">17</span> }
+RedoLSN = min(recLSN) = <span class="nm">13</span>           <span class="cm"># Redo starts here</span></pre>
+
+          <p><strong>② Redo</strong> — start at LSN 13, scan forward, re-apply after-images (skip any page
+          whose on-disk pageLSN already ≥ the record's LSN):</p>
+          <pre>LSN <span class="nm">13</span>: set P_B.B = <span class="nm">400</span>   (T1, a winner — but we repeat history regardless)
+LSN <span class="nm">14</span>: set P_C.C = <span class="nm">950</span>   (T2, a loser — still redone! "repeat history")
+LSN <span class="nm">17</span>: set P_D.D = <span class="nm">90</span>    (T2, loser — still redone)
+<span class="cm"># Database now exactly matches the moment of the crash.</span></pre>
+
+          <p><strong>③ Undo</strong> — T2 is the only loser. Walk its prevLSN chain backward
+          (17 → 14 → 12) applying before-images, logging a CLR for each undo:</p>
+          <pre>Undo LSN <span class="nm">17</span>: restore P_D.D = <span class="nm">70</span>   → write CLR (UndoNextLSN=<span class="nm">14</span>)
+Undo LSN <span class="nm">14</span>: restore P_C.C = <span class="nm">900</span>  → write CLR (UndoNextLSN=<span class="nm">12</span>)
+LSN <span class="nm">12</span> is T2's BEGIN     → write an END record for T2, done.
+<span class="cm"># T1's committed changes (P_A=400, P_B=400) are preserved → Durability ✓</span>
+<span class="cm"># T2's changes fully erased → Atomicity ✓</span></pre>
+          <p>Final state on disk: A=400, B=400 (T1 durable), C=900, D=70 (T2 rolled back). The database is
+          consistent, Atomicity and Durability both honoured — exactly what Topic 1 demanded.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common misconception</span>
+          <p>"Why redo a loser transaction's changes in Phase 2, only to undo them in Phase 3? Isn't that
+          wasted work?" It looks redundant, but redoing first puts the database into a <em>single,
+          well-defined state</em> (the crash-instant state), so the Undo phase has a clean, predictable
+          starting point and the before-images line up correctly. "Repeat history, then undo losers" is far
+          simpler and more robust than trying to selectively redo only winners.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>ARIES</strong> recovers in three passes: <strong>Analysis</strong> (scan forward from the
+          checkpoint to rebuild the ATT and DPT, and find losers + the RedoLSN); <strong>Redo</strong> (scan
+          forward from RedoLSN re-applying <em>all</em> after-images — repeat history, using pageLSN to skip
+          already-applied changes); <strong>Undo</strong> (scan backward rolling back loser transactions via
+          before-images, logging <strong>CLRs</strong> so recovery is itself crash-safe). The result:
+          Atomicity and Durability guaranteed through any crash.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a database keeps its promises through chaos. Here's the one-paragraph story
+        that connects all four topics:</p>
+        <div class="bigidea">
+          <p>Databases do fast work in a <strong>volatile buffer pool</strong> and slowly flush
+          <strong>dirty pages</strong> to non-volatile <strong>disk</strong>. For speed they adopt
+          <strong>STEAL + NO-FORCE</strong>, which means uncommitted changes can leak to disk (needing
+          <strong>UNDO</strong>) and committed changes can be missing from disk (needing <strong>REDO</strong>).
+          The <strong>Write-Ahead Log</strong> makes this safe: every change is described in an append-only
+          log — with an <strong>LSN</strong>, a <strong>before-image</strong> and an <strong>after-image</strong>
+          — and that log record is flushed <em>before</em> the data page (and before any commit is reported).
+          To keep recovery fast, <strong>fuzzy checkpoints</strong> periodically snapshot the
+          <strong>Transaction Table</strong> and <strong>Dirty Page Table</strong>, bounding how far back we
+          must read. After a crash, <strong>ARIES</strong> runs <strong>Analysis → Redo → Undo</strong>:
+          discover who was running, repeat history to rebuild the crash-instant state, then roll back the
+          losers — logging <strong>CLRs</strong> so even a crash during recovery is survivable. The payoff is
+          the <strong>Atomicity</strong> and <strong>Durability</strong> we demanded back in Topic 1.</p>
+        </div>
+
+        <p>This caps off our reliability arc: <strong>Session 12</strong> introduced ACID transactions,
+        <strong>Session 13</strong> covered concurrency control (the I in ACID), and this session covered the
+        A and D. Next, in <strong>Session 15</strong>, we'll see how these ideas get reshaped in modern
+        distributed and cloud database architectures.</p>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What does the Write-Ahead Logging rule actually require?</summary>
+          <p class="ans">The log record describing a change must be flushed to disk <em>before</em> the
+          corresponding data page is flushed — and a transaction's COMMIT record must be on disk before we
+          report the transaction committed. In short: log before you write.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do real databases choose STEAL + NO-FORCE despite it being the hardest to recover?</summary>
+          <p class="ans">Performance. STEAL lets the buffer manager flush whenever convenient (no memory
+          pressure), and NO-FORCE makes commits fast because they don't wait for slow random data-page
+          writes. The cost — needing both UNDO and REDO — is paid by the logging/ARIES machinery.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is a dirty page, and why is it dangerous?</summary>
+          <p class="ans">A page modified in the buffer pool but not yet written back to disk. It's dangerous
+          because the new data exists only in volatile RAM; a crash loses it unless its change was first
+          recorded in the durable log.</p>
+        </details>
+        <details class="quiz">
+          <summary>In ARIES, why does the Redo phase re-apply changes from transactions that will be undone?</summary>
+          <p class="ans">Because ARIES "repeats history" — it rebuilds the exact state at the crash instant
+          first, giving the Undo phase a clean, well-defined starting point. Selectively redoing only winners
+          is far more complex and error-prone.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the role of the pageLSN during Redo?</summary>
+          <p class="ans">Each page stores the LSN of the last change applied to it. If a page's on-disk
+          pageLSN is already ≥ a log record's LSN, that change already reached disk, so Redo skips it. This
+          makes Redo idempotent — safe to replay.</p>
+        </details>
+        <details class="quiz">
+          <summary>What problem do Compensation Log Records (CLRs) solve?</summary>
+          <p class="ans">They make recovery itself crash-safe. By logging each undo action (and being
+          redo-only, never undone), CLRs ensure that if the system crashes mid-recovery, the next restart
+          won't re-undo work already undone; the UndoNextLSN pointer tells Undo exactly where to resume.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why take fuzzy checkpoints instead of "stop the world" checkpoints?</summary>
+          <p class="ans">A blocking checkpoint freezes the whole database while it flushes all dirty pages.
+          A fuzzy checkpoint just snapshots the Transaction Table and Dirty Page Table and lets normal work
+          continue, bounding recovery work without a service hiccup.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 14 — Logging &amp; Recovery"</strong>.</li>
+          <li>📝 Written assignment: <strong>"Design a recovery strategy"</strong> — given a workload and crash assumptions, choose STEAL/FORCE policies, a checkpoint cadence, and describe how your scheme would UNDO/REDO through a sample crash.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://cs.stanford.edu/people/chrismre/cs345/rl/aries.pdf" target="_blank" rel="noopener">Mohan et al., "ARIES" (ACM TODS, 1992)</a> — the original, definitive paper on the algorithm this whole session is built around; dense but foundational.</li>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 Database Systems — Logging &amp; Recovery lectures</a> — Andy Pavlo's free lectures and slides walk through WAL, checkpoints, and ARIES with great clarity.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Silberschatz, Korth &amp; Sudarshan, "Database System Concepts" — Recovery chapter</a> — the standard textbook treatment of recovery, log-based recovery, and checkpoints.</li>
+          <li><a href="https://www.postgresql.org/docs/current/wal-intro.html" target="_blank" rel="noopener">PostgreSQL Documentation — Write-Ahead Logging (WAL)</a> — see WAL, checkpoints, and recovery as implemented in a real, production database.</li>
+          <li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-recovery.html" target="_blank" rel="noopener">MySQL / InnoDB Documentation — Crash Recovery &amp; the Redo Log</a> — InnoDB's redo log and recovery, an ARIES-style scheme in widespread use.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-13.html"><div class="dir">← Previous</div><div class="ttl">Session 13: Concurrency Control</div></a>
+        <a class="next" href="session-15.html"><div class="dir">Next →</div><div class="ttl">Session 15: Modern Architectures</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 14 — Logging &amp; Recovery (ARIES) · Your data survives the crash 🛟</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

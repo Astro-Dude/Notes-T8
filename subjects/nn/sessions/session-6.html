@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 6 — Regularization: Fighting Overfitting</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 6</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 06 · Regularization</span>
+      <h1>Regularization — Fighting Overfitting</h1>
+      <p class="lead">
+        Your network can train perfectly on its homework and still flunk the real exam. That gap —
+        between "memorising the training data" and "actually learning the pattern" — is the single
+        biggest practical problem in deep learning. This session is the toolbox for fixing it. We
+        assume you've studied <em>none</em> of this before. Every topic opens with a tiny "explain
+        like I'm 5" story, then we go deeper with real math and code. Take it slow.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#overfitting">Overfitting vs underfitting</a></li>
+          <li><a href="#weight-decay">Weight decay (L1 / L2)</a></li>
+          <li><a href="#dropout">Dropout</a></li>
+          <li><a href="#early-aug">Early stopping &amp; data augmentation</a></li>
+          <li><a href="#batchnorm">Batch Normalization</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. OVERFITTING ===================== -->
+      <section id="overfitting">
+        <h2><span class="sec-num">1</span> Overfitting vs underfitting — the bias–variance trade-off</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine studying for a maths test. One friend <strong>memorises every answer</strong> in the
+          practice book word-for-word — but on the real test, with new numbers, they panic and fail. Another
+          friend <strong>barely studies</strong> and only learned "maths is about numbers" — they fail too,
+          for the opposite reason. The best student learns the <em>actual rules</em>, so any new question is
+          easy. A neural network can be like any of these three friends. Our job this session is to coach it
+          into being the good student.</p>
+        </div>
+
+        <p>When we train a network we always have (at least) two piles of data:</p>
+        <ul>
+          <li>The <span class="term">training set</span> — the examples the model learns from (its "practice book").</li>
+          <li>The <span class="term">validation set</span> (and later a held-out <span class="term">test set</span>)
+          — examples it has <em>never</em> seen, used to check whether it truly learned the pattern.</li>
+        </ul>
+        <p>What we actually care about is <span class="term">generalization</span>: doing well on data the
+        model has never seen. Doing well on the training data alone is worthless — that's just memorising.</p>
+
+        <h3>The two failure modes</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Problem</th><th>What it looks like</th><th>Why it happens</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Underfitting</span></td><td>Bad on training data <em>and</em> bad on validation data.</td><td>The model is too simple / under-trained to capture the real pattern. (The lazy friend.)</td></tr>
+              <tr><td><span class="term">Overfitting</span></td><td>Great on training data, but much worse on validation data.</td><td>The model is powerful enough to memorise the noise and quirks of the training set instead of the underlying rule. (The memoriser.)</td></tr>
+              <tr><td>Good fit</td><td>Good on training, and almost as good on validation.</td><td>The model captured the true signal and ignored the noise. (The good student.)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The bias–variance trade-off</h3>
+        <p>These two failure modes have formal names that you'll hear constantly:</p>
+        <ul>
+          <li><span class="term">Bias</span> — error from the model being <strong>too simple</strong> to represent
+          the truth. High bias → underfitting. (Think: trying to fit a straight line through a curve.)</li>
+          <li><span class="term">Variance</span> — error from the model being <strong>too sensitive</strong> to
+          the exact training data, so it changes wildly if you'd trained on a slightly different sample.
+          High variance → overfitting.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>There's a tug-of-war: making a model more flexible <em>lowers bias but raises variance</em>, and
+          making it simpler does the opposite. The <strong>sweet spot</strong> is the model complexity that
+          minimises <em>total</em> error on unseen data. <strong>Regularization is the family of tricks that
+          lets us keep a big, powerful network but push it back toward that sweet spot</strong> — getting the
+          low bias of a big model without paying the full variance price.</p>
+        </div>
+
+        <p>Total expected error on new data decomposes (roughly) as:</p>
+        <pre><span class="cm"># Expected test error</span>
+Error = Bias²  +  Variance  +  Irreducible noise
+        <span class="cm">#  ↑ too simple   ↑ too sensitive   ↑ can't fix</span></pre>
+        <p>You can't remove the irreducible noise (the world is messy). You <em>can</em> trade between bias and
+        variance, and that's the whole game.</p>
+
+        <h3>How you actually <em>see</em> overfitting: the learning curves</h3>
+        <p>The classic diagnostic is to plot <strong>training loss</strong> and <strong>validation loss</strong>
+        against training time (epochs). Recall from <strong>Session 5</strong> that <em>loss</em> is the number
+        the optimizer is trying to push down. Here's the tell-tale diagram:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📉</div><div class="s-t">Both fall</div><div class="s-d">Early on, train &amp; val loss both drop — model is genuinely learning.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Sweet spot</div><div class="s-d">Val loss bottoms out. Best generalization is here.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">↗️</div><div class="s-t">Diverge</div><div class="s-d">Train loss keeps falling, but val loss starts <em>rising</em> — overfitting begins.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">Memorising</div><div class="s-d">Train loss ≈ 0, val loss high. The model has memorised noise.</div></div>
+        </div>
+
+        <p>That <strong>growing gap between the two curves</strong> is the visual signature of overfitting. An
+        <em>underfitting</em> diagram looks different: both curves plateau high and close together — the model
+        never got good even on training data.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: fitting points with a polynomial</span>
+          <p>Say the true relationship is a gentle curve and you have 10 noisy data points.</p>
+          <ul>
+            <li><strong>Degree-1 (a line):</strong> can't bend to follow the curve → high bias → <em>underfit</em>.</li>
+            <li><strong>Degree-3 (a smooth curve):</strong> follows the real shape, ignores the wiggles → <em>good fit</em>.</li>
+            <li><strong>Degree-9 (very wiggly):</strong> passes <em>exactly</em> through all 10 points, including the
+            noise. Training error is zero, but ask it about a point in between and it shoots off to nonsense →
+            high variance → <em>overfit</em>.</li>
+          </ul>
+          <p>A neural network with millions of parameters is like that degree-9 polynomial: easily flexible
+          enough to memorise. Regularization is how we stop it.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>"99% training accuracy!" means <strong>nothing</strong> on its own — a model can hit that by pure
+          memorisation. Always judge a model by its <em>validation/test</em> performance. If training is great
+          but validation is poor, you're overfitting, full stop.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Underfitting (high bias) = too simple, bad everywhere. Overfitting (high variance) = memorises the
+          training noise, great on train but poor on new data. Total error trades bias against variance, and the
+          gap between training and validation loss curves is how you spot overfitting. Regularization is our
+          toolkit for keeping big models near the sweet spot.
+        </div>
+      </section>
+
+      <!-- ===================== 2. WEIGHT DECAY ===================== -->
+      <section id="weight-decay">
+        <h2><span class="sec-num">2</span> Weight decay — L1 &amp; L2 regularization</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're packing for a trip and your suitcase charges you money for every <em>kilogram</em>.
+          Suddenly you only pack what truly matters and keep everything light. Weight decay does this to a
+          network: it makes the model "pay a fee" for having big, heavy numbers (weights) inside it. To avoid
+          the fee, the network keeps its weights small — and small, gentle weights make smoother, simpler
+          predictions that don't overreact to noise.</p>
+        </div>
+
+        <p>Recall from <strong>Session 5</strong> that training means minimising a <span class="term">loss
+        function</span> — say the prediction error <code class="inl">L(w)</code>, where <code class="inl">w</code>
+        is the giant pile of weights. Weight decay adds a <span class="term">penalty term</span> that grows as the
+        weights grow, so the optimizer is now told: "fit the data <em>and</em> keep the weights small."</p>
+
+        <h3>L2 regularization (the most common one)</h3>
+        <p><span class="term">L2 regularization</span> adds the sum of <em>squared</em> weights to the loss:</p>
+        <pre><span class="cm"># L2-regularized loss</span>
+L_total(w) = L_data(w)  +  λ · Σ wᵢ²
+             <span class="cm">#   ↑ fit the data   ↑ penalty for big weights</span></pre>
+        <p>The knob <code class="inl">λ</code> (lambda) is the <span class="term">regularization strength</span>
+        — a hyperparameter <em>you</em> choose. Bigger <code class="inl">λ</code> = more pressure to shrink
+        weights = simpler model.</p>
+
+        <ul>
+          <li><code class="inl">λ = 0</code> → no regularization at all (free to overfit).</li>
+          <li><code class="inl">λ</code> too large → weights crushed toward zero → the model can't fit → underfit.</li>
+          <li>Goldilocks <code class="inl">λ</code> → just enough pressure to stay near the sweet spot.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Why "decay"? The connection to the update step</span>
+          <p>Recall gradient descent from Session 5: <code class="inl">w ← w − η · ∂L/∂w</code>. The L2 penalty's
+          gradient is <code class="inl">2λw</code>, so the update becomes:</p>
+          <pre>w ← w − η·(∂L_data/∂w)  −  η·2λ·w
+  = (1 − 2ηλ)·w  −  η·(∂L_data/∂w)
+    <span class="cm">#  ↑ every step, w is multiplied by a number &lt; 1 — it DECAYS toward zero</span></pre>
+          <p>So before each normal update, every weight is nudged a little toward zero. That's literally
+          "weight decay." (In plain SGD, L2 penalty and weight decay are the same thing; with fancier optimizers
+          like Adam they differ slightly, which is why the variant <span class="term">AdamW</span> exists.)</p>
+        </div>
+
+        <h3>L1 regularization</h3>
+        <p><span class="term">L1 regularization</span> penalises the sum of <em>absolute values</em> instead of squares:</p>
+        <pre><span class="cm"># L1-regularized loss</span>
+L_total(w) = L_data(w)  +  λ · Σ |wᵢ|</pre>
+        <p>This small change has a big consequence: L1 tends to drive many weights to <strong>exactly zero</strong>,
+        producing a <span class="term">sparse</span> model (lots of dead connections). L2 instead makes all weights
+        <em>small but rarely exactly zero</em>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: why L1 zeroes things out and L2 doesn't</span>
+          <p>Think about the penalty's "pull" on a single tiny weight, say <code class="inl">w = 0.01</code>:</p>
+          <ul>
+            <li><strong>L2</strong> penalty gradient is <code class="inl">2λw = 2λ(0.01)</code> — almost nothing.
+            As <code class="inl">w</code> shrinks, the pull shrinks too, so it <em>eases off</em> and the weight
+            settles near (but not at) zero.</li>
+            <li><strong>L1</strong> penalty gradient is <code class="inl">λ·sign(w) = +λ</code> — a <em>constant</em>
+            push toward zero regardless of how small <code class="inl">w</code> is. So it keeps pushing until the
+            weight hits exactly zero and stays there.</li>
+          </ul>
+          <p>Result: L1 acts like an automatic <strong>feature selector</strong> (keep the useful weights, delete
+          the rest); L2 acts like a <strong>smoother</strong> (shrink everything gently).</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>L1 (Lasso)</th><th>L2 (Ridge / weight decay)</th></tr></thead>
+            <tbody>
+              <tr><td>Penalty</td><td>Σ |wᵢ|</td><td>Σ wᵢ²</td></tr>
+              <tr><td>Effect on weights</td><td>Many become exactly 0 → <strong>sparse</strong></td><td>All shrink, smoothly → <strong>small</strong></td></tr>
+              <tr><td>Good for</td><td>Feature selection, compact models</td><td>General smoothing, the default in deep nets</td></tr>
+              <tr><td>Geometry</td><td>Diamond-shaped constraint (corners on axes)</td><td>Circular constraint (no corners)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre><span class="cm"># PyTorch: L2 weight decay is built into the optimizer</span>
+optimizer = torch.optim.SGD(model.parameters(),
+                            lr=<span class="nm">0.1</span>,
+                            weight_decay=<span class="nm">1e-4</span>)  <span class="cm"># this IS λ for L2</span>
+
+<span class="cm"># L1 has no built-in flag — you add it to the loss by hand:</span>
+l1 = <span class="nm">0.0</span>
+<span class="kw">for</span> p <span class="kw">in</span> model.parameters():
+    l1 = l1 + p.abs().sum()
+loss = data_loss + <span class="nm">1e-5</span> * l1</pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Big weights let a network make sharp, jumpy decisions that can fit noise. Penalising weight size
+          forces smoother functions that generalise better. <strong>L2 is the everyday default</strong> in deep
+          learning ("weight decay"); reach for <strong>L1</strong> when you specifically want sparsity.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Weight decay adds <code class="inl">λ·(penalty on weight size)</code> to the loss. L2 (Σw²) shrinks all
+          weights smoothly toward small values; L1 (Σ|w|) drives many to exactly zero for sparsity. λ is the dial:
+          too small overfits, too big underfits. In code, L2 is just the optimizer's <code class="inl">weight_decay</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DROPOUT ===================== -->
+      <section id="dropout">
+        <h2><span class="sec-num">3</span> Dropout</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a class group project where, every single day, the teacher randomly sends some students
+          home. Nobody knows who'll be absent tomorrow, so <em>everyone</em> has to learn the whole project
+          instead of relying on "Aisha always does the slides." The team becomes robust — any subset can get the
+          job done. Dropout does this to neurons: it randomly switches some off during each training step, so no
+          neuron can lazily depend on a specific buddy.</p>
+        </div>
+
+        <p><span class="term">Dropout</span> is one of the most effective and beloved regularizers, introduced by
+        Srivastava et al. in 2014. The idea is almost absurdly simple: <strong>during training, on every forward
+        pass, randomly set each neuron's output to zero with probability <code class="inl">p</code></strong> (a
+        typical <code class="inl">p</code> is 0.5 for hidden layers). The surviving neurons are scaled up to keep
+        the overall signal level steady.</p>
+
+        <h3>Why on earth does turning off neurons help?</h3>
+        <ul>
+          <li><strong>It breaks co-adaptation.</strong> <span class="term">Co-adaptation</span> is when neurons
+          form fragile little cliques that only work if their specific partners are present — a way of memorising.
+          Random dropping forces each neuron to be useful <em>on its own</em>, building redundant, robust features.</li>
+          <li><strong>It's like training a huge ensemble for free.</strong> Each random pattern of dropped neurons
+          is effectively a <em>different thinned network</em>. Over training you implicitly train an astronomical
+          number of these sub-networks that share weights. At test time, using all neurons approximates
+          <em>averaging</em> all those networks — and <span class="term">ensembles</span> (averaging many models)
+          are a classic way to reduce variance.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Dropout = cheaply training an exponential number of overlapping sub-networks and averaging them at
+          test time. The forced redundancy stops any neuron from memorising, which is exactly what fights
+          overfitting.</p>
+        </div>
+
+        <h3>The crucial difference between training and test time</h3>
+        <p>This trips everyone up, so go slow. Dropout behaves <strong>differently</strong> in the two modes:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Training time</th><th>Test / inference time</th></tr></thead>
+            <tbody>
+              <tr><td>Neurons</td><td>Randomly drop a fraction <code class="inl">p</code> each step.</td><td>Keep <strong>all</strong> neurons — no dropping.</td></tr>
+              <tr><td>Why</td><td>To force redundancy &amp; train the ensemble.</td><td>We want the full, stable network for the real prediction.</td></tr>
+              <tr><td>Scaling</td><td>"Inverted dropout": divide surviving outputs by <code class="inl">(1−p)</code> so the expected total stays the same.</td><td>Nothing extra — the training-time scaling already balanced it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Because of that scaling, at test time you do <em>nothing special</em> — just run the network normally.
+        This is why frameworks make you flip a switch (<code class="inl">model.train()</code> vs
+        <code class="inl">model.eval()</code>): it tells dropout which mode to use. Forgetting to call
+        <code class="inl">.eval()</code> is a classic bug that makes test predictions randomly jittery.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: dropout in PyTorch</span>
+          <pre><span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+model = nn.Sequential(
+    nn.Linear(<span class="nm">784</span>, <span class="nm">256</span>),
+    nn.ReLU(),
+    nn.Dropout(p=<span class="nm">0.5</span>),   <span class="cm"># drop 50% of these activations during training</span>
+    nn.Linear(<span class="nm">256</span>, <span class="nm">10</span>),
+)
+
+<span class="cm"># TRAINING: dropout is ACTIVE</span>
+model.train()
+out = model(x_batch)        <span class="cm"># random neurons zeroed each call</span>
+
+<span class="cm"># EVALUATION: dropout is OFF, full network used</span>
+model.eval()
+<span class="kw">with</span> torch.no_grad():
+    preds = model(x_test)   <span class="cm"># deterministic, all neurons on</span></pre>
+        </div>
+
+        <p>Manually, "inverted dropout" on a layer's activations <code class="inl">a</code> looks like:</p>
+        <pre><span class="cm"># Training forward pass, p = prob of DROPPING</span>
+mask = (torch.rand_like(a) &gt; p).float()   <span class="cm"># 1 = keep, 0 = drop</span>
+a = a * mask / (<span class="nm">1.0</span> - p)               <span class="cm"># scale up survivors</span>
+<span class="cm"># Test time: just use `a` as-is, no mask, no scaling</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Too much dropout (e.g. <code class="inl">p = 0.8</code> everywhere) starves the network and causes
+          <em>underfitting</em>. Common practice: moderate dropout (0.2–0.5) on large fully-connected layers,
+          and little-to-none on convolutional layers (they already share weights heavily). Dropout interacts with
+          Batch Normalization (Topic 5) too — many modern architectures lean more on normalization than on heavy dropout.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Dropout randomly zeroes neurons during training (prob <code class="inl">p</code>), scaling survivors up
+          to compensate. It prevents co-adaptation and acts like averaging a huge ensemble of sub-networks, cutting
+          variance. At <em>test</em> time all neurons are used with no dropping — so always switch to
+          <code class="inl">model.eval()</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. EARLY STOPPING & AUGMENTATION ===================== -->
+      <section id="early-aug">
+        <h2><span class="sec-num">4</span> Early stopping &amp; data augmentation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p><strong>Early stopping</strong> is like taking a cake out of the oven the moment it's perfectly golden
+          — leave it in longer and it just burns. <strong>Data augmentation</strong> is like practising a song in
+          different keys, speeds, and rooms: it's the same song, but now you can play it anywhere. One stops you
+          training too long; the other gives you more (varied) practice material — both fight overfitting.</p>
+        </div>
+
+        <h3>Part A — Early stopping</h3>
+        <p>From Topic 1, validation loss falls, bottoms out, then starts rising as overfitting kicks in. The
+        obvious move: <strong>stop training at the bottom</strong>. <span class="term">Early stopping</span>
+        watches validation performance and halts training once it stops improving — keeping the model from the
+        point where it was best at generalising.</p>
+
+        <p>Because validation loss can wobble up and down a little, we use a <span class="term">patience</span>
+        counter: keep going for a few more epochs after the best score, and only stop if it doesn't beat the best.
+        We also save the <strong>best</strong> weights, not just the last ones.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🏋️</div><div class="s-t">Train an epoch</div><div class="s-d">Update weights on training data</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📋</div><div class="s-t">Check val loss</div><div class="s-d">Measure on the validation set</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">New best?</div><div class="s-d">Save weights, reset patience</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⏳</div><div class="s-t">No improvement?</div><div class="s-d">Count down patience</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛑</div><div class="s-t">Patience = 0</div><div class="s-d">Stop, restore best weights</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: an early-stopping loop</span>
+          <pre>best_val = float(<span class="st">'inf'</span>)
+patience, wait = <span class="nm">5</span>, <span class="nm">0</span>
+
+<span class="kw">for</span> epoch <span class="kw">in</span> range(max_epochs):
+    train_one_epoch(model, train_loader)
+    val_loss = evaluate(model, val_loader)
+
+    <span class="kw">if</span> val_loss &lt; best_val:
+        best_val = val_loss
+        torch.save(model.state_dict(), <span class="st">"best.pt"</span>)  <span class="cm"># remember the best</span>
+        wait = <span class="nm">0</span>
+    <span class="kw">else</span>:
+        wait += <span class="nm">1</span>
+        <span class="kw">if</span> wait &gt;= patience:        <span class="cm"># no improvement for 5 epochs</span>
+            <span class="kw">print</span>(<span class="st">"Early stopping!"</span>)
+            <span class="kw">break</span>
+
+model.load_state_dict(torch.load(<span class="st">"best.pt"</span>))  <span class="cm"># roll back to the best</span></pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why it counts as regularization</span>
+          <p>Stopping early limits how far the weights drift from their small starting values — so effectively it
+          keeps the model simpler, much like weight decay does, but without an explicit penalty term. It's also
+          basically free: you were going to watch validation loss anyway.</p>
+        </div>
+
+        <h3>Part B — Data augmentation</h3>
+        <p>The deepest cure for overfitting is simply <strong>more data</strong> — a model can't memorise what it
+        can't keep up with. But collecting and labelling data is expensive. <span class="term">Data augmentation</span>
+        is a clever cheat: create new, slightly-altered copies of your existing examples that are still valid.
+        The model sees more variety and learns the <em>invariances</em> that actually matter.</p>
+
+        <p>For <strong>images</strong>, common augmentations include:</p>
+        <ul>
+          <li><span class="term">Horizontal flip</span> — mirror left↔right. A flipped cat is still a cat.</li>
+          <li><span class="term">Random crop</span> — take a random sub-region (often after padding). Teaches the
+          model that the object can be off-centre or partly out of frame.</li>
+          <li><span class="term">Color jitter</span> — randomly nudge brightness, contrast, saturation, hue. A cat
+          under warm lamp light vs cool daylight is still a cat.</li>
+          <li>Small rotations, scaling, translation, adding a little noise, random erasing of patches, and modern
+          mixes like <em>Cutout</em>, <em>Mixup</em> and <em>CutMix</em>.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — augmentations must preserve the label</span>
+          <p>A horizontal flip is fine for a cat, but a <strong>vertical</strong> flip of a handwritten "6" turns it
+          into something like a "9" — now the label is wrong and you've taught the model garbage. Augmentations are
+          domain-specific: choose transforms that genuinely leave the answer unchanged. (And augment only the
+          <em>training</em> set, never validation/test.)</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: image augmentation in PyTorch</span>
+          <pre><span class="kw">from</span> torchvision <span class="kw">import</span> transforms
+
+train_tf = transforms.Compose([
+    transforms.RandomCrop(<span class="nm">32</span>, padding=<span class="nm">4</span>),   <span class="cm"># shift the object around</span>
+    transforms.RandomHorizontalFlip(),         <span class="cm"># mirror 50% of the time</span>
+    transforms.ColorJitter(brightness=<span class="nm">0.2</span>,
+                           contrast=<span class="nm">0.2</span>,
+                           saturation=<span class="nm">0.2</span>),    <span class="cm"># lighting changes</span>
+    transforms.ToTensor(),
+])
+
+<span class="cm"># Validation/test: NO random augmentation — just resize &amp; tensor-ise</span>
+test_tf = transforms.Compose([transforms.ToTensor()])</pre>
+          <p>From a single 32×32 cat photo, these transforms can generate millions of slightly different valid
+          views — so the effective training set explodes, and the model learns "cat-ness" rather than the exact
+          pixels of one photo.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Beyond images</span>
+          <p>Augmentation isn't only for vision: text can be paraphrased or have synonyms swapped, audio can be
+          time-shifted or have background noise added, and tabular data can get small noise. The principle is
+          universal — generate label-preserving variety.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Early stopping halts training at the validation-loss minimum (with a patience buffer and saving the best
+          weights), keeping the model from drifting into overfitting. Data augmentation manufactures more, varied,
+          label-preserving training examples (flips, crops, color jitter…), so the model learns robust patterns
+          instead of memorising specific samples. Both apply augmentation/checks only on the right split.
+        </div>
+      </section>
+
+      <!-- ===================== 5. BATCH NORMALIZATION ===================== -->
+      <section id="batchnorm">
+        <h2><span class="sec-num">5</span> Batch Normalization</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a relay race where each runner hands a baton to the next. If one runner sprints wildly fast
+          and the next crawls, the whole team is a mess. It'd help if, between each hand-off, someone reset
+          everyone to a sensible, steady pace. <strong>Batch Normalization</strong> does that between the layers of
+          a network: it re-centres and re-scales the numbers flowing through, so each layer receives inputs in a
+          calm, consistent range instead of wildly varying ones.</p>
+        </div>
+
+        <p>As signals pass through many layers, their scale can drift — getting huge or tiny — which makes training
+        slow and unstable (we'll dig into <em>why</em> deeper, along with weight initialization, in
+        <strong>Session 7</strong>). <span class="term">Batch Normalization</span> (Ioffe &amp; Szegedy, 2015)
+        tackles this by <strong>normalising the activations of a layer across each mini-batch</strong>.</p>
+
+        <h3>What it actually computes</h3>
+        <p>Recall from Session 5 that we train on <span class="term">mini-batches</span> — small groups of examples
+        at a time. For a given activation, BatchNorm looks at its values across all examples <em>in the current
+        mini-batch</em> and standardises them:</p>
+        <pre><span class="cm"># For each feature, over the B examples in the mini-batch:</span>
+μ  = mean(x)                 <span class="cm"># batch mean</span>
+σ² = var(x)                  <span class="cm"># batch variance</span>
+x̂  = (x − μ) / sqrt(σ² + ε)  <span class="cm"># normalize → mean 0, variance 1  (ε avoids /0)</span>
+y  = γ · x̂ + β               <span class="cm"># scale &amp; shift with LEARNED γ, β</span></pre>
+        <p>The first three lines force the activation to have mean 0 and variance 1. The last line is the clever
+        part: <span class="term">γ (gamma)</span> and <span class="term">β (beta)</span> are <em>learnable</em>
+        parameters that let the network <strong>undo</strong> the normalization if that's actually better. So
+        BatchNorm doesn't force a rigid distribution — it gives the network a well-behaved starting point and the
+        freedom to adjust.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>By keeping each layer's inputs in a steady range, BatchNorm makes the <em>loss landscape</em> smoother.
+          That lets you use <strong>higher learning rates</strong>, train <strong>much faster</strong>, and be far
+          less fussy about how you initialize weights. It often improves final accuracy too, and its
+          mini-batch noise adds a mild <em>regularizing</em> side-effect.</p>
+        </div>
+
+        <h3>Why it speeds up and stabilises training</h3>
+        <ul>
+          <li><strong>No more exploding/vanishing scale</strong> between layers → gradients (Session 5) stay
+          well-behaved, so updates are reliable.</li>
+          <li><strong>Smoother optimization</strong> → you can crank the learning rate up and converge in fewer epochs.</li>
+          <li><strong>Mild regularization</strong> → because each example's normalization depends on the <em>random
+          other examples</em> in its batch, the network sees slightly noisy activations — a bit like dropout. This
+          is why heavy dropout is often unnecessary when BatchNorm is used.</li>
+        </ul>
+
+        <h3>The train vs inference difference (very important)</h3>
+        <p>Just like dropout, BatchNorm behaves differently in the two modes:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Training</th><th>Inference / test</th></tr></thead>
+            <tbody>
+              <tr><td>μ and σ²</td><td>Computed fresh from the <strong>current mini-batch</strong>.</td><td>Use a fixed <strong>running average</strong> of μ and σ² collected during training.</td></tr>
+              <tr><td>Why</td><td>Batch stats give the smoothing &amp; noise benefit.</td><td>At test time you may predict on a single example — there's no meaningful "batch" to average over, and predictions must be deterministic.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>So during training, BatchNorm quietly keeps a moving average of the means and variances it sees; at
+        inference it switches to those frozen statistics. Once again this is governed by
+        <code class="inl">model.train()</code> vs <code class="inl">model.eval()</code> — forget
+        <code class="inl">.eval()</code> and your test predictions will wrongly depend on whatever else happens to
+        be in the batch.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: BatchNorm in PyTorch</span>
+          <pre><span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+model = nn.Sequential(
+    nn.Linear(<span class="nm">784</span>, <span class="nm">256</span>),
+    nn.BatchNorm1d(<span class="nm">256</span>),   <span class="cm"># normalize the 256 activations across the batch</span>
+    nn.ReLU(),                <span class="cm"># normalize BEFORE the nonlinearity is common</span>
+    nn.Linear(<span class="nm">256</span>, <span class="nm">10</span>),
+)
+
+model.train()   <span class="cm"># BN uses this batch's mean/var + updates running stats</span>
+loss = criterion(model(x_batch), y_batch)
+
+model.eval()    <span class="cm"># BN now uses the stored running mean/var → deterministic</span>
+<span class="kw">with</span> torch.no_grad():
+    preds = model(x_test)</pre>
+          <p>For convolutional networks you'd use <code class="inl">nn.BatchNorm2d</code> instead, which normalises
+          per-channel across the batch and spatial positions.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>BatchNorm relies on having a reasonable <em>batch size</em> — with tiny batches the per-batch mean and
+          variance are noisy and unreliable. In those cases people switch to relatives like <span class="term">Layer
+          Normalization</span> (used heavily in Transformers — recall the GenAI notes), <em>Group Norm</em>, or
+          <em>Instance Norm</em>. We'll meet these and the full initialization story in <strong>Session 7</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          BatchNorm standardises each layer's activations over the mini-batch (mean 0, variance 1) then rescales
+          with learnable γ, β. This smooths optimization → faster, more stable training, higher learning rates,
+          less init-sensitivity, plus a mild regularizing effect. It uses batch statistics during training but
+          frozen running averages at inference — so, like dropout, mind <code class="inl">model.eval()</code>.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You now have a complete toolkit for the central problem of deep learning. Here's the one-paragraph
+        story tying all five topics together:</p>
+        <div class="bigidea">
+          <p>A powerful network easily <strong>overfits</strong> — it memorises the training data's noise
+          (high <strong>variance</strong>) instead of the real pattern, which you spot as a widening gap between the
+          training and <strong>validation</strong> loss curves. To pull it back toward the bias–variance sweet
+          spot, we <strong>regularize</strong>. <strong>Weight decay</strong> (L2 for smoothness, L1 for sparsity)
+          penalises big weights so the function stays smooth. <strong>Dropout</strong> randomly silences neurons to
+          break co-adaptation and average a huge ensemble. <strong>Early stopping</strong> halts training at the
+          validation minimum, and <strong>data augmentation</strong> manufactures more varied, label-preserving
+          examples so there's simply more to learn from. <strong>Batch Normalization</strong> keeps activations in a
+          steady range, speeding and stabilising training with a regularizing bonus. Two of these — dropout and
+          BatchNorm — behave differently at train vs test time, so always switch with
+          <code class="inl">model.eval()</code>. In real projects you combine several of these at once.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Your model has 99% training accuracy but 70% validation accuracy. What's happening, and name two fixes.</summary>
+          <p class="ans">Overfitting (high variance) — it's memorising the training data. Fixes: add weight decay,
+          add dropout, use early stopping, add data augmentation, or get more data. Any two are fine.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the practical difference between L1 and L2 regularization?</summary>
+          <p class="ans">L1 (Σ|w|) drives many weights to <em>exactly zero</em>, producing a sparse model — good for
+          feature selection. L2 (Σw²) shrinks all weights smoothly toward small (but nonzero) values — the usual
+          default "weight decay" for smoothness.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why must you call <code class="inl">model.eval()</code> before testing a network with dropout or BatchNorm?</summary>
+          <p class="ans">Both behave differently at test time. In eval mode dropout stops dropping neurons (uses the
+          full network), and BatchNorm switches from per-batch statistics to stored running averages — making
+          predictions deterministic and correct. Forgetting it makes test outputs randomly depend on the batch.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is a vertical flip a bad augmentation for handwritten-digit images?</summary>
+          <p class="ans">It can change the label — flipping a "6" can look like a "9", so the example is now
+          mislabelled. Augmentations must preserve the correct answer; choose transforms that genuinely leave the
+          label unchanged.</p>
+        </details>
+        <details class="quiz">
+          <summary>In one sentence, why does dropout reduce overfitting?</summary>
+          <p class="ans">By randomly dropping neurons it prevents them from co-adapting into fragile cliques and
+          effectively averages a huge ensemble of sub-networks, which lowers variance.</p>
+        </details>
+        <details class="quiz">
+          <summary>Give two concrete benefits Batch Normalization provides during training.</summary>
+          <p class="ans">It lets you use higher learning rates and trains faster/more stably (smoother loss
+          landscape, less sensitivity to initialization), and it adds a mild regularizing effect from the
+          batch-statistic noise.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 6) — your course handout for this session, available through the class at <a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">priyanshsaxena.com/sst-deep-learning-nn</a>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://jmlr.org/papers/v15/srivastava14a.html" target="_blank" rel="noopener">Dropout: A Simple Way to Prevent Neural Networks from Overfitting (Srivastava et al., 2014)</a> — the original dropout paper; clear and very readable on the ensemble/co-adaptation intuition.</li>
+          <li><a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">Batch Normalization (Ioffe &amp; Szegedy, 2015)</a> — the paper that introduced BatchNorm and showed how it speeds and stabilises training.</li>
+          <li><a href="https://cs231n.github.io/neural-networks-2/" target="_blank" rel="noopener">CS231n: Neural Networks Part 2 (Stanford)</a> — an excellent, beginner-friendly walkthrough of regularization, dropout, and data preprocessing.</li>
+          <li><a href="https://www.deeplearningbook.org/contents/regularization.html" target="_blank" rel="noopener">Deep Learning Book, Ch. 7: Regularization (Goodfellow, Bengio &amp; Courville)</a> — the definitive, free textbook chapter covering L1/L2, early stopping, dropout and more.</li>
+          <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.Dropout.html" target="_blank" rel="noopener">PyTorch docs: nn.Dropout &amp; nn.BatchNorm</a> — the official API reference for the layers used in this session's code.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-5.html"><div class="dir">← Previous</div><div class="ttl">Session 5: Loss Functions &amp; Optimization</div></a>
+        <a class="next" href="session-7.html"><div class="dir">Next →</div><div class="ttl">Session 7: Initialization &amp; Normalization</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 6 — Regularization: Fighting Overfitting · Keep your models humble 🧠</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

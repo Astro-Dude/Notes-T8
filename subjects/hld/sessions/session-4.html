@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 4 — Caching — Part 2: Eviction, Consistency &amp; Invalidation</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 4</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 04 · Caching 2</span>
+      <h1>Caching, Part 2: how caches decide what to forget — and stay correct</h1>
+      <p class="lead">
+        In Session 3 we learned <em>what</em> a cache is and <em>why</em> it makes systems fast. Now we go
+        one level deeper. A cache is small, so it must constantly throw old things away (eviction). It holds
+        copies of data, so those copies can drift out of date (consistency). And when the real data changes,
+        the cache must be told (invalidation). We'll build all of it up from scratch, with everyday stories,
+        real pseudocode, and a full case study at the end. Take it slow — none of this requires prior knowledge.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#eviction">Eviction: deciding what to drop</a></li>
+          <li><a href="#consistency">Consistency models for caches</a></li>
+          <li><a href="#invalidation">Write strategies &amp; invalidation</a></li>
+          <li><a href="#casestudy">Case study: Scaler Code Judge</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. EVICTION ===================== -->
+      <section id="eviction">
+        <h2><span class="sec-num">1</span> Eviction mechanisms — deciding what to drop</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your school backpack can only hold 5 books, but you own 50. Every time you grab a new
+          book to carry, if the bag is full you have to take one out and leave it at home. Which one do you
+          leave behind? Maybe the one you haven't touched in ages. Maybe the one you almost never read. A
+          <strong>cache is exactly that small backpack</strong>, and an <strong>eviction rule</strong> is your
+          way of choosing which book to leave behind when a new one needs to fit.</p>
+        </div>
+
+        <p>Recall from Session 3 that a <span class="term">cache</span> is a small, fast store that keeps copies
+        of the data we use most. The word "small" is the whole point: fast memory (like RAM) is expensive, so a
+        cache only has room for a tiny slice of all your data. When the cache is <strong>full</strong> and a new
+        item needs to come in, something already inside must go. Choosing what to remove is called
+        <span class="term">eviction</span>, and the rule that makes the choice is an
+        <span class="term">eviction policy</span> (sometimes called a <span class="term">replacement policy</span>).</p>
+
+        <h3>Why a cache is (almost) always full</h3>
+        <p>When you first start a cache server, it is <strong>empty</strong>. But an empty cache is wasted cache —
+        you want it holding as much useful data as possible. So as requests flow in, the cache fills up… and from
+        that point onwards it <strong>stays full</strong> (until it crashes and restarts). Once it's full but you
+        still want to cache <em>more</em> data, you must first kick something out to make room. That is the entire
+        job of an eviction policy: <strong>decide which already-cached item to "kick out" to make space for new
+        data.</strong></p>
+
+        <div class="callout key">
+          <span class="c-title">How do you choose an eviction policy?</span>
+          <p><strong>Just use LRU.</strong> For 99% of use cases you don't need to think at all — LRU works well
+          enough. It might not be <em>perfect</em> for your workload, but it will be fine. Only if you have lots of
+          spare time and have already optimised everything else should you implement several strategies, run them on
+          real traffic, and <strong>measure</strong> which performs best. The rule is: <em>never guess — measure.</em></p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A cache wins only when the things it keeps are the things you're about to ask for again. So a good
+          eviction policy is really a <strong>prediction of the future</strong>: "which item am I least likely to
+          need soon?" Throw <em>that</em> one out. Every policy below is just a different guess about the future.</p>
+        </div>
+
+        <h3>Two words you'll hear constantly</h3>
+        <ul>
+          <li><span class="term">Cache hit</span> — you asked for something and it was already in the cache (fast! good!).</li>
+          <li><span class="term">Cache miss</span> — it wasn't there, so you had to fetch it from the slow source
+          and (usually) put it in the cache, evicting something if full.</li>
+        </ul>
+        <p>The goal of every eviction policy is to <strong>maximise the hit rate</strong> — the percentage of
+        requests that are hits.</p>
+
+        <h3>The policies, one at a time</h3>
+
+        <h4>LRU — Least Recently Used</h4>
+        <p><span class="term">LRU</span> evicts the item that hasn't been <em>touched</em> for the longest time.
+        The bet: "if you haven't used it in a while, you probably won't need it soon." This is the most popular
+        policy in real systems (the right choice in ~99% of cases) because it matches how people actually use data —
+        recently used things tend to be used again.</p>
+
+        <div class="callout note">
+          <span class="c-title">Homework: locality of reference</span>
+          <p>LRU works because of <strong>locality</strong>. Read about these two ideas:</p>
+          <ul>
+            <li><span class="term">Temporal locality</span> — if some data has been accessed <em>right now</em>, it
+            is highly likely to be accessed <em>again</em> in the near future. (This is exactly why LRU keeps
+            recently-used items.)</li>
+            <li><span class="term">Spatial locality</span> — if some data has been accessed right now, then
+            <em>nearby</em> data is highly likely to be accessed soon. (e.g. iterating over an array
+            <code class="inl">[a, b, c, d, f, e, g, r, …]</code> — touching <code class="inl">a</code> hints
+            <code class="inl">b</code> is next.)</li>
+          </ul>
+        </div>
+
+        <h4>LFU — Least Frequently Used</h4>
+        <p><span class="term">LFU</span> evicts the item that has been used the <em>fewest times overall</em>. It
+        keeps a counter per item. The bet: "popular things stay popular." Great for items with a stable, long-term
+        popularity (a viral video everyone keeps watching), but it can keep stale "once-famous" items around too
+        long and is slow to let go of yesterday's hits.</p>
+
+        <h4>FIFO — First In, First Out</h4>
+        <p><span class="term">FIFO</span> evicts whatever was <em>added first</em>, regardless of how often or how
+        recently it's been used — like a queue at a ticket counter. Simple and cheap, but dumb: it might evict a
+        super-popular item just because it happens to be old.</p>
+
+        <h4>MRU — Most Recently Used</h4>
+        <p><span class="term">MRU</span> is the complete <strong>opposite</strong> of LRU: it evicts the item used
+        <em>most</em> recently. Sounds backwards, and it is <strong>bad for 99% of cases</strong> — but it shines in
+        specific patterns, e.g. scanning a big file once top-to-bottom, where the page you just read is the one
+        you're <em>least</em> likely to read again soon. <strong>Homework:</strong> find a valid use-case of the MRU
+        eviction policy.</p>
+
+        <h4>FIFO vs LIFO</h4>
+        <p>Alongside FIFO there's <span class="term">LIFO (Last In, First Out)</span> — evict whatever was added
+        <em>most</em> recently, like a stack. Both ignore usage entirely; they are simple but rarely the best choice.
+        In practice the field narrows to <strong>FIFO, LIFO, LRU, LFU, and MRU</strong>, and for ~99% of cases the
+        answer is <strong>LRU</strong>.</p>
+
+        <h4>Random</h4>
+        <p><span class="term">Random</span> replacement just picks a victim at random. No bookkeeping at all. It
+        sounds careless, but it's extremely cheap and, surprisingly, performs almost as well as LRU in some
+        hardware caches — which is why CPUs sometimes use it.</p>
+
+        <h4>TTL-based — Time To Live</h4>
+        <p>A <span class="term">TTL (Time To Live)</span> isn't a victim-selection rule like the others; it's an
+        <strong>expiry stamp</strong>. Each item is tagged "good until 3:05pm." After that, it's treated as gone
+        no matter how popular it is. TTL is usually combined <em>with</em> another policy: TTL handles "too old to
+        trust," while LRU/LFU handle "no room left." We'll lean on TTL heavily in the consistency and case-study
+        sections.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: same requests, different policies</span>
+          <p>Cache size = <strong>3</strong>. Requests arrive in this order:
+          <code class="inl">A B C A D B</code>. Let's see what each policy evicts when <code class="inl">D</code>
+          arrives and the cache is full of <code class="inl">{A, B, C}</code>.</p>
+          <ul>
+            <li><strong>LRU</strong>: at the moment <code class="inl">D</code> arrives, the use-order was A, B, C,
+            A, B — so <code class="inl">C</code> is the least recently used. <strong>Evict C.</strong></li>
+            <li><strong>LFU</strong>: counts are A=2, B=2, C=1 — <code class="inl">C</code> is least frequent.
+            <strong>Evict C.</strong></li>
+            <li><strong>FIFO</strong>: <code class="inl">A</code> was inserted first. <strong>Evict A</strong>
+            (even though A was just used again — FIFO doesn't care!).</li>
+            <li><strong>MRU</strong>: the most recently used item was <code class="inl">B</code>.
+            <strong>Evict B.</strong></li>
+          </ul>
+          <p>Same workload, four different victims. That difference is exactly why choosing the right policy matters.</p>
+        </div>
+
+        <h3>Implementing LRU: hashmap + doubly linked list</h3>
+        <p>LRU needs two things to be fast: instant lookup ("is X in the cache?") and instant reordering ("mark X
+        as just-used" and "find the oldest item"). The classic trick combines two data structures so that
+        <strong>every operation is O(1)</strong>:</p>
+        <ul>
+          <li>A <span class="term">hashmap</span> from <code class="inl">key → node</code> for O(1) lookup.</li>
+          <li>A <span class="term">doubly linked list</span> ordered by recency: the <strong>head</strong> is the
+          most-recently-used end, the <strong>tail</strong> is the least-recently-used end. A doubly linked node
+          (with <code class="inl">prev</code> and <code class="inl">next</code> pointers) lets us unlink and move a
+          node in O(1) without scanning.</li>
+        </ul>
+        <p>On a <strong>get</strong>, we look the key up in the map and move its node to the head (just used). On a
+        <strong>put</strong>, we add at the head; if we're over capacity, we drop the tail node (the oldest) and
+        remove it from the map.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">Look up</div><div class="s-d">hashmap key→node, O(1)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">Unlink node</div><div class="s-d">fix prev/next, O(1)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⬆️</div><div class="s-t">Move to head</div><div class="s-d">mark "just used"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗑️</div><div class="s-t">Over capacity?</div><div class="s-d">drop tail = LRU victim</div></div>
+        </div>
+
+        <pre><span class="cm"># LRU cache: O(1) get and put using hashmap + doubly linked list</span>
+<span class="kw">class</span> Node:
+    <span class="kw">def</span> __init__(self, key, value):
+        self.key   = key
+        self.value = value
+        self.prev  = <span class="kw">None</span>      <span class="cm"># toward head (most recent)</span>
+        self.next  = <span class="kw">None</span>      <span class="cm"># toward tail (least recent)</span>
+
+<span class="kw">class</span> LRUCache:
+    <span class="kw">def</span> __init__(self, capacity):
+        self.cap  = capacity
+        self.map  = {}                  <span class="cm"># key -> Node, gives O(1) lookup</span>
+        <span class="cm"># two dummy "sentinel" nodes so we never check for None edges</span>
+        self.head = Node(<span class="kw">None</span>, <span class="kw">None</span>)   <span class="cm"># most-recently-used side</span>
+        self.tail = Node(<span class="kw">None</span>, <span class="kw">None</span>)   <span class="cm"># least-recently-used side</span>
+        self.head.next = self.tail
+        self.tail.prev = self.head
+
+    <span class="kw">def</span> _remove(self, node):            <span class="cm"># unlink a node, O(1)</span>
+        node.prev.next = node.next
+        node.next.prev = node.prev
+
+    <span class="kw">def</span> _add_front(self, node):         <span class="cm"># insert right after head, O(1)</span>
+        node.next = self.head.next
+        node.prev = self.head
+        self.head.next.prev = node
+        self.head.next = node
+
+    <span class="kw">def</span> get(self, key):
+        <span class="kw">if</span> key <span class="kw">not in</span> self.map:
+            <span class="kw">return</span> -<span class="nm">1</span>               <span class="cm"># cache miss</span>
+        node = self.map[key]
+        self._remove(node)              <span class="cm"># pull it out...</span>
+        self._add_front(node)           <span class="cm"># ...and mark as most-recently-used</span>
+        <span class="kw">return</span> node.value
+
+    <span class="kw">def</span> put(self, key, value):
+        <span class="kw">if</span> key <span class="kw">in</span> self.map:           <span class="cm"># update existing</span>
+            self._remove(self.map[key])
+        node = Node(key, value)
+        self.map[key] = node
+        self._add_front(node)
+        <span class="kw">if</span> len(self.map) &gt; self.cap:   <span class="cm"># over capacity -> evict LRU</span>
+            lru = self.tail.prev        <span class="cm"># node just before tail = oldest</span>
+            self._remove(lru)
+            <span class="kw">del</span> self.map[lru.key]</pre>
+
+        <div class="callout note">
+          <span class="c-title">Why two "sentinel" nodes?</span>
+          <p>The dummy <code class="inl">head</code> and <code class="inl">tail</code> nodes never hold real data.
+          They exist so that inserting and removing never hit a <code class="inl">None</code> edge case — the list
+          is "never empty." It's a small trick that removes a pile of <code class="inl">if first/last</code> checks
+          and bugs. <strong>LFU</strong> is similar but harder: you also keep a count per node and group nodes by
+          frequency, so it's typically a hashmap of keys plus a hashmap of frequency-buckets.</p>
+        </div>
+
+        <h3>Comparison table</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Policy</th><th>Evicts…</th><th>Bet about the future</th><th>Cost / bookkeeping</th><th>Best for</th></tr></thead>
+            <tbody>
+              <tr><td><strong>LRU</strong></td><td>Least recently used</td><td>"Untouched lately = won't need soon"</td><td>O(1) with map + linked list</td><td>General purpose, web/app caches</td></tr>
+              <tr><td><strong>LFU</strong></td><td>Least frequently used (lowest count)</td><td>"Popular stays popular"</td><td>O(1) possible but more state (counters)</td><td>Stable long-term popularity</td></tr>
+              <tr><td><strong>FIFO</strong></td><td>Oldest inserted</td><td>"Old = expendable" (ignores usage)</td><td>Tiny — just a queue</td><td>Simple caches, streaming/scan</td></tr>
+              <tr><td><strong>MRU</strong></td><td>Most recently used</td><td>"Just-used = done with it"</td><td>O(1)</td><td>One-pass scans of large data</td></tr>
+              <tr><td><strong>Random</strong></td><td>A random item</td><td>No bet — pure luck</td><td>Near-zero</td><td>Hardware caches, ultra-cheap eviction</td></tr>
+              <tr><td><strong>TTL</strong></td><td>Anything past its expiry</td><td>"Old copies are untrustworthy"</td><td>Just a timestamp per item</td><td>Freshness/consistency (pair with LRU)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Gotcha: hit rate isn't everything</span>
+          <p>A fancy policy with a higher hit rate can still lose if its bookkeeping is slow or memory-hungry.
+          That's why Random and FIFO survive in real hardware: being "good enough" but <em>nearly free</em> can beat
+          being "optimal" but expensive. Always weigh hit-rate gains against the cost of tracking usage.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A cache is small, so when it fills up an <strong>eviction policy</strong> chooses what to drop, betting on
+          what you won't need soon. <strong>LRU</strong> drops the least-recently-used (and runs O(1) with a hashmap
+          + doubly linked list); <strong>LFU</strong> drops the least-used-overall; <strong>FIFO</strong> drops the
+          oldest; <strong>MRU</strong> drops the newest; <strong>Random</strong> picks blindly but cheaply; and
+          <strong>TTL</strong> expires items by time and is usually paired with one of the others.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CONSISTENCY ===================== -->
+      <section id="consistency">
+        <h2><span class="sec-num">2</span> Consistency models for caches</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the teacher writes the homework on the board (that's the <em>real</em> answer), and you copy it
+          into your notebook (that's your <em>cache</em>). Now the teacher changes the homework. Two things can
+          happen. Either someone tells everyone <strong>immediately</strong> to fix their notebooks — now every
+          notebook always matches the board. Or word spreads <strong>slowly</strong>, so for a little while some
+          kids still have the old homework in their notebook. The first way is always-correct but more work; the
+          second way is faster but means a few wrong copies float around for a bit.</p>
+        </div>
+
+        <p>A cache holds a <strong>copy</strong> of data that really "lives" somewhere else (the database, the
+        <span class="term">source of truth</span>). The moment we keep a copy, we face a question: <em>when the
+        original changes, how quickly must the copy agree with it?</em> The answer is the cache's
+        <span class="term">consistency model</span>.</p>
+
+        <h3>First, two plain words: consistent vs inconsistent</h3>
+        <ul>
+          <li><span class="term">Consistent</span> — it is <strong>not possible</strong> to read a stale value.
+          Every read is guaranteed to return the latest data.</li>
+          <li><span class="term">Inconsistent</span> — it <strong>is possible</strong> for reads to be stale (you
+          might read an old value).</li>
+        </ul>
+        <p>With that, there are <strong>three</strong> consistency models you'll hear about (we cover two in depth
+        here; the third is the scary one):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Model</th><th>What it means</th><th>Can you read stale data?</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Immediate (strong)</strong></td><td>Data is consistent immediately — no waiting. All copies sync up at once.</td><td>Never — impossible to read a stale value.</td></tr>
+              <tr><td><strong>Eventual</strong></td><td>Data becomes consistent <em>eventually</em>. For a while it may be inconsistent, but wait long enough and everything syncs up.</td><td>Yes, for a bounded window.</td></tr>
+              <tr><td><strong>No consistency</strong></td><td><strong>Data loss can happen!</strong> No matter how long you wait, the data will <em>never</em> become consistent.</td><td>Worse — the data can be lost entirely.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Where does "No consistency" come from?</span>
+          <p>It isn't a deliberate choice you'd make for important data — it's the property of the
+          <strong>write-back</strong> strategy (Section 3). Because writes live only in the volatile cache until a
+          later flush, a crash can wipe them permanently. We'll return to it there. (More on consistency in general
+          comes in future classes.)</p>
+        </div>
+
+        <h3>Strong (immediate) consistency</h3>
+        <p><span class="term">Strong consistency</span> (also called <span class="term">immediate
+        consistency</span>) means: <strong>the instant the real data changes, every read — from cache or database —
+        sees the new value.</strong> There is never a moment where someone reads an outdated copy. To guarantee
+        this, the cache and database must be kept in lockstep on every write (e.g. update both together, or wipe the
+        cached copy the moment the data changes — we'll see exactly how in Section 3).</p>
+
+        <h3>Eventual consistency</h3>
+        <p><span class="term">Eventual consistency</span> means: <strong>after a change, copies will all agree
+        <em>eventually</em></strong> — but for a short window, some readers may still get the old value. As long as
+        no new writes come in, given enough time everything converges to the latest value. The gap between "data
+        changed" and "all copies updated" is when staleness lives.</p>
+
+        <div class="callout note">
+          <span class="c-title">The word "staleness"</span>
+          <p><span class="term">Staleness</span> is how out-of-date a cached copy is. A value that's "5 seconds
+          stale" was correct 5 seconds ago but the real data has since changed. Eventual consistency
+          <em>accepts</em> some staleness in exchange for speed; strong consistency refuses to allow any.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The core trade-off</span>
+          <p>Strong consistency gives you <strong>always-correct reads</strong> but costs <strong>speed and
+          effort</strong> (every write must touch the cache too, and reads may have to wait). Eventual consistency
+          gives you <strong>blazing speed</strong> but accepts a <strong>window of wrong answers</strong>. There is
+          no free lunch — you pick based on how much a stale read would actually hurt.</p>
+        </div>
+
+        <h3>How TTL gives you "tunable" eventual consistency</h3>
+        <p>Recall TTL from Section 1. A TTL is the dial that controls <em>how stale</em> data can get. If you cache
+        a value with <code class="inl">TTL = 60s</code>, the cache promises the copy is at most 60 seconds old. So
+        the worst-case staleness equals the TTL. Shorter TTL → fresher data but more cache misses (more trips to
+        the slow database); longer TTL → faster but staler. <strong>The TTL knob lets you trade freshness for
+        speed.</strong></p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a product's price</span>
+          <p>An online store caches a product's price.</p>
+          <ul>
+            <li><strong>Strong consistency:</strong> the seller changes the price from $20 → $25. Every customer
+            <em>immediately</em> sees $25. Nobody can ever buy at the old price. Correct, but every price change
+            forces the cache to update right away, and reads can't be served until that's done.</li>
+            <li><strong>Eventual (TTL = 60s):</strong> after the change, customers might still see $20 for up to
+            60 seconds until the cached copy expires and gets refreshed to $25. Much faster and simpler — but for
+            up to a minute, some customers see a stale price.</li>
+          </ul>
+          <p>Which is right? For a price, a 60-second stale window might be unacceptable (legal/financial). For a
+          "number of likes" counter, who cares if it's a few seconds behind? <strong>The data's importance picks
+          the model.</strong></p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Strong / immediate</th><th>Eventual</th></tr></thead>
+            <tbody>
+              <tr><td>Reads after a write</td><td>Always the newest value</td><td>May be stale for a window</td></tr>
+              <tr><td>Speed</td><td>Slower (sync work on every write)</td><td>Faster (writes don't wait on the cache)</td></tr>
+              <tr><td>Complexity / cost</td><td>Higher — keep cache &amp; DB in lockstep</td><td>Lower — let copies drift, fix later</td></tr>
+              <tr><td>Staleness allowed</td><td>None</td><td>Yes — bounded by TTL / propagation time</td></tr>
+              <tr><td>Use when</td><td>Money, inventory, auth, anything where a wrong read is harmful</td><td>Likes, view counts, feeds, recommendations</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off to remember</span>
+          <p>You can't have "always correct," "always fast," and "always simple" all at once. Picking a consistency
+          model is really picking <em>how much staleness your users can tolerate</em>. Most real systems use eventual
+          consistency with a sensible TTL for most data, and reserve strong consistency for the few fields that truly
+          must never be wrong.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A cache holds copies, so it needs a <strong>consistency model</strong>. <strong>Strong/immediate</strong>
+          consistency means reads are always current (correct but slower and more work). <strong>Eventual</strong>
+          consistency lets copies be briefly stale (fast and simple, but wrong for a window). <strong>TTL</strong> is
+          the dial that bounds how stale data can get — trading freshness against speed. Pick the model based on how
+          badly a stale read would hurt.
+        </div>
+      </section>
+
+      <!-- ===================== 3. INVALIDATION / WRITE STRATEGIES ===================== -->
+      <section id="invalidation">
+        <h2><span class="sec-num">3</span> Write strategies &amp; invalidation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You keep a sticky note on your fridge with your friend's phone number (the cache), and the real number
+          lives in your phone's contacts (the database). When the number changes, what do you do? You could update
+          <strong>both the sticky note and the contact at the same time</strong>. Or update the sticky note now and
+          <strong>fix the real contact later</strong>. Or just <strong>throw the sticky note away</strong> and write
+          a fresh one only the next time you actually need to call. Each of those is a real "write strategy" for
+          keeping a cache and its source in sync.</p>
+        </div>
+
+        <p>Sections 1 and 2 set up the problem: cached copies drift from the truth, and we must decide how fresh to
+        keep them. A <span class="term">write strategy</span> is the concrete rule for <em>what happens to the cache
+        when data is written or changed</em>. Closely related is <span class="term">cache invalidation</span> —
+        marking a cached copy as no longer valid so it won't be served. (There's a famous joke: "There are only two
+        hard things in computer science: cache invalidation and naming things." It's hard because getting it wrong
+        means serving wrong data.)</p>
+
+        <h3>How cache reads &amp; writes actually happen</h3>
+        <p>Before naming strategies, here's the <strong>typical read/write cycle</strong> that most caches use:</p>
+        <ul>
+          <li><strong>Writes</strong> go directly to the <strong>database</strong> (typically) — <em>not</em> to the
+          cache.</li>
+          <li><strong>Reads</strong>: the app server first checks the cache.
+            <ul>
+              <li><span class="term">Cache hit</span> (value present) → return the cached value.</li>
+              <li><span class="term">Cache miss</span> (value absent) → app server fetches the value from the DB,
+              returns it to the user, and <em>(asynchronously)</em> updates the value in the cache.</li>
+            </ul>
+          </li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Consequence: the cache can go stale</span>
+          <p>Since writes only go to the DB, the copy inside the cache can become <strong>stale</strong>. Suppose the
+          DB now holds <code class="inl">a = 20</code> but the cache still says <code class="inl">a = 10</code>. A
+          read will be a <strong>cache hit</strong>, so the app server happily returns <strong>10</strong> — the
+          wrong value — and never even checks the database. This is precisely the problem invalidation exists to
+          solve.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Why doesn't the cache fetch from the DB itself on a miss?</span>
+          <p>You might ask: on a miss, why can't the cache just go to the DB, store the value, and return it — instead
+          of bouncing back to the app server? Some people do build it this way, but it's typically considered
+          <strong>bad design (an anti-pattern)</strong>. The reason is <strong>separation of concerns</strong>:</p>
+          <ul>
+            <li>All the <strong>business logic</strong> — which data to fetch, which tables to join, how to filter,
+            validate, and sort — lives in the <strong>app server</strong>.</li>
+            <li>The <strong>cache server is meant to be "dumb"</strong> — just fast key/value storage.</li>
+            <li>If you make the cache "intelligent," your business logic is now split across two codebases that can
+            drift out of sync (one becomes stale), and the cache server would need a powerful CPU to do all that
+            slicing and dicing.</li>
+          </ul>
+          <p>So all fetching/updating responsibility stays with the app server; the cache just acts as
+          dumb storage.</p>
+        </div>
+
+        <h3>Two reading patterns first</h3>
+        <p>How data gets <em>into</em> the cache also matters. Two read patterns:</p>
+        <ul>
+          <li><span class="term">Cache-aside (lazy loading)</span> — the application talks to the cache itself. On a
+          miss, the app loads from the DB and <em>then</em> fills the cache. The cache only ever holds things that
+          were actually requested.</li>
+          <li><span class="term">Read-through</span> — the app only ever talks to the cache; the cache itself knows
+          how to fetch from the DB on a miss. (Mentioned for completeness; cache-aside is by far the most common.)</li>
+        </ul>
+
+        <h3>Cache-aside (lazy loading) — the default workhorse</h3>
+        <p>This is the most common pattern in real systems. Reads are "lazy": data is loaded into the cache only
+        when first requested.</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">1. Read</div><div class="s-d">App asks cache</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">2. Hit?</div><div class="s-d">Yes → return it</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">3. Miss</div><div class="s-d">Read from DB</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">4. Fill cache</div><div class="s-d">Store for next time</div></div>
+        </div>
+        <pre><span class="cm"># Cache-aside read (lazy loading)</span>
+<span class="kw">def</span> get_user(user_id):
+    user = cache.get(user_id)
+    <span class="kw">if</span> user <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="kw">return</span> user                 <span class="cm"># cache hit</span>
+    user = db.query(user_id)         <span class="cm"># cache miss -> go to source of truth</span>
+    cache.set(user_id, user, ttl=<span class="nm">300</span>) <span class="cm"># fill cache for next time (5-min TTL)</span>
+    <span class="kw">return</span> user</pre>
+        <p><strong>On a write</strong> with cache-aside, you update the DB and then <strong>invalidate</strong>
+        (delete) the cached copy, so the next read re-loads the fresh value:</p>
+        <pre><span class="cm"># Cache-aside write: update DB, then invalidate the stale copy</span>
+<span class="kw">def</span> update_user(user_id, new_data):
+    db.update(user_id, new_data)     <span class="cm"># source of truth changes first</span>
+    cache.delete(user_id)            <span class="cm"># invalidate -> next read reloads fresh</span></pre>
+
+        <h3>TTL (Time To Live) — the simplest invalidation policy</h3>
+        <p>TTL is both an <strong>invalidation policy</strong> and (with a small modification) an
+        <strong>eviction</strong> consideration — you may even see it listed as an eviction strategy because it's so
+        simple. (Strictly, pure TTL is <em>not</em> an eviction policy on its own.)</p>
+        <p>The idea: whenever you store data in the cache, alongside the value you also store an <strong>expiry
+        time</strong>. Every entry is valid for a fixed amount of time (its TTL). TTL can be set <strong>globally</strong>
+        (one value for all keys) or <strong>per key</strong>. After the TTL expires, we <em>assume</em> the value is
+        stale and invalidate it — even though in reality we have no idea whether the DB value actually changed.</p>
+        <p>For example, if we write <code class="inl">a = 10</code> at <strong>8 am</strong> with a TTL of
+        <strong>1 hour</strong>, the entry's expiry is set to <strong>9 am</strong>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Value</th><th>Expiry</th></tr></thead>
+            <tbody>
+              <tr><td>a</td><td>10</td><td>9:00 am</td></tr>
+              <tr><td>b</td><td>20</td><td>9:05 am</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>When do we actually delete an expired entry? Eager vs Lazy</h4>
+        <ul>
+          <li><span class="term">Eager invalidation</span> — delete the entry <strong>immediately</strong> when its
+          expiry passes. This forces the cache to run a timer/event loop per expiry (think Timer + Priority Queue),
+          adding overhead. Worse, if many entries share an expiry time (say 9 am), then at 9 am incoming requests
+          must <em>wait</em> while the cache busily clears all the expired entries. Performance becomes
+          <strong>"jittery"</strong> — not smooth — with temporary latency spikes during cleanup.</li>
+          <li><span class="term">Lazy invalidation</span> — delete the entry only when the <strong>next read</strong>
+          for that key arrives and finds it expired. You may temporarily store stale data (wasted space), but that's
+          fine because the eviction algorithm reclaims it anyway. <strong>Lazy is almost always better</strong>: it
+          gives smooth latency across all requests.</li>
+        </ul>
+
+        <div class="callout key">
+          <span class="c-title">What consistency does TTL give? Can it serve stale data?</span>
+          <p><strong>Yes, TTL can serve stale data.</strong> If the DB is updated <em>before</em> the cache entry
+          expires, every read in that window returns the old cached value (a hit on not-yet-expired data). Because
+          the data does become correct once the entry expires and reloads, <strong>TTL provides eventual
+          consistency.</strong></p>
+        </div>
+
+        <h4>What's the ideal TTL value?</h4>
+        <p>Completely application-dependent — anywhere from <strong>5 seconds</strong> to <strong>a week</strong>.</p>
+        <ul>
+          <li><strong>Lower TTL</strong> → more cache <em>misses</em> (data invalidated quickly), but data is
+          <strong>fresher</strong>.</li>
+          <li><strong>Higher TTL</strong> → better hit rate, but data is <strong>staler</strong>.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Don't push the expiry forward on reads</span>
+          <p>Tempting idea: bump an entry's expiry every time it's read. <strong>Don't</strong> — that breaks TTL.
+          Suppose you set <code class="inl">a</code> at 8:55 with expiry 9:00. The DB is updated at 8:58 (cache now
+          stale), so it should be invalidated at 9:00. But a read arrives at 8:59 and you push expiry to 9:05 — now
+          your stale data lives until 9:05. You may push the expiry forward when you <em>write</em> to the cache, but
+          pushing it on reads turns TTL into something else entirely.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Analogy: TTL = fruit with expiry labels in your fridge</span>
+          <p>When you buy fruit, before putting it in the fridge you <strong>label each one with an expiry date</strong>.
+          When you're hungry you check the fridge and read the tag:</p>
+          <ul>
+            <li>If the expiry date has <strong>passed</strong> → throw the fruit in the garbage (even if it looks
+            fine) and go to the market to buy fresh.</li>
+            <li>If the expiry date has <strong>not</strong> passed → eat it (even if it's actually rotten).</li>
+          </ul>
+          <p>You trust the label, not the real freshness — exactly like TTL trusts the expiry stamp, not the DB.</p>
+        </div>
+
+        <h3>Write-around — a background job recomputes the cache</h3>
+        <p><span class="term">Write-around</span> is very similar to TTL in that it also provides <strong>eventual
+        consistency</strong>, but it's used for a different reason. The key difference is <em>how expensive it is to
+        produce the cached value</em>:</p>
+        <ul>
+          <li><strong>TTL works best</strong> when fetching an entry from the DB is easy and needs little
+          post-processing. Example — caching user preferences:
+            <pre><span class="cm">-- table: user_preferences(user_id bigint, name text, preferences json)</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> user_preferences <span class="kw">WHERE</span> user_id = <span class="nm">1234</span>;</pre>
+          A very simple, fast query. If we're OK with eventual consistency, <strong>TTL is ideal</strong> here.</li>
+          <li><strong>Write-around works best</strong> when producing the data is <em>extremely expensive</em> or
+          needs heavy computation. Example — "find all users using dark theme on a mobile device":
+            <pre><span class="cm">-- expensive join + group-by</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> user_preferences up
+<span class="kw">JOIN</span> user_devices ud <span class="kw">ON</span> ud.user_id = up.user_id
+<span class="kw">WHERE</span> ud.device_type = <span class="st">'mobile'</span> <span class="kw">AND</span> up.theme = <span class="st">'dark'</span>
+<span class="kw">GROUP BY</span> up.user_id;</pre>
+          A complex, slow query — here a <strong>write-around</strong> policy is better.</li>
+        </ul>
+        <p>With write-around there's a <strong>separate background process</strong> (running in its own app server)
+        that periodically fetches all <em>recently updated</em> data from the DB, does the heavy computation, and
+        updates the cache in one go:</p>
+        <pre><span class="cm"># background "cron job": recompute and refresh the cache in bulk</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> ...
+<span class="kw">WHERE</span> updated_at &gt; (now() - <span class="st">'1 hour'</span>);</pre>
+
+        <div class="callout key">
+          <span class="c-title">Two tricky questions about write-around</span>
+          <p><strong>Can it serve stale data?</strong> Yes. Until the background cron job runs again, any DB updates
+          mean the cache holds stale data — hence eventual consistency.</p>
+          <p><strong>What if the data isn't in the cache yet (the cron hasn't run once)?</strong> Reads always check
+          the cache; if the computed data isn't there, we return a <strong>404 to the client</strong> — we do
+          <em>NOT</em> go to the DB. Why? Because write-around is used precisely when the computation is expensive, so
+          we'd rather wait for the background job to compute it once than run that expensive computation on the fly
+          for every incoming request.</p>
+          <p><strong>What if the data is too large to fit in the cache?</strong> Write-around is typically used when
+          the <em>computed</em> result is small enough to fit. An eviction algorithm usually isn't needed here — you
+          evict only when the data is no longer required (e.g. drop the leaderboard once the contest is over).</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Analogy: write-around = restock the fridge on a schedule</span>
+          <p>You buy fruit and just put it in the fridge (no labels). You only go to the market at <strong>random
+          times</strong>. When hungry, you check the fridge: if the fruit is there you eat it (fresh or rotten); if
+          it's not there you sleep hungry — you do <em>not</em> rush to the market. Every weekend you simply throw
+          out everything in the fridge (fresh or rotten) and restock. The periodic restock is the cron job.</p>
+        </div>
+
+        <h3>Write-through — update cache and DB together, synchronously</h3>
+        <p><span class="term">Write-through</span> means every write goes <em>through</em> the cache to the DB in
+        the same operation: write the cache <strong>and</strong> the DB before reporting success. The cache is never
+        out of date, so it naturally supports strong consistency — at the cost of slower writes (you pay for two
+        writes every time).</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">1. Write</div><div class="s-d">App writes to cache</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">2. &amp; DB</div><div class="s-d">Cache writes DB too</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">3. Done</div><div class="s-d">Both updated, then ack</div></div>
+        </div>
+        <pre><span class="cm"># Write-through: both updated before we return success</span>
+<span class="kw">def</span> write_through(key, value):
+    cache.set(key, value)            <span class="cm"># 1) update cache</span>
+    db.write(key, value)             <span class="cm"># 2) update DB, synchronously</span>
+    <span class="kw">return</span> <span class="st">"ok"</span>                    <span class="cm"># only now is the write "done"</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Why write-through is genuinely hard: atomicity across servers</span>
+          <p>We sometimes <em>require</em> immediate (strong) consistency — no stale reads, ever. The only way is to
+          make every write land at <strong>both</strong> the cache and the DB <strong>together</strong>. But ensuring
+          atomicity across two separate servers is difficult:</p>
+          <ul>
+            <li><strong>Single server</strong> (shared RAM, OS thread synchronisation — locks, semaphores, mutexes):
+            it's easy to make two tasks happen atomically (either both or neither).</li>
+            <li><strong>Multiple servers</strong> (cache &amp; DB, no shared RAM): what if the DB write succeeds but
+            the cache write fails? You must either retry the cache write (user waits — high latency) or roll back the
+            DB write (a transaction). What if the DB and cache writes both succeed but the cache's <em>response</em>
+            is lost? The app server thinks it failed and tries to roll back — what if the rollback fails? What if the
+            ACK for the rollback fails? It cascades.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">2-Phase Commit (2PC)</span>
+          <p>The protocol used to perform atomic transactions in a distributed setting is <strong>Two-Phase
+          Commit</strong>. It's powerful but costly: <strong>slow</strong> (high latency, low throughput),
+          <strong>hard to implement</strong> (needs state management), and <strong>needs extra infrastructure</strong>.
+          We'll formalise this trade-off in the CAP theorem class. The blunt takeaway: <em>if you want consistency,
+          you pay for it in blood</em> — high latency and low throughput.</p>
+          <p><strong>Optional readings:</strong> "Distributed Systems 7.1: Two-phase commit"; "Distributed
+          Transactions are Hard (How Two-Phase Commit works)"; "Two-Phase Commit Protocol"; and an implementation
+          guide on building distributed transactions with 2PC.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">2PC is only needed for a <em>global</em> cache</span>
+          <p>2PC matters when the cache is <strong>global</strong> (separate from the app server), because the app
+          server must write in two places — DB and cache. But if the cache is <strong>local</strong> (in the app
+          server's own RAM/HDD) and writes come to the app servers, you can <strong>always use immediate
+          consistency (write-through) with no 2PC</strong>: there are no latency issues because a local write is
+          guaranteed to succeed, so you effectively only coordinate with the database write (one state, not two).</p>
+        </div>
+
+        <h3>Write-back (write-behind) — update cache now, DB later</h3>
+        <p><span class="term">Write-back</span> (a.k.a. <span class="term">write-behind</span>) writes only to the
+        cache immediately and returns success right away; the DB is updated <em>later</em>, asynchronously (in a
+        batch or after a short delay). It provides <strong>no consistency guarantees</strong> — in fact it can lead
+        to <strong>data loss</strong>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">How can there be data loss?</span>
+          <p>If the cache server crashes with <strong>unsynced changes</strong>, that data is <strong>permanently
+          lost</strong>. The cache is <em>volatile</em> (it doesn't persist to disk); the DB is persistent, but the
+          new writes never reached it before the crash.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">So why would anyone use it? Raw speed.</span>
+          <p>Every read/write happens at the cache, so it's <strong>insanely fast — 100,000+ reads/writes per
+          second</strong>, versus a database that handles only roughly <strong>100–1000 writes/second per
+          server</strong>. Use write-back when:</p>
+          <ul>
+            <li>individual data points are <strong>not</strong> important;</li>
+            <li>it's OK to <strong>lose some data</strong>;</li>
+            <li><strong>trends matter more than individual data points</strong> (analytics);</li>
+            <li>extremely high write throughput is required.</li>
+          </ul>
+          <p>Classic examples: counting views / likes / clicks on a video or post. This is the source of the
+          "<strong>No consistency</strong>" model from Section 2.</p>
+        </div>
+        <div class="flow">
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">1. Write</div><div class="s-d">App writes cache only</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">2. Ack fast</div><div class="s-d">Return immediately</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⏳</div><div class="s-t">3. Later</div><div class="s-d">Flush to DB async</div></div>
+        </div>
+        <pre><span class="cm"># Write-back: ack immediately, flush to DB asynchronously</span>
+<span class="kw">def</span> write_back(key, value):
+    cache.set(key, value)            <span class="cm"># update cache now</span>
+    dirty_queue.push(key)            <span class="cm"># mark "needs flushing to DB"</span>
+    <span class="kw">return</span> <span class="st">"ok"</span>                    <span class="cm"># return BEFORE the DB is updated</span>
+
+<span class="cm"># a background worker drains the queue periodically</span>
+<span class="kw">def</span> flush_worker():
+    <span class="kw">while</span> <span class="kw">True</span>:
+        key = dirty_queue.pop()      <span class="cm"># risk: a crash here loses un-flushed writes</span>
+        db.write(key, cache.get(key))</pre>
+
+        <h3>Write-around — write straight to the DB, skip the cache</h3>
+        <p><span class="term">Write-around</span> writes new data <em>only</em> to the DB and does <strong>not</strong>
+        put it in the cache. The cache is populated only later, on a read miss (often paired with cache-aside reads).
+        Good when freshly written data is rarely read again soon — it avoids flooding the cache with write-only data.
+        The downside: a read right after a write is a guaranteed miss (the new data isn't cached yet).</p>
+
+        <h3>Putting the write strategies side by side</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>What it does on a write</th><th>Write speed</th><th>Consistency</th><th>Main risk</th><th>Use when</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Write-through</strong></td><td>Write cache + DB together, synchronously</td><td>Slower (two writes)</td><td>Strong — cache never stale</td><td>Slower writes; caches data that may never be read</td><td>Reads must always be current (e.g. balances)</td></tr>
+              <tr><td><strong>Write-back / behind</strong></td><td>Write cache now, flush to DB later</td><td>Fastest</td><td>Weak until flush</td><td><strong>Lost writes</strong> if cache dies before flush</td><td>Write-heavy, can tolerate small loss risk (metrics, counters)</td></tr>
+              <tr><td><strong>Write-around</strong></td><td>Write DB only, skip cache</td><td>Fast</td><td>Fine, but cold cache</td><td>Read-after-write is a guaranteed miss</td><td>Written data rarely re-read soon (logs, archives)</td></tr>
+              <tr><td><strong>Cache-aside</strong></td><td>Write DB, then invalidate (delete) cached copy</td><td>Fast</td><td>Strong-ish if invalidation is reliable</td><td><strong>Stale reads</strong> if a delete is missed; thundering-herd on popular misses</td><td>Default for most read-heavy systems</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The two classic pitfalls</span>
+          <p><strong>1. Stale reads.</strong> If a write updates the DB but the cache keeps an old copy (a missed or
+          failed invalidation), readers get wrong data until the TTL saves them. This is the bug cache-aside must
+          guard against — always delete (or update) the cached key on a write.<br />
+          <strong>2. Lost writes.</strong> Write-back's nightmare: an acknowledged write that only lived in the
+          cache vanishes if the cache crashes before flushing. Never use plain write-back for data you can't afford
+          to lose.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why "delete" beats "update" on invalidation</span>
+          <p>On a write, many systems prefer to <em>delete</em> the cached key rather than overwrite it with the new
+          value. Deleting is simpler and avoids a subtle race: if two writes update the cache out of order, you could
+          leave a stale value behind. Delete-then-reload-on-next-read sidesteps that. The cost is one extra cache
+          miss after each write — usually a fine trade.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>write strategy</strong> decides what happens to the cache on a write.
+          <strong>Cache-aside</strong> (lazy loading) is the default: read from cache, fall back to DB on a miss,
+          and <strong>invalidate</strong> (delete) the key on writes. <strong>Write-through</strong> updates cache
+          and DB together (strong, but slower). <strong>Write-back</strong> updates the cache and flushes the DB
+          later (fastest, but can lose writes). <strong>Write-around</strong> skips the cache on writes (good when
+          new data isn't read soon). The two pitfalls to fear are <strong>stale reads</strong> and
+          <strong>lost writes</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. CASE STUDY ===================== -->
+      <section id="casestudy">
+        <h2><span class="sec-num">4</span> Case study — Scaler Code Judge</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a coding competition. There's a question sheet everyone reads, a hidden answer key the judges
+          use to grade, and a scoreboard showing who got it right. Thousands of students read the same question
+          sheet at once — it would be silly to print a fresh sheet for every single student from a faraway printer.
+          Instead, you keep stacks of pre-printed sheets nearby (a cache!). But the moment a teacher fixes a typo in
+          the question, you must throw away the old stacks so nobody reads the wrong sheet. That's the whole game
+          here, applied to a real system.</p>
+        </div>
+
+        <p>Let's design caching for a <span class="term">code judge</span> — an online-judge system (think Scaler,
+        LeetCode, Codeforces) where a user reads a problem, submits code, and the system runs that code against
+        hidden <span class="term">test cases</span> to produce a <span class="term">verdict</span> like "Accepted"
+        or "Wrong Answer." It's read-heavy and latency-sensitive — a perfect caching playground that lets us apply
+        everything from Sections 1–3.</p>
+
+        <h3>Step 1 — What should we cache?</h3>
+        <p>The first design question is always <em>what data is read far more often than it changes?</em> Those are
+        the caching candidates. Let's classify the judge's data:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Data</th><th>Read frequency</th><th>Change frequency</th><th>Cache it?</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Problem statements</strong></td><td>Extremely high (every visitor)</td><td>Very rare (occasional edit)</td><td>✅ Yes, aggressively</td><td>Classic read-heavy, write-rare — ideal for caching</td></tr>
+              <tr><td><strong>Test cases</strong></td><td>High (every submission runs them)</td><td>Rare (author updates)</td><td>✅ Yes</td><td>Reused across thousands of submissions; expensive to refetch</td></tr>
+              <tr><td><strong>Verdicts (per submission)</strong></td><td>Moderate (user re-checks result)</td><td>Never (a verdict is final)</td><td>✅ Yes — immutable, easy</td><td>Once computed, a verdict for a given submission never changes</td></tr>
+              <tr><td><strong>Leaderboard / counts</strong></td><td>High</td><td>Constant (every submission)</td><td>⚠️ Yes, with short TTL</td><td>Fine to be a few seconds stale (eventual consistency)</td></tr>
+              <tr><td><strong>User's live submission in progress</strong></td><td>Low</td><td>N/A</td><td>❌ No</td><td>Unique, single-use — caching gives nothing</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Step 2 — What consistency does each need?</h3>
+        <p>Now apply Section 2. Each data type tolerates a different amount of staleness:</p>
+        <ul>
+          <li><strong>Problem statements:</strong> mostly eventual consistency is fine (a long TTL, say minutes to
+          hours). <em>But</em> when an author fixes a wrong example or a typo that changes the answer, we must
+          invalidate <strong>immediately</strong> — a stale statement could make a correct solution look wrong.</li>
+          <li><strong>Test cases:</strong> this is the strict one. If a buggy test case is fixed, every later
+          submission must be judged against the new set. A stale test case = <strong>wrong verdicts</strong>. So we
+          want <strong>strong consistency</strong>: invalidate the moment they change.</li>
+          <li><strong>Verdicts:</strong> trivially consistent because they're <span class="term">immutable</span> —
+          a verdict for submission #12345 is computed once and never changes. Immutable data is the easiest thing in
+          the world to cache: cache it forever, never invalidate.</li>
+          <li><strong>Leaderboard:</strong> eventual consistency with a short TTL (e.g. 5–10s) is perfect — nobody
+          is harmed if the ranking is a few seconds behind.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The key insight</span>
+          <p>One system, <strong>several different caching strategies</strong> — chosen per data type by asking two
+          questions: <em>how often is it read vs. changed?</em> (Section 1) and <em>how much does a stale read
+          hurt?</em> (Section 2). There is no single right answer for "the cache"; you mix and match.</p>
+        </div>
+
+        <h3>Step 3 — Which write strategy and eviction policy?</h3>
+        <ul>
+          <li><strong>Reads:</strong> use <span class="term">cache-aside</span> (Section 3) everywhere — on a miss,
+          load from the DB and fill the cache. Simple and robust.</li>
+          <li><strong>Problem statements &amp; test cases:</strong> on an author edit, do a cache-aside write:
+          update the DB, then <strong>invalidate (delete)</strong> the cached key so the next read reloads the fresh
+          version. For test cases we make this invalidation reliable (strong consistency) so no submission is judged
+          on stale tests.</li>
+          <li><strong>Verdicts:</strong> write-through is natural and safe — when a verdict is computed, store it in
+          both DB and cache. Since it's immutable, there's never an invalidation to worry about.</li>
+          <li><strong>Eviction:</strong> <strong>LRU</strong> for problem statements and test cases (popular
+          problems stay hot, old contest problems fade out naturally). Add a <strong>TTL</strong> as a safety net so
+          nothing lingers wrong forever. <strong>LFU</strong> would also work well for problems, since a handful of
+          famous problems are read constantly.</li>
+        </ul>
+
+        <h3>Step 4 — Walk through the design end to end</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">👀</div><div class="s-t">User opens problem</div><div class="s-d">cache-aside: hit → instant; miss → load + fill (LRU+TTL)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📤</div><div class="s-t">User submits code</div><div class="s-d">judge fetches test cases from cache (hit)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">Run &amp; judge</div><div class="s-d">compute verdict against tests</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">Store verdict</div><div class="s-d">write-through: DB + cache (immutable)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📊</div><div class="s-t">Update board</div><div class="s-d">short-TTL eventual consistency</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: an author fixes a broken test case</span>
+          <p>Problem #88 has a wrong hidden test case, so correct solutions are getting "Wrong Answer." The author
+          fixes it. Here's the read and the invalidation in pseudocode:</p>
+          <pre><span class="cm"># --- Read path (cache-aside) used by the judge for every submission ---</span>
+<span class="kw">def</span> get_test_cases(problem_id):
+    tests = cache.get(<span class="st">f"tests:{problem_id}"</span>)
+    <span class="kw">if</span> tests <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="kw">return</span> tests                       <span class="cm"># hit: thousands of submissions reuse this</span>
+    tests = db.get_test_cases(problem_id)    <span class="cm"># miss: load from source of truth</span>
+    cache.set(<span class="st">f"tests:{problem_id}"</span>, tests, ttl=<span class="nm">3600</span>)  <span class="cm"># LRU + 1h TTL safety net</span>
+    <span class="kw">return</span> tests
+
+<span class="cm"># --- Author edits the test cases: strong consistency required ---</span>
+<span class="kw">def</span> update_test_cases(problem_id, new_tests):
+    db.set_test_cases(problem_id, new_tests)     <span class="cm"># 1) source of truth first</span>
+    cache.delete(<span class="st">f"tests:{problem_id}"</span>)        <span class="cm"># 2) invalidate immediately</span>
+    cache.delete(<span class="st">f"problem:{problem_id}"</span>)      <span class="cm"># 3) statement may reference them too</span>
+    <span class="cm"># next submission misses, reloads fresh tests -> no more wrong verdicts</span></pre>
+          <p>Because we <strong>delete</strong> (not overwrite) and we delete <em>after</em> the DB write, the very
+          next submission is guaranteed to judge against the corrected tests. Old, already-final verdicts stay as
+          they were (immutable) — re-judging old submissions, if desired, is a separate batch job.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Pitfalls specific to a judge</span>
+          <p><strong>Stale test cases = wrong verdicts</strong>, which is far worse than a slightly stale
+          leaderboard — so test-case invalidation must be reliable, not best-effort. And beware the
+          <span class="term">thundering herd</span>: if a wildly popular problem's cache entry expires during a
+          contest, thousands of submissions miss at once and stampede the DB. Mitigate with longer TTLs for hot
+          problems, pre-warming the cache before a contest, or a lock so only one request reloads while others wait.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          In the Scaler Code Judge we cache <strong>problem statements</strong> and <strong>test cases</strong>
+          (read-heavy, write-rare) and <strong>verdicts</strong> (immutable, cache forever). We use
+          <strong>cache-aside</strong> reads with <strong>LRU + TTL</strong> eviction, accept
+          <strong>eventual consistency</strong> for the leaderboard, but demand <strong>strong consistency</strong>
+          (immediate invalidation) for test cases — because a stale test case produces a wrong verdict. The design is
+          really just Sections 1–3 applied data-type by data-type.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You've now gone from "what is a cache" (Session 3) to "how do real caches stay small <em>and</em>
+        correct." Here's the one-paragraph story tying the four topics together:</p>
+        <div class="bigidea">
+          <p>A cache is small, so when it fills it runs an <strong>eviction policy</strong> — usually
+          <strong>LRU</strong> (O(1) with a hashmap + doubly linked list), sometimes <strong>LFU, FIFO, MRU, or
+          Random</strong>, often with a <strong>TTL</strong> stamp. Because a cache holds <em>copies</em>, it needs a
+          <strong>consistency model</strong>: <strong>strong</strong> (always current, slower) or
+          <strong>eventual</strong> (fast, briefly <strong>stale</strong>, with TTL as the dial). When data changes,
+          a <strong>write strategy</strong> keeps things in sync — <strong>cache-aside</strong> with
+          <strong>invalidation</strong> by default, or <strong>write-through</strong> (strong, slow),
+          <strong>write-back</strong> (fast, risks <strong>lost writes</strong>), or <strong>write-around</strong> —
+          each guarding against <strong>stale reads</strong> and lost writes. Put it all together in the
+          <strong>Scaler Code Judge</strong> and you pick a different mix per data type, because the right cache
+          design is never one rule — it's the right rule for each piece of data.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What two data structures make LRU O(1), and what is each for?</summary>
+          <p class="ans">A <strong>hashmap</strong> (key → node) for O(1) lookup, and a <strong>doubly linked
+          list</strong> ordered by recency so you can move a node to the head (just-used) or drop the tail
+          (least-recently-used) in O(1) without scanning.</p>
+        </details>
+        <details class="quiz">
+          <summary>Cache holds {A, B, C} (size 3), use-order was A B C A B, now D arrives. What does LRU evict vs FIFO?</summary>
+          <p class="ans">LRU evicts <strong>C</strong> (least recently used). FIFO evicts <strong>A</strong> (first
+          inserted), even though A was just used again — FIFO ignores usage.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the core trade-off between strong and eventual consistency?</summary>
+          <p class="ans">Strong/immediate = always-correct reads but slower and more work on every write. Eventual =
+          fast and simple but allows a window of stale reads. You choose based on how much a stale read hurts; TTL
+          lets you bound the staleness.</p>
+        </details>
+        <details class="quiz">
+          <summary>Which write strategy risks losing acknowledged writes, and why?</summary>
+          <p class="ans"><strong>Write-back (write-behind)</strong>. It acknowledges the write after updating only
+          the cache and flushes to the DB later; if the cache crashes before flushing, those writes are lost.</p>
+        </details>
+        <details class="quiz">
+          <summary>In cache-aside, why delete the cached key on a write instead of overwriting it?</summary>
+          <p class="ans">Deleting is simpler and avoids a race where two out-of-order writes leave a stale value
+          behind. The next read just reloads the fresh value from the DB — at the cost of one extra miss.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the code judge, why must test cases use strong consistency but the leaderboard can be eventual?</summary>
+          <p class="ans">A stale test case produces a <strong>wrong verdict</strong> (real harm), so it must be
+          invalidated immediately. A leaderboard that's a few seconds behind harms no one, so eventual consistency
+          with a short TTL is fine.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/12tdw0PoZAOhgCH8A9HgWu9zYYjUDS4lzaq3gqcrLZq8/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] - Caching 2</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li><a href="https://aws.amazon.com/caching/best-practices/" target="_blank" rel="noopener">AWS: Caching best practices</a> — cache-aside, write-through and other write strategies explained.</li>
+    <li><a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis: Key eviction policies</a> — LRU, LFU, TTL and how a real cache evicts under memory pressure.</li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching" target="_blank" rel="noopener">MDN: HTTP caching</a> — freshness, expiry and cache invalidation in practice.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-3.html"><div class="dir">← Previous</div><div class="ttl">Session 3: Caching 1</div></a>
+        <a class="next" href="session-5.html"><div class="dir">Next →</div><div class="ttl">Session 5: Caching Case Studies</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 4 — Caching, Part 2: Eviction, Consistency &amp; Invalidation · Your caches are now small and correct 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

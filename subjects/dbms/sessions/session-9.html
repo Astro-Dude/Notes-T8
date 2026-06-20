@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 9 — Query Execution (Part 1)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 9</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 09 · Query Execution</span>
+      <h1>How a database actually runs your query</h1>
+      <p class="lead">
+        In <a href="session-8.html">Session 8</a> we watched your SQL get parsed and turned into a
+        <em>plan</em> — a tree of operations. But a plan is just a recipe. Today we learn how the
+        database <strong>cooks</strong>: how it turns that plan tree into machinery that streams real
+        rows out of disk, one tuple at a time. We assume you've studied <em>none</em> of this before.
+        Every topic starts with a tiny "explain like I'm 5" story, then we build up the real detail with
+        pseudocode and worked examples. Take it slow — by the end you'll understand exactly what's
+        happening between "press enter" and "here are your rows."
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 18 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#model">The execution model (Volcano / iterator)</a></li>
+          <li><a href="#scans">Scan operators: SeqScan &amp; IndexScan</a></li>
+          <li><a href="#filter-proj">Filter &amp; Projection</a></li>
+          <li><a href="#nested-loop">Nested loop join</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. EXECUTION MODEL ===================== -->
+      <section id="model">
+        <h2><span class="sec-num">1</span> The execution model — running a plan tree</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a line of friends passing buckets of water from a well to a fire. The person at the
+          fire shouts <em>"next bucket!"</em> The friend behind them shouts <em>"next bucket!"</em> to the
+          friend behind <em>them</em>, all the way back to the well. The well fills <strong>one</strong>
+          bucket, it gets passed up the line, and the fire gets watered. Nobody fills a thousand buckets and
+          stacks them in a pile — each bucket is fetched only when someone above asks for it. A database runs
+          your query exactly like this: each step asks the step below it for <strong>one row at a time</strong>.</p>
+        </div>
+
+        <p>Recall from <a href="session-8.html">Session 8</a> that the optimiser hands the executor a
+        <span class="term">query plan</span>: a tree where each node is an <span class="term">operator</span>
+        (a small piece of machinery like "scan this table", "filter these rows", "join these two inputs").
+        Leaves read data; the root produces the final answer. <strong>Execution</strong> is the act of
+        actually running that tree to produce rows.</p>
+
+        <h3>The Volcano / iterator model</h3>
+        <p>The dominant way to run a plan tree is the <span class="term">Volcano model</span> (also called the
+        <span class="term">iterator model</span> or <strong>pipeline model</strong>), described by Goetz Graefe
+        in the early 1990s. The idea is beautifully uniform: <strong>every operator exposes the same three
+        methods</strong>, no matter what it does.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Method</th><th>What it does</th><th>Bucket-line analogy</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">open()</code></td><td>Get ready: set up state, open files, tell children to <code class="inl">open()</code> too.</td><td>"Everyone, get in line."</td></tr>
+              <tr><td><code class="inl">next()</code></td><td>Produce and return the <strong>next single tuple</strong> (or "no more rows").</td><td>"Pass me one bucket."</td></tr>
+              <tr><td><code class="inl">close()</code></td><td>Clean up: free memory, close files, tell children to <code class="inl">close()</code>.</td><td>"We're done, go home."</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>A <span class="term">tuple</span> is just one row. Because every operator speaks this same little
+        language, you can plug any operator on top of any other — a filter on top of a scan, a join on top of
+        two filters — and it all just works. This is what Graefe meant by <em>extensible</em>: adding a new
+        operator never breaks the others.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The root calls <code class="inl">next()</code>. That operator calls <code class="inl">next()</code>
+          on its child to get the row it needs, which calls <code class="inl">next()</code> on <em>its</em>
+          child, and so on down to the leaf. One tuple flows up the tree per call. This is
+          <span class="term">pull-based execution</span>: data is <strong>pulled</strong> from the top, not
+          pushed from the bottom.</p>
+        </div>
+
+        <h3>Pull-based, one tuple at a time</h3>
+        <p>The opposite of pulling would be <span class="term">materialisation</span>: each operator fully
+        computes its entire output, stores it in a temporary table, and hands the whole thing up. That wastes
+        huge amounts of memory for big tables. The Volcano model instead <strong>pipelines</strong>: a row is
+        produced, flows all the way to the top, gets returned to the user, and only <em>then</em> does the next
+        row get pulled. Memory stays tiny, and the very first row can come back almost instantly.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🙋</div><div class="s-t">User / root</div><div class="s-d">calls next()</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔗</div><div class="s-t">Join</div><div class="s-d">needs a row, asks child</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">Filter</div><div class="s-d">needs a row, asks child</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Scan (leaf)</div><div class="s-d">reads 1 tuple from disk</div></div>
+        </div>
+        <p>The request travels <em>down</em> (the <code class="inl">next()</code> calls); the tuple travels back
+        <em>up</em>. Repeat until the scan says "no more rows."</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a generic iterator</span>
+          <p>Here is the skeleton every operator follows. This particular one is a generic template — real
+          operators (scan, filter, join) just fill in the bodies.</p>
+<pre><span class="cm">// Every operator implements this same interface.</span>
+<span class="kw">interface</span> Operator {
+    <span class="kw">void</span>  open();          <span class="cm">// prepare state, open children</span>
+    Tuple next();          <span class="cm">// return next tuple, or NULL when exhausted</span>
+    <span class="kw">void</span>  close();         <span class="cm">// release resources, close children</span>
+}
+
+<span class="cm">// The driver loop the database runs at the very top:</span>
+<span class="kw">function</span> runQuery(rootOperator):
+    rootOperator.open()
+    <span class="kw">while</span> (tuple = rootOperator.next()) <span class="kw">is not</span> NULL:
+        emitToClient(tuple)        <span class="cm">// send this row to the user</span>
+    rootOperator.close()</pre>
+          <p>Notice the whole query is driven by one tiny loop pulling tuples off the root until it returns
+          NULL. Everything else is operators calling <code class="inl">next()</code> on their children.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Where the name "Volcano" comes from</span>
+          <p>Graefe's research system was literally named <em>Volcano</em>. People often draw the plan tree with
+          the leaves at the bottom and tuples "erupting" up to the root — hence the name. It also pioneered
+          <strong>parallel</strong> execution, but we'll keep to the single-threaded picture in this session.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off: one function call per tuple</span>
+          <p>The iterator model is simple and memory-light, but calling <code class="inl">next()</code> millions
+          of times — once per row — adds up. Each call has overhead. Modern systems often process a
+          <strong>batch</strong> of tuples per <code class="inl">next()</code> (the <span class="term">vectorised
+          model</span>) or compile the plan to machine code to avoid this. We mention these as the modern
+          evolution; the classic one-tuple Volcano model is still the clearest way to understand execution.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The optimiser's plan tree is run by the <strong>Volcano / iterator model</strong>: every operator
+          exposes <code class="inl">open</code>, <code class="inl">next</code>, <code class="inl">close</code>.
+          The root pulls one tuple at a time; each <code class="inl">next()</code> cascades down to the leaves
+          and a single row flows back up. This <strong>pull-based, pipelined</strong> design keeps memory tiny
+          and returns the first row fast.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SCANS ===================== -->
+      <section id="scans">
+        <h2><span class="sec-num">2</span> Scan operators — getting rows off disk</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You want to find your friend Sam in a huge phone book. One way: start at page 1 and read every
+          single name until you hit Sam — slow, but it always works. The other way: the book is sorted
+          alphabetically, so you flip straight to "S" and find Sam in seconds. The catch: that shortcut only
+          helps if the book is <em>sorted the right way</em>. A database has the same two choices for reading a
+          table: read every row, or use a sorted shortcut called an index.</p>
+        </div>
+
+        <p>Scan operators are the <strong>leaves</strong> of the plan tree — they're where actual data enters the
+        pipeline. The two you'll meet constantly are the <span class="term">sequential scan</span> and the
+        <span class="term">index scan</span>.</p>
+
+        <h3>SeqScan — read the whole table</h3>
+        <p>A <span class="term">SeqScan</span> (sequential / full-table scan) reads <strong>every page of the
+        table</strong> from start to finish and emits each row. Recall from earlier sessions that a table is
+        stored as a set of fixed-size <span class="term">pages</span> (blocks) on disk, each holding many rows.
+        SeqScan walks them all.</p>
+
+        <div class="callout example">
+          <span class="c-title">SeqScan as an iterator</span>
+<pre><span class="kw">class</span> SeqScan implements Operator:
+    <span class="kw">function</span> open():
+        self.pageCursor = firstPageOf(self.table)
+        self.rowCursor  = 0
+
+    <span class="kw">function</span> next():
+        <span class="kw">while</span> self.pageCursor <span class="kw">is not</span> NULL:
+            <span class="kw">if</span> self.rowCursor &lt; rowsIn(self.pageCursor):
+                tuple = readRow(self.pageCursor, self.rowCursor)
+                self.rowCursor += <span class="nm">1</span>
+                <span class="kw">return</span> tuple
+            <span class="cm">// page exhausted, move to the next one</span>
+            self.pageCursor = nextPage(self.pageCursor)
+            self.rowCursor  = <span class="nm">0</span>
+        <span class="kw">return</span> NULL          <span class="cm">// no more pages, table fully scanned</span>
+
+    <span class="kw">function</span> close():
+        releasePages(self.table)</pre>
+        </div>
+
+        <h3>IndexScan — use a sorted shortcut</h3>
+        <p>An <span class="term">IndexScan</span> uses an <span class="term">index</span> (typically a
+        <span class="term">B+-tree</span>, covered in our indexing sessions) to jump straight to the rows that
+        match a condition, without reading the whole table. The index is a separate, sorted structure mapping
+        column values to the locations of matching rows.</p>
+
+        <div class="callout example">
+          <span class="c-title">IndexScan for a range, as an iterator</span>
+          <p>For <code class="inl">WHERE age BETWEEN 30 AND 40</code> on an index over <code class="inl">age</code>:</p>
+<pre><span class="kw">class</span> IndexScan implements Operator:
+    <span class="kw">function</span> open():
+        <span class="cm">// descend the B+-tree to the first key &gt;= low bound</span>
+        self.cursor = index.seek(self.lowKey)   <span class="cm">// e.g. age = 30</span>
+
+    <span class="kw">function</span> next():
+        <span class="kw">if</span> self.cursor <span class="kw">is</span> atEnd <span class="kw">or</span> self.cursor.key &gt; self.highKey:
+            <span class="kw">return</span> NULL                       <span class="cm">// passed age = 40, stop</span>
+        rowId  = self.cursor.value             <span class="cm">// pointer to the actual row</span>
+        tuple  = fetchRow(rowId)               <span class="cm">// follow pointer to the heap</span>
+        self.cursor = self.cursor.advance()    <span class="cm">// next sorted entry</span>
+        <span class="kw">return</span> tuple
+
+    <span class="kw">function</span> close():
+        index.releaseCursor(self.cursor)</pre>
+          <p>The leaf entries of a B+-tree are linked in sorted order, so once we've found <code class="inl">age =
+          30</code> we just walk forward, fetching each matching row, until a key exceeds 40.</p>
+        </div>
+
+        <h3>When is each chosen? Cost intuition</h3>
+        <p>The optimiser (Session 8) picks based on <span class="term">selectivity</span> — what fraction of the
+        table matches. The key trade-off is <strong>sequential vs random I/O</strong>:</p>
+        <ul>
+          <li><strong>SeqScan</strong> reads pages in order — fast, sequential disk reads — but reads
+          <em>everything</em>. Cost ≈ number of pages in the table.</li>
+          <li><strong>IndexScan</strong> reads only matching rows, but each matching row may require a
+          <em>random</em> jump to a different page (slow), plus the cost of walking the index.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Situation</th><th>Better choice</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Query returns most of the table (low selectivity, e.g. &gt; ~10–20%)</td><td>SeqScan</td><td>You'd touch most pages anyway; sequential reads beat thousands of random jumps.</td></tr>
+              <tr><td>Query returns a tiny fraction (high selectivity, e.g. <code class="inl">id = 42</code>)</td><td>IndexScan</td><td>Jump straight to a few rows instead of reading millions.</td></tr>
+              <tr><td>No useful index exists on the predicate column</td><td>SeqScan</td><td>There's no shortcut to use.</td></tr>
+              <tr><td>Need rows in sorted order &amp; index matches that order</td><td>IndexScan</td><td>Index already yields rows sorted — avoids a separate sort (Session 10).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why an index can be <em>slower</em></span>
+          <p>Beginners assume "index = always faster." Not so. If a query matches 80% of rows, an IndexScan
+          would do ~hundreds of thousands of <strong>random</strong> page fetches (one per matching row, jumping
+          all over the disk), while a SeqScan reads the whole table in efficient sequential order. Above a
+          certain selectivity threshold, the full scan wins — which is exactly why the cost-based optimiser
+          estimates row counts before deciding.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Scans are the leaves that feed rows into the pipeline. <strong>SeqScan</strong> reads every page
+          (great when you need most of the table or have no index). <strong>IndexScan</strong> uses a sorted
+          B+-tree to fetch only matching rows (great for high-selectivity lookups), trading sequential I/O for
+          random I/O. The optimiser chooses based on estimated selectivity and cost.
+        </div>
+      </section>
+
+      <!-- ===================== 3. FILTER & PROJECTION ===================== -->
+      <section id="filter-proj">
+        <h2><span class="sec-num">3</span> Filter &amp; Projection — the pipeline's gatekeepers</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a conveyor belt of lunchboxes. A <strong>filter</strong> is a worker who only lets through
+          the lunchboxes that have a sandwich inside, tossing the rest. A <strong>projection</strong> is the
+          next worker who opens each allowed lunchbox and keeps only the sandwich and the apple, throwing away
+          everything else. One decides <em>which</em> boxes pass; the other decides <em>what parts</em> of each
+          box you keep. Both work on one lunchbox at a time as it rolls by — they never stop the belt.</p>
+        </div>
+
+        <p>Filter and Projection map directly onto two pieces of SQL you already know: the
+        <code class="inl">WHERE</code> clause and the <code class="inl">SELECT</code> list.</p>
+
+        <h3>Filter — applying the WHERE predicate</h3>
+        <p>A <span class="term">Filter</span> operator (also called <strong>Selection</strong>, the σ in
+        relational algebra) sits on top of a child operator. For each tuple the child gives it, it evaluates a
+        boolean <span class="term">predicate</span> (the WHERE condition). If the predicate is true, the tuple
+        passes up; if false, it's dropped and the filter immediately asks its child for another.</p>
+
+        <div class="callout example">
+          <span class="c-title">Filter as an iterator</span>
+          <p>For <code class="inl">WHERE salary &gt; 50000</code>:</p>
+<pre><span class="kw">class</span> Filter implements Operator:
+    <span class="kw">function</span> open():
+        self.child.open()
+
+    <span class="kw">function</span> next():
+        <span class="kw">while</span> (tuple = self.child.next()) <span class="kw">is not</span> NULL:
+            <span class="kw">if</span> evaluate(self.predicate, tuple) <span class="kw">is</span> TRUE:
+                <span class="kw">return</span> tuple      <span class="cm">// passed the test</span>
+            <span class="cm">// else: drop it and loop to fetch the next child tuple</span>
+        <span class="kw">return</span> NULL              <span class="cm">// child exhausted</span>
+
+    <span class="kw">function</span> close():
+        self.child.close()</pre>
+          <p>The <code class="inl">while</code> loop is the whole trick: a filter may pull many child tuples
+          before it finds one to return. It's still <strong>one tuple out per <code class="inl">next()</code></strong>
+          to the operator above it — the pipeline shape is preserved.</p>
+        </div>
+
+        <h3>Projection — choosing and computing columns</h3>
+        <p>A <span class="term">Projection</span> operator (the π in relational algebra) reshapes each tuple:
+        it keeps only the requested columns and can <strong>compute new ones</strong>. Crucially, a filter
+        changes <em>how many</em> rows flow; a projection changes <em>what each row looks like</em> but never
+        adds or removes rows.</p>
+
+        <div class="callout example">
+          <span class="c-title">Projection as an iterator</span>
+          <p>For <code class="inl">SELECT name, salary * 12 AS annual</code>:</p>
+<pre><span class="kw">class</span> Projection implements Operator:
+    <span class="kw">function</span> open():
+        self.child.open()
+
+    <span class="kw">function</span> next():
+        tuple = self.child.next()
+        <span class="kw">if</span> tuple <span class="kw">is</span> NULL: <span class="kw">return</span> NULL
+        <span class="kw">return</span> {
+            name:   tuple.name,
+            annual: evaluate(tuple.salary * <span class="nm">12</span>, tuple)   <span class="cm">// computed column</span>
+        }
+
+    <span class="kw">function</span> close():
+        self.child.close()</pre>
+        </div>
+
+        <h3>Expression evaluation</h3>
+        <p>Both operators rely on <span class="term">expression evaluation</span>: turning something like
+        <code class="inl">salary &gt; 50000</code> or <code class="inl">salary * 12</code> into a value for a
+        given tuple. Internally an expression is a small tree — and yes, it's evaluated by the same recursive
+        pattern as the plan tree.</p>
+
+        <div class="callout example">
+          <span class="c-title">Evaluating an expression tree</span>
+          <p>The predicate <code class="inl">salary &gt; 50000</code> parses to:</p>
+<pre>        &gt;
+       / \
+   salary  50000
+
+<span class="kw">function</span> evaluate(node, tuple):
+    <span class="kw">if</span> node <span class="kw">is</span> Constant:  <span class="kw">return</span> node.value          <span class="cm">// 50000</span>
+    <span class="kw">if</span> node <span class="kw">is</span> Column:    <span class="kw">return</span> tuple[node.name]      <span class="cm">// look up salary in the row</span>
+    <span class="kw">if</span> node <span class="kw">is</span> Operator:                            <span class="cm">// e.g. &gt;, *, AND</span>
+        left  = evaluate(node.left,  tuple)
+        right = evaluate(node.right, tuple)
+        <span class="kw">return</span> apply(node.op, left, right)             <span class="cm">// 60000 &gt; 50000 -&gt; TRUE</span></pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Pipelined, so order matters</span>
+          <p>Filter and Projection are <strong>pipelined</strong> (sometimes called <em>on-the-fly</em>)
+          operators: they hold no big intermediate table, just pass tuples through. The optimiser likes to push
+          filters <strong>as low as possible</strong> in the tree (called <span class="term">predicate
+          pushdown</span>) so rows are discarded early — there's no point carrying a row up through three joins
+          only to throw it away at the top.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Filter</strong> (selection / σ) drops rows that fail the WHERE predicate, looping to fetch
+          the next child tuple until one passes. <strong>Projection</strong> (π) keeps and computes columns
+          per the SELECT list without changing the row count. Both are pipelined and both lean on
+          <strong>expression evaluation</strong>, which recursively walks a little expression tree against each
+          tuple. Filters get pushed down so rows die early.
+        </div>
+      </section>
+
+      <!-- ===================== 4. NESTED LOOP JOIN ===================== -->
+      <section id="nested-loop">
+        <h2><span class="sec-num">4</span> Nested loop join — the simplest join</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You have a stack of name cards and a stack of phone-number cards, and you want to pair up the ones
+          that match. The most obvious way: pick up the first name card, then flip through the
+          <em>entire</em> phone-number stack looking for matches; then pick up the second name card and flip
+          through the whole phone stack again; and so on. It's not clever, but it always works. That "for each
+          card, go through the whole other stack" idea is a <strong>nested loop join</strong>.</p>
+        </div>
+
+        <p>A <span class="term">join</span> combines rows from two tables based on a matching condition (e.g.
+        <code class="inl">Employees.dept_id = Departments.id</code>). The <span class="term">nested loop
+        join</span> is the simplest algorithm and the foundation for the rest. There are three flavours.</p>
+
+        <h3>Naive (tuple-at-a-time) nested loop join</h3>
+        <p>For every tuple in the <span class="term">outer</span> table, scan <strong>every</strong> tuple in the
+        <span class="term">inner</span> table and emit the pairs that satisfy the join condition.</p>
+
+        <div class="callout example">
+          <span class="c-title">Naive nested loop, as an iterator</span>
+<pre><span class="kw">class</span> NestedLoopJoin implements Operator:
+    <span class="kw">function</span> open():
+        self.outer.open()
+        self.inner.open()
+        self.outerTuple = self.outer.next()   <span class="cm">// grab first outer row</span>
+
+    <span class="kw">function</span> next():
+        <span class="kw">while</span> self.outerTuple <span class="kw">is not</span> NULL:
+            <span class="kw">while</span> (innerTuple = self.inner.next()) <span class="kw">is not</span> NULL:
+                <span class="kw">if</span> joinMatches(self.outerTuple, innerTuple):
+                    <span class="kw">return</span> combine(self.outerTuple, innerTuple)
+            <span class="cm">// inner exhausted: advance outer, rewind inner</span>
+            self.outerTuple = self.outer.next()
+            self.inner.close(); self.inner.open()   <span class="cm">// restart inner scan</span>
+        <span class="kw">return</span> NULL
+
+    <span class="kw">function</span> close():
+        self.outer.close(); self.inner.close()</pre>
+          <p>Note the inner side is re-scanned <strong>from scratch</strong> for every outer row. That's the
+          expensive part.</p>
+        </div>
+
+        <p>If the outer table has <code class="inl">M</code> rows and the inner has <code class="inl">N</code>
+        rows, this compares roughly <code class="inl">M × N</code> pairs — <span class="term">O(M·N)</span>
+        time. Worse, if we re-read the inner table from disk every time, the I/O cost is brutal.</p>
+
+        <h3>Block nested loop join</h3>
+        <p>The big waste above is re-reading the inner table once <em>per outer row</em>. The
+        <span class="term">block nested loop join</span> fixes this by reading the outer table a
+        <strong>block of pages at a time</strong>: load as many outer rows as fit in memory, then scan the
+        inner table <em>once</em> for that whole block. This cuts inner re-scans from "once per outer row" to
+        "once per outer block" — a massive I/O reduction. (Same O(M·N) comparisons, but far fewer disk reads.)</p>
+
+        <h3>Index nested loop join</h3>
+        <p>If there's an <strong>index on the inner table's join column</strong>, we don't scan the inner table
+        at all. For each outer row, we do an IndexScan (Topic 2) to jump straight to matching inner rows. This
+        turns the inner "loop" into a fast lookup.</p>
+
+        <div class="callout example">
+          <span class="c-title">Index nested loop, as an iterator</span>
+<pre><span class="kw">class</span> IndexNestedLoopJoin implements Operator:
+    <span class="kw">function</span> next():
+        <span class="kw">while</span> TRUE:
+            <span class="kw">if</span> self.innerCursor <span class="kw">has</span> moreMatches:
+                inner = self.innerCursor.next()
+                <span class="kw">return</span> combine(self.outerTuple, inner)
+            self.outerTuple = self.outer.next()
+            <span class="kw">if</span> self.outerTuple <span class="kw">is</span> NULL: <span class="kw">return</span> NULL
+            <span class="cm">// probe the index instead of scanning the whole inner table</span>
+            self.innerCursor = innerIndex.lookup(self.outerTuple.joinKey)</pre>
+          <p>Cost becomes roughly <code class="inl">M × (cost of one index lookup)</code> — often
+          <span class="term">O(M·log N)</span> instead of O(M·N). This is the best nested loop variant when a
+          suitable index exists.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Variant</th><th>Inner side per outer row</th><th>Rough cost</th><th>Good when…</th></tr></thead>
+            <tbody>
+              <tr><td>Naive</td><td>Full re-scan, one row at a time</td><td>O(M·N), heavy I/O</td><td>Both tables tiny; teaching example.</td></tr>
+              <tr><td>Block</td><td>Inner scanned once per outer <em>block</em></td><td>O(M·N) compares, far less I/O</td><td>No index; one table fits in a few pages.</td></tr>
+              <tr><td>Index</td><td>Index lookup, no scan</td><td>O(M·log N)</td><td>Index exists on inner join column; outer is small.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: two small tables</span>
+          <p>Join <code class="inl">Employees</code> (outer) to <code class="inl">Departments</code> (inner) on
+          <code class="inl">dept_id = id</code>:</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Employees (outer)</th><th>Departments (inner)</th></tr></thead>
+              <tbody>
+                <tr><td>(Ann, dept 1)</td><td>(1, Sales)</td></tr>
+                <tr><td>(Bob, dept 2)</td><td>(2, Eng)</td></tr>
+                <tr><td>(Cy, dept 1)</td><td>(3, HR)</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Naive nested loop, step by step (M=3 outer rows, N=3 inner rows → 9 comparisons):</p>
+          <ul>
+            <li><strong>Ann (dept 1)</strong> vs (1 Sales) → match! emit <code class="inl">(Ann, Sales)</code>; vs (2 Eng) → no; vs (3 HR) → no.</li>
+            <li><strong>Bob (dept 2)</strong> vs (1 Sales) → no; vs (2 Eng) → match! emit <code class="inl">(Bob, Eng)</code>; vs (3 HR) → no.</li>
+            <li><strong>Cy (dept 1)</strong> vs (1 Sales) → match! emit <code class="inl">(Cy, Sales)</code>; vs (2 Eng) → no; vs (3 HR) → no.</li>
+          </ul>
+          <p>Result: <code class="inl">(Ann, Sales), (Bob, Eng), (Cy, Sales)</code>. With an index on
+          <code class="inl">Departments.id</code>, each employee would jump straight to its one matching
+          department — 3 quick lookups instead of 9 comparisons.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">When nested loop is good — and bad</span>
+          <p><strong>Good:</strong> when one table is small, or an index lets you avoid scanning the inner side
+          (index nested loop). It also streams results immediately and uses little memory. <strong>Bad:</strong>
+          joining two large tables with no helpful index — O(M·N) explodes (a million × a million is a trillion
+          comparisons). For that case we use smarter algorithms — <strong>hash join</strong> and
+          <strong>sort-merge join</strong> — which we cover in <a href="session-10.html">Session 10</a>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The <strong>nested loop join</strong> pairs rows by, for each outer tuple, looking through the inner
+          input. <strong>Naive</strong> re-scans the whole inner table per row (O(M·N)); <strong>block</strong>
+          re-scans per outer <em>block</em> to slash I/O; <strong>index</strong> replaces the inner scan with a
+          fast index lookup (O(M·log N)). It shines when a table is small or an index exists, and struggles on
+          two big un-indexed tables — where joins from Session 10 take over.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You now know how a database turns a plan into running machinery. Here's the one-paragraph story
+        connecting all four topics:</p>
+        <div class="bigidea">
+          <p>The optimiser's <strong>plan tree</strong> is run by the <strong>Volcano / iterator model</strong>:
+          every operator exposes <code class="inl">open</code>, <code class="inl">next</code>,
+          <code class="inl">close</code>, and the root <strong>pulls</strong> one tuple at a time down through
+          the tree. At the leaves, <strong>scan operators</strong> feed rows in — a <strong>SeqScan</strong>
+          reads the whole table, an <strong>IndexScan</strong> uses a sorted B+-tree to grab only matching rows,
+          and the optimiser chooses between them by estimated selectivity. As tuples flow up, a
+          <strong>Filter</strong> drops rows that fail the WHERE predicate and a <strong>Projection</strong>
+          keeps/computes columns — both pipelined, both driven by recursive <strong>expression evaluation</strong>.
+          To combine two tables, the simplest tool is the <strong>nested loop join</strong>, whose
+          <em>naive</em>, <em>block</em>, and <em>index</em> variants trade off comparisons and I/O — and when
+          tables get large, we'll reach for hash and sort-merge joins next time.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What three methods does every operator in the Volcano model expose?</summary>
+          <p class="ans"><code class="inl">open()</code>, <code class="inl">next()</code>, and
+          <code class="inl">close()</code>. The root repeatedly calls <code class="inl">next()</code>, which
+          cascades down the tree, and one tuple flows back up per call.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is execution called "pull-based"?</summary>
+          <p class="ans">Because data is pulled from the top: the root asks its child for the next tuple, which
+          asks its child, down to the leaf scan. Nothing is computed until something above requests it, which
+          keeps memory small and returns the first row quickly (pipelining).</p>
+        </details>
+        <details class="quiz">
+          <summary>Your query matches 90% of a large table. SeqScan or IndexScan, and why?</summary>
+          <p class="ans">SeqScan. An IndexScan would do a random page fetch for almost every row; reading the
+          whole table sequentially is far cheaper. Indexes win for high <em>selectivity</em> (few matching rows),
+          not when you need most of the table.</p>
+        </details>
+        <details class="quiz">
+          <summary>How do Filter and Projection differ in their effect on the tuple stream?</summary>
+          <p class="ans">Filter changes <em>how many</em> rows pass (drops those failing the predicate);
+          Projection changes <em>what each row looks like</em> (keeps/computes columns) but never changes the
+          row count.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a naive nested loop join cost O(M·N), and how does an index nested loop join help?</summary>
+          <p class="ans">For each of M outer rows it scans all N inner rows → M·N comparisons. With an index on
+          the inner join column, each outer row does a fast index lookup instead of a full scan, giving roughly
+          O(M·log N).</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the point of pushing a filter low in the plan tree (predicate pushdown)?</summary>
+          <p class="ans">To discard rows as early as possible, so fewer rows are carried up through expensive
+          operators like joins. There's no point processing a row through several operators only to throw it
+          away at the top.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 9 — Query Execution (your course handout for this session).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems (course site)</a> — the gold-standard free course; its query execution and join lectures cover exactly this material with slides and recorded videos.</li>
+          <li><a href="https://dl.acm.org/doi/10.1109/69.273032" target="_blank" rel="noopener">Graefe — "Volcano: An Extensible and Parallel Query Evaluation System" (IEEE TKDE, 1994)</a> — the original paper that defined the open/next/close iterator model we used all session.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Silberschatz, Korth &amp; Sudarshan — <em>Database System Concepts</em></a> — the standard textbook; the "Query Processing" chapter walks through scans, selection, projection, and join algorithms in depth.</li>
+          <li><a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener">PostgreSQL docs — Using EXPLAIN</a> — see real plan trees with Seq Scan, Index Scan, and Nested Loop nodes in a production database, with cost and row estimates.</li>
+          <li><a href="https://15445.courses.cs.cmu.edu/fall2023/notes/" target="_blank" rel="noopener">CMU 15-445 lecture notes (Fall 2023)</a> — concise written notes on the processing model, access methods, and join algorithms to complement the videos.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-8.html"><div class="dir">← Previous</div><div class="ttl">Session 8: Query Parsing</div></a>
+        <a class="next" href="session-10.html"><div class="dir">Next →</div><div class="ttl">Session 10: Query Execution — Joins &amp; Sorting</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 9 — Query Execution (Part 1) · One tuple at a time, all the way up 🌋</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

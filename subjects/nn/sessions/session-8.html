@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 8 — Hands-On Project — Building an ANN from Scratch</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 8</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 08 · Hands-on Project — ANN</span>
+      <h1>Let's actually build a neural network — twice</h1>
+      <p class="lead">
+        Up to now we've been learning the pieces: neurons, activations, gradient descent, backprop,
+        regularization, initialization. Today we <em>put them all together</em> and build a working
+        digit-recognising neural network — first by hand in pure NumPy so you can see every gear turn,
+        then the idiomatic way in PyTorch so you see how a framework does the heavy lifting for you.
+        Everything here is real, runnable code. Grab a coffee, open a notebook, and let's build.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#project">The project &amp; the dataset</a></li>
+          <li><a href="#numpy">A neural net from scratch in NumPy</a></li>
+          <li><a href="#pytorch">The same net in PyTorch</a></li>
+          <li><a href="#train">Training, evaluating &amp; improving</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. PROJECT ===================== -->
+      <section id="project">
+        <h2><span class="sec-num">1</span> The project &amp; the dataset</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a giant shoebox full of 70,000 little photos, and on each photo someone
+          drew a number from 0 to 9 with a pencil. We want to teach a computer to look at any one of
+          those scribbles and shout out the right number. To do that we show it tens of thousands of
+          examples — "this squiggle is a 7, this one is a 2" — until it gets the hang of it. Then we
+          test it on photos it has <strong>never seen</strong> to check it actually learned, instead
+          of just memorising.</p>
+        </div>
+
+        <p>Our goal for this whole session is one concrete project: <strong>train a fully-connected
+        neural network to recognise handwritten digits</strong>. The dataset we'll use is the famous
+        <span class="term">MNIST</span> dataset — 70,000 grayscale images of handwritten digits (0–9),
+        each one a tiny 28×28 pixel square. It is the "hello world" of machine learning: small enough
+        to train on a laptop, but real enough to teach you everything.</p>
+
+        <h3>What one example looks like</h3>
+        <p>Each image is 28×28 = <strong>784 pixels</strong>. Every pixel is a single brightness number
+        from 0 (black) to 255 (white). The <span class="term">label</span> is the correct answer — the
+        digit the image actually shows. So one training example is a pair:
+        <code class="inl">(image of 784 numbers, correct digit)</code>.</p>
+
+        <div class="callout note">
+          <span class="c-title">A "fully-connected" net — quick reminder</span>
+          <p>A <span class="term">fully-connected network</span> (also called a
+          <span class="term">multilayer perceptron</span>, or MLP) is the kind we've studied all
+          course: every neuron in one layer connects to every neuron in the next. We flatten the
+          28×28 image into one long row of 784 numbers and feed it in. (In <a href="session-9.html">Session 9</a>
+          we'll meet <em>convolutions</em>, which are smarter about images — but the humble MLP already
+          gets us well over 97% accuracy here.)</p>
+        </div>
+
+        <h3>The end-to-end machine-learning workflow</h3>
+        <p>Every supervised ML project — not just this one — follows the same five-stage pipeline.
+        Burn this into your memory; it's the map for the rest of the session.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">1. Data</div><div class="s-d">Load, normalize, split into train / val / test</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧱</div><div class="s-t">2. Model</div><div class="s-d">Choose layers, sizes, activations</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏋️</div><div class="s-t">3. Train</div><div class="s-d">Forward → loss → backprop → update, repeat</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📊</div><div class="s-t">4. Evaluate</div><div class="s-d">Measure accuracy on unseen data</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔧</div><div class="s-t">5. Improve</div><div class="s-d">Tune, regularize, repeat</div></div>
+        </div>
+
+        <h3>Why we split the data into three piles</h3>
+        <p>The single most important rule in machine learning: <strong>you must test on data the model
+        never trained on.</strong> Otherwise the model can just memorise the answers and look brilliant
+        while being useless on anything new (we'll call this <span class="term">overfitting</span>). So
+        we split our examples into three groups:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Split</th><th>Job</th><th>Typical size</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Training set</span></td><td>The model learns from these — this is what gradient descent looks at.</td><td>~60,000 (85%)</td></tr>
+              <tr><td><span class="term">Validation set</span></td><td>Used <em>during</em> development to tune choices (layer sizes, learning rate). The model never trains on it.</td><td>~10,000</td></tr>
+              <tr><td><span class="term">Test set</span></td><td>Touched <strong>once</strong>, at the very end, to report honest final accuracy.</td><td>10,000</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — loading and inspecting MNIST</span>
+          <p>Here's the very first code you'd run. It loads MNIST, normalizes the pixels, and prints
+          the shapes so you understand exactly what you're holding:</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+<span class="kw">from</span> sklearn.datasets <span class="kw">import</span> fetch_openml
+
+<span class="cm"># Download MNIST (70,000 images of 784 pixels each)</span>
+mnist = fetch_openml(<span class="st">'mnist_784'</span>, version=<span class="nm">1</span>, as_frame=<span class="kw">False</span>)
+X = mnist.data.astype(np.float32)      <span class="cm"># shape (70000, 784), values 0..255</span>
+y = mnist.target.astype(np.int64)      <span class="cm"># shape (70000,),   values 0..9</span>
+
+<span class="cm"># Normalize pixels to the 0..1 range (Session 7: scaled inputs train better)</span>
+X = X / <span class="nm">255.0</span>
+
+<span class="cm"># Split: 60k train, 10k test (MNIST's standard split is the last 10k)</span>
+X_train, X_test = X[:<span class="nm">60000</span>], X[<span class="nm">60000</span>:]
+y_train, y_test = y[:<span class="nm">60000</span>], y[<span class="nm">60000</span>:]
+
+<span class="kw">print</span>(X_train.shape, y_train.shape)   <span class="cm"># (60000, 784) (60000,)</span>
+<span class="kw">print</span>(X_train.min(), X_train.max())   <span class="cm"># 0.0 1.0</span>
+<span class="kw">print</span>(<span class="st">"first label:"</span>, y_train[<span class="nm">0</span>]) <span class="cm"># e.g. 5</span></pre>
+          <p>Notice the <strong>normalization</strong> step — dividing by 255. Recall from
+          <a href="session-7.html">Session 7</a> that neural nets train far more reliably when inputs
+          are on a small, consistent scale. Feeding raw 0–255 values would make the early gradients
+          wildly large.</p>
+        </div>
+
+        <h3>One more data trick: one-hot labels</h3>
+        <p>Our network will output ten numbers — one "score" per digit. To compare those scores against
+        the true answer, it helps to turn each label into a <span class="term">one-hot vector</span>:
+        a length-10 list that is all zeros except a single 1 at the correct digit's position. The label
+        <code class="inl">3</code> becomes <code class="inl">[0,0,0,1,0,0,0,0,0,0]</code>.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The project: classify 28×28 handwritten digits with a fully-connected net. The workflow
+          never changes — <strong>data → model → train → evaluate → improve</strong> — and the golden
+          rule is to always judge the model on data it has never seen.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          MNIST = 70,000 handwritten digits, each a 784-pixel image with a 0–9 label. We normalize
+          pixels to 0–1, split into train / validation / test so we can measure honest performance,
+          and one-hot-encode labels so the net's ten outputs can be scored against the truth.
+        </div>
+      </section>
+
+      <!-- ===================== 2. NUMPY ===================== -->
+      <section id="numpy">
+        <h2><span class="sec-num">2</span> A neural net from scratch in NumPy</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Building a net in pure NumPy is like baking bread from raw flour instead of buying it.
+          It's more work, but you <em>see and touch</em> every ingredient. We'll do four things over
+          and over: (1) push the picture through the net to get a guess (<strong>forward</strong>),
+          (2) measure how wrong the guess was (<strong>loss</strong>), (3) figure out which knobs to
+          turn and by how much (<strong>backprop</strong>), and (4) nudge every knob a tiny bit in the
+          right direction (<strong>update</strong>). Do that thousands of times and the scribbles
+          start getting recognised.</p>
+        </div>
+
+        <p>We're going to tie together everything from Sessions 3–5 in one file. Our architecture is a
+        simple two-layer MLP:</p>
+        <ul>
+          <li><strong>Input:</strong> 784 numbers (the flattened image).</li>
+          <li><strong>Hidden layer:</strong> 128 neurons with a <span class="term">ReLU</span> activation
+          (recall from <a href="session-4.html">Session 4</a>: ReLU just sets negatives to zero).</li>
+          <li><strong>Output layer:</strong> 10 neurons, one per digit, turned into probabilities with
+          <span class="term">softmax</span>.</li>
+        </ul>
+
+        <h3>The four moving parts</h3>
+
+        <h4>Part A — the forward pass</h4>
+        <p>The <span class="term">forward pass</span> is just two matrix multiplications with an
+        activation in between. For a batch of images <code class="inl">X</code>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Step</th><th>Math</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td><code class="inl">z1 = X·W1 + b1</code></td><td>Weighted sums into the hidden layer</td></tr>
+              <tr><td>2</td><td><code class="inl">a1 = ReLU(z1)</code></td><td>Apply the activation</td></tr>
+              <tr><td>3</td><td><code class="inl">z2 = a1·W2 + b2</code></td><td>Weighted sums into the output layer (the <span class="term">logits</span>)</td></tr>
+              <tr><td>4</td><td><code class="inl">a2 = softmax(z2)</code></td><td>Turn the 10 scores into probabilities that sum to 1</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Part B — the loss</h4>
+        <p>We use <span class="term">cross-entropy loss</span>, the standard for classification. It is
+        small when the probability assigned to the <em>correct</em> digit is high, and large when the
+        model is confidently wrong. For one example it's simply <code class="inl">-log(probability of
+        the true class)</code>.</p>
+
+        <h4>Part C — backpropagation</h4>
+        <p><span class="term">Backpropagation</span> (Session 5) is just the chain rule applied
+        backwards through the net to find how the loss changes with respect to every weight — the
+        <span class="term">gradients</span>. There's a famous and beautiful simplification: when you
+        pair softmax with cross-entropy, the gradient at the output collapses to the tidy expression
+        <code class="inl">(a2 − y_onehot)</code> — predicted minus actual. That one fact does most of
+        the work.</p>
+
+        <h4>Part D — the gradient-descent update</h4>
+        <p>Finally we nudge every weight a small step <em>against</em> its gradient (Session 3):
+        <code class="inl">W = W − learning_rate × gradient</code>. Repeat the whole loop and the loss
+        steadily falls.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the complete NumPy network</span>
+          <p>This is a full, runnable program. It assumes <code class="inl">X_train, y_train</code>
+          from Topic 1. Read the comments — every line maps to something we've studied.</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+np.random.seed(<span class="nm">42</span>)
+
+<span class="cm"># ---------- helpers ----------</span>
+<span class="kw">def</span> <span class="nm">one_hot</span>(y, num_classes=<span class="nm">10</span>):
+    out = np.zeros((y.size, num_classes))
+    out[np.arange(y.size), y] = <span class="nm">1</span>      <span class="cm"># put a 1 at the correct digit</span>
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> <span class="nm">relu</span>(z):
+    <span class="kw">return</span> np.maximum(<span class="nm">0</span>, z)        <span class="cm"># negatives become 0</span>
+
+<span class="kw">def</span> <span class="nm">softmax</span>(z):
+    <span class="cm"># subtract row max for numerical stability, then normalize</span>
+    z = z - z.max(axis=<span class="nm">1</span>, keepdims=<span class="kw">True</span>)
+    e = np.exp(z)
+    <span class="kw">return</span> e / e.sum(axis=<span class="nm">1</span>, keepdims=<span class="kw">True</span>)
+
+<span class="cm"># ---------- initialize weights (Session 7: He init for ReLU) ----------</span>
+n_in, n_hidden, n_out = <span class="nm">784</span>, <span class="nm">128</span>, <span class="nm">10</span>
+W1 = np.random.randn(n_in, n_hidden) * np.sqrt(<span class="nm">2.0</span> / n_in)
+b1 = np.zeros(n_hidden)
+W2 = np.random.randn(n_hidden, n_out) * np.sqrt(<span class="nm">2.0</span> / n_hidden)
+b2 = np.zeros(n_out)
+
+<span class="cm"># ---------- hyperparameters ----------</span>
+lr        = <span class="nm">0.1</span>      <span class="cm"># learning rate (Session 3)</span>
+epochs    = <span class="nm">20</span>       <span class="cm"># full passes over the training data</span>
+batch     = <span class="nm">128</span>      <span class="cm"># mini-batch size (Session 3: SGD)</span>
+n         = X_train.shape[<span class="nm">0</span>]
+Y_train   = one_hot(y_train)
+
+<span class="cm"># ---------- the training loop ----------</span>
+<span class="kw">for</span> epoch <span class="kw">in</span> range(epochs):
+    <span class="cm"># shuffle each epoch so batches differ</span>
+    perm = np.random.permutation(n)
+    Xs, Ys = X_train[perm], Y_train[perm]
+
+    <span class="kw">for</span> i <span class="kw">in</span> range(<span class="nm">0</span>, n, batch):
+        xb = Xs[i:i+batch]                  <span class="cm"># (B, 784)</span>
+        yb = Ys[i:i+batch]                  <span class="cm"># (B, 10) one-hot</span>
+        B  = xb.shape[<span class="nm">0</span>]
+
+        <span class="cm"># ----- FORWARD PASS -----</span>
+        z1 = xb @ W1 + b1                   <span class="cm"># (B, 128)</span>
+        a1 = relu(z1)                       <span class="cm"># (B, 128)</span>
+        z2 = a1 @ W2 + b2                   <span class="cm"># (B, 10) logits</span>
+        a2 = softmax(z2)                    <span class="cm"># (B, 10) probabilities</span>
+
+        <span class="cm"># ----- LOSS (cross-entropy, averaged over the batch) -----</span>
+        loss = -np.sum(yb * np.log(a2 + <span class="nm">1e-9</span>)) / B
+
+        <span class="cm"># ----- BACKPROP (chain rule, Session 5) -----</span>
+        dz2 = (a2 - yb) / B                 <span class="cm"># softmax+CE shortcut: pred - actual</span>
+        dW2 = a1.T @ dz2                    <span class="cm"># (128, 10)</span>
+        db2 = dz2.sum(axis=<span class="nm">0</span>)            <span class="cm"># (10,)</span>
+
+        da1 = dz2 @ W2.T                    <span class="cm"># (B, 128)</span>
+        dz1 = da1 * (z1 &gt; <span class="nm">0</span>)              <span class="cm"># ReLU gradient: 1 where z1&gt;0 else 0</span>
+        dW1 = xb.T @ dz1                    <span class="cm"># (784, 128)</span>
+        db1 = dz1.sum(axis=<span class="nm">0</span>)            <span class="cm"># (128,)</span>
+
+        <span class="cm"># ----- GRADIENT-DESCENT UPDATE (Session 3) -----</span>
+        W2 -= lr * dW2;  b2 -= lr * db2
+        W1 -= lr * dW1;  b1 -= lr * db1
+
+    <span class="kw">print</span>(<span class="st">f"epoch {epoch+1:2d}  loss {loss:.4f}"</span>)
+
+<span class="cm"># ---------- evaluate on the held-out test set ----------</span>
+<span class="kw">def</span> <span class="nm">predict</span>(X):
+    a1 = relu(X @ W1 + b1)
+    <span class="kw">return</span> softmax(a1 @ W2 + b2).argmax(axis=<span class="nm">1</span>)
+
+acc = (predict(X_test) == y_test).mean()
+<span class="kw">print</span>(<span class="st">f"test accuracy: {acc*100:.2f}%"</span>)   <span class="cm"># ~97% after 20 epochs</span></pre>
+          <p>That is a complete neural network — forward, loss, backprop, update — in about 50 lines,
+          with no framework. Run it and you'll watch the loss fall and finish around 97% test accuracy.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — the two classic backprop bugs</span>
+          <p><strong>(1) Shape mismatches.</strong> 90% of "from scratch" pain is matrices not lining
+          up. Print <code class="inl">.shape</code> at every step. <strong>(2) Forgetting the
+          <code class="inl">1/B</code>.</strong> If you don't average the gradient over the batch, your
+          effective learning rate scales with batch size and training explodes. Note how
+          <code class="inl">dz2</code> is divided by <code class="inl">B</code> above.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why softmax subtracts the max</span>
+          <p><code class="inl">np.exp</code> of a large logit overflows to infinity. Subtracting the
+          row's maximum before exponentiating gives the <em>exact same</em> probabilities (it cancels
+          out) but keeps the numbers safe. This is a standard, important trick.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A from-scratch net is a loop of four steps: <strong>forward</strong> (two matmuls + ReLU +
+          softmax), <strong>cross-entropy loss</strong>, <strong>backprop</strong> (chain rule, with the
+          softmax+CE gradient collapsing to <code class="inl">pred − actual</code>), and the
+          <strong>gradient-descent update</strong>. He initialization and input normalization make it
+          train smoothly — that's why we studied Session 7.
+        </div>
+      </section>
+
+      <!-- ===================== 3. PYTORCH ===================== -->
+      <section id="pytorch">
+        <h2><span class="sec-num">3</span> The same net in PyTorch</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If NumPy was baking bread from raw flour, PyTorch is a bread machine. You still decide what
+          kind of bread you want and the ingredients, but you press one button and it does the kneading
+          for you. The magic button is called <strong>autograd</strong>: PyTorch quietly remembers every
+          calculation, so when you say "how wrong were we?", it figures out <em>all</em> the gradients by
+          itself. No hand-written backprop — that whole scary middle section of our NumPy code disappears.</p>
+        </div>
+
+        <p>We'll rebuild the exact same two-layer MLP, but the idiomatic PyTorch way. The framework
+        gives us three big conveniences:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>We hand-wrote</th><th>PyTorch gives us</th></tr></thead>
+            <tbody>
+              <tr><td>Weight matrices &amp; the forward formula</td><td><code class="inl">nn.Module</code> with <code class="inl">nn.Linear</code> layers (init handled for us)</td></tr>
+              <tr><td>The entire backprop block</td><td><code class="inl">loss.backward()</code> — automatic differentiation</td></tr>
+              <tr><td>The manual <code class="inl">W -= lr * dW</code> updates</td><td>An <code class="inl">optimizer</code> (e.g. <code class="inl">optim.SGD</code> or <code class="inl">Adam</code>)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the complete PyTorch network</span>
+          <p>A full, runnable training script. Compare it line-by-line with the NumPy version — the
+          structure is identical, but backprop is now a single call.</p>
+          <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">from</span> torch.utils.data <span class="kw">import</span> DataLoader, TensorDataset
+<span class="kw">from</span> torchvision <span class="kw">import</span> datasets, transforms
+
+device = <span class="st">"cuda"</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="st">"cpu"</span>
+
+<span class="cm"># ---------- 1. DATA ----------</span>
+tfm = transforms.Compose([
+    transforms.ToTensor(),                      <span class="cm"># to tensor, scales pixels to 0..1</span>
+    transforms.Normalize((<span class="nm">0.1307</span>,), (<span class="nm">0.3081</span>,)),  <span class="cm"># MNIST mean/std</span>
+])
+train_ds = datasets.MNIST(<span class="st">"./data"</span>, train=<span class="kw">True</span>,  download=<span class="kw">True</span>, transform=tfm)
+test_ds  = datasets.MNIST(<span class="st">"./data"</span>, train=<span class="kw">False</span>, download=<span class="kw">True</span>, transform=tfm)
+
+train_loader = DataLoader(train_ds, batch_size=<span class="nm">128</span>, shuffle=<span class="kw">True</span>)
+test_loader  = DataLoader(test_ds,  batch_size=<span class="nm">256</span>)
+
+<span class="cm"># ---------- 2. MODEL ----------</span>
+<span class="kw">class</span> <span class="nm">MLP</span>(nn.Module):
+    <span class="kw">def</span> <span class="nm">__init__</span>(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),               <span class="cm"># (B,1,28,28) -&gt; (B,784)</span>
+            nn.Linear(<span class="nm">784</span>, <span class="nm">128</span>),       <span class="cm"># hidden layer</span>
+            nn.ReLU(),                  <span class="cm"># activation (Session 4)</span>
+            nn.Linear(<span class="nm">128</span>, <span class="nm">10</span>),        <span class="cm"># output layer (logits)</span>
+        )
+    <span class="kw">def</span> <span class="nm">forward</span>(self, x):
+        <span class="kw">return</span> self.net(x)
+
+model = MLP().to(device)
+
+<span class="cm"># ---------- 3. LOSS + OPTIMIZER ----------</span>
+<span class="cm"># CrossEntropyLoss applies softmax internally, so the model outputs raw logits</span>
+loss_fn   = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=<span class="nm">0.1</span>)
+
+<span class="cm"># ---------- 4. TRAIN ----------</span>
+<span class="kw">for</span> epoch <span class="kw">in</span> range(<span class="nm">20</span>):
+    model.train()
+    <span class="kw">for</span> xb, yb <span class="kw">in</span> train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+
+        logits = model(xb)              <span class="cm"># FORWARD</span>
+        loss   = loss_fn(logits, yb)    <span class="cm"># LOSS</span>
+
+        optimizer.zero_grad()           <span class="cm"># clear last step's gradients (!)</span>
+        loss.backward()                 <span class="cm"># BACKPROP — autograd does it all</span>
+        optimizer.step()                <span class="cm"># UPDATE every weight</span>
+    <span class="kw">print</span>(<span class="st">f"epoch {epoch+1:2d}  loss {loss.item():.4f}"</span>)
+
+<span class="cm"># ---------- 5. EVALUATE ----------</span>
+model.eval()
+correct = <span class="nm">0</span>
+<span class="kw">with</span> torch.no_grad():                   <span class="cm"># no gradients needed at test time</span>
+    <span class="kw">for</span> xb, yb <span class="kw">in</span> test_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        preds = model(xb).argmax(dim=<span class="nm">1</span>)
+        correct += (preds == yb).sum().item()
+<span class="kw">print</span>(<span class="st">f"test accuracy: {100*correct/len(test_ds):.2f}%"</span>)  <span class="cm"># ~97-98%</span></pre>
+          <p>Same architecture, same result — but the hand-written gradients are gone. The three lines
+          <code class="inl">zero_grad()</code> → <code class="inl">backward()</code> →
+          <code class="inl">step()</code> are the heart of <em>every</em> PyTorch training loop you will
+          ever write.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway — the framework hides backprop, not the ideas</span>
+          <p><code class="inl">loss.backward()</code> is literally doing the chain-rule arithmetic you
+          coded by hand in Topic 2 — PyTorch just recorded the operations as you ran the forward pass
+          and replays them in reverse. Knowing what's under the hood is exactly why we built it from
+          scratch first. The framework saves typing, not understanding.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The #1 PyTorch beginner bug</span>
+          <p>Forgetting <code class="inl">optimizer.zero_grad()</code>. PyTorch <em>accumulates</em>
+          gradients by default, so if you don't clear them each step they pile up across batches and
+          training goes haywire. Always zero, backward, step — in that order.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why <code class="inl">CrossEntropyLoss</code> takes raw logits</span>
+          <p>In NumPy we applied softmax then cross-entropy as two steps. PyTorch's
+          <code class="inl">nn.CrossEntropyLoss</code> fuses them into one numerically-stable operation,
+          so your model's last layer should output <strong>raw logits</strong> — do <em>not</em> add a
+          softmax yourself. Doing both is a common, silent mistake that hurts accuracy.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          PyTorch rebuilds the same net with <code class="inl">nn.Module</code> + <code class="inl">nn.Linear</code>
+          layers, a loss function, and an optimizer. The manual backprop block becomes a single
+          <code class="inl">loss.backward()</code> thanks to autograd, and the weight updates become
+          <code class="inl">optimizer.step()</code>. Same maths, far less code.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TRAIN/EVAL/IMPROVE ===================== -->
+      <section id="train">
+        <h2><span class="sec-num">4</span> Training, evaluating &amp; improving</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Teaching the net is like coaching a student for an exam. You give them practice questions
+          (training data) and watch two scores: how well they do on the practice sheet, and how well
+          they do on a <em>fresh</em> mock exam (validation data). If they ace the practice sheet but
+          flop the mock, they've just memorised the answers instead of learning — that's
+          <strong>overfitting</strong>. The fixes are the same as for a real student: give them more
+          variety, don't let them cram pointlessly, and stop the moment the mock score stops improving.</p>
+        </div>
+
+        <h3>Splitting off a validation set</h3>
+        <p>In Topic 1 we set aside a test set. But to <em>tune</em> the model during development we also
+        carve a <span class="term">validation set</span> out of the training data — typically the last
+        chunk. We watch its loss every epoch:</p>
+        <pre><span class="kw">from</span> torch.utils.data <span class="kw">import</span> random_split
+
+<span class="cm"># carve 10,000 examples out of the 60,000 training images for validation</span>
+train_ds, val_ds = random_split(train_ds, [<span class="nm">50000</span>, <span class="nm">10000</span>])
+val_loader = DataLoader(val_ds, batch_size=<span class="nm">256</span>)</pre>
+
+        <h3>Monitoring train vs validation loss</h3>
+        <p>The single most useful habit in training: <strong>plot both curves together.</strong> The
+        gap between them tells you almost everything.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>What you see</th><th>Diagnosis</th><th>What to do</th></tr></thead>
+            <tbody>
+              <tr><td>Both losses high, both falling slowly</td><td><span class="term">Underfitting</span> — model too weak or not trained enough</td><td>Bigger/more layers, train longer, higher learning rate</td></tr>
+              <tr><td>Train loss ↓ but val loss flattens then <em>rises</em></td><td><span class="term">Overfitting</span> — memorising the training set</td><td>Regularize (below), more data, stop earlier</td></tr>
+              <tr><td>Both low and close together</td><td>Healthy — good fit 🎉</td><td>You're done; report test accuracy</td></tr>
+              <tr><td>Loss is NaN or explodes</td><td>Learning rate too high / bad init</td><td>Lower lr, check normalization &amp; init (Session 7)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a training loop that tracks validation loss</span>
+          <p>Here's the practical loop you'd actually use, computing validation loss each epoch:</p>
+          <pre><span class="kw">def</span> <span class="nm">evaluate</span>(loader):
+    model.eval()
+    total, correct, loss_sum = <span class="nm">0</span>, <span class="nm">0</span>, <span class="nm">0.0</span>
+    <span class="kw">with</span> torch.no_grad():
+        <span class="kw">for</span> xb, yb <span class="kw">in</span> loader:
+            xb, yb = xb.to(device), yb.to(device)
+            logits = model(xb)
+            loss_sum += loss_fn(logits, yb).item() * xb.size(<span class="nm">0</span>)
+            correct  += (logits.argmax(<span class="nm">1</span>) == yb).sum().item()
+            total    += xb.size(<span class="nm">0</span>)
+    <span class="kw">return</span> loss_sum / total, correct / total
+
+best_val, patience, waited = <span class="nm">1e9</span>, <span class="nm">3</span>, <span class="nm">0</span>
+<span class="kw">for</span> epoch <span class="kw">in</span> range(<span class="nm">50</span>):
+    model.train()
+    <span class="kw">for</span> xb, yb <span class="kw">in</span> train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        loss = loss_fn(model(xb), yb)
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+    val_loss, val_acc = evaluate(val_loader)
+    <span class="kw">print</span>(<span class="st">f"epoch {epoch+1}  val_loss {val_loss:.4f}  val_acc {val_acc*100:.2f}%"</span>)
+
+    <span class="cm"># EARLY STOPPING: stop if val loss hasn't improved for `patience` epochs</span>
+    <span class="kw">if</span> val_loss &lt; best_val:
+        best_val, waited = val_loss, <span class="nm">0</span>
+        torch.save(model.state_dict(), <span class="st">"best.pt"</span>)  <span class="cm"># keep the best model</span>
+    <span class="kw">else</span>:
+        waited += <span class="nm">1</span>
+        <span class="kw">if</span> waited &gt;= patience:
+            <span class="kw">print</span>(<span class="st">"early stopping"</span>); <span class="kw">break</span></pre>
+          <p>The <span class="term">early stopping</span> logic — save the model whenever validation loss
+          hits a new low, and quit if it hasn't improved in a few epochs — is the simplest, most
+          effective regularizer there is.</p>
+        </div>
+
+        <h3>Applying regularization (Session 6)</h3>
+        <p>When you spot overfitting, reach for the tools from <a href="session-6.html">Session 6</a>.
+        In PyTorch they're nearly free to add:</p>
+        <ul>
+          <li><strong>Dropout</strong> — randomly zero some hidden activations during training so the
+          net can't rely on any one neuron. Add <code class="inl">nn.Dropout(0.2)</code> after the
+          ReLU.</li>
+          <li><strong>Weight decay (L2)</strong> — gently shrink weights toward zero. Just pass
+          <code class="inl">weight_decay=1e-4</code> to the optimizer.</li>
+          <li><strong>More data / data augmentation</strong> — small random shifts and rotations of the
+          images give the net more variety to learn from.</li>
+        </ul>
+        <pre><span class="cm"># model with dropout</span>
+self.net = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(<span class="nm">784</span>, <span class="nm">128</span>), nn.ReLU(),
+    nn.Dropout(<span class="nm">0.2</span>),                 <span class="cm"># Session 6: regularization</span>
+    nn.Linear(<span class="nm">128</span>, <span class="nm">10</span>),
+)
+
+<span class="cm"># optimizer with L2 weight decay + Adam (often trains faster than plain SGD)</span>
+optimizer = torch.optim.Adam(model.parameters(), lr=<span class="nm">1e-3</span>, weight_decay=<span class="nm">1e-4</span>)</pre>
+
+        <div class="callout note">
+          <span class="c-title">Good initialization, revisited (Session 7)</span>
+          <p><code class="inl">nn.Linear</code> already uses a sensible default init (Kaiming/He-style),
+          which is why our PyTorch net "just works." In the NumPy version we did it by hand with
+          <code class="inl">np.sqrt(2/n_in)</code>. Bad init is a top cause of a loss that refuses to
+          fall or that NaNs out — if training won't start, suspect init or learning rate first.</p>
+        </div>
+
+        <h3>Reading the results — accuracy isn't everything</h3>
+        <p>Once you have a trained model, look beyond the single accuracy number. A
+        <span class="term">confusion matrix</span> shows <em>which</em> digits get mixed up (4s and 9s
+        are classic confusions). Look at the actual misclassified images — often they're genuinely
+        ambiguous scribbles, which tells you the model is doing fine and the data is just hard.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common pitfalls — a checklist</span>
+          <p><strong>Data leakage:</strong> never let test data touch training, and compute
+          normalization stats from the <em>training</em> set only.<br />
+          <strong>Forgetting <code class="inl">model.eval()</code>:</strong> dropout and batch-norm
+          behave differently at test time — switch to eval mode or your accuracy will look wrong.<br />
+          <strong>Learning rate too high/low:</strong> the #1 reason training fails. Try 0.1 for SGD,
+          1e-3 for Adam, then adjust.<br />
+          <strong>Tuning on the test set:</strong> if you keep peeking at test accuracy and tweaking,
+          you've secretly turned it into a validation set — keep it sacred for the final report.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Split off a validation set, watch train vs val loss every epoch, and read the gap:
+          underfitting → make the model stronger; overfitting → regularize with dropout / weight decay /
+          more data and use early stopping. Good init and a sane learning rate keep training healthy.
+          Judge with a confusion matrix and misclassified examples — and keep the test set untouched
+          until the very end.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was the payoff for everything in Sessions 1–7. Here's the one-paragraph story
+        that ties the whole project together:</p>
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>We took a real dataset (<strong>MNIST</strong>), normalized it and split it into
+          <strong>train / validation / test</strong>, then built a fully-connected net <em>twice</em>.
+          In <strong>NumPy</strong> we hand-coded the <strong>forward pass</strong> (matmuls + ReLU +
+          softmax), the <strong>cross-entropy loss</strong>, <strong>backprop</strong> (the chain rule,
+          with the softmax+CE gradient collapsing to <code class="inl">pred − actual</code>), and the
+          <strong>gradient-descent update</strong> — using <strong>He initialization</strong> from
+          Session 7 so it trained smoothly. Then in <strong>PyTorch</strong> we rebuilt the exact same
+          model with <code class="inl">nn.Module</code> and let <strong>autograd</strong> do the
+          backprop and an <strong>optimizer</strong> do the updates. Finally we watched
+          <strong>train vs validation loss</strong> to spot <strong>overfitting</strong>, fought it with
+          <strong>dropout and weight decay</strong> (Session 6) and <strong>early stopping</strong>, and
+          reported honest accuracy on the untouched test set — around 97–98%. You now know how every
+          neural network on Earth is actually trained.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why do we split data into train, validation, and test sets?</summary>
+          <p class="ans">Train teaches the model; validation lets us tune choices without cheating;
+          test gives one honest, final accuracy number on data the model has never seen. Without this
+          split we can't tell learning from memorising (overfitting).</p>
+        </details>
+        <details class="quiz">
+          <summary>In the NumPy net, why is the output-layer gradient just <code class="inl">a2 − y_onehot</code>?</summary>
+          <p class="ans">Because softmax paired with cross-entropy simplifies algebraically: the messy
+          derivatives cancel and the gradient of the loss w.r.t. the logits collapses to
+          predicted-probabilities minus the one-hot truth. It's the neatest result in all of backprop.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does <code class="inl">loss.backward()</code> replace from our NumPy code?</summary>
+          <p class="ans">The entire hand-written backprop block (computing dz2, dW2, da1, dz1, dW1…).
+          PyTorch's autograd records the forward operations and automatically computes every gradient
+          via the chain rule — the same maths, done for you.</p>
+        </details>
+        <details class="quiz">
+          <summary>Training loss keeps falling but validation loss starts rising. What's happening and what do you do?</summary>
+          <p class="ans">That's overfitting — the model is memorising the training set. Fix it with
+          regularization (dropout, weight decay), more/augmented data, or early stopping (stop when
+          validation loss stops improving).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why must the PyTorch model output raw logits instead of softmax probabilities?</summary>
+          <p class="ans">Because <code class="inl">nn.CrossEntropyLoss</code> applies softmax internally
+          (in a numerically stable, fused way). Adding your own softmax first double-applies it and hurts
+          accuracy.</p>
+        </details>
+        <details class="quiz">
+          <summary>You forgot <code class="inl">optimizer.zero_grad()</code>. What goes wrong?</summary>
+          <p class="ans">PyTorch accumulates gradients by default, so without zeroing them each step they
+          pile up across batches, producing huge, wrong updates and unstable training.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>Your course handout: <strong>"SST Deep Learning handout (Session 8)"</strong> — the
+          accompanying notes for this hands-on project session, available at
+          <a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">priyanshsaxena.com/sst-deep-learning-nn</a>.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://pytorch.org/tutorials/beginner/deep_learning_60min_blitz.html" target="_blank" rel="noopener">PyTorch — Deep Learning with PyTorch: A 60 Minute Blitz</a> — the official quickstart that mirrors exactly what we built in Topic 3 (tensors, autograd, nn.Module, training loop).</li>
+          <li><a href="https://karpathy.ai/zero-to-hero.html" target="_blank" rel="noopener">Andrej Karpathy — Neural Networks: Zero to Hero</a> — a superb video course that builds backprop and nets from scratch, the perfect companion to our NumPy implementation.</li>
+          <li><a href="http://yann.lecun.com/exdb/mnist/" target="_blank" rel="noopener">The MNIST database of handwritten digits</a> — the original dataset home page, with benchmark accuracies for many model types.</li>
+          <li><a href="https://pytorch.org/docs/stable/notes/autograd.html" target="_blank" rel="noopener">PyTorch docs — Autograd mechanics</a> — how <code class="inl">backward()</code> actually computes gradients, if you want to peek behind the curtain.</li>
+          <li><a href="https://cs231n.github.io/optimization-2/" target="_blank" rel="noopener">Stanford CS231n — Backpropagation, intuitions</a> — the clearest written explanation of the chain rule and gradient flow we coded by hand.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-7.html"><div class="dir">← Previous</div><div class="ttl">Session 7: Initialization &amp; Normalization</div></a>
+        <a class="next" href="session-9.html"><div class="dir">Next →</div><div class="ttl">Session 9: Convolutions</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 8 — Hands-On Project — Building an ANN from Scratch · You trained your first neural network 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

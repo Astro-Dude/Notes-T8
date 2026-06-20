@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 4 — Backpropagation &amp; Computational Graphs</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 4</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 04 · Backpropagation</span>
+      <h1>How a neural network actually learns</h1>
+      <p class="lead">
+        This is the session where the magic stops being magic. You'll see <em>exactly</em> how a network
+        turns a mistake into a tiny adjustment of every weight inside it. We start each topic with a
+        simple story, then do the real arithmetic by hand — no skipped steps. By the end you'll be able
+        to backpropagate through a tiny network with pen and paper, and you'll know precisely what
+        <code class="inl">loss.backward()</code> does under the hood.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#loop">The big learning loop</a></li>
+          <li><a href="#chain">Chain rule &amp; computational graphs</a></li>
+          <li><a href="#backprop">Backprop, step by step</a></li>
+          <li><a href="#autodiff">Automatic differentiation</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. THE BIG LOOP ===================== -->
+      <section id="loop">
+        <h2><span class="sec-num">1</span> How a network learns — the big loop</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're blindfolded on a bumpy hill and you want to walk to the lowest point. You can't
+          see, but you <em>can</em> feel which way the ground tilts under your feet. So you take a tiny step
+          downhill, feel again, take another tiny step, and keep going. Bit by bit you slide to the bottom.
+          A neural network learns the exact same way: it feels which direction makes its mistakes
+          <strong>smaller</strong>, then takes a tiny step that way — over and over.</p>
+        </div>
+
+        <p>Recall from <strong>Session 3</strong> that a network is just a stack of layers, each holding
+        a pile of numbers called <span class="term">weights</span> (and biases). Learning means
+        <strong>finding good values for those weights</strong> so the network's outputs match the right
+        answers. Training is a loop that repeats this four-step cycle millions of times:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">➡️</div><div class="s-t">1. Forward pass</div><div class="s-d">Run input through the net to get a prediction</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📏</div><div class="s-t">2. Loss</div><div class="s-d">Measure how wrong the prediction is</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⬅️</div><div class="s-t">3. Backward pass</div><div class="s-d">Find how each weight affected the error</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔧</div><div class="s-t">4. Update</div><div class="s-d">Nudge every weight to shrink the error</div></div>
+        </div>
+
+        <h3>Step 1 — the forward pass</h3>
+        <p>The <span class="term">forward pass</span> is just running the network normally: feed in the
+        input, let each layer compute its outputs, and read off the final prediction. We did this in
+        Session 3. Nothing learns yet — we're just <em>guessing</em>.</p>
+
+        <h3>Step 2 — the loss</h3>
+        <p>The <span class="term">loss</span> (also called the <em>cost</em> or <em>error</em>) is a single
+        number that says <strong>how bad the guess was</strong>. Big loss = very wrong; loss of zero =
+        perfect. A simple one is the <span class="term">squared error</span>: take the difference between
+        the prediction and the true answer, and square it. We'll explore many loss functions in
+        <strong>Session 5</strong>; for now just think "one number measuring wrongness."</p>
+
+        <h3>Step 3 — the backward pass</h3>
+        <p>This is the heart of this whole session. The <span class="term">backward pass</span> (a.k.a.
+        <span class="term">backpropagation</span>) answers one question for every single weight in the
+        network: <strong>"if I nudge you up a little, does the loss go up or down, and by how much?"</strong>
+        That "how much" is called a <span class="term">gradient</span>.</p>
+
+        <div class="callout note">
+          <span class="c-title">What is a gradient, really?</span>
+          <p>A gradient is just a <strong>slope</strong>. For one weight, the gradient
+          <code class="inl">∂Loss/∂w</code> (read: "the rate of change of loss with respect to w") tells
+          you the slope of the loss as you wiggle that weight. Positive slope → increasing the weight
+          increases the loss (so you should <em>decrease</em> it). The gradient for the <em>whole</em>
+          network is just the collection of every individual weight's slope.</p>
+        </div>
+
+        <h3>Step 4 — the update (gradient descent)</h3>
+        <p>Now we take the downhill step. <span class="term">Gradient descent</span> updates each weight
+        by moving it a tiny bit in the direction that <em>reduces</em> the loss — i.e. <strong>opposite</strong>
+        to the gradient (because the gradient points uphill):</p>
+
+        <pre><span class="cm"># the single most important formula in deep learning</span>
+w_new = w_old - learning_rate * (&part;Loss / &part;w)</pre>
+
+        <p>The <span class="term">learning rate</span> is the size of your step. Too small and you crawl
+        downhill forever; too big and you leap right over the valley and bounce around. (We tune it
+        properly in Session 5.)</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example — one weight, one step</span>
+          <p>Suppose a weight is <code class="inl">w = 0.80</code>, the loss is currently 0.50, and backprop
+          tells us the gradient is <code class="inl">&part;Loss/&part;w = +2.0</code> (loss rises steeply as
+          w grows). With learning rate <code class="inl">0.1</code>:</p>
+          <pre>w_new = 0.80 - 0.1 &times; (+2.0)
+      = 0.80 - 0.20
+      = 0.60</pre>
+          <p>We <strong>decreased</strong> w because its gradient was positive (uphill). After this nudge,
+          the next forward pass should give a slightly smaller loss. Repeat a few thousand times and the
+          network gets good.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Learning = repeatedly <strong>roll downhill</strong> on the loss surface. The forward pass
+          makes a guess, the loss scores it, backprop measures the slope for every weight, and gradient
+          descent steps each weight a little downhill. The whole rest of this session is just
+          <em>how backprop computes those slopes efficiently</em>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Training is a four-step loop: <strong>forward pass</strong> (guess) → <strong>loss</strong>
+          (measure wrongness) → <strong>backward pass</strong> (gradient = slope for each weight) →
+          <strong>update</strong> (<code class="inl">w = w − lr·∂Loss/∂w</code>, step downhill). Do this
+          many times and the network descends to low loss.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CHAIN RULE & GRAPHS ===================== -->
+      <section id="chain">
+        <h2><span class="sec-num">2</span> The chain rule &amp; computational graphs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a line of dominoes. You push the first one, it knocks the second, which knocks the
+          third. If you wanted to know "how much harder do I push the first domino to make the last one
+          fall 2 cm further?", you'd multiply the effects along the chain: push → domino 1 → domino 2 →
+          domino 3. The <strong>chain rule</strong> is exactly that — when one thing affects another
+          through a chain of steps, you <em>multiply</em> the little effects together to get the total
+          effect.</p>
+        </div>
+
+        <h3>A computation is a graph</h3>
+        <p>Any calculation can be drawn as a <span class="term">computational graph</span>: a diagram of
+        <span class="term">nodes</span> (operations like + or ×) connected by arrows that carry values.
+        Inputs flow in on the left; the final result comes out on the right. A neural network is just a
+        very big computational graph.</p>
+
+        <p>Let's build a tiny one. Consider the function:</p>
+        <pre>f = (a + b) &times; c</pre>
+        <p>We break it into two simple steps, giving the intermediate a name:</p>
+        <pre>d = a + b      <span class="cm"># node 1: an addition</span>
+f = d &times; c      <span class="cm"># node 2: a multiplication</span></pre>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🅰️</div><div class="s-t">a</div><div class="s-d">input</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">d = a+b</div><div class="s-d">add node</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✖️</div><div class="s-t">f = d×c</div><div class="s-d">multiply node</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">f</div><div class="s-d">output</div></div>
+        </div>
+
+        <h3>Local gradients — each node minds its own business</h3>
+        <p>The beautiful trick: each node only needs to know how its <em>own</em> output changes when its
+        <em>own</em> inputs wiggle. These are called <span class="term">local gradients</span>, and they're
+        always simple, even when the whole function is huge. The standard derivative rules are all you need:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Node</th><th>Operation</th><th>Local gradients</th></tr></thead>
+            <tbody>
+              <tr><td>Add</td><td><code class="inl">d = a + b</code></td><td><code class="inl">∂d/∂a = 1</code>, <code class="inl">∂d/∂b = 1</code> (an add just passes gradient through)</td></tr>
+              <tr><td>Multiply</td><td><code class="inl">f = d × c</code></td><td><code class="inl">∂f/∂d = c</code>, <code class="inl">∂f/∂c = d</code> (a multiply swaps the other input in)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The chain rule composes them</h3>
+        <p>To find how the <em>final</em> output <code class="inl">f</code> changes when an <em>early</em>
+        input <code class="inl">a</code> changes, we can't read it off directly — <code class="inl">a</code>
+        doesn't touch <code class="inl">f</code> directly, it goes <em>through</em> <code class="inl">d</code>.
+        The <span class="term">chain rule</span> says: multiply the local gradients along the path.</p>
+
+        <pre>&part;f/&part;a = (&part;f/&part;d) &times; (&part;d/&part;a)</pre>
+
+        <p>Read it as: "how f reacts to d" times "how d reacts to a." The intermediate
+        <code class="inl">d</code> cancels conceptually, leaving the total effect of <code class="inl">a</code>
+        on <code class="inl">f</code>. This is the entire mathematical engine of backpropagation.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example with numbers</span>
+          <p>Let <code class="inl">a = 2</code>, <code class="inl">b = 3</code>, <code class="inl">c = 4</code>.</p>
+          <p><strong>Forward pass</strong> (left to right):</p>
+          <pre>d = a + b = 2 + 3 = 5
+f = d &times; c = 5 &times; 4 = 20</pre>
+          <p><strong>Local gradients</strong> at these values:</p>
+          <pre>&part;f/&part;d = c = 4
+&part;f/&part;c = d = 5
+&part;d/&part;a = 1
+&part;d/&part;b = 1</pre>
+          <p><strong>Chain them</strong> to get the gradient of f with respect to every input:</p>
+          <pre>&part;f/&part;a = (&part;f/&part;d)(&part;d/&part;a) = 4 &times; 1 = 4
+&part;f/&part;b = (&part;f/&part;d)(&part;d/&part;b) = 4 &times; 1 = 4
+&part;f/&part;c = 5                              <span class="cm"># direct, one node away</span></pre>
+          <p><strong>Sanity check:</strong> the gradient <code class="inl">∂f/∂a = 4</code> claims that
+          bumping <code class="inl">a</code> by a tiny amount multiplies into f four-fold. Test it: set
+          <code class="inl">a = 2.01</code>. Then <code class="inl">d = 5.01</code> and
+          <code class="inl">f = 5.01 × 4 = 20.04</code>. The output rose by <code class="inl">0.04</code> for
+          an input bump of <code class="inl">0.01</code> — exactly 4× . The gradient was right. 🎉</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why graphs make this easy</span>
+          <p>The graph view lets us solve a terrifyingly complex derivative by only ever doing
+          <em>tiny</em> local derivatives at each node and multiplying along edges. You never have to
+          differentiate the whole monster function at once. A network with millions of weights is just a
+          huge graph where this same trick is applied edge by edge.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A computation is a <strong>graph</strong> of simple nodes. Each node has easy
+          <strong>local gradients</strong>. The <strong>chain rule</strong> gets the effect of an early
+          input on the final output by <strong>multiplying local gradients along the path</strong>. That's
+          the whole math behind backprop — verified above by a tiny numeric perturbation.
+        </div>
+      </section>
+
+      <!-- ===================== 3. BACKPROP STEP BY STEP ===================== -->
+      <section id="backprop">
+        <h2><span class="sec-num">3</span> Backpropagation, step by step</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a relay race run in reverse. The error finishes at the end, then it's handed back
+          down the line — each runner takes the baton, keeps a share of the blame for the mistake, and
+          passes the rest backward to the runner before them. By the time the baton reaches the start,
+          <strong>everyone knows exactly how much they contributed to the error</strong>. Backprop hands
+          the error backward through the network so every weight learns its share of the blame.</p>
+        </div>
+
+        <p>Now we do the real thing: a complete forward <em>and</em> backward pass on a tiny
+        <strong>2-layer network</strong>, with every number worked out. Take it slowly — this is the most
+        important worked example in the whole course.</p>
+
+        <h3>The network</h3>
+        <p>One input <code class="inl">x</code>, one hidden neuron, one output neuron, and we'll use the
+        <span class="term">sigmoid</span> activation <code class="inl">σ(z) = 1/(1+e⁻ᶻ)</code> on each
+        (recall sigmoids from Session 3). Squared-error loss against a target <code class="inl">y</code>.</p>
+
+        <pre><span class="cm"># Layer 1 (hidden)</span>
+z1 = w1 &middot; x  + b1
+h  = &sigma;(z1)
+
+<span class="cm"># Layer 2 (output)</span>
+z2 = w2 &middot; h  + b2
+o  = &sigma;(z2)
+
+<span class="cm"># Loss (½ makes the derivative clean)</span>
+L  = &frac12; (o - y)&sup2;</pre>
+
+        <p>A handy fact we'll lean on: the derivative of sigmoid is
+        <code class="inl">σ'(z) = σ(z)·(1 − σ(z))</code>. So if a neuron's output is
+        <code class="inl">h</code>, then <code class="inl">∂h/∂z1 = h·(1−h)</code>. Neat — no exponentials
+        needed once you already have the output.</p>
+
+        <h3>Forward pass (pick concrete numbers)</h3>
+        <div class="callout example">
+          <span class="c-title">Forward arithmetic</span>
+          <p>Inputs &amp; parameters: <code class="inl">x = 1.0</code>, <code class="inl">y = 0.0</code> (target),
+          <code class="inl">w1 = 0.5</code>, <code class="inl">b1 = 0.0</code>,
+          <code class="inl">w2 = 0.5</code>, <code class="inl">b2 = 0.0</code>.</p>
+          <pre>z1 = w1&middot;x + b1 = 0.5&middot;1.0 + 0 = 0.500
+h  = &sigma;(0.500)        = 0.6225        <span class="cm"># 1/(1+e^-0.5)</span>
+
+z2 = w2&middot;h + b2 = 0.5&middot;0.6225 + 0 = 0.31124
+o  = &sigma;(0.31124)     = 0.5772        <span class="cm"># the prediction</span>
+
+L  = &frac12;(o - y)&sup2; = &frac12;(0.5772 - 0)&sup2; = &frac12;(0.33316) = 0.16658</pre>
+          <p>The network predicted <code class="inl">0.5772</code> but the target was <code class="inl">0</code>,
+          so we have a loss of <code class="inl">0.1666</code>. Now we assign blame.</p>
+        </div>
+
+        <h3>Backward pass — propagate the gradient right-to-left</h3>
+        <p>We walk backward through the graph, applying the chain rule at each node. At every step we keep
+        a running gradient "of the loss with respect to this value," then multiply by the next local
+        gradient as we move left.</p>
+
+        <div class="callout example">
+          <span class="c-title">Backward arithmetic — every step shown</span>
+          <p><strong>Step A — loss w.r.t. output o.</strong> With <code class="inl">L = ½(o−y)²</code>:</p>
+          <pre>&part;L/&part;o = (o - y) = 0.5772 - 0 = 0.5772</pre>
+
+          <p><strong>Step B — through the output sigmoid</strong> (<code class="inl">o = σ(z2)</code>,
+          local gradient <code class="inl">o(1−o)</code>):</p>
+          <pre>&part;o/&part;z2 = o(1-o) = 0.5772 &times; (1 - 0.5772) = 0.5772 &times; 0.4228 = 0.2440
+&part;L/&part;z2 = &part;L/&part;o &times; &part;o/&part;z2 = 0.5772 &times; 0.2440 = 0.14086</pre>
+          <p>Call this running value <code class="inl">δ2 = ∂L/∂z2 = 0.14086</code> — the "blame at the
+          output neuron's pre-activation."</p>
+
+          <p><strong>Step C — output-layer weights &amp; bias.</strong> Since
+          <code class="inl">z2 = w2·h + b2</code>, the local gradients are
+          <code class="inl">∂z2/∂w2 = h</code> and <code class="inl">∂z2/∂b2 = 1</code>:</p>
+          <pre>&part;L/&part;w2 = &delta;2 &times; h = 0.14086 &times; 0.6225 = 0.08769
+&part;L/&part;b2 = &delta;2 &times; 1 = 0.14086</pre>
+
+          <p><strong>Step D — push blame back into the hidden output h.</strong> Also from
+          <code class="inl">z2 = w2·h + b2</code>, we have <code class="inl">∂z2/∂h = w2</code>:</p>
+          <pre>&part;L/&part;h = &delta;2 &times; w2 = 0.14086 &times; 0.5 = 0.07043</pre>
+
+          <p><strong>Step E — through the hidden sigmoid</strong> (<code class="inl">h = σ(z1)</code>,
+          local gradient <code class="inl">h(1−h)</code>):</p>
+          <pre>&part;h/&part;z1 = h(1-h) = 0.6225 &times; (1 - 0.6225) = 0.6225 &times; 0.3775 = 0.23499
+&part;L/&part;z1 = &part;L/&part;h &times; &part;h/&part;z1 = 0.07043 &times; 0.23499 = 0.01655</pre>
+          <p>Call this <code class="inl">δ1 = ∂L/∂z1 = 0.01655</code> — the blame at the hidden neuron.</p>
+
+          <p><strong>Step F — hidden-layer weight &amp; bias.</strong> From
+          <code class="inl">z1 = w1·x + b1</code>: <code class="inl">∂z1/∂w1 = x</code>,
+          <code class="inl">∂z1/∂b1 = 1</code>:</p>
+          <pre>&part;L/&part;w1 = &delta;1 &times; x = 0.01655 &times; 1.0 = 0.01655
+&part;L/&part;b1 = &delta;1 &times; 1 = 0.01655</pre>
+        </div>
+
+        <p>We now have a gradient for <strong>every</strong> parameter. Notice the pattern: at each layer
+        the blame <code class="inl">δ</code> is "current running gradient × local sigmoid slope," then we
+        spread it onto that layer's weights (× the input feeding the weight) and pass a slimmer version
+        further back (× the weight). That repeating shape is why it's called back-<em>propagation</em>.</p>
+
+        <h3>The update step</h3>
+        <div class="callout example">
+          <span class="c-title">One gradient-descent step (learning rate = 1.0)</span>
+          <pre>w2 &larr; 0.5 - 1.0 &times; 0.08769 = 0.41231
+b2 &larr; 0.0 - 1.0 &times; 0.14086 = -0.14086
+w1 &larr; 0.5 - 1.0 &times; 0.01655 = 0.48345
+b1 &larr; 0.0 - 1.0 &times; 0.01655 = -0.01655</pre>
+          <p><strong>Did it help?</strong> Re-run the forward pass with the new weights:
+          <code class="inl">z1 = 0.48345</code> → <code class="inl">h = 0.6186</code> →
+          <code class="inl">z2 = 0.41231·0.6186 − 0.14086 = 0.1143</code> →
+          <code class="inl">o = σ(0.1143) = 0.5285</code> →
+          <code class="inl">L = ½(0.5285)² = 0.1397</code>. The loss dropped from
+          <strong>0.1666 to 0.1397</strong>. The network just learned. ✅</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why notice that the deeper weight got a tiny gradient?</span>
+          <p>See how <code class="inl">∂L/∂w1 = 0.0166</code> is much smaller than
+          <code class="inl">∂L/∂w2 = 0.0877</code>? Each sigmoid multiplied the gradient by a factor less
+          than 1 (here ~0.24, ~0.23) as it travelled backward. Stack many sigmoid layers and the gradient
+          can shrink toward zero — the famous <span class="term">vanishing gradient problem</span>. It's
+          exactly why modern nets prefer ReLU activations and careful initialisation. We'll meet it again
+          in later sessions.</p>
+        </div>
+
+        <h3>The same thing in code</h3>
+        <pre><span class="cm"># Backprop by hand in plain Python — the example above</span>
+<span class="kw">import</span> math
+
+<span class="kw">def</span> sigmoid(z): <span class="kw">return</span> <span class="nm">1</span> / (<span class="nm">1</span> + math.exp(-z))
+
+x, y = <span class="nm">1.0</span>, <span class="nm">0.0</span>
+w1, b1, w2, b2 = <span class="nm">0.5</span>, <span class="nm">0.0</span>, <span class="nm">0.5</span>, <span class="nm">0.0</span>
+
+<span class="cm"># --- forward ---</span>
+z1 = w1 * x + b1
+h  = sigmoid(z1)
+z2 = w2 * h + b2
+o  = sigmoid(z2)
+L  = <span class="nm">0.5</span> * (o - y) ** <span class="nm">2</span>
+
+<span class="cm"># --- backward (chain rule, right to left) ---</span>
+dL_do  = (o - y)                 <span class="cm"># 0.5772</span>
+dL_dz2 = dL_do * o * (<span class="nm">1</span> - o)     <span class="cm"># 0.14086  (= delta2)</span>
+dL_dw2 = dL_dz2 * h              <span class="cm"># 0.08769</span>
+dL_db2 = dL_dz2                  <span class="cm"># 0.14086</span>
+dL_dh  = dL_dz2 * w2             <span class="cm"># 0.07043</span>
+dL_dz1 = dL_dh * h * (<span class="nm">1</span> - h)      <span class="cm"># 0.01655  (= delta1)</span>
+dL_dw1 = dL_dz1 * x              <span class="cm"># 0.01655</span>
+dL_db1 = dL_dz1                  <span class="cm"># 0.01655</span>
+
+<span class="cm"># --- update (gradient descent, lr = 1.0) ---</span>
+lr = <span class="nm">1.0</span>
+w2 -= lr * dL_dw2;  b2 -= lr * dL_db2
+w1 -= lr * dL_dw1;  b1 -= lr * dL_db1</pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Backprop = <strong>forward</strong> to get every value, then <strong>backward</strong> applying
+          the chain rule node by node. At each layer: blame <code class="inl">δ</code> = incoming gradient
+          × activation slope; spread it onto weights (× the weight's input) and pass it further back (×
+          the weight). We computed all four gradients by hand, took one step, and watched the loss fall
+          from 0.1666 to 0.1397.
+        </div>
+      </section>
+
+      <!-- ===================== 4. AUTODIFF ===================== -->
+      <section id="autodiff">
+        <h2><span class="sec-num">4</span> Automatic differentiation</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Doing that backward arithmetic by hand was fine for one tiny network — but real networks have
+          <em>millions</em> of weights. Nobody wants to compute a million derivatives with pen and paper.
+          So the computer keeps a little notebook: every time it does a math step on the way forward, it
+          jots down what it did. Then to find all the gradients, it just <strong>reads its notebook
+          backward</strong> and applies the chain rule automatically. That clever notebook trick is called
+          <span class="term">automatic differentiation</span>.</p>
+        </div>
+
+        <p><span class="term">Automatic differentiation</span> ("autodiff" or "autograd") is how frameworks
+        like <span class="term">PyTorch</span> and <span class="term">TensorFlow</span> compute exact
+        gradients with no hand-derived formulas from you. It is <em>not</em> the same as the two things
+        people confuse it with:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Approach</th><th>How it works</th><th>Problem</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Numerical</strong></td><td>Nudge a weight by a tiny ε, re-run forward, see how loss changed.</td><td>Slow (one re-run per weight) and imprecise (rounding error). Fine for spot-checks, useless for training.</td></tr>
+              <tr><td><strong>Symbolic</strong></td><td>Derive one giant algebra formula for the whole gradient (like a calculus class).</td><td>The formula explodes in size ("expression swell") for big nets.</td></tr>
+              <tr><td><strong>Automatic (autodiff)</strong></td><td>Record each elementary op in a graph; apply the chain rule numerically along it.</td><td>None of the above — exact <em>and</em> fast. This is what frameworks use.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>It records the graph as you compute</h3>
+        <p>When you run a forward pass in PyTorch, it secretly builds the same computational graph from
+        Topic 2, node by node, remembering each operation and the local gradient it will need later. This
+        recorded graph is sometimes called the <span class="term">tape</span> (TensorFlow even names its
+        tool <code class="inl">GradientTape</code>). When you ask for gradients, it replays the tape
+        backward — exactly the right-to-left walk we did by hand in Topic 3.</p>
+
+        <h3>Forward-mode vs reverse-mode</h3>
+        <p>There are two directions you can apply the chain rule along the graph:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Forward-mode</th><th>Reverse-mode</th></tr></thead>
+            <tbody>
+              <tr><td>Direction</td><td>Inputs → output (left to right)</td><td>Output → inputs (right to left)</td></tr>
+              <tr><td>One pass gives you</td><td>Derivative of <em>all</em> outputs w.r.t. <em>one</em> input</td><td>Derivative of <em>one</em> output w.r.t. <em>all</em> inputs</td></tr>
+              <tr><td>Cheap when</td><td>Few inputs, many outputs</td><td>Many inputs, few outputs</td></tr>
+              <tr><td>Cost to get all gradients</td><td>One pass per <em>input</em></td><td>One pass per <em>output</em></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">Why deep learning uses reverse-mode</span>
+          <p>A neural network has <strong>millions of inputs</strong> (the weights) but the loss is a
+          <strong>single output</strong> number. Forward-mode would need one pass <em>per weight</em> —
+          millions of passes. Reverse-mode gets the gradient for <em>every</em> weight in <strong>just one
+          backward pass</strong>. That's the whole game. <strong>Backpropagation is simply reverse-mode
+          autodiff applied to a neural network.</strong></p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">So when is forward-mode better?</span>
+          <p>When you have few inputs and many outputs — the mirror image. That's rarer in deep learning,
+          but it shows up in some physics/sensitivity problems. For training a net (many weights, one
+          loss), reverse-mode wins every time.</p>
+        </div>
+
+        <h3>PyTorch autograd — our example, automatically</h3>
+        <p>Here's the very same 2-layer computation from Topic 3, but now PyTorch computes all the
+        gradients for us. We just mark which numbers need gradients with
+        <code class="inl">requires_grad=True</code>, run the forward pass, and call
+        <code class="inl">.backward()</code>.</p>
+
+        <pre><span class="kw">import</span> torch
+
+<span class="cm"># parameters we want gradients for (requires_grad=True)</span>
+w1 = torch.tensor(<span class="nm">0.5</span>, requires_grad=<span class="kw">True</span>)
+b1 = torch.tensor(<span class="nm">0.0</span>, requires_grad=<span class="kw">True</span>)
+w2 = torch.tensor(<span class="nm">0.5</span>, requires_grad=<span class="kw">True</span>)
+b2 = torch.tensor(<span class="nm">0.0</span>, requires_grad=<span class="kw">True</span>)
+x  = torch.tensor(<span class="nm">1.0</span>)
+y  = torch.tensor(<span class="nm">0.0</span>)
+
+<span class="cm"># forward pass — autograd records the graph as this runs</span>
+h = torch.sigmoid(w1 * x + b1)
+o = torch.sigmoid(w2 * h + b2)
+L = <span class="nm">0.5</span> * (o - y) ** <span class="nm">2</span>
+
+<span class="cm"># one call walks the tape backward and fills every .grad</span>
+L.backward()
+
+<span class="kw">print</span>(w1.grad, b1.grad, w2.grad, b2.grad)
+<span class="cm"># tensor(0.0166) tensor(0.0166) tensor(0.0877) tensor(0.1409)</span>
+<span class="cm"># &mdash; identical to the numbers we derived by hand! &nbsp;🎉</span></pre>
+
+        <p>The printed gradients match our hand calculation exactly:
+        <code class="inl">∂L/∂w1 = 0.0166</code>, <code class="inl">∂L/∂w2 = 0.0877</code>,
+        <code class="inl">∂L/∂b2 = 0.1409</code>. Autograd did in one line what took us six steps —
+        and it would do the same for a network with a billion weights.</p>
+
+        <div class="callout note">
+          <span class="c-title">TensorFlow does the same with a tape</span>
+          <p>TensorFlow is explicit about the notebook: you wrap the forward pass in
+          <code class="inl">with tf.GradientTape() as tape:</code>, then call
+          <code class="inl">tape.gradient(L, [w1, w2, ...])</code>. Same reverse-mode autodiff, just a
+          different name. In practice you rarely write either by hand — an optimiser (Session 5) calls
+          <code class="inl">.backward()</code> and the update step for you inside the training loop.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>You will almost never compute gradients by hand again — but knowing what
+          <code class="inl">.backward()</code> actually does (record a graph, replay it backward with the
+          chain rule, reverse-mode because there are many weights and one loss) is what separates someone
+          who can debug a model from someone who just hopes it works.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Autodiff</strong> records each operation in a graph (the "tape") during the forward pass,
+          then replays it backward applying the chain rule — exact and fast, unlike numerical or symbolic
+          differentiation. Deep learning uses <strong>reverse-mode</strong> (one backward pass yields every
+          weight's gradient) because there are many weights but one loss. PyTorch's
+          <code class="inl">.backward()</code> and TF's <code class="inl">GradientTape</code> are just this
+          — and they reproduced our hand-computed gradients exactly.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You now understand the single most important algorithm in deep learning. Here's the
+        one-paragraph story that ties all four topics together:</p>
+        <div class="bigidea">
+          <p>A network learns by a <strong>loop</strong>: <em>forward pass</em> to make a prediction,
+          a <strong>loss</strong> to score how wrong it is, a <em>backward pass</em> to get the
+          <strong>gradient</strong> (slope) of the loss for every weight, and an <strong>update</strong>
+          that steps each weight downhill (<code class="inl">w = w − lr·∂L/∂w</code>). The backward pass
+          works because any computation is a <strong>graph</strong> of simple nodes with easy
+          <strong>local gradients</strong>, and the <strong>chain rule</strong> multiplies them along the
+          path. We did this fully by hand on a 2-layer net — pushing blame right-to-left to get every
+          gradient and watching the loss fall. Frameworks automate exactly this with
+          <strong>reverse-mode automatic differentiation</strong>: record the graph on the way forward,
+          replay it backward in one pass with <code class="inl">.backward()</code>. Same math, a million
+          times faster.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the four steps of the training loop, in order?</summary>
+          <p class="ans">Forward pass (predict) → loss (measure error) → backward pass (compute gradients)
+          → update (step each weight downhill with gradient descent). Repeat.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do we subtract the gradient in the update, instead of adding it?</summary>
+          <p class="ans">The gradient points in the direction that <em>increases</em> the loss (uphill).
+          We want to decrease the loss, so we move the opposite way:
+          <code class="inl">w = w − lr·∂L/∂w</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the chain rule's role in backpropagation?</summary>
+          <p class="ans">It lets us find how an early value affects the final loss by multiplying the
+          simple <em>local</em> gradients of each node along the path between them — so we never have to
+          differentiate the whole network at once.</p>
+        </details>
+        <details class="quiz">
+          <summary>In our worked example, why was ∂L/∂w1 smaller than ∂L/∂w2?</summary>
+          <p class="ans">The gradient passed back through an extra sigmoid, which multiplied it by a
+          factor less than 1 (its slope ≈0.24). Stacking many such layers shrinks gradients toward zero —
+          the vanishing-gradient problem.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does deep learning use reverse-mode autodiff rather than forward-mode?</summary>
+          <p class="ans">A net has many inputs (weights) but one output (the loss). Reverse-mode gets the
+          gradient for <em>all</em> weights in a single backward pass; forward-mode would need one pass per
+          weight — millions of them.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does PyTorch's <code class="inl">L.backward()</code> actually do?</summary>
+          <p class="ans">It walks the computational graph that was recorded during the forward pass
+          backward, applying the chain rule at each node, and stores the resulting gradient for every
+          tensor that had <code class="inl">requires_grad=True</code> in its <code class="inl">.grad</code>
+          attribute.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 4) — your course handout for this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.nature.com/articles/323533a0" target="_blank" rel="noopener">Rumelhart, Hinton &amp; Williams (1986) — "Learning representations by back-propagating errors"</a> — the landmark paper that put backpropagation on the map; remarkably readable.</li>
+          <li><a href="https://cs231n.github.io/optimization-2/" target="_blank" rel="noopener">Stanford CS231n — Backpropagation notes</a> — the clearest gateway explanation, built entirely around computational graphs and local gradients.</li>
+          <li><a href="https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b" target="_blank" rel="noopener">Andrej Karpathy — "Yes you should understand backprop"</a> — why treating <code class="inl">.backward()</code> as a black box will burn you, with vivid failure cases.</li>
+          <li><a href="https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html" target="_blank" rel="noopener">PyTorch — Autograd basics tutorial</a> — the official intro to <code class="inl">requires_grad</code> and <code class="inl">.backward()</code> used above.</li>
+          <li><a href="https://www.youtube.com/watch?v=VMj-3S1tku0" target="_blank" rel="noopener">Karpathy — "The spelled-out intro to neural networks and backpropagation" (micrograd)</a> — builds a tiny autodiff engine from scratch; the perfect companion to Topic 4.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-3.html"><div class="dir">← Previous</div><div class="ttl">Session 3: Perceptron to MLP</div></a>
+        <a class="next" href="session-5.html"><div class="dir">Next →</div><div class="ttl">Session 5: Loss Functions &amp; Optimization</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 4 — Backpropagation &amp; Computational Graphs · You can now backprop by hand 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

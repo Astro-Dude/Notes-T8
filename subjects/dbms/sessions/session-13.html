@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 13 — Concurrency Control — Locking &amp; MVCC</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 13</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 13 · Concurrency Control</span>
+      <h1>How a database keeps everyone honest at once</h1>
+      <p class="lead">
+        In <a href="session-12.html">Session 12</a> we learned what a <em>transaction</em> is and why we want
+        ACID guarantees. But here's the catch: a real database serves <em>hundreds</em> of transactions at the
+        same time. How does it stop them from stepping on each other's toes? This session is all about
+        <strong>concurrency control</strong> — the clever rules that let many people read and write the same data
+        at once without chaos. We start each idea with a tiny everyday story, then build up the real mechanisms:
+        locking, deadlocks, and the modern favourite, MVCC. Take it slow — by the end you'll understand how
+        PostgreSQL lets a hundred users edit a table at once and nobody gets a corrupted answer.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 20 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#s2pl">Strict 2PL in practice</a></li>
+          <li><a href="#deadlocks">Deadlocks &amp; how to handle them</a></li>
+          <li><a href="#mvcc">MVCC — multi-version concurrency</a></li>
+          <li><a href="#compare">2PL vs MVCC — the trade-offs</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. STRICT 2PL ===================== -->
+      <section id="s2pl">
+        <h2><span class="sec-num">1</span> Strict 2PL in practice</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a colouring book that the whole class wants to use. To stop two kids scribbling on the
+          same page at once, there's one rule: <strong>before you touch a page, you grab its little token</strong>,
+          and nobody else can touch that page until you hand the token back. If you want to <em>look</em> at a
+          page, lots of kids can share a "looking" token at once — but if you want to <em>draw</em>, you need the
+          page all to yourself. And the strict version of the rule says: <strong>you must hold on to every token
+          until you're completely finished</strong> and the teacher has marked your work done. That way nobody
+          ever sees your half-finished scribbles.</p>
+        </div>
+
+        <p>Let's recall the problem from <a href="session-12.html">Session 12</a>. When two transactions run at the
+        same time and touch the same data, you can get nasty bugs: <span class="term">dirty reads</span> (reading
+        someone's uncommitted change), <span class="term">lost updates</span> (two writes clobbering each other),
+        and more. To prevent these, the database uses <span class="term">locks</span> — little "do not disturb"
+        signs placed on data so transactions take turns.</p>
+
+        <h3>Recap: what is Two-Phase Locking (2PL)?</h3>
+        <p><span class="term">Two-Phase Locking (2PL)</span> is the classic rule for using locks safely. Every
+        transaction's lock activity is split into exactly two phases:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📈</div><div class="s-t">Growing phase</div><div class="s-d">Acquire locks, never release</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔒</div><div class="s-t">Lock point</div><div class="s-d">The last lock is taken</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📉</div><div class="s-t">Shrinking phase</div><div class="s-d">Release locks, never acquire</div></div>
+        </div>
+        <p>The single rule: <strong>once you release any lock, you may never acquire another one</strong>. This
+        simple discipline is what guarantees <span class="term">serializability</span> — the schedule behaves as if
+        the transactions ran one-after-another, even though they actually interleaved.</p>
+
+        <div class="callout warn">
+          <span class="c-title">The problem plain 2PL leaves open</span>
+          <p>Plain 2PL lets you <em>release</em> a lock during the shrinking phase while you're still running.
+          If another transaction grabs that data and you later <strong>abort</strong>, the other transaction read
+          data that never officially existed — and now <em>it</em> must abort too. This domino effect is called a
+          <span class="term">cascading abort</span>, and it's both slow and painful to recover from.</p>
+        </div>
+
+        <h3>Strict 2PL — the fix used in real systems</h3>
+        <p><span class="term">Strict 2PL</span> adds one extra rule to 2PL: <strong>hold every exclusive (write)
+        lock until the transaction commits or aborts</strong>. You don't release write locks early — they all drop
+        at the very end, atomically, at commit time. (The even stricter variant, <span class="term">Rigorous
+        2PL</span>, holds <em>all</em> locks — both read and write — until the end; most textbook discussions and
+        most real lock-based engines effectively use this.)</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>By holding write locks until commit, <strong>no other transaction can ever see your uncommitted
+          changes</strong>. If you abort, nobody depended on you, so nobody has to cascade-abort. Strict 2PL buys
+          you serializability <em>and</em> a clean, cascade-free recovery — which is exactly why nearly every
+          lock-based database uses it.</p>
+        </div>
+
+        <h3>Shared vs exclusive locks</h3>
+        <p>Not all locks are equal. A reader doesn't conflict with another reader — two transactions can safely
+        read the same row at the same time. They only conflict with writers. So databases use two lock
+        <em>modes</em>:</p>
+        <ul>
+          <li><span class="term">Shared lock (S)</span> — a "read" lock. Many transactions can hold an S-lock on
+          the same item simultaneously. ("I'm reading; you can read too.")</li>
+          <li><span class="term">Exclusive lock (X)</span> — a "write" lock. Only one transaction can hold it, and
+          no one else can hold <em>any</em> lock on that item meanwhile. ("I'm writing; everybody back off.")</li>
+        </ul>
+
+        <h3>The lock compatibility table</h3>
+        <p>The lock manager consults this tiny table every time a transaction asks for a lock. "Yes" means the
+        request is granted immediately; "No" means the requester must <strong>wait</strong> until the holder
+        releases.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Requested ↓ / Held →</th><th>None</th><th>Shared (S)</th><th>Exclusive (X)</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Shared (S)</strong></td><td>✅ Yes</td><td>✅ Yes</td><td>❌ No (wait)</td></tr>
+              <tr><td><strong>Exclusive (X)</strong></td><td>✅ Yes</td><td>❌ No (wait)</td><td>❌ No (wait)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Read it as a friendly rule of thumb: <strong>reads share, writes don't</strong>. S–S is the only pair
+        that gets along.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a safe interleaved schedule</span>
+          <p>Two transactions on a bank table. <code class="inl">T1</code> transfers ₹100 from account A to B.
+          <code class="inl">T2</code> just wants to read A's balance. Under strict 2PL the timeline looks like:</p>
+          <pre><span class="cm">-- T1: transfer 100 from A to B    T2: read A's balance</span>
+<span class="kw">T1</span>:  X-lock(A)                     <span class="cm">-- T1 grabs exclusive lock on A</span>
+<span class="kw">T1</span>:  read(A) -&gt; <span class="nm">500</span>
+<span class="kw">T1</span>:  write(A = <span class="nm">400</span>)
+<span class="kw">T2</span>:  S-lock(A)  ............... <span class="cm">⏸ BLOCKED (X held by T1)</span>
+<span class="kw">T1</span>:  X-lock(B)
+<span class="kw">T1</span>:  read(B) -&gt; <span class="nm">200</span>
+<span class="kw">T1</span>:  write(B = <span class="nm">300</span>)
+<span class="kw">T1</span>:  <span class="kw">COMMIT</span>   <span class="cm">-- ALL locks (A and B) released here, atomically</span>
+<span class="kw">T2</span>:  S-lock(A)  ............... <span class="cm">▶ granted now</span>
+<span class="kw">T2</span>:  read(A) -&gt; <span class="nm">400</span>      <span class="cm">-- sees the committed value, never 500-mid-transfer</span>
+<span class="kw">T2</span>:  <span class="kw">COMMIT</span></pre>
+          <p>Notice T2's read was <strong>blocked</strong> the entire time T1 held the X-lock, and was only released
+          after T1 committed. So T2 can <em>never</em> see the in-between state where ₹100 has left A but not yet
+          arrived at B. The money is never seen as missing. That's strict 2PL protecting the ACID
+          <em>Isolation</em> and <em>Consistency</em> we met in Session 12.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Strict 2PL = 2PL + "hold write locks until commit." It gives you serializable execution <em>and</em>
+          cascade-free aborts. The cost? Readers and writers <strong>block each other</strong> — a writer freezes
+          out every reader of that row until it commits. Remember that pain point; MVCC (Topic 3) is largely a
+          reaction to it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          2PL splits a transaction into a growing phase (only acquire) and a shrinking phase (only release),
+          guaranteeing serializability. <strong>Strict 2PL</strong> additionally holds all write locks until
+          commit, which prevents cascading aborts. Locks come in two modes — <strong>shared (S)</strong> for
+          reads and <strong>exclusive (X)</strong> for writes — and the only compatible pair is S with S.
+        </div>
+      </section>
+
+      <!-- ===================== 2. DEADLOCKS ===================== -->
+      <section id="deadlocks">
+        <h2><span class="sec-num">2</span> Deadlocks &amp; how to handle them</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture two kids in a narrow hallway. Aria is holding the red crayon and reaching for the blue one.
+          Ben is holding the blue crayon and reaching for the red one. Neither will let go first, so they stand
+          there frozen <em>forever</em>, each waiting for the other. That frozen-forever situation is called a
+          <strong>deadlock</strong>. The grown-up has to step in, take a crayon from one kid, and tell them
+          "you have to start over." Annoying — but better than standing frozen all day.</p>
+        </div>
+
+        <p>Strict 2PL keeps data correct, but it introduces a new danger. Because transactions <em>wait</em> for
+        locks, two of them can end up waiting on each other in a circle. Nobody can proceed, nobody will give up
+        — a <span class="term">deadlock</span>.</p>
+
+        <h3>How a lock cycle forms</h3>
+        <div class="callout example">
+          <span class="c-title">Example — the classic deadlock</span>
+          <pre><span class="cm">-- T1 wants to update A then B; T2 wants to update B then A</span>
+<span class="kw">T1</span>:  X-lock(A)   ✅ granted
+<span class="kw">T2</span>:  X-lock(B)   ✅ granted
+<span class="kw">T1</span>:  X-lock(B)   ⏸ waits for T2 to release B
+<span class="kw">T2</span>:  X-lock(A)   ⏸ waits for T1 to release A
+<span class="cm">-- T1 waits for T2, T2 waits for T1 -> frozen forever (DEADLOCK)</span></pre>
+        </div>
+
+        <p>The database detects this using a <span class="term">wait-for graph</span>: draw an arrow
+        <code class="inl">Ti → Tj</code> whenever transaction <code class="inl">Ti</code> is waiting for a lock
+        held by <code class="inl">Tj</code>. <strong>A cycle in this graph means a deadlock.</strong></p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔵</div><div class="s-t">T1</div><div class="s-d">holds A, wants B</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🟢</div><div class="s-t">T2</div><div class="s-d">holds B, wants A</div></div>
+          <div class="arrow">↩</div>
+          <div class="step"><div class="s-ico">♻️</div><div class="s-t">Back to T1</div><div class="s-d">cycle = deadlock</div></div>
+        </div>
+
+        <h3>Three strategies for handling deadlocks</h3>
+        <p>There are three broad approaches. Real systems pick one (often detection).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>How it works</th><th>Trade-off</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Detection</strong> (wait-for graph)</td><td>Let deadlocks happen, but periodically scan the wait-for graph for cycles. When one is found, pick a victim and abort it.</td><td>No restriction on locking order; but you pay the cost of running the detector and of the work the victim wasted. Used by PostgreSQL, MySQL/InnoDB.</td></tr>
+              <tr><td><strong>Prevention</strong> (timestamp schemes)</td><td>Never let a deadlock form in the first place, by deciding up front who is allowed to wait, based on transaction age. Two schemes: <em>wait-die</em> and <em>wound-wait</em>.</td><td>Some transactions get aborted even when no real deadlock would have happened — but you never need a detector.</td></tr>
+              <tr><td><strong>Timeouts</strong></td><td>If a transaction waits longer than some limit, just assume it's deadlocked and abort it.</td><td>Dead simple to implement, but crude: a slow-but-fine transaction can be killed needlessly, and picking the timeout is guesswork.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Prevention in detail: wait-die vs wound-wait</h3>
+        <p>Both give every transaction a <span class="term">timestamp</span> when it starts — older transactions
+        have smaller timestamps. When transaction <code class="inl">Ti</code> wants a lock held by
+        <code class="inl">Tj</code>, the rule decides who lives:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Scheme</th><th>If requester (Ti) is OLDER than holder (Tj)</th><th>If requester (Ti) is YOUNGER than holder (Tj)</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Wait-die</strong> (non-preemptive)</td><td>Ti <strong>waits</strong> for Tj.</td><td>Ti <strong>dies</strong> (aborts &amp; restarts later) — a young transaction never makes an old one wait.</td></tr>
+              <tr><td><strong>Wound-wait</strong> (preemptive)</td><td>Ti <strong>wounds</strong> Tj (forces Tj to abort) and takes the lock.</td><td>Ti <strong>waits</strong> for Tj.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The key shared idea: <strong>both schemes only ever let waiting go in one direction by age</strong>, so
+        a cycle (which needs waiting going both ways) can never form. A nice property is that the <em>oldest</em>
+        transaction never gets aborted, so it always eventually finishes — no transaction starves forever.</p>
+
+        <div class="callout note">
+          <span class="c-title">Easy way to remember the names</span>
+          <p><strong>Wait-die</strong>: the requester either <em>waits</em> (if old) or <em>dies</em> (if young).
+          <strong>Wound-wait</strong>: the requester either <em>wounds</em> the other (if old) or <em>waits</em>
+          (if young). In both, "old transactions get priority." Older = closer to finishing = worth protecting.</p>
+        </div>
+
+        <h3>Resolving a deadlock: victim selection</h3>
+        <p>Whether you detect a cycle or prevent one, the resolution is the same: <strong>abort one transaction</strong>
+        (the <span class="term">victim</span>), roll it back so its locks release, and restart it later. The system
+        tries to pick a cheap victim — typically the one that has done the <em>least</em> work, holds the fewest
+        locks, or has made the fewest changes — to minimise wasted effort.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — starvation</span>
+          <p>If the victim-picker always chooses the <em>same</em> unlucky transaction, that transaction might be
+          aborted again and again and never finish — this is <span class="term">starvation</span>. Good systems
+          guard against it, e.g. by giving a transaction higher priority each time it's restarted, or (as in
+          wait-die/wound-wait) by never aborting the oldest transaction.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A deadlock is a <em>cycle</em> of transactions each waiting for a lock the next one holds. You can
+          <strong>detect</strong> it (wait-for graph + abort a victim), <strong>prevent</strong> it (wait-die /
+          wound-wait using timestamps), or use blunt <strong>timeouts</strong>. Every resolution costs you an
+          aborted transaction — so concurrency is never free.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Locks can form cycles where transactions wait on each other forever — a deadlock. Detection uses a
+          wait-for graph and looks for cycles; prevention uses transaction timestamps via wait-die (wait if older,
+          die if younger) or wound-wait (wound if older, wait if younger); timeouts are the lazy fallback. All of
+          them resolve a deadlock by aborting a chosen victim and restarting it.
+        </div>
+      </section>
+
+      <!-- ===================== 3. MVCC ===================== -->
+      <section id="mvcc">
+        <h2><span class="sec-num">3</span> MVCC — multi-version concurrency control</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a notebook where, instead of erasing the old answer when you change something, you
+          <strong>cross it out lightly and write the new version on the next line</strong> — keeping every old
+          version too. Now if a friend started reading the page a moment ago, they can keep reading <em>their</em>
+          version in peace, even while you scribble a new one. Nobody has to wait for anybody. Readers read their
+          own snapshot; writers add new versions. That's the whole trick of MVCC: <strong>keep many versions, so
+          readers never block writers and writers never block readers</strong>.</p>
+        </div>
+
+        <p>Recall the pain point from Topic 1: under strict 2PL, a writer holding an X-lock <strong>freezes out
+        every reader</strong> of that row until commit. In a read-heavy system (most systems!) that's a serious
+        bottleneck. <span class="term">MVCC (Multi-Version Concurrency Control)</span> attacks exactly this.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Instead of overwriting a row in place (which forces locking), <strong>each write creates a new
+          version</strong> of the row and leaves the old one alive. A reading transaction is handed a consistent
+          <span class="term">snapshot</span> — the set of row versions that were committed at the moment it
+          started. So <strong>readers don't block writers, and writers don't block readers</strong>. The only
+          real conflict left is writer-vs-writer on the same row.</p>
+        </div>
+
+        <h3>Snapshots — everyone gets a consistent photo</h3>
+        <p>When a transaction begins (or, depending on isolation level, when each statement begins), MVCC
+        conceptually takes a <span class="term">snapshot</span>: a frozen view of the database as of that instant.
+        Every read it does sees that same consistent picture, no matter how many other transactions commit changes
+        meanwhile. This is how MVCC delivers <span class="term">snapshot isolation</span> — reads are stable and
+        repeatable without holding any read locks at all.</p>
+
+        <h3>How PostgreSQL implements MVCC</h3>
+        <p>PostgreSQL is the textbook real-world example. Every row version (PostgreSQL calls a row version a
+        <span class="term">tuple</span>) carries two hidden system columns:</p>
+        <ul>
+          <li><span class="term">xmin</span> — the ID of the transaction that <strong>created</strong> this row
+          version (its "born at" stamp).</li>
+          <li><span class="term">xmax</span> — the ID of the transaction that <strong>deleted or replaced</strong>
+          this row version (its "died at" stamp). If the row is still live, xmax is empty/zero.</li>
+        </ul>
+        <p>Every transaction has a monotonically increasing <span class="term">XID (transaction ID)</span>. A row
+        version is <strong>visible</strong> to your transaction roughly when: its <code class="inl">xmin</code> is a
+        transaction that <em>committed before your snapshot</em>, AND its <code class="inl">xmax</code> is either
+        empty or belongs to a transaction that had <em>not</em> committed as of your snapshot. That visibility check
+        is what makes your snapshot consistent.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — an UPDATE creates a new version</span>
+          <p>Start with one row, <code class="inl">Alice, balance 500</code>, created by transaction 100:</p>
+          <pre><span class="cm">-- Initial tuple (one physical row version)</span>
+xmin=<span class="nm">100</span>  xmax=<span class="nm">0</span>     (name=Alice, balance=<span class="nm">500</span>)   &lt;- live
+
+<span class="cm">-- Transaction 105 runs:  UPDATE accounts SET balance=600 WHERE name='Alice';</span>
+<span class="cm">-- Postgres does NOT overwrite. It marks the old row dead and inserts a new version:</span>
+
+xmin=<span class="nm">100</span>  xmax=<span class="nm">105</span>   (name=Alice, balance=<span class="nm">500</span>)   &lt;- old version, now dead to new readers
+xmin=<span class="nm">105</span>  xmax=<span class="nm">0</span>     (name=Alice, balance=<span class="nm">600</span>)   &lt;- new version</pre>
+          <p>Now suppose another transaction <code class="inl">T_old</code> started <em>before</em> 105 committed.
+          Its snapshot says "105 hasn't committed." So when it reads Alice, the visibility rule rejects the new
+          version (xmin=105, not yet committed to me) and shows it the old version — <strong>balance 500</strong>.
+          Meanwhile a transaction that starts <em>after</em> 105 commits sees <strong>balance 600</strong>. Two
+          readers, two correct answers, <strong>zero locks, zero blocking</strong>. A <code class="inl">DELETE</code>
+          works the same way: it just sets <code class="inl">xmax</code> on the current version, leaving the row
+          physically present but invisible to new snapshots.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Writer-vs-writer still needs care</span>
+          <p>MVCC removes read/write blocking, but two transactions updating the <em>same</em> row still conflict —
+          one must wait or, at higher isolation levels, get a "could not serialize" error and retry. PostgreSQL
+          handles writes with row-level locks <em>only</em> against other writers, plus a check on
+          <code class="inl">xmax</code>. So writes are serialized per row; reads are completely free.</p>
+        </div>
+
+        <h3>The catch: garbage collection &amp; VACUUM</h3>
+        <p>If every update leaves an old version lying around, the table just keeps growing with dead tuples —
+        called <span class="term">bloat</span>. Eventually no live transaction can still see those old versions, so
+        they're pure garbage that wastes disk and slows scans. PostgreSQL reclaims them with a background process
+        called <span class="term">VACUUM</span> (and its automatic form, <span class="term">autovacuum</span>),
+        which finds dead tuples no snapshot needs anymore and frees their space for reuse.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — long transactions hurt everyone</span>
+          <p>VACUUM can only remove a dead version if <em>no</em> running transaction might still need it. So a
+          single very long-running transaction can pin millions of old versions in place, causing bloat to balloon
+          across the whole database. This is why "don't leave transactions open for hours" is a real-world golden
+          rule in MVCC systems.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>MVCC keeps multiple versions of each row so reads see a consistent snapshot without locking. In
+          PostgreSQL, <code class="inl">xmin</code>/<code class="inl">xmax</code> stamps plus transaction IDs decide
+          visibility; updates write new versions, deletes mark old ones dead, and VACUUM later cleans up. The
+          payoff is huge read concurrency; the price is extra storage and the housekeeping of garbage collection.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          MVCC stores many versions of each row so readers get a stable snapshot and never block writers (and
+          vice-versa). PostgreSQL implements it with hidden <code class="inl">xmin</code>/<code class="inl">xmax</code>
+          columns and per-transaction IDs that drive a visibility check; updates create new versions, deletes
+          stamp old ones dead, and VACUUM/autovacuum garbage-collects the versions no snapshot needs.
+        </div>
+      </section>
+
+      <!-- ===================== 4. COMPARE ===================== -->
+      <section id="compare">
+        <h2><span class="sec-num">4</span> 2PL vs MVCC — the trade-offs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two ways to share one library book. <strong>Way 1 (locking):</strong> only one person holds the book
+          at a time; everyone else stands in line and waits. Simple and tidy, but the line gets long. <strong>Way 2
+          (MVCC):</strong> the librarian photocopies the book so everybody reads their own copy and nobody waits —
+          but now there are copies everywhere that someone has to tidy up later. Neither way is "wrong"; they just
+          trade <em>waiting</em> for <em>extra copies</em>.</p>
+        </div>
+
+        <p>We've now seen both major families of concurrency control. Let's lay them side by side — this is exactly
+        the comparison your written assignment asks for.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Strict 2PL (lock-based)</th><th>MVCC (version-based)</th></tr></thead>
+            <tbody>
+              <tr><td>Core mechanism</td><td>Locks; transactions take turns on each item.</td><td>Multiple versions + snapshots; readers see a frozen view.</td></tr>
+              <tr><td>Readers vs writers</td><td><strong>Block each other.</strong> A writer freezes out all readers of that row.</td><td><strong>Never block each other.</strong> Readers use old versions, writers add new ones.</td></tr>
+              <tr><td>Writers vs writers</td><td>Block (X-lock conflict).</td><td>Still block / may abort on the same row.</td></tr>
+              <tr><td>Read overhead</td><td>Must acquire &amp; release S-locks.</td><td>No read locks — just a visibility check.</td></tr>
+              <tr><td>Storage cost</td><td>Low — data stored once.</td><td>Higher — old versions linger until garbage-collected.</td></tr>
+              <tr><td>Extra housekeeping</td><td>Lock manager, deadlock detection.</td><td>Version visibility checks + VACUUM / GC.</td></tr>
+              <tr><td>Main failure mode</td><td>Deadlocks &amp; long lock waits.</td><td>Table bloat; write-write conflicts → retries.</td></tr>
+              <tr><td>Best for</td><td>Write-heavy, contention-light workloads.</td><td><strong>Read-heavy</strong> workloads (the common case).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — same workload, two outcomes</span>
+          <p>A reporting query scans the <code class="inl">orders</code> table for 30 seconds while a busy
+          checkout flow keeps inserting and updating orders.</p>
+          <ul>
+            <li><strong>Under strict 2PL:</strong> the long report holds S-locks (or the writers hold X-locks), so
+            either the report blocks the checkouts or the checkouts block the report. Throughput tanks; you might
+            even hit lock-wait timeouts.</li>
+            <li><strong>Under MVCC:</strong> the report reads a 30-second-old consistent snapshot and never touches
+            a lock, while checkouts merrily create new versions. <strong>Both run full speed.</strong> The only
+            cost is some dead versions for VACUUM to mop up afterward.</li>
+          </ul>
+          <p>This is the everyday scenario that makes MVCC win — and it's why your assignment should conclude that
+          for typical, read-dominated applications MVCC usually delivers far better concurrency.</p>
+        </div>
+
+        <h3>Why most modern databases use MVCC</h3>
+        <p>Real-world workloads are overwhelmingly <strong>read-heavy</strong>, and the single worst thing you can
+        do to a database's responsiveness is make reads wait. MVCC's promise — "readers never block writers" — maps
+        perfectly onto that reality. That's why it's the default in <strong>PostgreSQL, Oracle, MySQL's InnoDB
+        engine, SQL Server (snapshot isolation), and most in-memory databases.</strong> Pure strict 2PL still
+        shows up where write contention dominates or where the implementation must stay simple, and many systems
+        actually <em>combine</em> the two — MVCC for reads, locks for the write paths.</p>
+
+        <div class="callout note">
+          <span class="c-title">What the research says</span>
+          <p>The 2017 VLDB paper <em>"An Empirical Evaluation of In-Memory MVCC"</em> (Wu et al.) tested many MVCC
+          design choices on modern hardware. Its headline finding: there's no single "best" MVCC scheme — the
+          right version-storage, garbage-collection, and conflict-detection choices all depend on the workload.
+          The takeaway for us: MVCC is a <em>family</em> of designs, and tuning garbage collection in particular
+          matters enormously for performance.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>2PL trades <em>throughput</em> for <em>simplicity and low storage</em>; MVCC trades <em>storage and
+          housekeeping</em> for <em>far better read concurrency</em>. Because most apps read far more than they
+          write, MVCC (often blended with locking on the write path) is the dominant choice in modern databases.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Strict 2PL is simple and storage-cheap but makes readers and writers block each other and risks
+          deadlocks. MVCC removes read/write blocking by keeping versions and snapshots, at the cost of storage and
+          garbage collection (VACUUM) plus write-write retries. Since real workloads are read-heavy, most modern
+          databases — PostgreSQL, Oracle, InnoDB, SQL Server — default to MVCC, sometimes combined with locking.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how a database lets a crowd of transactions share data without corrupting it. Here's
+        the one-paragraph story that connects all four topics:</p>
+        <div class="bigidea">
+          <p>To keep concurrent transactions correct, the classic approach is <strong>locking</strong>:
+          <strong>strict 2PL</strong> takes <strong>shared</strong> locks for reads and <strong>exclusive</strong>
+          locks for writes, and holds write locks until commit so there are no <strong>cascading aborts</strong>.
+          But locks make transactions <strong>wait</strong>, and waiting can form a cycle — a
+          <strong>deadlock</strong> — which the system handles by <strong>detection</strong> (wait-for graph),
+          <strong>prevention</strong> (wait-die / wound-wait), or <strong>timeouts</strong>, always resolving it by
+          aborting a <strong>victim</strong>. To dodge the read/write blocking that locking causes, modern systems
+          use <strong>MVCC</strong>: each write makes a new <strong>version</strong>, readers see a consistent
+          <strong>snapshot</strong> (in PostgreSQL via hidden <strong>xmin/xmax</strong> stamps), and
+          <strong>VACUUM</strong> later garbage-collects dead versions. Because most workloads are read-heavy, MVCC
+          usually wins — which is why it's the default in nearly every modern database. Next session we'll see what
+          happens when the whole thing crashes: <a href="session-14.html">logging &amp; recovery</a>.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What extra rule does <em>strict</em> 2PL add on top of plain 2PL, and what does it buy you?</summary>
+          <p class="ans">It holds all exclusive (write) locks until the transaction commits or aborts, instead of
+          releasing them during the shrinking phase. This prevents other transactions from reading uncommitted
+          data, which eliminates cascading aborts.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the lock compatibility table, which pair of lock requests is compatible?</summary>
+          <p class="ans">Only Shared–Shared (two readers). Any combination involving an Exclusive lock conflicts,
+          so the requester must wait.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does a database <em>detect</em> a deadlock, and how does it resolve one?</summary>
+          <p class="ans">It builds a wait-for graph (an arrow from each waiting transaction to the one holding the
+          lock it wants) and looks for a cycle. A cycle means a deadlock. It resolves it by choosing a victim
+          transaction, aborting and rolling it back so its locks release, then restarting it later.</p>
+        </details>
+        <details class="quiz">
+          <summary>In wound-wait, what happens when an OLDER transaction requests a lock held by a younger one?</summary>
+          <p class="ans">The older transaction "wounds" the younger one — it forces the younger transaction to
+          abort and takes the lock. (If the requester were younger, it would instead wait.)</p>
+        </details>
+        <details class="quiz">
+          <summary>In PostgreSQL MVCC, what do xmin and xmax record, and what happens on an UPDATE?</summary>
+          <p class="ans">xmin is the transaction ID that created the row version; xmax is the transaction ID that
+          deleted/replaced it (empty if still live). An UPDATE does not overwrite in place — it stamps xmax on the
+          old version (marking it dead) and inserts a brand-new version with a fresh xmin.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does MVCC need VACUUM, and why are long-running transactions dangerous for it?</summary>
+          <p class="ans">Old row versions pile up as dead tuples (bloat); VACUUM reclaims those no live snapshot
+          needs. A long-running transaction keeps an old snapshot alive, so VACUUM can't remove versions it might
+          still need — letting bloat grow across the whole database.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do most modern databases prefer MVCC over pure strict 2PL?</summary>
+          <p class="ans">Most workloads are read-heavy, and MVCC's defining property is that readers never block
+          writers and writers never block readers. That delivers much higher read concurrency than locking, at the
+          acceptable cost of extra storage and garbage collection.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 13 — Concurrency — the class handout that accompanies this session.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.postgresql.org/docs/current/mvcc.html" target="_blank" rel="noopener">PostgreSQL Documentation — Concurrency Control (MVCC)</a> — the official, authoritative explanation of snapshots, visibility, and isolation levels behind Topic 3.</li>
+          <li><a href="https://www.vldb.org/pvldb/vol10/p781-Wu.pdf" target="_blank" rel="noopener">Wu et al., "An Empirical Evaluation of In-Memory MVCC" (VLDB 2017)</a> — measures the real trade-offs between MVCC design choices; the research backing for Topic 4.</li>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 Database Systems — Concurrency Control &amp; MVCC lectures</a> — Andy Pavlo's free, superb lectures covering 2PL, deadlocks, and MVCC in depth.</li>
+          <li><a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" target="_blank" rel="noopener">PostgreSQL Documentation — Routine Vacuuming</a> — exactly how garbage collection and autovacuum reclaim dead tuples (the VACUUM part of Topic 3).</li>
+          <li><a href="https://15445.courses.cs.cmu.edu/fall2023/notes/16-twophaselocking.pdf" target="_blank" rel="noopener">CMU 15-445 — Two-Phase Locking lecture notes</a> — a clean written treatment of 2PL, strict 2PL, and deadlock handling for Topics 1 and 2.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-12.html"><div class="dir">← Previous</div><div class="ttl">Session 12: Transactions</div></a>
+        <a class="next" href="session-14.html"><div class="dir">Next →</div><div class="ttl">Session 14: Logging &amp; Recovery</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 13 — Concurrency Control — Locking &amp; MVCC · Many transactions, one consistent truth 🔐</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

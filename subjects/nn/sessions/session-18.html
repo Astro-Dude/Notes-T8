@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 18 — Project Week — Text Generation (LSTM) &amp; Translation (Seq2Seq)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 18</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 18 · Project — Text Generation &amp; Translation</span>
+      <h1>Build a Shakespeare bot and a translator</h1>
+      <p class="lead">
+        This is a <strong>project week</strong> — less lecture, more building. We'll write two complete,
+        runnable PyTorch programs from scratch: a tiny AI that writes Shakespeare one letter at a time
+        (an LSTM language model), and a little machine translator that turns English into French
+        (an encoder–decoder with attention). We assume you've followed Sessions 12–14, but we'll
+        re-explain everything gently. By the end you'll have code you can actually run and tinker with.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#charlstm">Char-level Shakespeare (LSTM)</a></li>
+          <li><a href="#sampling">Sampling &amp; temperature</a></li>
+          <li><a href="#seq2seq">English→French (Seq2Seq + attention)</a></li>
+          <li><a href="#evaluate">Evaluating &amp; improving</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. CHAR LSTM ===================== -->
+      <section id="charlstm">
+        <h2><span class="sec-num">1</span> Char-level Shakespeare generator (LSTM)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a kid who has read one giant Shakespeare play so many times that they can play a guessing
+          game: I show them a few letters, and they guess the <strong>next letter</strong>. Show them
+          <em>"To be or not to b"</em> and they shout <em>"e!"</em>. If we let them keep guessing — taking their
+          own last guess and adding it to the front of the next guess — they'll eventually scribble out a whole
+          new fake-Shakespeare speech, one letter at a time. That guessing machine is what we're building.</p>
+        </div>
+
+        <p>Our first project is a <span class="term">character-level language model</span>: a neural network
+        whose only job is, given the characters seen so far, to predict the <strong>next character</strong>.
+        "Character-level" means our basic unit isn't a word or a token — it's a single letter, space, or
+        punctuation mark. This is the classic <span class="term">char-rnn</span> idea popularised by Andrej
+        Karpathy, and it's a beautiful first project because the whole thing fits in one short file.</p>
+
+        <p>We'll build it with an <span class="term">LSTM</span> (Long Short-Term Memory network) — the
+        gated recurrent network you met in <strong>Sessions 12–13</strong>. Recall the key idea: an LSTM reads
+        a sequence one step at a time, carrying a <span class="term">hidden state</span> (its short-term
+        working memory) and a <span class="term">cell state</span> (its long-term memory conveyor belt), and
+        special <em>gates</em> decide what to remember, forget, and output at each step. That memory is exactly
+        what lets it track context like an open quote or the rhythm of a line.</p>
+
+        <h3>The plan, end to end</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📜</div><div class="s-t">1. Data</div><div class="s-d">Read text, build char↔index maps</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">2. Chunk</div><div class="s-d">Cut into (input, target) windows</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">3. Model</div><div class="s-d">Embed → LSTM → Linear</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏋️</div><div class="s-t">4. Train</div><div class="s-d">Predict next char, minimise loss</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">5. Sample</div><div class="s-d">Generate new text letter by letter</div></div>
+        </div>
+
+        <h3>Step 1 &amp; 2 — Data preparation</h3>
+        <p>A language model can't read letters directly; it needs numbers. So we collect every unique character
+        into a <span class="term">vocabulary</span>, then build two lookup tables: <code class="inl">stoi</code>
+        ("string to integer") maps each character to a number, and <code class="inl">itos</code> maps back. The
+        training data is then just the whole text rewritten as a long list of integers.</p>
+
+        <p>For training we slide a window over that long sequence. The <strong>input</strong> is a chunk of
+        characters, and the <strong>target</strong> is the <em>same chunk shifted one step to the right</em> —
+        because at every position we want the model to predict the character that actually came next.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — turning text into training pairs</span>
+          <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">import</span> torch.nn.functional <span class="kw">as</span> F
+
+<span class="cm"># --- 1. Load data (download tinyshakespeare.txt, ~1MB of plays) ---</span>
+text = <span class="kw">open</span>(<span class="st">"tinyshakespeare.txt"</span>, <span class="st">"r"</span>).read()
+
+<span class="cm"># --- 2. Build the vocabulary and the two lookup tables ---</span>
+chars   = <span class="kw">sorted</span>(<span class="kw">list</span>(<span class="kw">set</span>(text)))   <span class="cm"># every unique character</span>
+vocab_size = <span class="kw">len</span>(chars)                  <span class="cm"># ~65 for tinyshakespeare</span>
+stoi = {ch: i <span class="kw">for</span> i, ch <span class="kw">in</span> <span class="kw">enumerate</span>(chars)}
+itos = {i: ch <span class="kw">for</span> ch, i <span class="kw">in</span> stoi.items()}
+
+encode = <span class="kw">lambda</span> s: [stoi[c] <span class="kw">for</span> c <span class="kw">in</span> s]          <span class="cm"># text  -> list of ints</span>
+decode = <span class="kw">lambda</span> l: <span class="st">""</span>.join(itos[i] <span class="kw">for</span> i <span class="kw">in</span> l)   <span class="cm"># ints -> text</span>
+
+data = torch.tensor(encode(text), dtype=torch.long)
+
+<span class="cm"># --- 3. A batch is many (input, target) windows; target is input shifted by 1 ---</span>
+block_size = <span class="nm">128</span>   <span class="cm"># how many chars of context the model sees</span>
+batch_size = <span class="nm">64</span>
+
+<span class="kw">def</span> get_batch(data):
+    ix = torch.randint(<span class="kw">len</span>(data) - block_size - <span class="nm">1</span>, (batch_size,))
+    x = torch.stack([data[i : i + block_size]       <span class="kw">for</span> i <span class="kw">in</span> ix])
+    y = torch.stack([data[i + <span class="nm">1</span> : i + block_size + <span class="nm">1</span>] <span class="kw">for</span> i <span class="kw">in</span> ix])
+    <span class="kw">return</span> x, y   <span class="cm"># shapes: (batch_size, block_size)</span></pre>
+          <p>So if a window of <code class="inl">x</code> is <code class="inl">"To be or not to b"</code>,
+          the matching <code class="inl">y</code> is <code class="inl">"o be or not to be"</code> — each
+          position's label is "the next character."</p>
+        </div>
+
+        <h3>Step 3 — The model</h3>
+        <p>The network has three parts, and you've met all of them: an <span class="term">embedding</span> layer
+        turns each character index into a learnable vector (its "meaning code"); the <strong>LSTM</strong>
+        processes the sequence carrying memory through time; and a final <span class="term">linear</span> layer
+        projects each step's hidden state into <code class="inl">vocab_size</code> scores — one
+        <span class="term">logit</span> per possible next character.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the LSTM language model</span>
+          <pre><span class="kw">class</span> <span class="nm">CharLSTM</span>(nn.Module):
+    <span class="kw">def</span> __init__(self, vocab_size, embed_dim=<span class="nm">128</span>, hidden_dim=<span class="nm">256</span>, num_layers=<span class="nm">2</span>):
+        <span class="kw">super</span>().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.lstm  = nn.LSTM(embed_dim, hidden_dim, num_layers,
+                             batch_first=<span class="kw">True</span>, dropout=<span class="nm">0.2</span>)
+        self.fc    = nn.Linear(hidden_dim, vocab_size)
+
+    <span class="kw">def</span> forward(self, x, hidden=<span class="kw">None</span>):
+        <span class="cm"># x: (batch, seq) of char indices</span>
+        emb = self.embed(x)                  <span class="cm"># (batch, seq, embed_dim)</span>
+        out, hidden = self.lstm(emb, hidden) <span class="cm"># out: (batch, seq, hidden_dim)</span>
+        logits = self.fc(out)                <span class="cm"># (batch, seq, vocab_size)</span>
+        <span class="kw">return</span> logits, hidden            <span class="cm"># return hidden so we can carry memory</span></pre>
+          <p>Notice <code class="inl">forward</code> returns the LSTM's <code class="inl">hidden</code> state.
+          During training we don't need it, but during generation we'll feed it back in so the model
+          "remembers" what it already wrote.</p>
+        </div>
+
+        <h3>Step 4 — The training loop</h3>
+        <p>Training is the standard recipe from earlier sessions: get a batch, run it forward to get logits,
+        measure how wrong they are with <span class="term">cross-entropy loss</span> (it compares the predicted
+        probability distribution over characters to the true next character), then
+        <span class="term">backpropagate</span> and let the optimiser nudge the weights. One extra trick for
+        recurrent nets: <span class="term">gradient clipping</span>, which caps the size of gradients so a single
+        wild batch can't blow up the weights (RNNs are prone to <em>exploding gradients</em>, from Session 12).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — full training loop</span>
+          <pre>device = <span class="st">"cuda"</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="st">"cpu"</span>
+model = CharLSTM(vocab_size).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=<span class="nm">3e-3</span>)
+
+model.train()
+<span class="kw">for</span> step <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">5000</span>):
+    x, y = get_batch(data)
+    x, y = x.to(device), y.to(device)
+
+    logits, _ = model(x)                          <span class="cm"># (batch, seq, vocab)</span>
+    <span class="cm"># cross-entropy wants (N, vocab) vs (N,), so flatten the batch+seq dims</span>
+    loss = F.cross_entropy(
+        logits.view(-<span class="nm">1</span>, vocab_size),
+        y.view(-<span class="nm">1</span>)
+    )
+
+    optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), <span class="nm">1.0</span>)  <span class="cm"># clip exploding grads</span>
+    optimizer.step()
+
+    <span class="kw">if</span> step % <span class="nm">500</span> == <span class="nm">0</span>:
+        <span class="kw">print</span>(<span class="st">f"step {step:5d} | loss {loss.item():.3f}"</span>)</pre>
+          <p>You'll watch the loss fall from ~4.2 (random guessing over 65 characters is
+          <code class="inl">ln(65) ≈ 4.17</code>) toward ~1.4–1.5. That drop <em>is</em> the model learning
+          English spelling, then Shakespeare's punctuation, then his rhythm.</p>
+        </div>
+
+        <h3>Step 5 — Sampling / generation</h3>
+        <p>Now the fun part. To <strong>generate</strong>, we feed the model a starting character, take its
+        prediction, append it, and feed the result back in — exactly the <span class="term">autoregressive</span>
+        loop. We carry the LSTM's hidden state forward so it doesn't forget what it already wrote.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — generating text</span>
+          <pre>@torch.no_grad()
+<span class="kw">def</span> generate(model, start=<span class="st">"ROMEO:"</span>, length=<span class="nm">500</span>, temperature=<span class="nm">1.0</span>):
+    model.eval()
+    idx = torch.tensor([encode(start)], device=device)  <span class="cm"># (1, len(start))</span>
+    hidden = <span class="kw">None</span>
+    out = <span class="kw">list</span>(start)
+
+    <span class="cm"># warm up the hidden state on the prompt, keep only the last step</span>
+    logits, hidden = model(idx, hidden)
+    last = idx[:, -<span class="nm">1</span>:]                                    <span class="cm"># (1, 1)</span>
+
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(length):
+        logits, hidden = model(last, hidden)            <span class="cm"># (1, 1, vocab)</span>
+        logits = logits[:, -<span class="nm">1</span>, :] / temperature       <span class="cm"># scale by temperature</span>
+        probs  = F.softmax(logits, dim=-<span class="nm">1</span>)
+        last   = torch.multinomial(probs, num_samples=<span class="nm">1</span>)  <span class="cm"># sample one char</span>
+        out.append(itos[last.item()])
+
+    <span class="kw">return</span> <span class="st">""</span>.join(out)
+
+<span class="kw">print</span>(generate(model, start=<span class="st">"ROMEO:"</span>, length=<span class="nm">500</span>, temperature=<span class="nm">0.8</span>))</pre>
+          <p>Early in training this spits out gibberish like <code class="inl">"qx; zj!Rk"</code>. After a few
+          thousand steps it produces convincing fake-Shakespeare: invented character names, line breaks, even
+          <em>"Enter"</em> stage directions — all hallucinated, none memorised verbatim.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A char-level LSTM language model learns to predict the next character. We map chars↔ints, cut the text
+          into shifted (input, target) windows, run <strong>Embedding → LSTM → Linear</strong>, train with
+          cross-entropy and gradient clipping, then generate autoregressively by feeding the model its own last
+          character while carrying the hidden state forward.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SAMPLING & TEMPERATURE ===================== -->
+      <section id="sampling">
+        <h2><span class="sec-num">2</span> Sampling &amp; temperature</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine our Shakespeare-guesser has a bag of letters and the bag's odds say "e" is most likely.
+          Three ways to pick: <strong>always grab "e"</strong> (boring but safe), <strong>close your eyes and
+          draw fairly</strong> (sometimes a surprise!), or <strong>turn a "wildness knob"</strong> first — turn
+          it down and "e" almost always wins; turn it up and even rare letters get a real chance. That knob is
+          <strong>temperature</strong>.</p>
+        </div>
+
+        <p>In Topic 1 we already used the wildness knob (<code class="inl">temperature=0.8</code>). Let's slow
+        down and understand the three picking strategies, because they decide whether your generator is
+        repetitive, balanced, or chaotic. This is the same concept you'll meet for big LLMs — see
+        <strong>GenAI Session 1</strong>, where temperature controls a chatbot's creativity.</p>
+
+        <h3>Greedy decoding — always take the top pick</h3>
+        <p><span class="term">Greedy decoding</span> just takes the highest-probability character every single
+        step (<code class="inl">torch.argmax</code>). It's deterministic — same prompt, same output forever.
+        For a character model that's a problem: it tends to fall into <strong>repetitive loops</strong> like
+        <code class="inl">"the the the the"</code> because the locally-safest choice repeated forever isn't
+        globally interesting.</p>
+
+        <h3>Sampling — draw from the probabilities</h3>
+        <p><span class="term">Sampling</span> instead treats the model's softmax output as a real probability
+        distribution and <em>draws</em> from it (<code class="inl">torch.multinomial</code>). A character the
+        model rates at 30% genuinely shows up about 30% of the time. This brings variety and surprise, and it's
+        why each run of <code class="inl">generate()</code> gives a different speech.</p>
+
+        <h3>Temperature — reshaping the odds before sampling</h3>
+        <p><span class="term">Temperature</span> <code class="inl">T</code> divides the logits before softmax:
+        <code class="inl">softmax(logits / T)</code>. It <em>reshapes</em> the distribution:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Temperature</th><th>What it does to the odds</th><th>Resulting text</th></tr></thead>
+            <tbody>
+              <tr><td>T → 0</td><td>Sharpens to a spike on the top choice — becomes greedy.</td><td>Safe, repetitive, can loop.</td></tr>
+              <tr><td>T ≈ 0.5–0.8</td><td>Mildly sharpened; confident but still varied.</td><td>Coherent and the usual sweet spot.</td></tr>
+              <tr><td>T = 1.0</td><td>Uses the raw learned probabilities, unchanged.</td><td>Balanced creativity.</td></tr>
+              <tr><td>T &gt; 1.2</td><td>Flattens the odds; rare characters get real chances.</td><td>Wild, surprising, more typos/nonsense.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — same model, three temperatures</span>
+          <pre><span class="cm"># T = 0.3  (timid): clean words but dull and loopy</span>
+<span class="cm">#   "the streath the streath the streath of the..."</span>
+
+<span class="cm"># T = 0.8  (sweet spot): coherent fake-Shakespeare</span>
+<span class="cm">#   "ROMEO: I am the son of such a heart, / And in the cause..."</span>
+
+<span class="cm"># T = 1.5  (wild): inventive but messy</span>
+<span class="cm">#   "ROMEO: Wzt! quoth-pluck'd yon glimmer-jib of zorn..."</span>
+
+<span class="cm"># All three come from the SAME trained model -- only T changed.</span>
+<span class="kw">for</span> T <span class="kw">in</span> [<span class="nm">0.3</span>, <span class="nm">0.8</span>, <span class="nm">1.5</span>]:
+    <span class="kw">print</span>(<span class="st">f"--- T={T} ---"</span>)
+    <span class="kw">print</span>(generate(model, start=<span class="st">"ROMEO:"</span>, length=<span class="nm">200</span>, temperature=T))</pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">One more knob: top-k</span>
+          <p>A popular refinement is <span class="term">top-k sampling</span>: before sampling, keep only the
+          <em>k</em> most likely characters and zero out the rest. This stops bizarre rare characters from
+          sneaking in while still allowing variety. In PyTorch you'd mask the logits below the k-th largest,
+          then softmax + sample. (GenAI Session 1 covers the close cousin <em>top-p / nucleus sampling</em>.)</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>There's no single "right" temperature — it's a creativity-vs-coherence trade-off. Too low and the
+          text loops; too high and it dissolves into noise. Always sample a few temperatures and read the output
+          yourself; the loss number alone won't tell you which feels best.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Greedy</strong> always takes the top character (deterministic, can loop). <strong>Sampling</strong>
+          draws from the probabilities (varied). <strong>Temperature</strong> divides the logits before softmax:
+          low = sharp/safe, high = flat/wild, T=1 = unchanged. <strong>Top-k</strong> trims the unlikely tail. Tune
+          by reading samples, not just the loss.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SEQ2SEQ ===================== -->
+      <section id="seq2seq">
+        <h2><span class="sec-num">3</span> English→French translation (Seq2Seq)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture two friends. The first reads an English sentence and squeezes its whole meaning into a
+          little note. The second friend can't read English — only the note — and writes the French sentence one
+          word at a time, glancing back at the note for hints. The first friend is the
+          <strong>encoder</strong>, the second is the <strong>decoder</strong>, and the "glancing back" is
+          <strong>attention</strong>. Together they translate.</p>
+        </div>
+
+        <p>Our second project is <span class="term">sequence-to-sequence</span> (Seq2Seq) translation: input one
+        sequence (English words), output a different-length sequence (French words). The architecture is an
+        <span class="term">encoder–decoder</span> with <span class="term">attention</span> — exactly the
+        machinery from <strong>Session 14</strong>. We'll build the canonical version from the PyTorch
+        translation tutorial.</p>
+
+        <h3>The big picture</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🇬🇧</div><div class="s-t">Encoder</div><div class="s-d">Reads English, outputs hidden states</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Attention</div><div class="s-d">Decoder picks which words to focus on</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🇫🇷</div><div class="s-t">Decoder</div><div class="s-d">Writes French one word at a time</div></div>
+        </div>
+
+        <h3>Step 1 — Data preparation</h3>
+        <p>Translation works on <strong>words</strong>, not characters, so we build a word-level vocabulary per
+        language and add two special tokens: <code class="inl">SOS</code> ("start of sentence", tells the
+        decoder to begin) and <code class="inl">EOS</code> ("end of sentence", tells it to stop). We pair each
+        English sentence with its French translation and turn both into lists of word-indices.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — vocabulary and pairs</span>
+          <pre>SOS_token, EOS_token = <span class="nm">0</span>, <span class="nm">1</span>
+
+<span class="kw">class</span> <span class="nm">Lang</span>:                       <span class="cm"># one per language</span>
+    <span class="kw">def</span> __init__(self):
+        self.word2index = {}
+        self.index2word = {<span class="nm">0</span>: <span class="st">"SOS"</span>, <span class="nm">1</span>: <span class="st">"EOS"</span>}
+        self.n_words = <span class="nm">2</span>
+    <span class="kw">def</span> add_sentence(self, sentence):
+        <span class="kw">for</span> word <span class="kw">in</span> sentence.split():
+            <span class="kw">if</span> word <span class="kw">not in</span> self.word2index:
+                self.word2index[word] = self.n_words
+                self.index2word[self.n_words] = word
+                self.n_words += <span class="nm">1</span>
+
+<span class="cm"># pairs = [("i am cold", "j ai froid"), ...]  (lowercased, punctuation-stripped)</span>
+<span class="kw">def</span> tensor_from(lang, sentence):
+    idxs = [lang.word2index[w] <span class="kw">for</span> w <span class="kw">in</span> sentence.split()] + [EOS_token]
+    <span class="kw">return</span> torch.tensor(idxs, dtype=torch.long, device=device).view(-<span class="nm">1</span>, <span class="nm">1</span>)</pre>
+          <p>To keep the project small and fast, the tutorial filters to short sentences (≤ 10 words) and a few
+          simple sentence templates — enough to learn real translations in minutes on a laptop.</p>
+        </div>
+
+        <h3>Step 2 — Encoder</h3>
+        <p>The <span class="term">encoder</span> is a GRU (a lighter LSTM cousin from Session 13) that reads the
+        English sentence word by word and outputs a hidden state at every step. We keep <em>all</em> those
+        per-word states (not just the last one) because attention will need them.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the encoder</span>
+          <pre><span class="kw">class</span> <span class="nm">EncoderRNN</span>(nn.Module):
+    <span class="kw">def</span> __init__(self, input_size, hidden_size):
+        <span class="kw">super</span>().__init__()
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=<span class="kw">True</span>)
+
+    <span class="kw">def</span> forward(self, input):
+        embedded = self.embedding(input)            <span class="cm"># (1, seq, hidden)</span>
+        outputs, hidden = self.gru(embedded)        <span class="cm"># outputs: per-word states</span>
+        <span class="kw">return</span> outputs, hidden</pre>
+        </div>
+
+        <h3>Step 3 — Attention decoder</h3>
+        <p>The <span class="term">decoder</span> generates French one word at a time. At each step, instead of
+        relying only on a single squished summary vector, it uses <strong>attention</strong> to compute a
+        weighted blend of the encoder's per-word states — focusing on the English words most relevant to the
+        word it's about to produce. Those attention weights are also a lovely visualisation: you can literally
+        see "chat" line up with "cat."</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — attention decoder</span>
+          <pre><span class="kw">class</span> <span class="nm">AttnDecoderRNN</span>(nn.Module):
+    <span class="kw">def</span> __init__(self, hidden_size, output_size, max_len=<span class="nm">10</span>):
+        <span class="kw">super</span>().__init__()
+        self.embedding = nn.Embedding(output_size, hidden_size)
+        self.attn      = nn.Linear(hidden_size * <span class="nm">2</span>, max_len)
+        self.attn_comb = nn.Linear(hidden_size * <span class="nm">2</span>, hidden_size)
+        self.gru       = nn.GRU(hidden_size, hidden_size, batch_first=<span class="kw">True</span>)
+        self.out       = nn.Linear(hidden_size, output_size)
+
+    <span class="kw">def</span> forward(self, input, hidden, encoder_outputs):
+        emb = self.embedding(input)                            <span class="cm"># (1,1,hidden)</span>
+        <span class="cm"># 1. score how much to attend to each encoder state</span>
+        attn_w = F.softmax(
+            self.attn(torch.cat((emb[<span class="nm">0</span>], hidden[<span class="nm">0</span>]), <span class="nm">1</span>)), dim=<span class="nm">1</span>)
+        <span class="cm"># 2. weighted sum of encoder outputs = the "context"</span>
+        context = torch.bmm(attn_w.unsqueeze(<span class="nm">1</span>), encoder_outputs)
+        <span class="cm"># 3. mix context with the input word, run the GRU</span>
+        x = self.attn_comb(torch.cat((emb[<span class="nm">0</span>], context[<span class="nm">0</span>]), <span class="nm">1</span>)).unsqueeze(<span class="nm">0</span>)
+        x = F.relu(x)
+        out, hidden = self.gru(x, hidden)
+        <span class="cm"># 4. predict the next French word</span>
+        logits = self.out(out[<span class="nm">0</span>])
+        <span class="kw">return</span> logits, hidden, attn_w</pre>
+        </div>
+
+        <h3>Step 4 — Training with teacher forcing</h3>
+        <p>Here's the key training trick. The decoder predicts French word-by-word, but during training we have
+        a choice for what to feed it as the <em>next input</em>: its own (possibly wrong) prediction, or the
+        <strong>real</strong> correct French word. Feeding the real word is called
+        <span class="term">teacher forcing</span>. It makes training faster and more stable (one early mistake
+        doesn't derail the whole sentence), but if we <em>only</em> ever teacher-force, the model never learns to
+        recover from its own errors at inference time. So we use it <strong>randomly, some fraction of the
+        time</strong>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — one training step</span>
+          <pre><span class="kw">def</span> train_step(input_tensor, target_tensor, encoder, decoder,
+               enc_opt, dec_opt, criterion, tf_ratio=<span class="nm">0.5</span>):
+    enc_opt.zero_grad(); dec_opt.zero_grad()
+
+    encoder_outputs, enc_hidden = encoder(input_tensor.view(<span class="nm">1</span>, -<span class="nm">1</span>))
+    dec_input  = torch.tensor([[SOS_token]], device=device)
+    dec_hidden = enc_hidden
+    loss = <span class="nm">0</span>
+
+    use_tf = random.random() &lt; tf_ratio
+    <span class="kw">for</span> t <span class="kw">in</span> <span class="kw">range</span>(target_tensor.size(<span class="nm">0</span>)):
+        logits, dec_hidden, _ = decoder(dec_input, dec_hidden, encoder_outputs)
+        loss += criterion(logits, target_tensor[t])
+        <span class="kw">if</span> use_tf:
+            dec_input = target_tensor[t].view(<span class="nm">1</span>, <span class="nm">1</span>)   <span class="cm"># feed the TRUE word</span>
+        <span class="kw">else</span>:
+            dec_input = logits.argmax(<span class="nm">1</span>).view(<span class="nm">1</span>, <span class="nm">1</span>)  <span class="cm"># feed its OWN guess</span>
+            <span class="kw">if</span> dec_input.item() == EOS_token:
+                <span class="kw">break</span>
+
+    loss.backward()
+    enc_opt.step(); dec_opt.step()
+    <span class="kw">return</span> loss.item() / target_tensor.size(<span class="nm">0</span>)</pre>
+          <p>We use <code class="inl">nn.NLLLoss</code> / <code class="inl">cross_entropy</code> as the criterion,
+          and two separate <code class="inl">SGD</code> or <code class="inl">Adam</code> optimisers (one for the
+          encoder, one for the decoder).</p>
+        </div>
+
+        <h3>Step 5 — Inference</h3>
+        <p>At translation time there is no correct answer to peek at, so teacher forcing is off: we always feed
+        the decoder its <em>own</em> previous output, starting from <code class="inl">SOS</code> and stopping when
+        it emits <code class="inl">EOS</code>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — translating a sentence</span>
+          <pre>@torch.no_grad()
+<span class="kw">def</span> translate(sentence, encoder, decoder, eng, fra, max_len=<span class="nm">10</span>):
+    encoder.eval(); decoder.eval()
+    input_tensor = tensor_from(eng, sentence)
+    encoder_outputs, hidden = encoder(input_tensor.view(<span class="nm">1</span>, -<span class="nm">1</span>))
+
+    dec_input = torch.tensor([[SOS_token]], device=device)
+    words = []
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(max_len):
+        logits, hidden, _ = decoder(dec_input, hidden, encoder_outputs)
+        top = logits.argmax(<span class="nm">1</span>).item()
+        <span class="kw">if</span> top == EOS_token:
+            <span class="kw">break</span>
+        words.append(fra.index2word[top])
+        dec_input = torch.tensor([[top]], device=device)
+    <span class="kw">return</span> <span class="st">" "</span>.join(words)
+
+<span class="kw">print</span>(translate(<span class="st">"i am cold"</span>, encoder, decoder, eng, fra))  <span class="cm"># -> "j ai froid"</span></pre>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Seq2Seq translation = an <strong>encoder</strong> GRU reads English into per-word hidden states, and an
+          <strong>attention decoder</strong> writes French one word at a time, attending to the relevant English
+          words each step. Train with <strong>teacher forcing</strong> applied randomly (~50%) so the model is
+          both stable to train and robust at inference; at inference, feed its own outputs until
+          <code class="inl">EOS</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. EVALUATE ===================== -->
+      <section id="evaluate">
+        <h2><span class="sec-num">4</span> Evaluating &amp; improving</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>How do you know your robot writer is getting better? Two ways: watch its "mistake score" go down on
+          a graph (numbers), <em>and</em> actually read what it writes (eyeballs). A low score with bad-looking
+          output means something's off — so always do both, like checking a cake's timer <em>and</em> tasting it.</p>
+        </div>
+
+        <p>You've built both models — now how do you tell if they're any good, and how do you make them better?
+        Evaluation for generative models is part number, part judgement.</p>
+
+        <h3>Loss curves — the health monitor</h3>
+        <p>Log the loss every N steps and plot it. A healthy run shows <span class="term">training loss</span>
+        falling smoothly. To catch <span class="term">overfitting</span> (memorising instead of learning), hold
+        out a slice of data the model never trains on and also plot its <span class="term">validation loss</span>:
+        when validation loss starts <em>rising</em> while training loss keeps falling, you've overfit — stop
+        there (this is <em>early stopping</em>).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — tracking and plotting loss</span>
+          <pre>losses = []
+<span class="kw">for</span> step <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">5000</span>):
+    <span class="cm"># ... compute loss as before ...</span>
+    losses.append(loss.item())
+
+<span class="kw">import</span> matplotlib.pyplot <span class="kw">as</span> plt
+plt.plot(losses)
+plt.xlabel(<span class="st">"step"</span>); plt.ylabel(<span class="st">"cross-entropy loss"</span>)
+plt.title(<span class="st">"Training loss"</span>); plt.show()</pre>
+          <p>For language models people often report <span class="term">perplexity</span> =
+          <code class="inl">exp(loss)</code> — intuitively "how many characters the model is choosing between on
+          average." Lower is better; a perplexity of 1 would mean perfect certainty.</p>
+        </div>
+
+        <h3>Qualitative samples — read the output</h3>
+        <p>The loss can't fully capture "does this <em>feel</em> like Shakespeare?" or "is this a correct
+        translation?" So periodically print samples during training. Watching the Shakespeare model evolve from
+        random characters → real words → proper line structure is the most satisfying part of the project, and
+        it catches problems (looping, garbage) that the loss alone hides.</p>
+
+        <h3>BLEU — scoring translations (high level)</h3>
+        <p>For translation we want a number that says "how close is the model's French to a human's French?"
+        The standard metric is <span class="term">BLEU</span> (Bilingual Evaluation Understudy). At a high level,
+        BLEU measures how many short word-sequences (<span class="term">n-grams</span>: single words, word pairs,
+        triples) the model's output shares with one or more reference translations, with a penalty for being too
+        short. It ranges 0–100; higher is better.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example — BLEU intuition</span>
+          <pre>Reference : <span class="st">"the cat is on the mat"</span>
+Model out : <span class="st">"the cat is on mat"</span>
+
+<span class="cm"># Most 1-grams (the, cat, is, on, mat) match -> high unigram overlap.</span>
+<span class="cm"># A missing "the" lowers the 2-gram overlap, and the shorter</span>
+<span class="cm"># length triggers the brevity penalty -> BLEU below a perfect 100.</span>
+
+<span class="kw">from</span> torchtext.data.metrics <span class="kw">import</span> bleu_score
+score = bleu_score([[<span class="st">"the"</span>,<span class="st">"cat"</span>,<span class="st">"is"</span>,<span class="st">"on"</span>,<span class="st">"mat"</span>]],
+                   [[[<span class="st">"the"</span>,<span class="st">"cat"</span>,<span class="st">"is"</span>,<span class="st">"on"</span>,<span class="st">"the"</span>,<span class="st">"mat"</span>]]])</pre>
+          <p>BLEU is a rough proxy — it rewards word overlap, not true meaning, so a perfectly fluent paraphrase
+          can score low. Treat it as a <em>directional</em> signal, paired with reading real examples.</p>
+        </div>
+
+        <h3>Pitfalls and next steps</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pitfall</th><th>Symptom</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>Exploding gradients</td><td>Loss suddenly jumps to NaN.</td><td>Gradient clipping (we did this); lower learning rate.</td></tr>
+              <tr><td>Repetitive output</td><td>"the the the…"</td><td>Sample with temperature/top-k instead of greedy.</td></tr>
+              <tr><td>Overfitting</td><td>Validation loss rises; output quotes training text verbatim.</td><td>Dropout, more data, early stopping.</td></tr>
+              <tr><td>Exposure bias</td><td>Translation good with teacher forcing, bad at inference.</td><td>Lower the teacher-forcing ratio over training.</td></tr>
+              <tr><td>Tiny vocabulary</td><td>Translator can't handle new words.</td><td>Subword tokenisation (BPE); more training pairs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Where this leads next</span>
+          <p>Both projects use recurrent networks that read sequentially and can struggle with very long
+          dependencies. The fix — replacing recurrence with pure attention — is the
+          <strong>Transformer</strong>, which we build from scratch in <strong>Session 19 (Mini-Transformer)</strong>.
+          Today's char-LM and attention decoder are the perfect stepping stones to it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Evaluate generative models with <strong>both</strong> numbers (loss curves, perplexity, BLEU for
+          translation) <strong>and</strong> eyeballs (qualitative samples). Watch for exploding gradients,
+          repetition, overfitting, and exposure bias — each has a standard fix. The natural next step is
+          replacing recurrence with attention: the Transformer.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You shipped two real neural networks this week. Here's the one-paragraph story tying the projects
+        together:</p>
+        <div class="bigidea">
+          <p>Both projects are <strong>sequence models</strong> trained to predict the next symbol. The
+          <strong>char-level LSTM</strong> reads characters and predicts the next character, learning to write
+          fake-Shakespeare; we generate from it <strong>autoregressively</strong>, steering creativity with
+          <strong>temperature</strong> and the choice of <strong>greedy vs sampling</strong>. The
+          <strong>Seq2Seq translator</strong> splits the job in two: an <strong>encoder</strong> reads English
+          into hidden states and an <strong>attention decoder</strong> writes French one word at a time,
+          focusing on the relevant input words; we train it efficiently with <strong>teacher forcing</strong>.
+          We judge both with <strong>loss curves</strong> plus <strong>qualitative samples</strong>, and grade
+          translations with <strong>BLEU</strong> — then carry these ideas straight into the
+          <strong>Transformer</strong> next session.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>In the char-LSTM, what is the training "target" for a given input window?</summary>
+          <p class="ans">The same window shifted one character to the right — at every position the label is the
+          character that actually comes next.</p>
+        </details>
+        <details class="quiz">
+          <summary>You set temperature to 0. What kind of decoding does that become, and what's the risk?</summary>
+          <p class="ans">It becomes greedy decoding (always the top character). The risk is repetitive loops like
+          "the the the" because the locally-safest choice repeated forever isn't interesting.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does the attention mechanism let the decoder do?</summary>
+          <p class="ans">At each output step it computes a weighted blend of the encoder's per-word hidden states,
+          focusing on the input words most relevant to the word it's about to produce — instead of relying on one
+          fixed summary vector.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is teacher forcing, and why not use it 100% of the time?</summary>
+          <p class="ans">Feeding the decoder the true previous word during training (instead of its own guess). It
+          speeds and stabilises training, but used exclusively the model never learns to recover from its own
+          mistakes at inference time — so we apply it only a fraction of the time.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your translation loss is low but BLEU and the actual outputs are poor. What might be going on?</summary>
+          <p class="ans">Likely overfitting or exposure bias (great with teacher forcing, weak feeding its own
+          outputs), or the loss simply doesn't capture meaning. Always check qualitative samples, not just loss.</p>
+        </details>
+        <details class="quiz">
+          <summary>What architecture replaces recurrence with pure attention, and when do we build it?</summary>
+          <p class="ans">The Transformer — built from scratch next session (Session 19, Mini-Transformer).</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 18) — your course handout for this project week.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://github.com/karpathy/char-rnn" target="_blank" rel="noopener">Karpathy — char-rnn (GitHub)</a> — the original character-level RNN/LSTM code that inspired Project 1; read it after building yours.</li>
+          <li><a href="https://karpathy.github.io/2015/05/21/rnn-effectiveness/" target="_blank" rel="noopener">Karpathy — The Unreasonable Effectiveness of Recurrent Neural Networks</a> — the classic blog post showing what char-level models can generate and why it works.</li>
+          <li><a href="https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html" target="_blank" rel="noopener">PyTorch — Translation with a Seq2Seq Network and Attention</a> — the official tutorial our translation project follows step by step.</li>
+          <li><a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Bahdanau et al. — Neural Machine Translation by Jointly Learning to Align and Translate</a> — the paper that introduced attention for translation (the mechanism in our decoder).</li>
+          <li><a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">Sutskever et al. — Sequence to Sequence Learning with Neural Networks</a> — the foundational encoder–decoder Seq2Seq paper.</li>
+          <li><a href="https://aclanthology.org/P02-1040/" target="_blank" rel="noopener">Papineni et al. — BLEU: a Method for Automatic Evaluation of Machine Translation</a> — the original BLEU metric paper for grading translations.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-17.html"><div class="dir">← Previous</div><div class="ttl">Session 17: Project — Neural Style Transfer</div></a>
+        <a class="next" href="session-19.html"><div class="dir">Next →</div><div class="ttl">Session 19: Project — Mini-Transformer</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 18 — Project Week: Text Generation &amp; Translation · You built two networks 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

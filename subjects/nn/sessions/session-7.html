@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 7 — Initialization, Normalization &amp; Debugging</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 7</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 07 · Initialization &amp; Normalization</span>
+      <h1>Why training a deep net sometimes just… fails (and how to fix it)</h1>
+      <p class="lead">
+        You've built a network, you've picked a loss, you press "train" — and the loss either sits
+        flat forever or explodes into <code class="inl">NaN</code>. What happened? Very often the
+        culprit is one of three boring-but-crucial things: how you <em>started</em> the weights, how
+        the signal <em>flows</em> through the layers, and a handful of silent bugs. This session is
+        about making deep nets actually <strong>train</strong>. We assume you've studied none of this
+        before — every topic starts with a tiny story, then we go deep with real math and code.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why-init">Why initialization matters</a></li>
+          <li><a href="#vanishing">Vanishing &amp; exploding gradients</a></li>
+          <li><a href="#smart-init">Smart initialization (Xavier &amp; He)</a></li>
+          <li><a href="#norm">Normalization (Batch &amp; Layer)</a></li>
+          <li><a href="#debug">Debugging neural nets</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY INIT ===================== -->
+      <section id="why-init">
+        <h2><span class="sec-num">1</span> Why initialization matters</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a class of kids who all have to <em>guess</em> a number, then the teacher tells
+          them if they're too high or too low so they can fix their guess. If every single kid starts
+          with the <strong>exact same guess</strong>, they all get the same feedback and all change in
+          the same way — forever. They're really just one kid in disguise! And if a kid starts with a
+          <em>ridiculous</em> guess like a billion, the teacher's gentle "a little lower" never catches
+          up. Where you <strong>start</strong> matters a lot.</p>
+        </div>
+
+        <p>When you create a neural network, every connection has a <span class="term">weight</span> — a
+        number the network will adjust during training. Before training begins you must give those
+        weights some starting values. That choice is called <span class="term">weight
+        initialization</span>, and beginners usually assume it's harmless. It isn't. A bad init can make
+        a perfectly good architecture <strong>fail to learn at all</strong>.</p>
+
+        <p>There are two classic ways init goes wrong. Let's name them.</p>
+
+        <h3>Problem A — the symmetry problem (why not all zeros?)</h3>
+        <p>The tempting idea is "just set every weight to 0, that's neutral." It's a disaster. If every
+        weight in a layer is identical, then every neuron in that layer computes the <em>same</em>
+        output, receives the <em>same</em> gradient during <span class="term">backpropagation</span>
+        (the algorithm from Session 3 that pushes error backwards to update weights), and therefore
+        gets updated <em>identically</em>. They stay clones of each other forever.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea: break the symmetry</span>
+          <p>Neurons only become useful if they can specialize — one detects edges, another detects
+          curves, and so on. For that, they must start <strong>different</strong> from each other. We
+          break symmetry by initializing weights to small <em>random</em> numbers. Randomness here isn't
+          sloppiness — it's the whole point.</p>
+        </div>
+
+        <p>Note: <span class="term">biases</span> can safely start at 0, because each neuron's
+        randomly-different weights already break the symmetry. It's the <em>weights</em> that must be
+        random.</p>
+
+        <h3>Problem B — the scale problem (how big should the random numbers be?)</h3>
+        <p>Okay, random — but random <em>how big</em>? This is the subtle part. Each layer multiplies its
+        input by its weights and sums them up. If the weights are <strong>too large</strong>, those sums
+        grow bigger and bigger as the signal passes through layer after layer (the values
+        <em>explode</em>). If the weights are <strong>too small</strong>, the sums shrink toward zero
+        layer after layer (the signal <em>vanishes</em>). Either way, by the time the signal reaches the
+        end — or the gradient travels back to the start — it's useless.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: watch the signal blow up or die</span>
+          <p>Let's pass a random input through 50 layers and just multiply by weights (no activation yet),
+          using two different weight scales. This is the experiment that makes the problem obvious:</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+x = np.random.randn(<span class="nm">512</span>)            <span class="cm"># input vector, ~unit variance</span>
+
+<span class="cm"># Case 1: weights too big (std = 0.1, but 512 of them add up)</span>
+a = x.copy()
+<span class="kw">for</span> i <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">50</span>):
+    W = np.random.randn(<span class="nm">512</span>, <span class="nm">512</span>) * <span class="nm">0.1</span>
+    a = W @ a
+<span class="kw">print</span>(<span class="st">"big   :"</span>, a.std())   <span class="cm"># -&gt; astronomically large (explodes)</span>
+
+<span class="cm"># Case 2: weights too small (std = 0.001)</span>
+b = x.copy()
+<span class="kw">for</span> i <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">50</span>):
+    W = np.random.randn(<span class="nm">512</span>, <span class="nm">512</span>) * <span class="nm">0.001</span>
+    b = W @ b
+<span class="kw">print</span>(<span class="st">"small :"</span>, b.std())   <span class="cm"># -&gt; basically 0 (vanishes)</span></pre>
+          <p>The "big" case prints something enormous (or <code class="inl">inf</code>); the "small" case
+          prints essentially <code class="inl">0</code>. Notice neither weight value looks crazy on its
+          own — <code class="inl">0.1</code> seems tiny! The damage comes from <strong>repeating the
+          multiplication 50 times</strong>. That repetition is the heart of the next topic.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Initialization must do two jobs at once: (1) be <strong>random</strong> so neurons break
+          symmetry and can specialize, and (2) be the <strong>right scale</strong> so the signal neither
+          explodes nor vanishes as it travels through many layers. Topic 3 gives the exact recipe; first
+          we need to understand <em>why</em> the scale problem is so vicious.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Weights need starting values. All-zeros (or all-equal) fails because of the <strong>symmetry
+          problem</strong> — neurons become identical clones. So we use small random numbers. But the
+          <strong>scale</strong> of those numbers is critical: too big explodes the signal, too small
+          kills it, especially in deep nets where the effect compounds layer after layer.
+        </div>
+      </section>
+
+      <!-- ===================== 2. VANISHING / EXPLODING ===================== -->
+      <section id="vanishing">
+        <h2><span class="sec-num">2</span> Vanishing &amp; exploding gradients</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a long line of people whispering a message ear to ear (the game "telephone"). If
+          each person whispers a little <em>quieter</em> than they heard, by the end of a long line the
+          message is silence — nobody can hear it to pass it on. If each person whispers a little
+          <em>louder</em>, by the end everyone's screaming nonsense. Gradients travelling back through a
+          deep network are exactly like that whisper: each layer multiplies them a bit, and over many
+          layers they either fade to nothing or blow up.</p>
+        </div>
+
+        <p>Recall from Session 3 that we train with <span class="term">backpropagation</span>: we compute
+        the loss at the output, then use the <span class="term">chain rule</span> to figure out how much
+        each weight contributed to that loss — the <span class="term">gradient</span>. The chain rule
+        works backwards layer by layer, and crucially it <strong>multiplies</strong> a term for every
+        layer it passes through.</p>
+
+        <h3>Why repeated multiplication is dangerous</h3>
+        <p>Roughly, the gradient that reaches an early layer is a long product of per-layer factors:</p>
+        <pre>grad_early  ≈  f₁ · f₂ · f₃ · … · f_L
+
+         (one factor f per layer, L layers deep)</pre>
+        <p>Now think about what happens to a product of many numbers:</p>
+        <ul>
+          <li>If each factor is <strong>less than 1</strong> (say 0.8), then 0.8<sup>50</sup> ≈
+          0.00001 — the gradient <span class="term">vanishes</span>. Early layers get almost no update
+          signal, so they barely learn.</li>
+          <li>If each factor is <strong>greater than 1</strong> (say 1.5), then 1.5<sup>50</sup> ≈
+          640,000,000 — the gradient <span class="term">explodes</span>. Updates become huge, weights
+          jump wildly, and the loss often turns into <code class="inl">NaN</code>.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The core problem</span>
+          <p>Deep networks multiply gradients through every layer. Unless each per-layer factor sits very
+          close to <strong>1</strong>, the product runs away to zero (vanishing) or to infinity
+          (exploding). The deeper the network, the more violent the effect. This is <em>the</em> reason
+          deep nets were considered "untrainable" for years.</p>
+        </div>
+
+        <h3>Which activations make it worse</h3>
+        <p>One of those per-layer factors is the <strong>derivative of the activation function</strong>.
+        So your choice of activation (Session 2) directly controls whether gradients survive.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Activation</th><th>Derivative range</th><th>Effect on gradients</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Sigmoid</span></td><td>0 to 0.25 (max is just 0.25!)</td><td>Multiplying by ≤0.25 every layer crushes gradients fast → strong vanishing. Worst offender.</td></tr>
+              <tr><td><span class="term">Tanh</span></td><td>0 to 1 (max 1 at the center)</td><td>Better than sigmoid, but still saturates (flattens) at the edges → derivative ≈ 0 there → vanishing.</td></tr>
+              <tr><td><span class="term">ReLU</span></td><td>exactly 0 or 1</td><td>Where active, the factor is 1 — gradients pass undamaged. The main reason ReLU made deep nets practical.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The problem with sigmoid and tanh is <span class="term">saturation</span>: when their input is
+        large (positive or negative), the curve flattens, so their slope (derivative) is nearly 0. A
+        nearly-0 factor, multiplied through many layers, guarantees vanishing gradients. ReLU avoids this
+        on its positive side — its slope is a clean <code class="inl">1</code> — which is exactly why
+        modern deep nets lean on ReLU and its cousins (recall Session 2's discussion of activations).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the dying gradient through sigmoids</span>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+<span class="kw">def</span> sigmoid(z):      <span class="kw">return</span> <span class="nm">1</span> / (<span class="nm">1</span> + np.exp(-z))
+<span class="kw">def</span> sig_deriv(z):    s = sigmoid(z); <span class="kw">return</span> s * (<span class="nm">1</span> - s)
+
+<span class="cm"># Suppose each layer's activation derivative averages ~0.2</span>
+factor = <span class="nm">0.2</span>
+<span class="kw">for</span> depth <span class="kw">in</span> [<span class="nm">5</span>, <span class="nm">10</span>, <span class="nm">30</span>]:
+    <span class="kw">print</span>(depth, <span class="st">"layers -&gt; gradient scaled by"</span>, factor ** depth)
+
+<span class="cm"># 5  layers -&gt; 0.00032</span>
+<span class="cm"># 10 layers -&gt; 1.0e-07</span>
+<span class="cm"># 30 layers -&gt; 1.07e-21   (effectively zero)</span></pre>
+          <p>By 30 layers the gradient reaching the first layer is one billionth of one billionth of its
+          original size. That first layer is, for all practical purposes, frozen.</p>
+        </div>
+
+        <h3>Symptoms — how to recognize it in the wild</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+            <tbody>
+              <tr><td>Loss barely moves; early layers' weights hardly change</td><td><strong>Vanishing</strong> gradients</td></tr>
+              <tr><td>Later layers learn but earlier ones stay near their init values</td><td><strong>Vanishing</strong> gradients</td></tr>
+              <tr><td>Loss suddenly spikes or becomes <code class="inl">NaN</code>/<code class="inl">inf</code></td><td><strong>Exploding</strong> gradients</td></tr>
+              <tr><td>Weights or gradient norms grow huge over a few steps</td><td><strong>Exploding</strong> gradients</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A quick fix for explosions: gradient clipping</span>
+          <p>For exploding gradients there's a simple seatbelt called <span class="term">gradient
+          clipping</span>: if the gradient's overall size exceeds a threshold, scale it back down before
+          the weight update. It caps the damage from any single huge step. (Vanishing has no such cheap
+          patch — that's why we need better init and normalization, our next two topics.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Backprop multiplies a factor per layer, so over many layers the gradient explodes (factors &gt;1)
+          or vanishes (factors &lt;1). Saturating activations like <strong>sigmoid</strong> (slope ≤ 0.25)
+          and <strong>tanh</strong> make vanishing worse; <strong>ReLU</strong> (slope 1 when active)
+          helps. Symptoms: frozen early layers (vanishing) or <code class="inl">NaN</code> loss
+          (exploding). Clipping tames explosions; the rest of this session tames vanishing.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SMART INIT ===================== -->
+      <section id="smart-init">
+        <h2><span class="sec-num">3</span> Smart initialization: Xavier &amp; He</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine pouring water from cup to cup down a long staircase of cups. You want the same
+          <em>amount</em> of water in each cup at every step — not overflowing, not drying up. The trick
+          is to size each cup's spout based on how many cups feed into it. Smart initialization is just
+          that: it sizes the random starting weights so the "amount of signal" stays steady from layer to
+          layer, no matter how deep the staircase.</p>
+        </div>
+
+        <p>Topic 1 told us weights must be random and the right scale. Topic 2 told us "right scale" means
+        keeping per-layer factors near 1. <strong>Smart initialization</strong> turns that into an exact
+        formula. The guiding principle has a name:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The variance-preserving idea</span>
+          <p>Pick the weight scale so the <span class="term">variance</span> (the statistical "spread") of
+          a layer's outputs equals the variance of its inputs. If every layer preserves variance, the
+          signal neither grows nor shrinks as it flows forward — and the same balance keeps gradients
+          healthy as they flow backward. We just need each layer's weights to be neither too loud nor too
+          quiet.</p>
+        </div>
+
+        <p>Here's the intuition for the math. A neuron computes a weighted sum of <span class="term">fan-in</span>
+        inputs (the number of inputs feeding into it, written <code class="inl">n_in</code>). When you add
+        up <code class="inl">n_in</code> independent random products, the variance of the sum grows
+        roughly proportional to <code class="inl">n_in</code>. To cancel that growth, we shrink each
+        weight's variance by a factor of <code class="inl">1 / n_in</code>. That single observation gives
+        us both famous initialization schemes.</p>
+
+        <h3>Xavier / Glorot initialization (for sigmoid &amp; tanh)</h3>
+        <p><span class="term">Xavier initialization</span> (also called <span class="term">Glorot
+        initialization</span>, from Glorot &amp; Bengio, 2010) balances <em>both</em> the forward signal
+        and the backward gradient, so it uses both fan-in and <span class="term">fan-out</span> (number of
+        outputs). Draw weights with variance:</p>
+        <pre>Var(W) = 2 / (n_in + n_out)
+
+  Normal form : W ~ Normal(0, sqrt(2 / (n_in + n_out)))
+  Uniform form: W ~ Uniform(-limit, +limit),
+                limit = sqrt(6 / (n_in + n_out))</pre>
+        <p>Xavier assumes the activation is roughly linear around 0 and symmetric — which is true for
+        <strong>tanh</strong> and <strong>sigmoid</strong>. Use Xavier with those.</p>
+
+        <h3>He initialization (for ReLU &amp; friends)</h3>
+        <p><span class="term">He initialization</span> (from He et al., 2015 — the same group behind
+        ResNet) fixes Xavier for ReLU. The catch: ReLU zeroes out all negative inputs, so on average it
+        throws away <em>half</em> the signal's variance. He compensates by doubling the scale:</p>
+        <pre>Var(W) = 2 / n_in
+
+  Normal form : W ~ Normal(0, sqrt(2 / n_in))
+  Uniform form: W ~ Uniform(-limit, +limit),
+                limit = sqrt(6 / n_in)</pre>
+        <p>That extra factor of 2 exactly undoes ReLU's halving. Use <strong>He</strong> with ReLU,
+        Leaky ReLU, and similar.</p>
+
+        <h3>Which to use with which activation</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Activation</th><th>Use this init</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Sigmoid, Tanh</td><td><strong>Xavier / Glorot</strong></td><td>Symmetric, near-linear at 0 → balance fan-in &amp; fan-out.</td></tr>
+              <tr><td>ReLU, Leaky ReLU, ELU</td><td><strong>He</strong></td><td>ReLU discards half the variance → need the ×2 boost.</td></tr>
+              <tr><td>(Output layer, linear)</td><td>Xavier is a fine default</td><td>No squashing nonlinearity to compensate for.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: it actually preserves the signal</span>
+          <p>Re-run the 50-layer experiment from Topic 1, but this time with <strong>He init</strong> and
+          a ReLU after each layer. Watch the standard deviation stay sane instead of blowing up or dying:</p>
+          <pre><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+<span class="kw">def</span> relu(z): <span class="kw">return</span> np.maximum(<span class="nm">0</span>, z)
+
+x = np.random.randn(<span class="nm">512</span>)
+a = x.copy()
+<span class="kw">for</span> i <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">50</span>):
+    n_in = <span class="nm">512</span>
+    W = np.random.randn(<span class="nm">512</span>, <span class="nm">512</span>) * np.sqrt(<span class="nm">2.0</span> / n_in)  <span class="cm"># He init</span>
+    a = relu(W @ a)
+<span class="kw">print</span>(<span class="st">"He init, 50 ReLU layers -&gt; std ="</span>, a.std())
+<span class="cm"># prints a healthy value of roughly the same order as the input</span></pre>
+          <p>And the equivalent in PyTorch, where these are one-liners:</p>
+          <pre><span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+layer = nn.Linear(<span class="nm">512</span>, <span class="nm">512</span>)
+nn.init.kaiming_normal_(layer.weight, nonlinearity=<span class="st">"relu"</span>)  <span class="cm"># He</span>
+nn.init.zeros_(layer.bias)
+
+<span class="cm"># For tanh/sigmoid layers instead:</span>
+nn.init.xavier_uniform_(layer.weight)                            <span class="cm"># Xavier</span></pre>
+          <p>(PyTorch calls He init <code class="inl">kaiming_</code> after Kaiming He, the first
+          author.)</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Gotcha</span>
+          <p>Smart init solves the problem <em>at the start</em> of training. But as weights drift during
+          training, the nice variance balance can erode. That's why we <em>also</em> use normalization
+          layers (next topic) to keep the signal well-behaved throughout — init and normalization are
+          partners, not rivals.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Smart init sizes the random weights to <strong>preserve variance</strong> layer to layer.
+          <strong>Xavier/Glorot</strong> (<code class="inl">Var = 2/(n_in+n_out)</code>) suits
+          symmetric activations like tanh/sigmoid. <strong>He</strong> (<code class="inl">Var = 2/n_in</code>)
+          adds a ×2 to compensate for ReLU discarding half the variance — use it with ReLU. Right init
+          keeps gradients near factor-1 and lets deep nets train from step one.
+        </div>
+      </section>
+
+      <!-- ===================== 4. NORMALIZATION ===================== -->
+      <section id="norm">
+        <h2><span class="sec-num">4</span> Normalization techniques</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a relay race where each runner hands off a baton, but some runners sprint and some
+          crawl, so the next runner never knows how fast the baton will arrive. Chaos. Now imagine a coach
+          who, between every handoff, resets the baton to a steady, predictable speed. Each runner can
+          relax and just do their job well. Normalization is that coach: between layers, it resets the
+          numbers to a steady, predictable range so the next layer always gets a sensible input.</p>
+        </div>
+
+        <p>Good initialization keeps the signal balanced at the <em>start</em>. <span class="term">Normalization</span>
+        keeps it balanced <em>throughout</em> training by actively re-centering and re-scaling the values
+        flowing between layers. The core operation is the same for every variant: take a set of numbers,
+        subtract their mean, divide by their standard deviation (so they have mean 0, variance 1), then
+        let the network re-scale and re-shift them with two <em>learnable</em> parameters,
+        <code class="inl">γ</code> (gamma, scale) and <code class="inl">β</code> (beta, shift):</p>
+        <pre>normalized = (x - mean) / sqrt(variance + ε)
+output     = γ · normalized + β        <span class="cm"># γ, β are learned</span></pre>
+        <p>The tiny <code class="inl">ε</code> (epsilon, e.g. 1e-5) just avoids dividing by zero. The only
+        question that separates the variants is: <strong>which numbers do we compute the mean and variance
+        over?</strong></p>
+
+        <h3>Recap: Batch Normalization (from a previous session)</h3>
+        <p><span class="term">Batch Normalization</span> (BatchNorm), which you met earlier in the course,
+        normalizes <strong>across the batch</strong>: for each feature, it computes the mean and variance
+        over all the examples in the current <span class="term">mini-batch</span>. So if your batch has 32
+        images, BatchNorm computes statistics for feature #1 across all 32 images, feature #2 across all
+        32, and so on.</p>
+        <ul>
+          <li>It stabilizes training, often lets you use a higher learning rate, and adds a mild
+          regularizing effect (recall regularization from <strong>Session 6</strong>).</li>
+          <li><strong>Catch:</strong> it depends on the batch. With tiny batches the statistics are noisy,
+          and at <em>inference</em> time (one example at a time) there's no batch — so BatchNorm keeps a
+          running average of training statistics to use instead. This train/inference difference is a
+          common source of bugs (see Topic 5).</li>
+        </ul>
+
+        <h3>New: Layer Normalization</h3>
+        <p><span class="term">Layer Normalization</span> (LayerNorm) flips the axis: instead of
+        normalizing each feature across the batch, it normalizes <strong>each example across its own
+        features</strong>. For a single example with 512 features, LayerNorm computes one mean and one
+        variance over those 512 numbers and normalizes them.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The key difference, in one line</span>
+          <p><strong>BatchNorm</strong> normalizes a feature <em>across examples</em> (needs a batch).
+          <strong>LayerNorm</strong> normalizes an example <em>across its features</em> (works on a single
+          example, batch size 1, and is identical at train and inference time).</p>
+        </div>
+
+        <p>That independence from batch size is exactly why <strong>LayerNorm is the standard in
+        Transformers</strong> (the architecture behind modern language models). Transformers process
+        variable-length sequences where batch statistics are awkward and inference is often one sequence
+        at a time — LayerNorm sidesteps all of that. As a rule of thumb: <strong>BatchNorm dominates in
+        convolutional vision networks (CNNs); LayerNorm dominates in Transformers and other
+        sequence/NLP models.</strong></p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Batch Normalization</th><th>Layer Normalization</th></tr></thead>
+            <tbody>
+              <tr><td>Normalizes over</td><td>The batch (per feature, across examples)</td><td>The features (per example, across features)</td></tr>
+              <tr><td>Depends on batch size?</td><td>Yes — bad with tiny batches</td><td>No — works at batch size 1</td></tr>
+              <tr><td>Train vs inference</td><td>Different (uses running stats at inference)</td><td>Identical</td></tr>
+              <tr><td>Typical home</td><td>CNNs / vision</td><td>Transformers / NLP / RNNs</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Why normalization helps gradient flow</h3>
+        <p>Recall Topic 2: gradients explode or vanish because per-layer factors drift away from 1, and
+        activations <em>saturate</em> when their inputs wander into the flat tails. By forcing each layer's
+        inputs back to a tidy mean-0, variance-1 distribution, normalization keeps activations in their
+        responsive, non-saturated region — where derivatives are healthy and gradients pass through
+        cleanly. It smooths the loss landscape so gradient descent can take bigger, more confident steps.
+        It is, in effect, a continuous version of what good init does once.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: BatchNorm vs LayerNorm in PyTorch</span>
+          <pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+
+x = torch.randn(<span class="nm">8</span>, <span class="nm">512</span>)   <span class="cm"># batch of 8 examples, 512 features each</span>
+
+bn = nn.BatchNorm1d(<span class="nm">512</span>)   <span class="cm"># stats over the 8 examples, per feature</span>
+ln = nn.LayerNorm(<span class="nm">512</span>)     <span class="cm"># stats over the 512 features, per example</span>
+
+<span class="kw">print</span>(bn(x).shape, ln(x).shape)   <span class="cm"># both -&gt; torch.Size([8, 512])</span>
+
+<span class="cm"># A Transformer block uses LayerNorm; a CNN block uses BatchNorm:</span>
+transformer_block = nn.Sequential(
+    nn.Linear(<span class="nm">512</span>, <span class="nm">512</span>),
+    nn.LayerNorm(<span class="nm">512</span>),     <span class="cm"># &lt;- the Transformer choice</span>
+    nn.ReLU(),
+)</pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Aside: there are more cousins</span>
+          <p>You'll also hear of <span class="term">Group Normalization</span> and <span class="term">Instance
+          Normalization</span> — same recipe, different choice of which numbers to average over. They exist
+          precisely because "which axis to normalize" is the one knob that matters. BatchNorm and LayerNorm
+          are the two you must know.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Normalization re-centers and re-scales values between layers (mean 0, variance 1, then learnable
+          <code class="inl">γ</code>/<code class="inl">β</code>). <strong>BatchNorm</strong> averages over
+          the batch (great for CNNs, but batch-dependent); <strong>LayerNorm</strong> averages over an
+          example's features (batch-independent, the standard in <strong>Transformers</strong>). Both keep
+          activations out of saturated regions, so gradients flow and training is faster and more stable.
+        </div>
+      </section>
+
+      <!-- ===================== 5. DEBUGGING ===================== -->
+      <section id="debug">
+        <h2><span class="sec-num">5</span> Debugging neural nets</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If you bake a cake and it comes out flat, you don't throw out the whole kitchen — you check
+          one thing at a time: Did I add the baking powder? Is the oven actually on? Did I read "cup" as
+          "tablespoon"? Debugging a neural net is the same calm, one-thing-at-a-time detective work. The
+          net almost never "just doesn't work" — there's usually one small, findable mistake.</p>
+        </div>
+
+        <p>A neural net can fail <em>silently</em>: no error message, it just doesn't learn. So we lean on
+        deliberate checks and habits. Here are the essential ones.</p>
+
+        <h3>Check 1 — Overfit a tiny batch (the single best sanity check)</h3>
+        <p>Before training on your full dataset, take a <strong>handful of examples</strong> (say 2–10) and
+        try to make the network memorize them perfectly. A correctly-wired network <em>should</em> be able
+        to drive the loss on 5 examples to nearly zero — it has way more than enough capacity. If it
+        <em>can't</em>, your model, loss, or data pipeline has a real bug, and there's no point training on
+        the full set.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: the tiny-batch test</span>
+          <pre><span class="cm"># Grab a tiny fixed batch and overfit it on purpose.</span>
+x_tiny, y_tiny = x_train[:<span class="nm">5</span>], y_train[:<span class="nm">5</span>]
+
+<span class="kw">for</span> step <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">500</span>):
+    optimizer.zero_grad()
+    loss = loss_fn(model(x_tiny), y_tiny)
+    loss.backward()
+    optimizer.step()
+    <span class="kw">if</span> step % <span class="nm">100</span> == <span class="nm">0</span>:
+        <span class="kw">print</span>(step, loss.item())
+
+<span class="cm"># GOOD: loss marches toward ~0  -&gt; wiring is sound.</span>
+<span class="cm"># BAD : loss stalls / is NaN     -&gt; bug in model, loss, or data.</span></pre>
+        </div>
+
+        <h3>Check 2 — Gradient checking</h3>
+        <p><span class="term">Gradient checking</span> verifies that your backprop is computing correct
+        gradients, by comparing them to a brute-force <em>numerical</em> estimate. The numerical gradient
+        nudges one weight by a tiny <code class="inl">h</code> and measures how the loss changes:</p>
+        <pre>numerical_grad ≈ ( L(w + h) − L(w − h) ) / (2h)     <span class="cm"># h ~ 1e-5</span></pre>
+        <p>If your analytic (backprop) gradient and this numerical estimate agree to several decimal
+        places, your gradients are correct. This was essential when people hand-wrote backprop; today
+        frameworks like PyTorch compute gradients automatically (<span class="term">autograd</span>), so
+        you'll rarely do it by hand — but it's the gold-standard way to validate any custom layer or loss
+        you write yourself.</p>
+        <div class="callout note">
+          <span class="c-title">In modern frameworks</span>
+          <p>PyTorch ships <code class="inl">torch.autograd.gradcheck</code>, which runs exactly this
+          comparison for you on a custom function. Reach for it whenever you implement a non-standard
+          operation.</p>
+        </div>
+
+        <h3>Check 3 — Watch the loss curves</h3>
+        <p>Plot training and validation loss over time. The shape of the curve is a diagnostic dashboard:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>What you see</th><th>What it usually means</th><th>Try</th></tr></thead>
+            <tbody>
+              <tr><td>Loss flat from the start</td><td>LR too low, vanishing gradients, or bug</td><td>Raise LR; check init/activations; run the tiny-batch test</td></tr>
+              <tr><td>Loss explodes / <code class="inl">NaN</code></td><td>LR too high, exploding gradients</td><td>Lower LR; add gradient clipping; check for bad data</td></tr>
+              <tr><td>Loss is jagged / noisy</td><td>LR a bit high, or batch too small</td><td>Lower LR; increase batch size</td></tr>
+              <tr><td>Train loss ↓ but val loss ↑</td><td><span class="term">Overfitting</span></td><td>Regularize (Session 6): dropout, weight decay, more data</td></tr>
+              <tr><td>Both losses high &amp; flat</td><td><span class="term">Underfitting</span></td><td>Bigger model, train longer, better features</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Check 4 — Hunt the common bugs</h3>
+        <p>A few mistakes account for a huge share of "my net won't train" cases:</p>
+        <ul>
+          <li><strong>Wrong learning rate.</strong> The #1 culprit. Too high → divergence/<code class="inl">NaN</code>;
+          too low → painfully slow or stuck. Always sweep a few LRs (e.g. 1e-2, 1e-3, 1e-4).</li>
+          <li><strong>Data leakage.</strong> Information from the validation/test set sneaks into training —
+          e.g. normalizing using statistics computed over the <em>whole</em> dataset, or shuffling before
+          splitting time-series. Symptom: suspiciously great validation scores that collapse in production.
+          Fix: compute all preprocessing stats on the <em>training set only</em>.</li>
+          <li><strong>Label mismatch / misalignment.</strong> Inputs and labels get shuffled out of sync, or
+          class indices are off by one, or one-hot vs index labels are mixed up. The model is being told the
+          wrong answers. Symptom: loss won't drop even on the tiny-batch test.</li>
+          <li><strong>Forgetting <code class="inl">model.train()</code> / <code class="inl">model.eval()</code>.</strong>
+          Dropout and BatchNorm behave differently in the two modes (Topic 4). Forgetting to switch causes
+          weird train/eval gaps.</li>
+          <li><strong>Forgetting <code class="inl">optimizer.zero_grad()</code>.</strong> In PyTorch,
+          gradients accumulate by default; skip the reset and your updates are garbage.</li>
+          <li><strong>Unnormalized inputs.</strong> Feeding raw pixel values 0–255 instead of scaling them —
+          instantly destabilizes training.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out: change one thing at a time</span>
+          <p>When debugging, resist the urge to change five things at once. Alter a single variable, observe
+          the effect, then move on. Otherwise you'll fix the bug and never know which change did it — and
+          you'll likely introduce a new one.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">A practical pre-flight checklist</span>
+          <p>Run through this before and during any training run:</p>
+          <ul>
+            <li>☐ Inputs normalized; labels verified and aligned with inputs.</li>
+            <li>☐ Loss function matches the task (e.g. cross-entropy for classification).</li>
+            <li>☐ Sensible init (He for ReLU, Xavier for tanh — Topic 3).</li>
+            <li>☐ <strong>Overfit a tiny batch to ≈0 loss</strong> — the make-or-break check.</li>
+            <li>☐ Verify the <em>initial</em> loss is in the expected range (e.g. ≈<code class="inl">ln(num_classes)</code> for balanced classification).</li>
+            <li>☐ Sweep a few learning rates; watch the loss curve.</li>
+            <li>☐ Correct <code class="inl">train()</code>/<code class="inl">eval()</code> modes; <code class="inl">zero_grad()</code> each step.</li>
+            <li>☐ Monitor gradient norms to catch vanishing/exploding early.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Nets fail silently, so debug deliberately: <strong>overfit a tiny batch</strong> (best single
+          sanity check), <strong>gradient-check</strong> custom code, and <strong>read the loss
+          curves</strong> for too-high/too-low LR, over/underfitting. Watch for the usual suspects — wrong
+          LR, data leakage, label mismatch, train/eval mode, forgotten <code class="inl">zero_grad</code>,
+          unnormalized inputs — and always change one thing at a time.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>These five topics are really one story about keeping the <em>signal</em> healthy as it flows
+        through a deep network — forwards and backwards. Here's the connected version:</p>
+        <div class="bigidea">
+          <p>A deep net trains by sending signal forward and <strong>gradients</strong> backward, and each
+          layer <em>multiplies</em> them. Unless those per-layer factors stay near 1, gradients
+          <strong>vanish or explode</strong>, and saturating activations like <strong>sigmoid</strong> make
+          it worse. We attack this from three angles. First, <strong>smart initialization</strong>
+          (<strong>Xavier</strong> for tanh/sigmoid, <strong>He</strong> for ReLU) sizes the starting
+          weights to <em>preserve variance</em> from step one. Second, <strong>normalization</strong>
+          (<strong>BatchNorm</strong> in CNNs, <strong>LayerNorm</strong> in Transformers) keeps the signal
+          well-behaved <em>throughout</em> training so activations don't saturate. Third, when things still
+          go wrong, we <strong>debug deliberately</strong> — overfit a tiny batch, watch the loss curves,
+          and rule out the classic bugs — changing one thing at a time. Master these and "my deep net won't
+          train" stops being a mystery. Next session we put it all into practice in a hands-on ANN project.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why can't you initialize all the weights of a layer to the same value (e.g. zero)?</summary>
+          <p class="ans">The symmetry problem: identical weights make every neuron compute the same output
+          and receive the same gradient, so they update identically and stay clones forever. Random init
+          breaks the symmetry so neurons can specialize.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does the sigmoid activation cause vanishing gradients?</summary>
+          <p class="ans">Its derivative maxes out at just 0.25 and approaches 0 when it saturates.
+          Backprop multiplies one such factor per layer, so a product of numbers ≤ 0.25 shrinks toward zero
+          across many layers — the gradient vanishes and early layers stop learning.</p>
+        </details>
+        <details class="quiz">
+          <summary>You're using ReLU activations. Should you use Xavier or He initialization, and why?</summary>
+          <p class="ans">He. ReLU zeroes out negative inputs and so discards about half the signal's
+          variance; He's extra factor of 2 (<code class="inl">Var = 2/n_in</code>) compensates for that.
+          Xavier is the right choice for symmetric activations like tanh/sigmoid.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the key difference between BatchNorm and LayerNorm, and why is LayerNorm used in Transformers?</summary>
+          <p class="ans">BatchNorm normalizes each feature across the examples in a batch; LayerNorm
+          normalizes each example across its own features. LayerNorm doesn't depend on batch size and is
+          identical at train and inference time, which fits Transformers' variable-length, often
+          single-sequence processing.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the single most useful sanity check before a full training run?</summary>
+          <p class="ans">Overfit a tiny batch (a handful of examples) and confirm the loss drops to nearly
+          zero. If a correctly-wired net can't memorize 5 examples, there's a bug in the model, loss, or
+          data pipeline — fix it before training on everything.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your loss suddenly becomes <code class="inl">NaN</code> after a few steps. What are the likely causes and fixes?</summary>
+          <p class="ans">Exploding gradients, usually from a learning rate that's too high (or bad/unnormalized
+          data). Fixes: lower the learning rate, add gradient clipping, and check inputs are normalized and
+          labels are valid.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 7) — your course handout for this session, covering
+          initialization, normalization, and debugging.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning handout (Session 7) — online</a> — the official class handout page for this session.</li>
+          <li><a href="https://proceedings.mlr.press/v9/glorot10a.html" target="_blank" rel="noopener">Glorot &amp; Bengio (2010): Understanding the difficulty of training deep feedforward networks</a> — the original paper introducing Xavier/Glorot initialization and the variance-preserving argument.</li>
+          <li><a href="https://arxiv.org/abs/1502.01852" target="_blank" rel="noopener">He et al. (2015): Delving Deep into Rectifiers</a> — introduces He initialization, tailored to ReLU, and the ×2 variance correction.</li>
+          <li><a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Karpathy: A Recipe for Training Neural Networks</a> — a famous, practical playbook for debugging nets, including the "overfit one batch" advice.</li>
+          <li><a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">Ioffe &amp; Szegedy (2015): Batch Normalization</a> — the paper that introduced BatchNorm and the idea of normalizing layer inputs during training.</li>
+          <li><a href="https://arxiv.org/abs/1607.06450" target="_blank" rel="noopener">Ba, Kiros &amp; Hinton (2016): Layer Normalization</a> — introduces LayerNorm, the normalization used throughout Transformers.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-6.html"><div class="dir">← Previous</div><div class="ttl">Session 6: Regularization</div></a>
+        <a class="next" href="session-8.html"><div class="dir">Next →</div><div class="ttl">Session 8: Hands-on Project — ANN</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 7 — Initialization, Normalization &amp; Debugging · Now your deep nets will actually train 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

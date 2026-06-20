@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 3 — Caching — Part 1: Fundamentals</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 3</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 03 · Caching 1</span>
+      <h1>Caching: how systems remember answers so they don't redo work</h1>
+      <p class="lead">
+        Welcome to your first caching class. We assume you've studied <em>none</em> of this before.
+        Every topic opens with a tiny "explain like I'm 5" story, then we slowly go deeper with real
+        examples, diagrams, and a little code. By the end you'll understand <em>why</em> nearly every
+        fast website on the planet leans on caching — and you'll be ready for the two genuinely hard
+        problems we tackle next session.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 34 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what">What is caching &amp; why</a></li>
+          <li><a href="#hierarchy">The caching hierarchy</a></li>
+          <li><a href="#cdn">CDNs deep dive</a></li>
+          <li><a href="#types">Types of backend caches</a></li>
+          <li><a href="#hard">The two hard problems</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHAT IS CACHING ===================== -->
+      <section id="what">
+        <h2><span class="sec-num">1</span> What is caching &amp; why we do it</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your favourite snack is kept in a big warehouse across town. Every time you're
+          hungry, walking there and back takes ages. So you keep a few of those snacks in a bowl on
+          your kitchen counter. Now most of the time you just grab one from the bowl — instant! You
+          only make the long warehouse trip when the bowl is empty. The bowl is a <strong>cache</strong>:
+          a small, super-close copy of stuff you keep asking for, so you don't keep making the slow trip.</p>
+        </div>
+
+        <p>A <span class="term">cache</span> is a small, fast store that holds copies of data that's
+        expensive to fetch or compute, kept <strong>closer</strong> to whoever needs it. <span class="term">Caching</span>
+        is the act of putting answers in that store the first time, then reusing them. The goal is
+        simple and always the same: <strong>cut latency</strong> (make things feel fast) and
+        <strong>cut load</strong> (stop hammering the slow thing behind it).</p>
+
+        <p>The "slow thing behind it" has a name: the <span class="term">origin</span> (or
+        <span class="term">source of truth</span>) — the real, authoritative place the data lives,
+        like a database or another service. A cache never replaces the origin; it just sits in front
+        of it and answers the easy, repeated questions.</p>
+
+        <h3>Hits, misses, and the hit ratio</h3>
+        <p>Every time something asks the cache for data, exactly one of two things happens:</p>
+        <ul>
+          <li>A <span class="term">cache hit</span> — the data was already in the cache. Fast. We avoided the slow trip.</li>
+          <li>A <span class="term">cache miss</span> — the data wasn't there. Now we <em>do</em> make the slow trip to the origin, fetch it, and usually store a copy in the cache so the <em>next</em> request hits.</li>
+        </ul>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">1. Ask cache</div><div class="s-d">"Do you have key X?"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">2a. Hit</div><div class="s-d">Return copy instantly</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">❌</div><div class="s-t">2b. Miss</div><div class="s-d">Go to origin (slow)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">3. Store</div><div class="s-d">Save copy in cache</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📤</div><div class="s-t">4. Return</div><div class="s-d">Hand data back</div></div>
+        </div>
+
+        <p>The single most important number for any cache is its <span class="term">hit ratio</span>
+        (also called hit rate): the fraction of requests that were hits.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: computing a hit ratio</span>
+          <p>Suppose over one hour your cache sees <strong>10,000 requests</strong>: 9,200 were hits
+          and 800 were misses.</p>
+          <pre><span class="cm"># hit ratio = hits / total requests</span>
+hit_ratio = 9200 / 10000   <span class="cm"># = 0.92  → 92%</span>
+miss_ratio = 800 / 10000   <span class="cm"># = 0.08  →  8%</span>
+miss_ratio = <span class="nm">1</span> - hit_ratio  <span class="cm"># always true</span></pre>
+          <p>A 92% hit ratio means only 8% of requests ever bothered the slow origin. If each origin
+          trip costs, say, 50&nbsp;ms and a cache hit costs 1&nbsp;ms, the <em>average</em> latency is:</p>
+          <pre><span class="cm"># average = (hit% × hit_cost) + (miss% × miss_cost)</span>
+avg = (<span class="nm">0.92</span> * <span class="nm">1</span>) + (<span class="nm">0.08</span> * <span class="nm">50</span>)
+avg = <span class="nm">0.92</span> + <span class="nm">4.0</span> = <span class="nm">4.92</span> ms   <span class="cm"># vs 50 ms with no cache</span></pre>
+          <p>The cache made the system roughly <strong>10× faster on average</strong> — just by remembering
+          answers. Push the hit ratio higher and the average drops further.</p>
+        </div>
+
+        <h3>Latency-numbers intuition: why "closer and faster" matters so much</h3>
+        <p>To feel why caching pays off, you need a gut sense of how wildly different "fast" and "slow"
+        are inside a computer. These are the famous <span class="term">latency numbers every engineer
+        should know</span> — rounded to make the <em>ratios</em> obvious, not to be exact:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>Rough time</th><th>Human-scale analogy (×1 billion)</th></tr></thead>
+            <tbody>
+              <tr><td>Read from CPU cache (L1)</td><td>~1 ns</td><td>1 second</td></tr>
+              <tr><td>Read from main memory (RAM)</td><td>~100 ns</td><td>~1.5 minutes</td></tr>
+              <tr><td>Read 1&nbsp;MB from RAM</td><td>~10 µs</td><td>~3 hours</td></tr>
+              <tr><td>SSD random read</td><td>~100 µs</td><td>~1 day</td></tr>
+              <tr><td>Read 1&nbsp;MB from SSD</td><td>~1 ms</td><td>~11 days</td></tr>
+              <tr><td>Network round trip in same datacenter</td><td>~0.5 ms</td><td>~6 days</td></tr>
+              <tr><td>Spinning-disk (HDD) seek</td><td>~10 ms</td><td>~4 months</td></tr>
+              <tr><td>Network round trip across continents</td><td>~150 ms</td><td>~5 years</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>RAM is roughly <strong>100,000× faster</strong> than a spinning disk seek, and reaching
+          a server in your own datacenter is <em>hundreds</em> of times faster than reaching one across
+          the world. Caching is mostly about <strong>moving data up this ladder</strong> — out of slow
+          disks and far-away networks, into fast memory that's physically close to the request. Every
+          rung you climb is an order-of-magnitude win.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two flavours of "expensive"</span>
+          <p>Data can be expensive in two ways, and caching helps with both: <strong>slow to fetch</strong>
+          (it lives far away or on slow storage) and <strong>slow to compute</strong> (it takes heavy
+          CPU work, like rendering a report or running a big query). Caching the <em>result</em> means you
+          pay that cost once and reuse it many times.</p>
+        </div>
+
+        <h3>Why caching exists at all: memory is <em>always</em> hierarchical</h3>
+        <p>Here's the deep reason caching is unavoidable — it shows up even in the human brain. Think about
+        <strong>making a cup of tea</strong>: you keep the tea, sugar, and a mug on the counter (instant), the
+        spare packets in a cupboard (a few steps), and the bulk supply in a shop across town (a whole trip).
+        You naturally keep what you use most in the closest, smallest spot.</p>
+
+        <p>Your <strong>brain does the same thing</strong> with three tiers of memory:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Brain memory</th><th>Speed</th><th>Capacity</th><th>Durability &amp; access</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Working memory</span></td><td>Extremely fast</td><td>Only 4–7 items</td><td>Volatile, random access</td></tr>
+              <tr><td><span class="term">Short-term memory</span></td><td>Very fast</td><td>Thousands of items</td><td>Volatile (lasts up to weeks), random access</td></tr>
+              <tr><td><span class="term">Long-term memory</span></td><td>Extremely slow</td><td>Practically unlimited</td><td>Permanent, sequential access</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>When you sleep (during REM), your brain <strong>consolidates</strong> short-term memories into
+        long-term storage — exactly like flushing a fast cache down to slow, durable storage.</p>
+
+        <div class="bigidea">
+          <span class="c-title">Even biological memory is hierarchical!</span>
+          <p>The pattern is universal: <strong>larger storage is slower; smaller storage is faster.</strong>
+          If you have to produce a <em>lot</em> of something, you use cheaper, slower technology — registers
+          the size of RAM would be absurdly expensive. Larger stores are typically slow at sequential access
+          and <em>ultra</em>-slow at random access; smaller stores are fast and great at random access.
+          That mismatch is precisely why you <strong>need caching</strong> — to keep a small, fast copy of the
+          hot data close by.</p>
+        </div>
+
+        <h3>The same hierarchy inside a computer</h3>
+        <p>Your machine stacks memory the same way, from blistering and tiny to vast and slow:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Where / notes</th><th>Latency</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">CPU registers</span></td><td>What the CPU actually operates on; only a few bytes. Run at clock-tick speed (~5 billion ops/sec).</td><td>~0.2 ns per access</td></tr>
+              <tr><td><span class="term">CPU cache</span> — L1, L2, L3</td><td>Inside the CPU. L1 &amp; L2 exist <em>per core</em>; L3 is <em>shared</em> across all cores.</td><td>nanoseconds</td></tr>
+              <tr><td><span class="term">Main memory (RAM)</span></td><td>Almost <strong>500×–1000× slower</strong> than registers. Modern DDR4 random read ~10 ns.</td><td>~100 ns (traditional)</td></tr>
+              <tr><td><span class="term">HDD</span> (magnetic disk)</td><td><strong>~100,000× slower</strong> than RAM.</td><td>milliseconds</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>So a CPU register is roughly <strong>500× faster</strong> than RAM, and RAM is roughly
+        <strong>100,000× faster</strong> than a spinning disk. Climbing each rung of this ladder — disk → RAM
+        → CPU cache → registers — is an order-of-magnitude win, which is the whole reason caching pays off.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — caching isn't free</span>
+          <p>A cached copy can drift out of date the moment the origin changes. That trade-off between
+          "fast" and "fresh" is the heart of caching, and it's exactly what makes the two hard problems
+          in Topic 4 hard. Keep it in the back of your mind as we go.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A cache is a small, fast, close copy of expensive data, sitting in front of the slow
+          <strong>origin</strong>. A request is either a <strong>hit</strong> (found, fast) or a
+          <strong>miss</strong> (not found, go to origin). The <strong>hit ratio</strong> = hits ÷ total
+          requests, and a high one slashes average latency and origin load. It all works because moving
+          data up the latency ladder — disk → network → RAM — buys order-of-magnitude speedups.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CACHING HIERARCHY ===================== -->
+      <section id="hierarchy">
+        <h2><span class="sec-num">2</span> The caching hierarchy: layers from browser to backend</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of getting a glass of water. First you check the cup already on your desk. If it's
+          empty, you check the jug in your room. If <em>that's</em> empty, you go to the kitchen tap.
+          And only if the whole house is dry do you go all the way to the well outside. Each spot is
+          closer and faster than the next; you only travel further when the nearer spot can't help.
+          Web requests work the same way — they check a chain of caches, each further from you, before
+          finally bothering the "well" (the database).</p>
+        </div>
+
+        <p>Caching doesn't happen in just one place. A single request can pass through <strong>several
+        caches stacked in a line</strong>, each closer to the user than the last. This stack is the
+        <span class="term">caching hierarchy</span>. The closer a layer is to the user, the faster and
+        cheaper a hit there is — so we want to answer requests as early (as far "left") as possible.</p>
+
+        <h3>The three big layers</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Layer</th><th>Where it lives</th><th>What it caches</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Browser cache</span></td><td>On the user's own device (in the browser)</td><td>Static files already downloaded: images, CSS, JavaScript, fonts. A repeat visit can skip the network entirely.</td></tr>
+              <tr><td><span class="term">CDN</span> (edge cache)</td><td>On servers spread around the world, physically near users</td><td>Static assets and sometimes whole pages/API responses, served from the geographically nearest "edge."</td></tr>
+              <tr><td>Backend caches</td><td>Inside your datacenter, in front of your database/services</td><td>Computed results, database query results, session data — anything expensive to regenerate.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Two terms worth pinning down here. A <span class="term">CDN (Content Delivery Network)</span>
+        is a fleet of cache servers scattered across the globe; each location is called an
+        <span class="term">edge</span> because it sits at the edge of the network, close to users. When
+        someone in Tokyo and someone in Berlin request the same image, each is served from a nearby edge
+        rather than from one origin server on the other side of the planet — turning a ~150&nbsp;ms
+        cross-continent trip (Topic 1) into a few milliseconds. (We go much deeper on CDNs in Topic 3.)</p>
+
+        <h3>Zooming into the browser layer (client side)</h3>
+        <p>The browser cache is really several caches. Some of them a frontend developer
+        <strong>cannot</strong> touch, and some they <strong>can</strong>:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Browser store</th><th>Frontend access?</th><th>Capacity / notes</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">DNS cache</span></td><td>No</td><td>Remembers domain → IP lookups (inspect at <code class="inl">chrome://net-internals/#dns</code>).</td></tr>
+              <tr><td><span class="term">File / media cache</span></td><td>No</td><td>Downloaded images, CSS, JS, fonts, videos.</td></tr>
+              <tr><td><span class="term">Cookies</span></td><td>Yes</td><td>~4 KB — tiny, sent to the server on every request.</td></tr>
+              <tr><td><span class="term">Session Storage</span></td><td>Yes</td><td>~5 MB — cleared when the tab closes.</td></tr>
+              <tr><td><span class="term">Local Storage</span></td><td>Yes</td><td>up to ~10 MB — persists across sessions.</td></tr>
+              <tr><td><span class="term">IndexedDB</span></td><td>Yes</td><td>up to ~10 GB — a real in-browser database for large structured data.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Where a CDN actually sits</span>
+          <p>A CDN is <strong>neither client-side nor backend-side</strong> — it's a 3rd-party service (much
+          like DNS). It is <strong>client-facing</strong>: only clients (browsers) talk to it; your backend
+          servers do not. CDNs are often called the <em>backbone of the internet</em>, and for good reason —
+          they carry roughly <strong>70% of all internet traffic</strong>.</p>
+        </div>
+
+        <h3>End-to-end: a request falling through the layers</h3>
+        <p>Here's the journey of a single request when each layer in turn <em>misses</em>, all the way
+        down to the origin:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧑</div><div class="s-t">User</div><div class="s-d">Wants a page/asset</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌐</div><div class="s-t">Browser cache</div><div class="s-d">Miss → ask the CDN</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📍</div><div class="s-t">CDN edge</div><div class="s-d">Miss → ask origin server</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">App server</div><div class="s-d">Check backend cache</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">Backend cache</div><div class="s-d">Miss → query database</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">Database</div><div class="s-d">Source of truth</div></div>
+        </div>
+
+        <p>The data then flows <em>back</em> up the chain, and each layer can store a copy on the way so
+        future requests stop earlier. The very next identical request might be answered right at the
+        browser and never touch the network at all.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: loading a news homepage twice</span>
+          <p><strong>First visit (cold):</strong></p>
+          <ul>
+            <li>Browser cache: empty → miss.</li>
+            <li>CDN edge in your city: doesn't have today's hero image yet → miss → fetches from origin, then keeps a copy.</li>
+            <li>App server: needs the "top stories" list → checks its backend cache → miss → runs a heavy database query, then stores the result.</li>
+            <li>You wait maybe 800&nbsp;ms. Slow, but it only happens once.</li>
+          </ul>
+          <p><strong>Second visit (warm), a minute later:</strong></p>
+          <ul>
+            <li>Browser cache: has the logo, CSS, and JS → instant, no network.</li>
+            <li>CDN edge: now has the hero image cached → served from your city in ~5&nbsp;ms.</li>
+            <li>App server: "top stories" is in the backend cache → hit → no database query at all.</li>
+            <li>The page loads in ~100&nbsp;ms and the database did <em>zero</em> work.</li>
+          </ul>
+          <p>Same page, dramatically different experience — because each layer "warmed up" and now answers
+          earlier in the chain.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The further left (closer to the user) a request is answered, the faster and cheaper it is —
+          and the less work every layer behind it has to do. A request only "falls through" to a deeper,
+          slower layer when the nearer one misses. Good systems aim to answer most traffic at the browser
+          and CDN so the precious database is bothered as little as possible.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Where this session focuses</span>
+          <p>Browser and CDN caches are governed largely by HTTP headers (we'll meet those, and more on
+          CDNs, in <strong>Session 4: Caching 2</strong>). The rest of <em>this</em> session zooms into the
+          <strong>backend caches</strong> — the ones <em>you</em> design and run inside your own system.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Requests pass through a hierarchy of caches: <strong>browser</strong> (on the device) →
+          <strong>CDN/edge</strong> (near the user, worldwide) → <strong>backend caches</strong> (in your
+          datacenter) → <strong>database</strong> (source of truth). A request falls deeper only on a miss,
+          and answers flow back up, warming each layer. The goal: answer as far left as possible to save
+          both time and load.
+        </div>
+      </section>
+
+      <!-- ===================== 3. CDNs DEEP DIVE ===================== -->
+      <section id="cdn">
+        <h2><span class="sec-num">3</span> CDNs deep dive: serving the world from the edge</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a famous movie is only available in one cinema in another country. Everyone who wants to
+          watch it has to fly there — exhausting! Instead, the studio sends a copy of the film to a small
+          cinema in <em>every</em> town. Now you just walk to the one near your house. A <strong>CDN</strong>
+          is that worldwide network of nearby "cinemas" for internet content — pictures, videos, code — so you
+          fetch them from a server near your home instead of one across the planet.</p>
+        </div>
+
+        <h3>What does a CDN cache, and what problem does it solve?</h3>
+        <p>A CDN caches <strong>large (&gt; ~10 KB), mostly static</strong> data — content that changes rarely:</p>
+        <ul>
+          <li><strong>Multimedia:</strong> images, audio, videos, PDFs, zip files, …</li>
+          <li><strong>Code:</strong> JS, HTML, CSS.</li>
+          <li>Essentially <em>all</em> user-uploaded content (images, videos, reels, avatars) is served via CDNs.</li>
+        </ul>
+        <p>A CDN solves two problems at once: it <strong>acts as a cache</strong> and it
+        <strong>reduces latency</strong> by serving from a server close to the user.</p>
+
+        <h3>Why "close" matters: the US ⇄ India round trip</h3>
+        <p>Imagine you're watching a Scaler lecture recording. Scaler's servers are in Mumbai (AWS South-East
+        Asia), but you live in the US. How long does just <em>one</em> packet take to make the round trip?</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: round-trip time from physics alone</span>
+          <pre>circumference of earth  ≈ 40,000 km
+speed of light (vacuum) c = 299,792,458 m/s ≈ 3 × 10^8 m/s
+but inside fiber-optic cable, light is slower ≈ 2 × 10^8 m/s
+
+RTT = 40,000 km / (2 × 10^8 m/s)
+    = (4 × 10^4 × 10^3 m) / (2 × 10^8 m/s)
+    = 4 / 20 seconds
+    = 0.2 s = 200 ms</pre>
+          <p>So <strong>at least ~200 ms</strong> just for the US–India–US trip — and in reality, with extra
+          hops and queuing, it's closer to <strong>500–600 ms</strong>. That's a brutal delay before a single
+          byte of video even arrives.</p>
+        </div>
+
+        <p>Two definitions to keep straight:</p>
+        <ul>
+          <li><span class="term">Latency</span> = the delay between sending a request and receiving a response.</li>
+          <li><span class="term">Bandwidth</span> = bytes per second (throughput).</li>
+        </ul>
+        <p>Fetching from far away hurts <em>both</em>: latency is high, and bandwidth is low too. Data crosses
+        many <strong>hops</strong>, and your bandwidth is limited by the <em>slowest</em> server on the route.
+        The <span class="term">intercontinental fiber-optic cables</span> that carry trans-Atlantic and
+        trans-Pacific traffic are a real bottleneck — all cross-continent traffic squeezes through them.</p>
+
+        <p>The fix: what if you fetched that video from a server <strong>near your home</strong> instead?
+        Latency would drop to a few ms and bandwidth would be far higher. A server physically/geographically
+        close to the user is called an <span class="term">edge node</span> (or edge server); "the edge" simply
+        means close to the user.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea behind CDNs</span>
+          <p>If you could buy <strong>1,000,000 servers</strong> and scatter them across the globe to act as
+          caches, you could always serve data from one close to the user. That's exactly what a CDN does: it
+          provides a global infrastructure of edge nodes and <strong>rents them out</strong> to anyone who
+          wants to use it. Examples: <span class="term">Akamai</span>, Fastly,
+          <span class="term">Cloudflare</span>, Cloudfront, Cloudinary, …</p>
+        </div>
+
+        <h3>How do you find the nearest edge server?</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Mechanism</th><th>How it works</th><th>Catch</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">GeoDNS</span></td><td>A special DNS that resolves the closest IP based on the user's geographic location.</td><td>Low penetration — most DNS servers don't support GeoDNS protocols.</td></tr>
+              <tr><td><span class="term">AnyCast</span></td><td>A custom redirect the CDN provides to route you to the nearest server.</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Are CDNs databases?</h3>
+        <div class="callout key">
+          <span class="c-title">No — a CDN is a cache, not a database</span>
+          <p>A CDN doesn't <em>store</em> data permanently; it temporarily holds it to <em>serve</em> it to
+          clients. Any data you put on a CDN must be <strong>backed by a file-storage service like S3</strong>.
+          And your backend servers do <strong>not</strong> read from the CDN — they go straight to the file
+          storage (S3). CDNs are client-facing; only clients access them. (Nothing physically stops a backend
+          from requesting a file from the CDN — it's just pointless.)</p>
+        </div>
+
+        <h3>How does the CDN get the data in the first place?</h3>
+        <p>Walk through an upload, using the handout's cast. <strong>Abdul uploads a video:</strong></p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">⬆️</div><div class="s-t">1. Upload</div><div class="s-d">Abdul → Facebook backend</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗃️</div><div class="s-t">2. Store file</div><div class="s-d">Saved to S3 file storage</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📇</div><div class="s-t">3. Store metadata</div><div class="s-d">In a DB (Mongo / SQL)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔗</div><div class="s-t">4. Register</div><div class="s-d">Backend → Akamai: "URL for this?"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🆔</div><div class="s-t">5. CDN URL</div><div class="s-d">Akamai returns a CDN URL + stores the mapping</div></div>
+        </div>
+        <p>Concretely, the backend asks the CDN: "give me a CDN URL for this database URL
+        <code class="inl">s3.aws.com/1234/video.mp4</code>", and the CDN returns something like
+        <code class="inl">cdn.akamai.com/a3b2fd5.mp4</code>, storing the mapping
+        <code class="inl">CDN URL → database URL</code> internally.</p>
+
+        <p>Now <strong>Upinta wants to watch the video:</strong></p>
+        <ul>
+          <li>She requests the page from Facebook's backend, which returns an HTML+JS+CSS page.</li>
+          <li>The crucial choice is <em>which URL the backend embeds</em> in that page:</li>
+        </ul>
+        <pre>&lt;html&gt;
+  &lt;body&gt;
+    &lt;!-- BAD: the raw database URL — far away, slow, high latency --&gt;
+    &lt;video src="s3.aws.com/1234/video.mp4" /&gt;
+
+    &lt;!-- GOOD: the CDN URL — served from the nearest edge node --&gt;
+    &lt;video src="cdn.akamai.com/a3b2fd5.mp4" /&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</pre>
+        <p>If the embedded URL is the database URL, Upinta (far from the DB servers) gets slow downloads and
+        high latency. So the backend <strong>must embed the CDN URL</strong>. The edge node then:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">Request</div><div class="s-d">Edge gets cdn.akamai.com/…mp4</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">Cached locally?</div><div class="s-d">Check edge storage</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">Yes</div><div class="s-d">Serve the file</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⬇️</div><div class="s-t">No</div><div class="s-d">Look up DB URL, fetch from DB, cache it, serve</div></div>
+        </div>
+        <p>Finally, <strong>Pankaj (Upinta's neighbour) wants the same video.</strong> He hits the same edge
+        node, but this time the file is <strong>already cached</strong> — because Upinta just watched it — so
+        the edge simply serves it. Same edge, instant delivery.</p>
+
+        <h3>When does the CDN actually cache the file?</h3>
+        <div class="callout warn">
+          <span class="c-title">The 2nd-request rule (and 1-hit wonders)</span>
+          <p>The CDN learns about a file when the backend registers it, but it does <strong>not</strong> cache
+          it immediately. The CDN fetches from the DB for both the 1st and 2nd request (how else would it get
+          the file?), but it only <strong>stores it locally on the 2nd request</strong>. Why? CDNs found that
+          <strong>~70% of all URLs are "1-hit wonders"</strong> — accessed once and then never again. Caching
+          those would waste precious edge storage, so the CDN waits for a second hit as proof the file is
+          actually popular.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">War story: gaming the 2nd-request rule at Media.net</span>
+          <p>Media.net is an ad-tech platform — it serves ads, which are static content (images/videos) delivered
+          via CDN, and <em>ads must load instantly</em>. To force the CDN to cache an ad's URL immediately
+          (instead of waiting for real users), the team would fire <strong>two fake requests</strong> at the CDN
+          right after registering the URL — triggering the 2nd-request caching rule. They'd send those fake
+          requests from <strong>multiple countries</strong> so the file got cached at edge nodes everywhere.</p>
+        </div>
+
+        <h3>Can a CDN be a bottleneck?</h3>
+        <div class="callout key">
+          <span class="c-title">No</span>
+          <p>CDNs run <strong>hundreds of millions of servers</strong> distributed across the globe, so they
+          have far more capacity than any single client demand could saturate.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Some staggering CDN stats (as of 2025)</span>
+          <ul>
+            <li>Total CDN bandwidth (all CDNs combined) exceeds <strong>10 Petabits per second</strong> — that's ~10 million GB/s.</li>
+            <li>Total CDN storage exceeds <strong>1 Zettabyte</strong> (Giga &lt; Tera &lt; Peta &lt; Exa &lt; Zetta).</li>
+            <li>Akamai alone handles <strong>&gt; 3 Exabytes per day</strong>.</li>
+            <li><strong>70%</strong> of all internet traffic is handled by CDNs.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>CDN</strong> is a global fleet of <strong>edge nodes</strong> (rented out) that caches
+          large, mostly-static content close to users — cutting both latency (a US⇄India trip is ~200&nbsp;ms
+          of pure physics) and bandwidth pain. You reach the nearest edge via <strong>GeoDNS</strong> or
+          <strong>AnyCast</strong>. A CDN is a <em>cache, not a database</em> — it must be backed by storage
+          like <strong>S3</strong>, and the backend must embed the <strong>CDN URL</strong> (not the DB URL) in
+          its pages. The edge caches a file only on the <strong>2nd request</strong> (because ~70% of URLs are
+          1-hit wonders), and CDNs are too big to ever be a bottleneck.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TYPES OF BACKEND CACHES ===================== -->
+      <section id="types">
+        <h2><span class="sec-num">4</span> Types of backend caches: local vs distributed</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a group of kids doing homework. <strong>Option A:</strong> each kid keeps their own
+          little notebook of answers on their desk — super quick to check, but kids don't share, so they
+          each have to figure things out themselves and might write down different answers. <strong>Option
+          B:</strong> there's one big shared whiteboard in the middle of the room — everyone reads and writes
+          the same answers, so they all agree, but you have to walk over to it each time. Backend caches come
+          in these same two styles: your own private notebook, or one shared whiteboard.</p>
+        </div>
+
+        <p>Inside the datacenter, backend caches come in two fundamental shapes.</p>
+
+        <h3>Local (in-process) cache — the private notebook</h3>
+        <p>A <span class="term">local cache</span> lives <em>inside</em> the application process itself,
+        in that server's own memory (RAM). Because it's <span class="term">in-process</span> — the same
+        program, the same memory — a lookup is just a memory read: blisteringly fast, no network involved.</p>
+        <p>The catch: it's <strong>per-server</strong>. If you run 10 app servers behind a load balancer
+        (recall load balancing from <strong>Session 2</strong>), you have 10 separate caches that don't know
+        about each other. Each holds its own copy, and they can disagree.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: a tiny local cache in code</span>
+          <p>A bare-bones in-process cache is just a dictionary held in memory:</p>
+          <pre><span class="cm"># A simple per-server, in-process cache</span>
+cache = {}  <span class="cm"># lives in THIS server's RAM only</span>
+
+<span class="kw">def</span> get_user(user_id):
+    <span class="kw">if</span> user_id <span class="kw">in</span> cache:        <span class="cm"># cache hit</span>
+        <span class="kw">return</span> cache[user_id]
+    user = db.query(<span class="st">"SELECT * FROM users WHERE id = ?"</span>, user_id)  <span class="cm"># miss → origin</span>
+    cache[user_id] = user        <span class="cm"># store copy for next time</span>
+    <span class="kw">return</span> user</pre>
+          <p>Real local caches (e.g. <span class="term">Caffeine</span> in Java, or an in-memory LRU map)
+          add size limits and expiry, but the shape is exactly this. Notice there's no network call —
+          that's why local hits are measured in <em>nanoseconds</em>.</p>
+        </div>
+
+        <h3>Global / distributed cache — the shared whiteboard</h3>
+        <p>A <span class="term">global cache</span> (also called a <span class="term">distributed cache</span>)
+        is a separate, shared service that <em>all</em> your app servers talk to over the network. The two
+        famous examples are <span class="term">Redis</span> and <span class="term">Memcached</span> — fast
+        in-memory key-value stores that run as their own servers. Every app server reads and writes the same
+        cache, so they all see <strong>one consistent copy</strong>.</p>
+        <p>The cost: every lookup is now a <strong>network round trip</strong> (a fraction of a millisecond
+        inside a datacenter — slower than local RAM, but still vastly faster than a database query or disk
+        read). "Distributed" also hints that the cache itself can be spread across many machines — and the
+        trick for spreading keys evenly across them is <strong>consistent hashing</strong>, which you met in
+        <strong>Session 2</strong>.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">App 1</div><div class="s-d">reads/writes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">App 2</div><div class="s-d">reads/writes</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚡</div><div class="s-t">Shared cache</div><div class="s-d">Redis / Memcached — one copy</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🖥️</div><div class="s-t">App 3</div><div class="s-d">reads/writes</div></div>
+        </div>
+
+        <p>A global cache sits as a <strong>separate layer between the app servers and the DB</strong>, and
+        all app servers can reach it. The classic <span class="term">cache-aside</span> read pattern against a
+        Redis cache looks like this:</p>
+        <pre><span class="kw">def</span> get_user_preferences(request):
+    user_id = request.user_id
+    preferences = redisClient.getKey(<span class="st">'pref:user_id'</span>)
+    <span class="kw">if</span> preferences <span class="kw">is</span> None:                 <span class="cm"># cache miss</span>
+        preferences = sqlClient.getPreferencesForUser(user_id)
+        redisClient.setKey(<span class="st">'pref:user_id'</span>, preferences)
+    <span class="kw">return</span> preferences</pre>
+
+        <p>A <strong>local</strong> cache uses the exact same logic, but the store is just an in-memory
+        dictionary that lives in <em>this</em> server's RAM — no network call:</p>
+        <pre>user_preferences_cache = {}   <span class="cm"># stored in THIS server's RAM</span>
+
+<span class="kw">def</span> get_user_preferences(request):
+    user_id = request.user_id
+    preferences = user_preferences_cache.getKey(<span class="st">'pref:user_id'</span>)
+    <span class="kw">if</span> preferences <span class="kw">is</span> None:                 <span class="cm"># cache miss</span>
+        preferences = sqlClient.getPreferencesForUser(user_id)
+        user_preferences_cache.setKey(<span class="st">'pref:user_id'</span>, preferences)
+    <span class="kw">return</span> preferences</pre>
+
+        <div class="callout warn">
+          <span class="c-title">A local cache can make your app servers stateful</span>
+          <p>App servers are <strong>not allowed</strong> to read each other's local cache — it's local and
+          <em>private</em> to each server. And once app servers store data, they may become
+          <strong>stateful</strong> (depending on how the cache is used) — which means the application load
+          balancer might need <strong>consistent hashing</strong> (Session 2) to keep sending the same user to
+          the same server.</p>
+        </div>
+
+        <h3>Single vs distributed cache</h3>
+        <p>A quick clarification of words you'll see: a <strong>single cache</strong> means one cache node
+        (everything fits on one machine — simplest, but limited by that one box's memory and a single point
+        of failure). A <strong>distributed cache</strong> splits the data across many nodes — you reach for it
+        when one cache server isn't enough, either because you need to <em>store more data</em> or
+        <em>improve read throughput</em>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Single vs distributed only applies to <em>global</em> caches</span>
+          <p>A local cache is <strong>inherently distributed</strong> — each app server is its own cache, and
+          there are many app servers. So the single-vs-distributed question only makes sense for global caches.
+          That leaves exactly <strong>three kinds of cache</strong> in practice:</p>
+          <ul>
+            <li><strong>Local cache</strong> — automatically distributed (one per app server).</li>
+            <li><strong>Global single cache</strong> — e.g. a single Redis server.</li>
+            <li><strong>Global distributed cache</strong> — e.g. a cluster of Redis servers.</li>
+          </ul>
+        </div>
+
+        <details class="quiz">
+          <summary>Interview Q: What routing algorithm should the load balancer of a <em>distributed</em> cache use?</summary>
+          <p class="ans">It depends on <em>why</em> you went distributed:</p>
+          <p class="ans"><strong>Data was too large for one server</strong> → you <span class="term">sharded</span> the
+          data across cache servers, so each server holds <em>different</em> data. Use
+          <strong>consistent hashing</strong> so a given key always maps to the server that holds it.</p>
+          <p class="ans"><strong>Request volume was too high for one server</strong> → you <span class="term">replicated</span>
+          the data across cache servers, so each server holds the <em>same</em> data. Use
+          <strong>round robin</strong> to spread load evenly.</p>
+        </details>
+
+        <h3>Pros and cons, side by side</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Local (in-process)</th><th>Global / distributed</th></tr></thead>
+            <tbody>
+              <tr><td>Speed of a hit</td><td>Fastest — memory read, no network (~ns)</td><td>Fast — one network round trip (~sub-ms)</td></tr>
+              <tr><td>Consistency across servers</td><td>Poor — each server has its own copy; they can disagree</td><td>Good — all servers share one copy</td></tr>
+              <tr><td>Capacity</td><td>Limited to one server's spare RAM</td><td>Large — can scale out across many nodes</td></tr>
+              <tr><td>Survives a restart?</td><td>No — dies with the process (must re-warm)</td><td>Yes — separate service; data outlives app restarts</td></tr>
+              <tr><td>Duplication / memory use</td><td>Wasteful — same data cached N times across N servers</td><td>Efficient — stored once, shared</td></tr>
+              <tr><td>Operational complexity</td><td>Low — nothing extra to run</td><td>Higher — another service to deploy, monitor, scale</td></tr>
+              <tr><td>Best for</td><td>Tiny, hot, read-mostly data that rarely changes (e.g. config, feature flags)</td><td>Shared state that must agree everywhere (e.g. sessions, query results)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: when each one shines (and bites)</span>
+          <p><strong>Local wins:</strong> a list of country codes that changes once a year. Cache it locally
+          on every server — it's tiny, identical everywhere, and a network hop would be silly.</p>
+          <p><strong>Local bites:</strong> a user's shopping cart. If server 3 caches it but the next request
+          is load-balanced to server 7, server 7 has a stale or empty copy. Here you need a <em>global</em>
+          cache so all servers see the same cart.</p>
+          <p>Many real systems use <strong>both</strong>: a small local cache in front of a global one (a
+          "two-tier" cache), getting nanosecond hits for the hottest keys while still sharing a consistent
+          copy for everything else.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — the cache stampede</span>
+          <p>Picture a popular cached item that suddenly expires. In the next instant, <em>thousands</em> of
+          requests all miss at once, and all of them stampede to the database to recompute the same value
+          simultaneously — potentially overwhelming it. This is a <span class="term">cache stampede</span>
+          (also called a thundering herd or dog-piling). It's a real danger with any cache, and we'll cover
+          the standard defences (locks, request coalescing, staggered expiry) in <strong>Session 4</strong>.
+          For now, just know that <em>how</em> and <em>when</em> things leave the cache can itself cause trouble.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Backend caches are either <strong>local</strong> (in-process, per-server, fastest but
+          inconsistent and duplicated) or <strong>global/distributed</strong> (a shared service like
+          <strong>Redis</strong> or <strong>Memcached</strong>, consistent and scalable but a network hop
+          away). A <strong>single</strong> cache is one node; a <strong>distributed</strong> one spreads keys
+          across many. Pick by your needs, often combine both — and beware the <strong>cache stampede</strong>
+          when popular keys expire at once.
+        </div>
+      </section>
+
+      <!-- ===================== 5. THE TWO HARD PROBLEMS ===================== -->
+      <section id="hard">
+        <h2><span class="sec-num">5</span> The two hard problems (an introduction)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Your snack bowl from Topic 1 has two annoying problems. <strong>One:</strong> the bowl is small,
+          so when it's full and you want to add a new snack, you have to throw an old one out — but
+          <em>which</em> one? <strong>Two:</strong> the warehouse sometimes changes its snacks (new flavour!),
+          but your bowl still has the old kind — so how do you know your bowl is out of date? Deciding what
+          to throw out, and knowing when your copy is stale, are the two genuinely tricky parts of caching.</p>
+        </div>
+
+        <p>Caching sounds easy — keep a copy, reuse it. But two questions turn out to be deep, and they
+        haunt every cache ever built. A famous joke captures it: <em>"There are only two hard things in
+        computer science: cache invalidation and naming things."</em> Let's meet both problems so you know
+        exactly what <strong>Session 4</strong> is about to solve.</p>
+
+        <p>Both stem from the same root fact: a cache is <strong>much smaller</strong> than the database.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Challenge</th><th>Why it happens</th><th>Solution</th><th>When it runs</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Limited space</span></td><td>The cache is small, so it can get full. To insert a new entry into a full cache, you must first <em>evict</em> something.</td><td>Cache <strong>eviction</strong></td><td>During <strong>writes</strong></td></tr>
+              <tr><td><span class="term">Stale data</span></td><td>The DB (source of truth) can be updated while the cache still holds the old value — that copy is now <em>stale</em>. You must detect it and <em>invalidate</em> (remove) it.</td><td>Cache <strong>invalidation</strong></td><td>During <strong>reads</strong> (lazily)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout key">
+          <span class="c-title">Eviction and invalidation run <em>together</em>, always</span>
+          <p>Don't think of these as either/or. They solve <strong>different</strong> problems — eviction
+          frees space (on writes), invalidation kills staleness (on reads) — and a real cache runs
+          <strong>both algorithms simultaneously</strong>, each handling its own job. The cache is never the
+          source of truth; the database always is.</p>
+        </div>
+
+        <h3>Hard problem #1 — Eviction: what do we remove when the cache is full?</h3>
+        <p>A cache is small <em>on purpose</em> (fast memory is limited and costs money). So it can't hold
+        everything. When it's full and a new item needs space, the cache must <strong>throw something out</strong>.
+        That decision is called <span class="term">eviction</span>, and the rule it follows is an
+        <span class="term">eviction policy</span>.</p>
+        <p>Why is choosing hard? Because you're <em>guessing the future</em>: you want to evict the item
+        you're <em>least</em> likely to need again — but you can't see the future, so you use clues from the
+        past. Common policies you'll meet next session include:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Policy</th><th>Throws out…</th><th>Bet it's making</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">LRU</span> (Least Recently Used)</td><td>the item untouched for the longest</td><td>"If you haven't wanted it lately, you won't soon."</td></tr>
+              <tr><td><span class="term">LFU</span> (Least Frequently Used)</td><td>the item asked for the fewest times</td><td>"Rarely-wanted items aren't worth keeping."</td></tr>
+              <tr><td><span class="term">FIFO</span> (First In, First Out)</td><td>the oldest-added item</td><td>"Out with whatever arrived earliest."</td></tr>
+              <tr><td><span class="term">TTL</span> (Time To Live)</td><td>anything older than a set age</td><td>"After N seconds, assume it's not worth keeping."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Evict too aggressively and your hit ratio tanks (you keep throwing out things you'll need).
+        Keep too much and you run out of memory. There's no policy that's best for every workload — which
+        is exactly why it's a "hard problem."</p>
+
+        <h3>Hard problem #2 — Invalidation: keeping the copy fresh</h3>
+        <p>The cache holds a <em>copy</em>. The origin can change at any moment. The instant it does, every
+        cached copy is potentially <span class="term">stale</span> — out of date. <span class="term">Cache
+        invalidation</span> is the job of making sure stale copies get refreshed or removed, so users don't
+        see old data.</p>
+        <p>This is the tug-of-war at the centre of caching:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea: the fresh-vs-fast tension</span>
+          <p>A cache exists to be <strong>fast</strong> (serve a copy without checking the origin). But the
+          only way to be perfectly <strong>fresh</strong> is to check the origin every time — which defeats
+          the entire point of the cache. Every caching strategy is just a different compromise between
+          serving stale data (fast but possibly wrong) and checking the source of truth (correct but slow).</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: why staleness bites</span>
+          <p>An online store caches a product's price for speed. At 2:00 the price is cached as $50. At 2:05
+          a manager changes it to $40 in the database (the origin). But the cache still holds $50.</p>
+          <ul>
+            <li>If you <em>don't</em> invalidate: customers keep seeing $50 — a real, money-losing bug, until the copy eventually expires.</li>
+            <li>If you invalidate <em>too eagerly</em> (drop the cache on every tiny change): your hit ratio collapses and the database gets hammered — you've half-killed the cache.</li>
+          </ul>
+          <p>Getting this balance right — knowing <em>when</em> and <em>how</em> to refresh — is the whole
+          art of invalidation.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A useful word: TTL does double duty</span>
+          <p>Notice <span class="term">TTL</span> appeared under eviction <em>and</em> relates to freshness.
+          That's no accident: putting an expiry on a cached item is the simplest invalidation strategy —
+          "trust this copy for 60 seconds, then re-fetch." It's crude (data can be stale for up to 60s) but
+          dead simple, which is why it's everywhere. Smarter strategies — write-through, write-back, explicit
+          eviction on change — are the meat of Session 4.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p><strong>Eviction</strong> is about <em>space</em> (what to drop when full). <strong>Invalidation</strong>
+          is about <em>time/correctness</em> (when a copy goes stale). They're separate problems that both come
+          down to a guess you can't make perfectly — which is why even experienced engineers respect them. You
+          now know precisely what these two problems <em>are</em>; in the next session we'll learn the concrete
+          techniques that tame them.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Caching's two hard problems: <strong>eviction</strong> (a full cache must drop something — via LRU,
+          LFU, FIFO, TTL — while guessing what you won't need) and <strong>invalidation</strong> (a cached copy
+          can go <strong>stale</strong> when the origin changes, forcing a trade-off between fast and fresh).
+          TTL is the simplest tool for both. The detailed solutions are coming in Session 4: Caching 2.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just built the entire foundation of caching. Here's the one-paragraph story that connects
+        all four topics:</p>
+        <div class="bigidea">
+          <p>Memory is <strong>always hierarchical</strong> — from your brain's working/short/long-term tiers
+          to a computer's registers → CPU cache → RAM → disk — because bigger storage is slower and smaller is
+          faster, which is exactly <em>why</em> you need a <strong>cache</strong>: a small, fast copy of
+          expensive data close to whoever needs it, turning slow trips to the <strong>origin</strong> into
+          instant <strong>hits</strong>. The <strong>hit ratio</strong> measures how well it's working. These
+          caches stack into a <strong>hierarchy</strong> — <strong>browser → CDN/edge → backend → database</strong>
+          — answering requests as far left (close to the user) as possible. <strong>CDNs</strong> are the
+          internet's backbone: a global fleet of rented <strong>edge nodes</strong> that serve large, static
+          content from near the user (backed by storage like <strong>S3</strong>, reached via GeoDNS/AnyCast,
+          caching on the 2nd request). Inside the backend, caches are either <strong>local</strong>
+          (in-process, per-server, fastest but inconsistent) or <strong>global/distributed</strong> (shared
+          services like <strong>Redis</strong> or <strong>Memcached</strong>; shard with consistent hashing,
+          replicate with round robin). And no matter where it lives, every cache wrestles with the two hard
+          problems — <strong>eviction</strong> (what to drop when full, on writes) and
+          <strong>invalidation</strong> (keeping copies fresh, on reads) — both running together, the
+          fast-vs-fresh tension we'll learn to manage next session.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>A cache served 8,500 hits out of 10,000 requests. What's the hit ratio, and roughly why does it matter?</summary>
+          <p class="ans">85% (8,500 ÷ 10,000). It matters because only 15% of requests reached the slow
+          origin, so average latency and database load drop dramatically — the higher the hit ratio, the
+          faster and cheaper the system.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is reaching RAM so much better than reaching a database on a spinning disk across the network?</summary>
+          <p class="ans">RAM is roughly five-plus orders of magnitude faster than a disk seek, and a local
+          memory read avoids the network entirely. Caching's whole job is to move hot data up that latency
+          ladder — out of slow disk/far-away network into close, fast memory.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the caching hierarchy, why do we want requests answered "as far left as possible"?</summary>
+          <p class="ans">Left = closer to the user (browser, then CDN edge). A hit there is the fastest and
+          cheapest, and it spares every deeper layer — CDN, backend cache, and especially the database — from
+          doing any work. Requests only fall deeper on a miss.</p>
+        </details>
+        <details class="quiz">
+          <summary>You're caching user shopping carts behind 10 load-balanced servers. Local or global cache, and why?</summary>
+          <p class="ans">Global/distributed (e.g. Redis). A local cache is per-server, so if a user's next
+          request lands on a different server it would see a stale or empty cart. A shared cache gives all
+          servers one consistent copy.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between eviction and invalidation?</summary>
+          <p class="ans">Eviction is about <em>space</em> — choosing what to remove when the cache is full
+          (LRU, LFU, FIFO, TTL). Invalidation is about <em>freshness/correctness</em> — refreshing or removing
+          a copy when the origin changes so users don't see stale data.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is a cache stampede, and when does it strike?</summary>
+          <p class="ans">When a popular cached item expires, many requests miss simultaneously and all rush to
+          the origin to recompute the same value at once, potentially overwhelming it. It strikes right when a
+          hot key leaves the cache; defences come in Session 4.</p>
+        </details>
+        <details class="quiz">
+          <summary>Roughly how long does a packet take to round-trip US ⇄ India, and why?</summary>
+          <p class="ans">~200 ms from pure physics: ~40,000 km of fiber at ~2×10⁸ m/s gives 40,000 km ÷
+          (2×10⁸ m/s) = 0.2 s. In reality, with extra hops and queuing, it's closer to 500–600 ms. This is why
+          serving from a nearby CDN edge node (a few ms) is such a huge win.</p>
+        </details>
+        <details class="quiz">
+          <summary>Is a CDN a database? Where must its data actually live?</summary>
+          <p class="ans">No — a CDN is a cache, not a database. It only temporarily holds data to serve it.
+          The data must be backed by a file-storage service like S3, and backend servers read from S3 directly
+          (not the CDN). CDNs are client-facing.</p>
+        </details>
+        <details class="quiz">
+          <summary>When does a CDN edge node actually store a file in its cache, and why not on the first request?</summary>
+          <p class="ans">On the 2nd request. It fetches from the DB for both the 1st and 2nd requests but only
+          caches on the 2nd, because ~70% of URLs are "1-hit wonders" (accessed once, never again) — caching
+          those would waste limited edge storage.</p>
+        </details>
+        <details class="quiz">
+          <summary>A distributed cache was created because the data didn't fit on one server. Which routing algorithm should its LB use?</summary>
+          <p class="ans">Consistent hashing. The data was sharded, so each cache server holds different data;
+          a given key must always route to the server that actually holds it. (If instead it were replicated to
+          handle high request volume, you'd use round robin.)</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1wCMktm6Yh_XHoN5o0YvDsRLMYPGBIYpAs3B6jn4oYes/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>📝 <a href="https://docs.google.com/document/d/1GyQX3dNrcq5YlBiAxq9MNzS9wPwu_ZmRslAEjvhw8Bo/edit" target="_blank" rel="noopener">HLD101 Assignment — Search Typeahead</a> — the assignment shared for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Intro to Caching</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li><a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener">Latency Numbers Every Programmer Should Know</a> — the latency ladder behind why caching pays off.</li>
+    <li><a href="https://redis.io/docs/latest/develop/" target="_blank" rel="noopener">Redis developer docs</a> — using Redis as a fast in-memory distributed cache.</li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching" target="_blank" rel="noopener">MDN: HTTP caching</a> — how browser and proxy caches work via HTTP headers.</li>
+    <li><a href="https://www.cloudflare.com/learning/cdn/what-is-a-cdn/" target="_blank" rel="noopener">Cloudflare: What is a CDN?</a> — edge caching and serving content close to users.</li>
+  </ul>
+  <h4>CDN docs &amp; deep dives (from the handout)</h4>
+  <ul>
+    <li><a href="https://aws.amazon.com/what-is/cdn/" target="_blank" rel="noopener">AWS: What is a CDN?</a></li>
+    <li><a href="https://www.akamai.com/glossary/what-is-a-cdn" target="_blank" rel="noopener">Akamai: What is a CDN?</a></li>
+    <li><a href="https://www.cloudflare.com/learning/cdn/glossary/anycast-network/" target="_blank" rel="noopener">Cloudflare: AnyCast network</a> — how the nearest edge is reached.</li>
+    <li><a href="https://www.sumologic.com/blog/cdn-aws-cloudfront/" target="_blank" rel="noopener">Quick CDN setup guide (CloudFront)</a>.</li>
+    <li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html" target="_blank" rel="noopener">CloudFront: invalidate files to remove content</a> — CDN cache invalidation.</li>
+  </ul>
+  <h4>How storage &amp; memory work (videos / extras)</h4>
+  <ul>
+    <li>"How do Hard Disk Drives Work?", "How do SSDs Work?", "How does Computer Memory (RAM) Work?" — the storage tiers behind the latency ladder.</li>
+    <li>"Information Storage and the Brain: Learning and Memory", "How We Make Memories (Crash Course Psychology #13)", "Tools to Enhance Working Memory &amp; Attention" — the biological memory hierarchy.</li>
+    <li>"CppCon 2016: Timur Doumler — Want fast C++? Know your hardware!" — optimizing code for efficient CPU-cache usage.</li>
+    <li>"JavaScript Cookies vs Local Storage vs Session Storage" — the browser-side stores compared.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-2.html"><div class="dir">← Previous</div><div class="ttl">Session 2: Load Balancing &amp; Consistent Hashing</div></a>
+        <a class="next" href="session-4.html"><div class="dir">Next →</div><div class="ttl">Session 4: Caching 2</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 3 — Caching — Part 1: Fundamentals · Your cache is warm now 🔥</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

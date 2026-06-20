@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 10 — Query Execution (Part 2): Joins, Sorting &amp; Aggregation</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 10</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 10 · Query Execution — Joins &amp; Sorting</span>
+      <h1>How databases sort, join, and group data that's too big for memory</h1>
+      <p class="lead">
+        In Session 9 we met the building blocks of query execution — operators, scans, and how rows
+        flow through a plan. Now we tackle the hard part: <em>what do you do when the data is bigger
+        than your computer's memory?</em> We assume you've studied <em>none</em> of this before. Each
+        topic starts with a tiny "explain like I'm 5" story, then we build up the real algorithms with
+        pseudocode and cost formulas. Take it slow — by the end you'll understand the engines that make
+        <code class="inl">ORDER BY</code>, <code class="inl">JOIN</code>, and <code class="inl">GROUP BY</code> fast.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#extsort">External merge sort</a></li>
+          <li><a href="#smj">Sort-merge join</a></li>
+          <li><a href="#hashjoin">Hash join (&amp; grace)</a></li>
+          <li><a href="#hashagg">Hash aggregation &amp; grouping</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. EXTERNAL MERGE SORT ===================== -->
+      <section id="extsort">
+        <h2><span class="sec-num">1</span> External merge sort — sorting data bigger than RAM</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a thousand library books dumped on the floor and you need them alphabetised,
+          but your desk only fits ten books at a time. You can't see them all at once. So you grab ten,
+          sort just those, and put that neat little stack on a shelf. You repeat until the floor is empty
+          and the shelf has lots of small sorted stacks. Then you merge: look at the <em>top</em> book of
+          each stack, take whichever comes first alphabetically, and keep going. That two-step trick —
+          <strong>make small sorted piles, then merge them</strong> — is exactly how a database sorts more
+          data than fits in memory.</p>
+        </div>
+
+        <p>Sorting sounds simple, but a database often must sort a table that's <strong>far larger than the
+        memory it's allowed to use</strong>. A laptop algorithm like quicksort assumes the whole array fits
+        in RAM. Databases can't assume that. The solution is <span class="term">external merge sort</span> —
+        "external" meaning it uses external storage (disk) as scratch space.</p>
+
+        <h3>The unit of work: pages and buffers</h3>
+        <p>Recall from earlier sessions that a database reads and writes the disk in fixed-size chunks called
+        <span class="term">pages</span> (also called blocks). The database is given a chunk of memory measured
+        in pages — we'll call the number of memory pages available <code class="inl">B</code> (for "buffers").
+        Let <code class="inl">N</code> be the number of pages in the table we want to sort. The whole game is:
+        sort all <code class="inl">N</code> pages while only ever holding <code class="inl">B</code> of them
+        in memory at once.</p>
+
+        <h3>Phase 1 — Create sorted "runs"</h3>
+        <p>A <span class="term">run</span> is a chunk of data that is internally sorted. In the first pass we
+        read the table <code class="inl">B</code> pages at a time, sort those pages in memory (any in-memory
+        sort works), and write the result back to disk as one sorted run. Each pass over a group of pages
+        produces one run of length <code class="inl">B</code>. After reading the whole table we have produced
+        <code class="inl">⌈N / B⌉</code> sorted runs.</p>
+
+        <h3>Phase 2 — Merge runs together</h3>
+        <p>Now we repeatedly <span class="term">merge</span> runs into bigger runs. With <code class="inl">B</code>
+        memory pages we can merge <code class="inl">B − 1</code> runs at once (each input run needs one page to
+        read from, and we keep one page as the output buffer). This is called a <span class="term">(B−1)-way
+        merge</span>. We look at the smallest unread record across all input pages, copy it to the output,
+        refill pages as they empty, and write out output pages as they fill. Each merge pass reduces the number
+        of runs by a factor of <code class="inl">B − 1</code> until only one sorted run remains: the answer.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">Pass 0</div><div class="s-d">Sort B pages at a time → runs of size B</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Pass 1</div><div class="s-d">(B−1)-way merge → fewer, bigger runs</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">Pass 2…</div><div class="s-d">Keep merging</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">Done</div><div class="s-d">One fully sorted run</div></div>
+        </div>
+
+        <h3>The I/O cost formula</h3>
+        <p>Databases measure sort cost in <strong>page I/Os</strong> (disk reads + writes), because disk is
+        the bottleneck — not CPU. Every pass reads all <code class="inl">N</code> pages and writes all
+        <code class="inl">N</code> pages, so one pass costs <code class="inl">2N</code> I/Os. The number of
+        passes is: 1 pass to make the initial runs, then merge passes that each shrink the run count by a
+        factor of <code class="inl">B − 1</code>.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key formula</span>
+          <p>Number of passes = <code class="inl">1 + ⌈log<sub>B−1</sub>(⌈N / B⌉)⌉</code><br />
+          Total I/O cost = <code class="inl">2N × (number of passes)</code></p>
+        </div>
+
+        <p>The logarithm is what makes this practical: because each merge pass merges <code class="inl">B − 1</code>
+        runs at once and <code class="inl">B</code> is often large (hundreds or thousands of pages), the number
+        of passes is tiny even for huge tables. In many real systems <strong>two or three passes</strong> sort
+        terabytes.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p>Suppose <code class="inl">N = 108</code> pages and <code class="inl">B = 5</code> memory pages.</p>
+          <ul>
+            <li><strong>Pass 0:</strong> sort 5 pages at a time → <code class="inl">⌈108 / 5⌉ = 22</code> sorted runs.</li>
+            <li><strong>Merge passes:</strong> each merges <code class="inl">B − 1 = 4</code> runs at once.
+              <ul>
+                <li>Pass 1: <code class="inl">⌈22 / 4⌉ = 6</code> runs.</li>
+                <li>Pass 2: <code class="inl">⌈6 / 4⌉ = 2</code> runs.</li>
+                <li>Pass 3: <code class="inl">⌈2 / 4⌉ = 1</code> run. Done.</li>
+              </ul>
+            </li>
+          </ul>
+          <p>That's <strong>4 passes total</strong> (1 + 3). Cost = <code class="inl">2 × 108 × 4 = 864</code>
+          page I/Os. Check the formula: <code class="inl">1 + ⌈log<sub>4</sub>(22)⌉ = 1 + ⌈2.23⌉ = 1 + 3 = 4</code>. ✓</p>
+        </div>
+
+        <h3>Pseudocode</h3>
+        <pre><span class="cm">// External merge sort: N pages of input, B memory pages</span>
+<span class="kw">function</span> externalSort(table, B):
+    <span class="cm">// --- Phase 1: build initial sorted runs ---</span>
+    runs = []
+    <span class="kw">while</span> not table.atEnd():
+        chunk = table.read(B)          <span class="cm">// up to B pages</span>
+        inMemorySort(chunk)            <span class="cm">// e.g. quicksort</span>
+        runs.append(writeToDisk(chunk))
+
+    <span class="cm">// --- Phase 2: merge until one run remains ---</span>
+    <span class="kw">while</span> runs.length &gt; 1:
+        nextRuns = []
+        <span class="kw">for</span> group <span class="kw">in</span> chunksOf(runs, B - 1):   <span class="cm">// (B-1)-way merge</span>
+            merged = mergeRuns(group)              <span class="cm">// heap of run heads</span>
+            nextRuns.append(merged)
+        runs = nextRuns
+    <span class="kw">return</span> runs[0]</pre>
+
+        <div class="callout note">
+          <span class="c-title">A common optimisation: replacement selection</span>
+          <p>Smart sorters use a heap during Pass 0 to produce <em>longer</em> initial runs (on average
+          <code class="inl">2B</code> instead of <code class="inl">B</code>), cutting the run count and
+          sometimes a whole merge pass. Many engines also overlap I/O with CPU using <em>double buffering</em>.
+          You don't need the details now — just know the basic two-phase shape is the core.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Why sorting underpins so much</span>
+          <p>Sorting isn't just for <code class="inl">ORDER BY</code>. It also powers
+          <strong>sort-merge joins</strong> (Topic 2), <strong>duplicate elimination</strong>
+          (<code class="inl">DISTINCT</code>), <strong>sorted grouping</strong> (Topic 4), and building
+          ordered indexes. A fast external sort makes a whole family of operators fast — which is why it's
+          one of the first things a query engine gets right.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          External merge sort sorts data bigger than memory in two phases: build sorted <strong>runs</strong>
+          of <code class="inl">B</code> pages, then repeatedly do a <code class="inl">(B−1)</code>-way
+          <strong>merge</strong>. Cost is <code class="inl">2N × (1 + ⌈log<sub>B−1</sub>⌈N/B⌉⌉)</code> page
+          I/Os — only a handful of passes even for enormous tables. It's the foundation for sorting, joins,
+          and grouping.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SORT-MERGE JOIN ===================== -->
+      <section id="smj">
+        <h2><span class="sec-num">2</span> Sort-merge join</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine two teachers each have a class list sorted by student ID, and they want to find students
+          who appear on <em>both</em> lists. Instead of checking every name against every other name (slow!),
+          they each put a finger on the top of their list. If the IDs match — great, write it down. If one ID
+          is smaller, that teacher moves their finger down by one. Because both lists are sorted, they only
+          ever move forward, sweeping down both lists once like a zipper. That zipper sweep over two sorted
+          lists is a <strong>sort-merge join</strong>.</p>
+        </div>
+
+        <p>A <span class="term">join</span> combines rows from two tables that match on a condition, usually
+        equality on a shared key (an <span class="term">equi-join</span>), like
+        <code class="inl">orders.customer_id = customers.id</code>. The <span class="term">sort-merge join</span>
+        works in two stages: <strong>(1) sort</strong> both inputs on the join key, then <strong>(2) merge</strong>
+        them with the zipper sweep.</p>
+
+        <h3>Stage 1 — Sort both sides</h3>
+        <p>We sort both tables on the join key, typically using the external merge sort from Topic 1. If a side
+        is <em>already</em> sorted on that key — say it arrives from an index scan, or is the output of an
+        earlier sort — we skip its sort entirely. That's the single biggest reason to choose this join.</p>
+
+        <h3>Stage 2 — Merge the sorted inputs</h3>
+        <p>We walk both sorted inputs with two cursors. Compare the join keys at the cursors:</p>
+        <ul>
+          <li>If <code class="inl">left.key &lt; right.key</code> → advance the left cursor.</li>
+          <li>If <code class="inl">left.key &gt; right.key</code> → advance the right cursor.</li>
+          <li>If they're <strong>equal</strong> → output the matching pair(s), then advance.</li>
+        </ul>
+
+        <h3>Handling duplicates</h3>
+        <p>The tricky case is <strong>duplicate keys</strong> — when many left rows and many right rows share
+        the same key, every left must pair with every right (a small cross-product for that key group). To do
+        this we mark the start of the matching group on the right and, for each left row with that key, replay
+        the whole right group. After the keys differ, we move on. This is why the inner loop below "rewinds"
+        the right cursor for repeated keys.</p>
+
+        <pre><span class="cm">// Sort-merge join on equality of key k</span>
+sort(L) <span class="kw">by</span> k;  sort(R) <span class="kw">by</span> k
+i = 0;  j = 0
+<span class="kw">while</span> i &lt; L.size <span class="kw">and</span> j &lt; R.size:
+    <span class="kw">if</span> L[i].k &lt; R[j].k:  i += 1
+    <span class="kw">elif</span> L[i].k &gt; R[j].k:  j += 1
+    <span class="kw">else</span>:                              <span class="cm">// keys match</span>
+        jStart = j                     <span class="cm">// remember start of R group</span>
+        <span class="kw">while</span> i &lt; L.size <span class="kw">and</span> L[i].k == R[jStart].k:
+            j = jStart
+            <span class="kw">while</span> j &lt; R.size <span class="kw">and</span> R[j].k == L[i].k:
+                emit(L[i], R[j])       <span class="cm">// every L × every R in group</span>
+                j += 1
+            i += 1</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p>Join <code class="inl">L</code> (left, sorted) with <code class="inl">R</code> (right, sorted) on key <code class="inl">k</code>:</p>
+          <p><code class="inl">L.k = [10, 20, 20, 30]</code> &nbsp;&nbsp; <code class="inl">R.k = [20, 20, 30, 40]</code></p>
+          <ul>
+            <li><code class="inl">10 &lt; 20</code> → advance L. Now L=20.</li>
+            <li><code class="inl">20 == 20</code> → emit the group: the two L-rows with key 20 each pair with the two R-rows with key 20 → <strong>4 result rows</strong>.</li>
+            <li>Move past the 20s. Now L=30, R=30 → match → emit <strong>1 row</strong> (30,30).</li>
+            <li>Now L is exhausted; <code class="inl">R=40</code> has no partner. Stop.</li>
+          </ul>
+          <p>Result: 5 rows total. We swept each list essentially once — no nested re-scanning of unmatched rows.</p>
+        </div>
+
+        <h3>Complexity &amp; cost</h3>
+        <p>If sorting both sides costs <code class="inl">Sort(M)</code> and <code class="inl">Sort(N)</code>
+        page I/Os, and the merge sweep reads each input once for <code class="inl">M + N</code>, the total is:</p>
+        <div class="callout key">
+          <span class="c-title">Cost</span>
+          <p><code class="inl">Sort(L) + Sort(R) + (M + N)</code> page I/Os (in the common case with no
+          enormous duplicate groups). If both inputs are already sorted, the sort terms vanish and you pay
+          just the linear merge sweep <code class="inl">M + N</code> — beautifully cheap.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">When it shines — and when it doesn't</span>
+          <p><strong>Shines when:</strong> inputs are already sorted (e.g. from a clustered index or a prior
+          <code class="inl">ORDER BY</code>), or when the query also needs the output sorted (then the sort
+          isn't "wasted"), or for <strong>range/band joins</strong> like <code class="inl">L.k BETWEEN R.lo AND R.hi</code>
+          where hashing can't help. <strong>Suffers when:</strong> neither side is sorted and the result isn't
+          needed sorted — then you pay two full sorts, and a <strong>hash join</strong> (Topic 3) is usually
+          faster. <strong>Also watch:</strong> many duplicate keys cause big group cross-products that blow up
+          the cost.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Sort-merge join = sort both inputs on the join key, then zipper-merge them with two cursors. Cost is
+          <code class="inl">Sort(L) + Sort(R) + (M + N)</code>, dropping to just <code class="inl">M + N</code>
+          when inputs are pre-sorted. It's the go-to when inputs are already ordered, when output order is
+          needed, or for range joins; duplicate keys need careful group handling.
+        </div>
+      </section>
+
+      <!-- ===================== 3. HASH JOIN ===================== -->
+      <section id="hashjoin">
+        <h2><span class="sec-num">3</span> Hash join (and grace / partitioned hash join)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a small box of name tags and a long line of people, and you want to hand each
+          person their tag. Sorting everyone alphabetically would be slow. Instead you build a quick lookup:
+          a set of labelled cubbies, one per first letter, and drop each tag into its cubby. Now when a person
+          walks up, you instantly jump to the cubby for their first letter and check just those few tags. The
+          cubbies are a <strong>hash table</strong>, and using it to match two groups is a <strong>hash join</strong>.
+          You build the cubbies from the smaller group and "probe" them with the bigger one.</p>
+        </div>
+
+        <p>A <span class="term">hash join</span> is usually the fastest way to do an equi-join when neither
+        input is sorted. It relies on a <span class="term">hash table</span>: a structure that turns a key into
+        a slot via a <span class="term">hash function</span>, so you can find matching rows in roughly constant
+        time instead of scanning.</p>
+
+        <h3>The two phases: Build and Probe</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🏗️</div><div class="s-t">Build</div><div class="s-d">Hash the smaller table into a table in memory</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">Probe</div><div class="s-d">For each row of the bigger table, look up its key</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🤝</div><div class="s-t">Match</div><div class="s-d">Emit pairs that land in the same bucket and truly match</div></div>
+        </div>
+
+        <p><strong>Build phase:</strong> scan the <em>smaller</em> input (the <span class="term">build side</span>)
+        and insert every row into a hash table keyed on the join key. We pick the smaller side so the table is
+        more likely to fit in memory. <strong>Probe phase:</strong> scan the <em>larger</em> input (the
+        <span class="term">probe side</span>); for each row, hash its key, jump to that bucket, and emit a
+        result for every build row in the bucket that actually matches (hashing can put different keys in the
+        same bucket — a <span class="term">collision</span> — so we still compare the real keys).</p>
+
+        <pre><span class="cm">// In-memory hash join: build on smaller S, probe with larger R</span>
+<span class="kw">function</span> hashJoin(S, R, key):
+    H = {}                              <span class="cm">// hash table: bucket -&gt; list of rows</span>
+    <span class="cm">// --- Build phase (smaller input) ---</span>
+    <span class="kw">for</span> s <span class="kw">in</span> S:
+        H[ hash(s.key) ].append(s)
+    <span class="cm">// --- Probe phase (larger input) ---</span>
+    <span class="kw">for</span> r <span class="kw">in</span> R:
+        <span class="kw">for</span> s <span class="kw">in</span> H[ hash(r.key) ]:
+            <span class="kw">if</span> s.key == r.key:        <span class="cm">// guard against collisions</span>
+                emit(s, r)</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p>Join small table <code class="inl">S</code> (customers) with big table <code class="inl">R</code>
+          (orders) on <code class="inl">customer_id</code>.</p>
+          <ul>
+            <li><strong>Build:</strong> insert customers → buckets: <code class="inl">H[ hash(1) ] = [Alice]</code>,
+              <code class="inl">H[ hash(2) ] = [Bob]</code>, <code class="inl">H[ hash(3) ] = [Cara]</code>.</li>
+            <li><strong>Probe</strong> orders one by one:
+              <ul>
+                <li>Order(cust=2) → bucket for 2 → matches Bob → emit (Bob, order).</li>
+                <li>Order(cust=2) → matches Bob again → emit.</li>
+                <li>Order(cust=3) → matches Cara → emit.</li>
+                <li>Order(cust=9) → bucket empty → no match (Customer 9 doesn't exist).</li>
+              </ul>
+            </li>
+          </ul>
+          <p>Each order touched only its own bucket — no scan of the whole customer table per order.</p>
+        </div>
+
+        <h3>Complexity</h3>
+        <div class="callout key">
+          <span class="c-title">Cost (when the build side fits in memory)</span>
+          <p>I/O: <code class="inl">M + N</code> page I/Os — read each input once. CPU: <code class="inl">O(M + N)</code>
+          expected, since hash lookups are roughly constant-time. This is why hash join usually beats sort-merge
+          join when nothing is pre-sorted: no <code class="inl">N log N</code> sort.</p>
+        </div>
+
+        <h3>When the hash table doesn't fit: grace / partitioned hash join</h3>
+        <p>The simple version assumes the build side fits in memory. What if it doesn't? The answer is the
+        <span class="term">grace hash join</span> (also called <span class="term">partitioned hash join</span>),
+        and it leans on the same idea as external sort: use the disk and the hash function to break a big
+        problem into small ones.</p>
+
+        <p><strong>Partition phase:</strong> apply a hash function on the join key to split <em>both</em> inputs
+        into the same set of <code class="inl">k</code> partitions written to disk. Because the same hash sends
+        a given key to the same partition number in both tables, a row in partition <code class="inl">i</code>
+        of <code class="inl">S</code> can only ever match rows in partition <code class="inl">i</code> of
+        <code class="inl">R</code>. <strong>Join phase:</strong> for each partition pair, run the ordinary
+        in-memory hash join (build on the smaller partition, probe with the other). We sized partitions so each
+        build partition fits in memory.</p>
+
+        <pre><span class="cm">// Grace (partitioned) hash join</span>
+<span class="cm">// --- Partition phase: split both inputs by hash(key) ---</span>
+<span class="kw">for</span> s <span class="kw">in</span> S:  writeToPartition(Sp[ hashA(s.key) ], s)   <span class="cm">// k partitions on disk</span>
+<span class="kw">for</span> r <span class="kw">in</span> R:  writeToPartition(Rp[ hashA(r.key) ], r)
+<span class="cm">// --- Join phase: matching partitions only ---</span>
+<span class="kw">for</span> i <span class="kw">in</span> 0 .. k-1:
+    H = {}
+    <span class="kw">for</span> s <span class="kw">in</span> Sp[i]:  H[ hashB(s.key) ].append(s)  <span class="cm">// 2nd hash fn</span>
+    <span class="kw">for</span> r <span class="kw">in</span> Rp[i]:
+        <span class="kw">for</span> s <span class="kw">in</span> H[ hashB(r.key) ]:
+            <span class="kw">if</span> s.key == r.key:  emit(s, r)</pre>
+
+        <div class="callout note">
+          <span class="c-title">Why two different hash functions?</span>
+          <p>The partition phase uses one hash function (<code class="inl">hashA</code>) to split into disk
+          partitions; the in-memory join phase uses a <em>different</em> one (<code class="inl">hashB</code>) for
+          the actual bucket lookups. Reusing the same function would put every key in one bucket inside a
+          partition (since they all hashed to that partition), defeating the lookup. Also note: if one partition
+          is still too big to fit (e.g. one super-popular key — <span class="term">skew</span>), engines
+          recursively partition it again.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Grace hash join cost</span>
+          <p>Partitioning reads and writes both inputs once (<code class="inl">2(M + N)</code>), and the join
+          phase reads them once more (<code class="inl">M + N</code>): total <code class="inl">3(M + N)</code>
+          page I/Os. Still linear — no sort — which is why it stays competitive even when the data spills to disk.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Hash join builds a hash table on the smaller input, then probes it with the larger — about
+          <code class="inl">M + N</code> I/Os and no sorting, so it usually wins for unsorted equi-joins. When
+          the build side won't fit in memory, the <strong>grace / partitioned</strong> variant hashes both
+          inputs into matching disk partitions and joins them one pair at a time, costing about
+          <code class="inl">3(M + N)</code>. Hash join only does equality joins, not ranges.
+        </div>
+      </section>
+
+      <!-- ===================== 4. HASH AGGREGATION ===================== -->
+      <section id="hashagg">
+        <h2><span class="sec-num">4</span> Hash aggregation &amp; grouping</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine sorting a big bag of mixed coins by counting how much each <em>type</em> is worth. One way:
+          line every coin up by type first, then walk down counting each run (that's the "sort" way). Another
+          way: set out labelled jars — pennies, nickels, dimes — and just drop each coin into its jar as you go,
+          adding to a running total written on the jar. No lining up needed. The jars are a <strong>hash table</strong>,
+          and dropping each row into its group's jar and updating a running total is <strong>hash aggregation</strong>.</p>
+        </div>
+
+        <p>An <span class="term">aggregation</span> collapses many rows into summary numbers:
+        <code class="inl">COUNT</code>, <code class="inl">SUM</code>, <code class="inl">AVG</code>,
+        <code class="inl">MIN</code>, <code class="inl">MAX</code>. With <code class="inl">GROUP BY</code> you
+        get one summary row <em>per group</em> (e.g. total sales per region). There are two main strategies to
+        compute <code class="inl">GROUP BY</code>: <strong>sorting</strong> and <strong>hashing</strong>.</p>
+
+        <h3>Strategy A — Grouping by sorting</h3>
+        <p>Sort the rows on the grouping key (Topic 1). Now all rows of a group sit next to each other, so a
+        single linear pass can detect each group boundary and emit its aggregate. Cost is dominated by the sort:
+        <code class="inl">Sort(N) + N</code>. It's the natural choice if the data is already sorted or if you
+        also need the output sorted.</p>
+
+        <h3>Strategy B — Grouping by hashing</h3>
+        <p>Scan the rows once. For each row, hash its grouping key to find that group's slot in a hash table,
+        and <strong>update a running aggregate</strong> stored there. No sorting required — and no need to keep
+        the individual rows, only one small accumulator per distinct group. This is <span class="term">hash
+        aggregation</span>, and it's usually the winner when the number of <em>distinct groups</em> is small
+        enough that all the accumulators fit in memory.</p>
+
+        <h3>Computing the aggregates incrementally</h3>
+        <p>The clever part: most aggregates can be maintained with a tiny running state, updated one row at a time.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aggregate</th><th>Running state per group</th><th>Update on each new row v</th><th>Final answer</th></tr></thead>
+            <tbody>
+              <tr><td>COUNT</td><td><code class="inl">count</code></td><td><code class="inl">count += 1</code></td><td><code class="inl">count</code></td></tr>
+              <tr><td>SUM</td><td><code class="inl">sum</code></td><td><code class="inl">sum += v</code></td><td><code class="inl">sum</code></td></tr>
+              <tr><td>MIN / MAX</td><td><code class="inl">best</code></td><td><code class="inl">best = min/max(best, v)</code></td><td><code class="inl">best</code></td></tr>
+              <tr><td>AVG</td><td><code class="inl">(sum, count)</code></td><td><code class="inl">sum += v; count += 1</code></td><td><code class="inl">sum / count</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Note that <code class="inl">AVG</code> can't be kept as a single number — you must track both the
+        running <code class="inl">sum</code> and the <code class="inl">count</code>, and divide only at the end.</p>
+
+        <pre><span class="cm">// Hash aggregation: SELECT region, SUM(amount), COUNT(*)</span>
+<span class="cm">//                   FROM sales GROUP BY region</span>
+H = {}                                  <span class="cm">// group key -&gt; running state</span>
+<span class="kw">for</span> row <span class="kw">in</span> sales:
+    g = row.region
+    <span class="kw">if</span> g <span class="kw">not in</span> H:
+        H[g] = { sum: 0, count: 0 }
+    H[g].sum   += row.amount
+    H[g].count += 1
+<span class="kw">for</span> g <span class="kw">in</span> H:                            <span class="cm">// one output row per group</span>
+    emit(g, H[g].sum, H[g].count)</pre>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p>Rows: <code class="inl">(East, 10), (West, 5), (East, 7), (West, 3), (East, 4)</code> with query
+          <code class="inl">SELECT region, SUM(amount), AVG(amount) GROUP BY region</code>.</p>
+          <ul>
+            <li>(East,10) → East: sum=10, count=1</li>
+            <li>(West,5) → West: sum=5, count=1</li>
+            <li>(East,7) → East: sum=17, count=2</li>
+            <li>(West,3) → West: sum=8, count=2</li>
+            <li>(East,4) → East: sum=21, count=3</li>
+          </ul>
+          <p>Final: <strong>East</strong> SUM=21, AVG=21/3=7.0; &nbsp; <strong>West</strong> SUM=8, AVG=8/2=4.0.
+          One pass, two small accumulators — no sort at all.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">When the groups don't fit: partitioned aggregation</span>
+          <p>If there are too many distinct groups to hold all accumulators in memory, engines use the same
+          trick as grace hash join: hash-partition the rows to disk by group key, then aggregate each partition
+          separately. Same family of idea — divide a too-big problem into memory-sized pieces.</p>
+        </div>
+
+        <h3>Comparison: choosing a join / aggregation strategy</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>Needs sorting?</th><th>Typical I/O cost</th><th>Output sorted?</th><th>Best when…</th></tr></thead>
+            <tbody>
+              <tr><td>Sort-merge join</td><td>Yes (both sides)</td><td><code class="inl">Sort(L)+Sort(R)+M+N</code></td><td>Yes (on join key)</td><td>Inputs pre-sorted, output must be sorted, or range joins</td></tr>
+              <tr><td>Hash join (in-memory)</td><td>No</td><td><code class="inl">M + N</code></td><td>No</td><td>Unsorted equi-join, one side fits in memory</td></tr>
+              <tr><td>Grace hash join</td><td>No</td><td><code class="inl">3(M + N)</code></td><td>No</td><td>Unsorted equi-join, build side too big for memory</td></tr>
+              <tr><td>Sort-based grouping</td><td>Yes</td><td><code class="inl">Sort(N) + N</code></td><td>Yes (by group key)</td><td>Data already sorted, or sorted output needed</td></tr>
+              <tr><td>Hash aggregation</td><td>No</td><td><code class="inl">N</code> (groups fit) / partitioned if not</td><td>No</td><td>Few distinct groups; fastest for plain GROUP BY</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The recurring trade-off</span>
+          <p>See the pattern? <strong>Hashing is usually faster but produces no order and needs the working set
+          to fit (or partition).</strong> <strong>Sorting is more expensive but gives you order for free</strong>
+          and degrades gracefully on huge data. The query optimiser (next session) weighs these — using
+          statistics about table sizes, how many distinct values exist, and whether the output order is needed —
+          to pick the cheapest plan.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">GROUP BY</code> can be done by <strong>sorting</strong> (group rows adjacently, then
+          one pass) or by <strong>hashing</strong> (drop each row into its group's slot and update a running
+          aggregate). COUNT/SUM/MIN/MAX need one accumulator; AVG needs both sum and count. Hashing is usually
+          faster and unordered; sorting costs more but yields ordered output and scales to disk via partitioning.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned the heavy machinery behind <code class="inl">ORDER BY</code>,
+        <code class="inl">JOIN</code>, and <code class="inl">GROUP BY</code> on data that's too big for memory.
+        Here's the one-paragraph story connecting all four topics:</p>
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The whole field of physical query execution turns on one question: <strong>how do you process more
+          data than fits in memory using as few disk I/Os as possible?</strong> Two grand strategies answer it.
+          <strong>Sorting</strong> — via <em>external merge sort</em> (runs + multi-way merge) — gives you
+          ordered data, which directly enables the <em>sort-merge join</em> (the zipper sweep over two sorted
+          inputs) and <em>sort-based grouping</em>. <strong>Hashing</strong> — building a lookup table — gives
+          you the faster <em>hash join</em> and <em>hash aggregation</em>, falling back to <em>grace/partitioned</em>
+          variants that spill matching pieces to disk when memory runs out. Hashing is fast but unordered;
+          sorting is pricier but gives order for free. In the next session, the <strong>query optimiser</strong>
+          uses cost formulas exactly like the ones here to choose between them automatically.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why does external merge sort use disk at all — why not just quicksort?</summary>
+          <p class="ans">Because the table is bigger than the memory the database is allowed to use. Quicksort
+          assumes the whole array fits in RAM; external merge sort holds only <code class="inl">B</code> pages at
+          a time, making sorted runs and merging them so it never needs the whole table in memory at once.</p>
+        </details>
+        <details class="quiz">
+          <summary>You sort 100 pages with 6 memory pages. How many passes, and what's the I/O cost?</summary>
+          <p class="ans">Pass 0 makes <code class="inl">⌈100/6⌉ = 17</code> runs. Each merge is
+          <code class="inl">(B−1)=5</code>-way: 17→<code class="inl">⌈17/5⌉=4</code>→<code class="inl">⌈4/5⌉=1</code>.
+          That's 1 + 2 = <strong>3 passes</strong>, cost <code class="inl">2 × 100 × 3 = 600</code> I/Os.</p>
+        </details>
+        <details class="quiz">
+          <summary>Both inputs already arrive sorted on the join key. Sort-merge or hash join?</summary>
+          <p class="ans">Sort-merge join — the expensive sort stage is already done, so you pay only the linear
+          merge sweep <code class="inl">M + N</code>, which beats hashing here. It also keeps the output sorted.</p>
+        </details>
+        <details class="quiz">
+          <summary>In a hash join, which side do you build the hash table on, and why?</summary>
+          <p class="ans">The smaller input. A smaller hash table is more likely to fit entirely in memory, letting
+          you do the join in a single in-memory pass while probing with the larger side.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why must AVG track two numbers instead of one?</summary>
+          <p class="ans">AVG = sum ÷ count, and you can't average a stream by keeping just a running average
+          (you'd lose how many rows it represents). You keep a running <code class="inl">sum</code> and
+          <code class="inl">count</code>, then divide once at the very end.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the shared trick behind grace hash join and partitioned aggregation?</summary>
+          <p class="ans">Hash-partition the data to disk so that matching keys (or groups) always land in the
+          same partition, then process one memory-sized partition at a time. It turns a too-big problem into
+          many small in-memory ones — the same divide-and-conquer spirit as external merge sort.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>📘 Class handout: <strong>"DBMS Session 10 — Query Execution 2"</strong> — covers external sort, sort-merge join, hash join, and aggregation strategies.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 Database Systems</a> — the gold-standard course; see the lectures on sorting/aggregation and on join algorithms for slides and recordings of exactly these topics.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Database System Concepts (Silberschatz, Korth, Sudarshan)</a> — the query-processing chapter walks through external sort-merge, sort-merge join, and hash join with the same cost formulas used here.</li>
+          <li><a href="https://dl.acm.org/doi/10.1145/152610.152611" target="_blank" rel="noopener">Goetz Graefe, "Query Evaluation Techniques for Large Databases" (ACM Computing Surveys, 1993)</a> — the classic, deeply readable survey of sorting, joins, and hashing in real query engines.</li>
+          <li><a href="https://www.postgresql.org/docs/current/planner-optimizer.html" target="_blank" rel="noopener">PostgreSQL Documentation — Planner/Optimizer</a> — see how a production system actually chooses between merge join, hash join, and sort vs. hash aggregation.</li>
+          <li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Use The Index, Luke!</a> — a friendly, example-driven guide to how indexes and sorted data make joins and ordering fast.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-9.html"><div class="dir">← Previous</div><div class="ttl">Session 9: Query Execution</div></a>
+        <a class="next" href="session-11.html"><div class="dir">Next →</div><div class="ttl">Session 11: Query Optimization</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 10 — Query Execution (Part 2): Joins, Sorting &amp; Aggregation · Sorting, hashing, and the engines behind JOIN &amp; GROUP BY 🔧</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

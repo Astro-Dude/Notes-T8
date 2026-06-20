@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 19 — Project Week — A Mini-Transformer from Scratch</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 19</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 19 · Project — Mini-Transformer</span>
+      <h1>Let's build a tiny GPT, from scratch, that writes text</h1>
+      <p class="lead">
+        This is a <em>project</em> session — no new theory dumped on you, just rolling up our sleeves and
+        <strong>building a real, runnable mini-Transformer in PyTorch</strong>. We assemble everything from the
+        components you met back in Session 15 (attention, embeddings, residuals, LayerNorm), train it on a
+        small text file, and watch it generate brand-new text one character at a time. Every block is shown as
+        complete code you can copy and run. Take it slow — by the end you'll have a working baby-GPT and you'll
+        actually understand each line.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#goal">Goal &amp; the build plan</a></li>
+          <li><a href="#blocks">Building the blocks</a></li>
+          <li><a href="#assemble">Assembling &amp; training</a></li>
+          <li><a href="#generate">Generating &amp; understanding</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. GOAL ===================== -->
+      <section id="goal">
+        <h2><span class="sec-num">1</span> Goal &amp; the build plan</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you want to teach a parrot to finish your sentences. You read it a big storybook over and
+          over. Eventually, when you say "Once upon a…", the parrot squawks "time!" — not because it understands
+          the story, but because it has heard which sounds usually follow which. Today we're going to
+          <strong>build that parrot ourselves</strong>, out of small Lego-like pieces, and teach it on a little
+          book. Then we'll ask it to keep talking and watch what it makes up.</p>
+        </div>
+
+        <p>Our goal for this project is concrete: build a <span class="term">decoder-only Transformer</span> — a
+        <span class="term">GPT</span>-style model (the same family that powers ChatGPT) — small enough to train on
+        a laptop, and have it <strong>generate text</strong>. "Decoder-only" just means it does one job: read the
+        text so far and predict what comes next. It only ever looks <em>backwards</em>, never forwards (we'll
+        enforce that with <span class="term">causal masking</span> in Topic 3).</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>A GPT is just <strong>"predict the next token, given all previous tokens," wrapped in a neural network
+          that we train by example.</strong> Everything we build today — embeddings, attention, the feed-forward
+          layers — exists only to make that one prediction better. Stack the same block a few times, feed it lots
+          of text, and language-like behaviour falls out.</p>
+        </div>
+
+        <h3>What "from scratch" means here</h3>
+        <p>We will use PyTorch's <em>tensors</em> and <em>autograd</em> (the automatic differentiation engine from
+        Session 15) and basic layers like <code class="inl">nn.Linear</code> and <code class="inl">nn.Embedding</code>,
+        but we will <strong>not</strong> call any pre-built attention block. We write the attention math ourselves so
+        you can see exactly what happens. This mirrors Andrej Karpathy's famous "Let's build GPT" walkthrough (see
+        References), simplified for one sitting.</p>
+
+        <h3>Tokens: characters, not words</h3>
+        <p>Real LLMs split text into sub-word <span class="term">tokens</span> (recall the tokenisation idea — it
+        shows up across modern NLP). To keep our project tiny and self-contained, we use the simplest possible
+        tokeniser: <strong>each character is one token</strong>. So our vocabulary is just the set of unique
+        characters in our training file (maybe ~65 of them). This is enough to learn real structure — words,
+        spacing, even punctuation rhythm — without any external library.</p>
+
+        <h3>The components we'll build</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔤</div><div class="s-t">Embeddings</div><div class="s-d">token + position → vectors</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👀</div><div class="s-t">Self-attention</div><div class="s-d">tokens look at past tokens</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">Multi-head + MLP</div><div class="s-d">mix &amp; think</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧱</div><div class="s-t">Stack N blocks</div><div class="s-d">residual + LayerNorm</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">Predict + sample</div><div class="s-d">next-char loop</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">The full project at a glance (the file we'll fill in)</span>
+          <p>By the end we'll have a single Python file with this shape. The pieces in <code class="inl">...</code>
+          are what the next sections build:</p>
+<pre><span class="cm"># minigpt.py — a tiny decoder-only Transformer in PyTorch</span>
+<span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">from</span> torch.nn <span class="kw">import</span> functional <span class="kw">as</span> F
+
+<span class="cm"># 1. config + data + tokeniser    (Topic 1 &amp; 3)</span>
+<span class="cm"># 2. Head, MultiHeadAttention, FeedForward, Block   (Topic 2)</span>
+<span class="cm"># 3. MiniGPT model with embeddings + stacked blocks (Topic 2 &amp; 3)</span>
+<span class="cm"># 4. training loop                 (Topic 3)</span>
+<span class="cm"># 5. generate() autoregressive loop (Topic 4)</span></pre>
+          <p>Don't worry about understanding it yet — this is just the roadmap.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">What you need installed</span>
+          <p>Just PyTorch: <code class="inl">pip install torch</code>. A GPU makes it faster but is optional — our
+          model is small enough to train on CPU in a few minutes. We'll auto-detect the device in code.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We're building a small decoder-only (GPT-style) Transformer that predicts the next character, trains on a
+          little text file, and then generates new text. We'll write the attention ourselves on top of PyTorch
+          tensors. The pieces to build: token + positional embeddings, self-attention, multi-head attention, an MLP,
+          residual connections and LayerNorm — then stack and train.
+        </div>
+      </section>
+
+      <!-- ===================== 2. BLOCKS ===================== -->
+      <section id="blocks">
+        <h2><span class="sec-num">2</span> Building the blocks</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a group project where everyone reads the same paragraph. First, each kid turns their word into
+          a sticky note (an <strong>embedding</strong>) and writes which seat they're in (the <strong>position</strong>).
+          Then each kid asks the others "how much should I listen to you?" and blends in what the most relevant
+          friends said (that's <strong>attention</strong>). They do this a few times in parallel with different
+          questions (<strong>multi-head</strong>), then each kid thinks quietly for a moment (the
+          <strong>MLP</strong>). We're now building each of those little machines.</p>
+        </div>
+
+        <p>Every block here is a small PyTorch <code class="inl">nn.Module</code>. We'll define a tiny config first so
+        the dimensions line up, then build each piece bottom-up.</p>
+
+        <h3>Setup &amp; hyperparameters</h3>
+<pre><span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">from</span> torch.nn <span class="kw">import</span> functional <span class="kw">as</span> F
+
+torch.manual_seed(<span class="nm">1337</span>)          <span class="cm"># reproducible runs</span>
+
+<span class="cm"># --- hyperparameters (small on purpose) ---</span>
+block_size = <span class="nm">128</span>      <span class="cm"># context length: how many chars the model sees at once</span>
+n_embd     = <span class="nm">128</span>      <span class="cm"># size of each token's vector (the "width" of the model)</span>
+n_head     = <span class="nm">4</span>        <span class="cm"># number of attention heads (128 / 4 = 32 dims per head)</span>
+n_layer    = <span class="nm">4</span>        <span class="cm"># how many Transformer blocks we stack</span>
+dropout    = <span class="nm">0.1</span>      <span class="cm"># regularisation: randomly zero 10% of activations while training</span>
+device     = <span class="st">'cuda'</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="st">'cpu'</span></pre>
+
+        <h3>Part A — Token &amp; positional embeddings</h3>
+        <p>An <span class="term">embedding</span> turns a token's integer ID into a learnable vector of
+        <code class="inl">n_embd</code> numbers that captures meaning. But a Transformer reads all positions in
+        parallel, so on its own it has <strong>no sense of order</strong> ("dog bites man" would look identical to
+        "man bites dog"). We fix that with a <span class="term">positional embedding</span>: a second lookup table,
+        one learnable vector per position <code class="inl">0..block_size-1</code>. We <strong>add</strong> the two
+        together so each token vector carries both "what I am" and "where I am."</p>
+
+<pre><span class="cm"># inside the model's __init__ (full model assembled in Topic 3):</span>
+self.token_embedding    = nn.Embedding(vocab_size, n_embd)   <span class="cm"># what  (one row per char)</span>
+self.position_embedding = nn.Embedding(block_size, n_embd)   <span class="cm"># where (one row per slot)</span>
+
+<span class="cm"># inside forward(), idx is a (B, T) batch of token IDs:</span>
+B, T = idx.shape
+tok = self.token_embedding(idx)                              <span class="cm"># (B, T, n_embd)</span>
+pos = self.position_embedding(torch.arange(T, device=idx.device))  <span class="cm"># (T, n_embd)</span>
+x   = tok + pos                                              <span class="cm"># broadcast-add → (B, T, n_embd)</span></pre>
+
+        <div class="callout note">
+          <span class="c-title">Shapes you'll see everywhere: (B, T, C)</span>
+          <p><strong>B</strong> = batch (how many sequences we process at once), <strong>T</strong> = time (how many
+          tokens / the sequence length), <strong>C</strong> = channels (the vector size, our
+          <code class="inl">n_embd</code>). Keeping these letters straight is 90% of reading Transformer code.</p>
+        </div>
+
+        <h3>Part B — Scaled dot-product self-attention (one head)</h3>
+        <p>This is the heart of the Transformer. For every token we build three vectors (recall the
+        library analogy): a <span class="term">query</span> ("what am I looking for?"), a <span class="term">key</span>
+        ("what do I contain?"), and a <span class="term">value</span> ("what I'll hand over"). We compare each
+        token's query against every token's key to get <strong>attention scores</strong>, scale them, mask out the
+        future, softmax them into weights, and use those weights to average the values.</p>
+
+        <p>The "scaled dot-product" formula is just:</p>
+<pre>attention(Q, K, V) = softmax( (Q · Kᵀ) / √d_k ) · V</pre>
+        <p>The <code class="inl">√d_k</code> (square root of the head size) keeps the scores from getting huge, which
+        would make softmax too "peaky" and kill the gradients. Here's one head as code:</p>
+
+<pre><span class="kw">class</span> Head(nn.Module):
+    <span class="st">"""One head of causal self-attention."""</span>
+    <span class="kw">def</span> __init__(self, head_size):
+        <span class="kw">super</span>().__init__()
+        self.key   = nn.Linear(n_embd, head_size, bias=<span class="kw">False</span>)
+        self.query = nn.Linear(n_embd, head_size, bias=<span class="kw">False</span>)
+        self.value = nn.Linear(n_embd, head_size, bias=<span class="kw">False</span>)
+        <span class="cm"># lower-triangular matrix of 1s; 'buffer' = saved but not a learned parameter</span>
+        self.register_buffer(<span class="st">'tril'</span>, torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    <span class="kw">def</span> forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)      <span class="cm"># (B, T, head_size)</span>
+        q = self.query(x)    <span class="cm"># (B, T, head_size)</span>
+        <span class="cm"># compute attention scores ("affinities")</span>
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-<span class="nm">0.5</span>   <span class="cm"># (B, T, T), scaled by 1/√d_k</span>
+        <span class="cm"># causal mask: a token may NOT attend to future tokens (Topic 3)</span>
+        wei = wei.masked_fill(self.tril[:T, :T] == <span class="nm">0</span>, <span class="kw">float</span>(<span class="st">'-inf'</span>))
+        wei = F.softmax(wei, dim=-<span class="nm">1</span>)                       <span class="cm"># (B, T, T), rows sum to 1</span>
+        wei = self.dropout(wei)
+        v = self.value(x)                                  <span class="cm"># (B, T, head_size)</span>
+        out = wei @ v                                      <span class="cm"># (B, T, head_size)</span>
+        <span class="kw">return</span> out</pre>
+
+        <div class="callout example">
+          <span class="c-title">Walking through one tiny attention step</span>
+          <p>Say T = 3 tokens. The scores <code class="inl">wei</code> is a 3×3 grid: row <em>i</em>, column <em>j</em>
+          = "how much should token <em>i</em> listen to token <em>j</em>." After the causal mask + softmax, row 2
+          (the third token) might be <code class="inl">[0.2, 0.3, 0.5]</code> — it splits its attention over itself
+          and the two before it. Row 0 (the first token) can only attend to itself, so it's
+          <code class="inl">[1.0, 0, 0]</code>. Then <code class="inl">wei @ v</code> blends the value vectors using
+          exactly those weights. That blend is the token's new, context-aware representation.</p>
+        </div>
+
+        <h3>Part C — Multi-head attention</h3>
+        <p>One head learns one kind of relationship. <span class="term">Multi-head attention</span> runs several heads
+        in parallel — each with its own Q/K/V — so one head can track, say, subject–verb links while another tracks
+        nearby punctuation. We concatenate their outputs and pass them through a final linear "projection" to mix the
+        heads back together.</p>
+
+<pre><span class="kw">class</span> MultiHeadAttention(nn.Module):
+    <span class="st">"""Several self-attention heads running in parallel."""</span>
+    <span class="kw">def</span> __init__(self, n_head, head_size):
+        <span class="kw">super</span>().__init__()
+        self.heads = nn.ModuleList([Head(head_size) <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(n_head)])
+        self.proj  = nn.Linear(head_size * n_head, n_embd)   <span class="cm"># recombine the heads</span>
+        self.dropout = nn.Dropout(dropout)
+
+    <span class="kw">def</span> forward(self, x):
+        out = torch.cat([h(x) <span class="kw">for</span> h <span class="kw">in</span> self.heads], dim=-<span class="nm">1</span>)  <span class="cm"># (B, T, head_size*n_head)</span>
+        out = self.dropout(self.proj(out))                  <span class="cm"># (B, T, n_embd)</span>
+        <span class="kw">return</span> out</pre>
+
+        <h3>Part D — The MLP / feed-forward</h3>
+        <p>Attention lets tokens <em>communicate</em>. The <span class="term">feed-forward network</span> (an MLP) lets
+        each token <em>think on its own</em> about what it just gathered. It's a simple two-layer network applied to
+        every position independently. By convention the hidden layer is <strong>4× wider</strong> than
+        <code class="inl">n_embd</code>, with a non-linearity (ReLU here) in between.</p>
+
+<pre><span class="kw">class</span> FeedForward(nn.Module):
+    <span class="st">"""Position-wise MLP: think after you've gathered context."""</span>
+    <span class="kw">def</span> __init__(self, n_embd):
+        <span class="kw">super</span>().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, <span class="nm">4</span> * n_embd),   <span class="cm"># expand</span>
+            nn.ReLU(),                       <span class="cm"># non-linearity</span>
+            nn.Linear(<span class="nm">4</span> * n_embd, n_embd),   <span class="cm"># project back down</span>
+            nn.Dropout(dropout),
+        )
+
+    <span class="kw">def</span> forward(self, x):
+        <span class="kw">return</span> self.net(x)                  <span class="cm"># (B, T, n_embd) → (B, T, n_embd)</span></pre>
+
+        <h3>Part E — Residual connections + LayerNorm, packaged as a Block</h3>
+        <p>Two more ingredients make deep Transformers trainable, both from Session 15:</p>
+        <ul>
+          <li><span class="term">Residual connection</span> — instead of <code class="inl">x = layer(x)</code>, we do
+          <code class="inl">x = x + layer(x)</code>. The layer only has to learn a <em>small adjustment</em>; the
+          original signal flows straight through. This gives gradients a "highway" and lets us stack many layers
+          without them collapsing.</li>
+          <li><span class="term">LayerNorm</span> — normalises each token's vector (mean 0, variance 1) so numbers stay
+          in a sane range. We apply it <strong>before</strong> each sub-layer ("pre-norm"), which is the modern,
+          more stable arrangement.</li>
+        </ul>
+        <p>A <span class="term">Block</span> is just: norm → attention (+residual), then norm → MLP (+residual).</p>
+
+<pre><span class="kw">class</span> Block(nn.Module):
+    <span class="st">"""One Transformer block: communicate (attention), then think (MLP)."""</span>
+    <span class="kw">def</span> __init__(self, n_embd, n_head):
+        <span class="kw">super</span>().__init__()
+        head_size = n_embd // n_head
+        self.sa   = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1  = nn.LayerNorm(n_embd)
+        self.ln2  = nn.LayerNorm(n_embd)
+
+    <span class="kw">def</span> forward(self, x):
+        x = x + self.sa(self.ln1(x))     <span class="cm"># residual around attention (pre-norm)</span>
+        x = x + self.ffwd(self.ln2(x))   <span class="cm"># residual around MLP</span>
+        <span class="kw">return</span> x</pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A Transformer block is a <strong>repeatable unit</strong>: "let tokens look at each other (attention),
+          then let each token think (MLP)," with residual + LayerNorm keeping training stable. Stack this same block
+          N times and you have the body of a GPT. We never change the block — we just stack more of them and make
+          them wider for bigger models.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We built every piece: token + positional embeddings (added together for meaning + order); a single
+          scaled-dot-product attention <code class="inl">Head</code> (Q·Kᵀ/√d_k, mask, softmax, ·V); a
+          <code class="inl">MultiHeadAttention</code> that runs several heads and projects; a 4×-wide
+          <code class="inl">FeedForward</code> MLP; and a <code class="inl">Block</code> wrapping them with residual
+          connections and pre-LayerNorm.
+        </div>
+      </section>
+
+      <!-- ===================== 3. ASSEMBLE & TRAIN ===================== -->
+      <section id="assemble">
+        <h2><span class="sec-num">3</span> Assembling &amp; training</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>We've built all the Lego bricks. Now we snap them into a tower (stack the blocks), then go to school:
+          we show the model lots of little text snippets, let it guess the next letter, tell it how wrong it was, and
+          nudge its dials a tiny bit in the right direction. Do that thousands of times and the guesses get good.
+          The one strict rule during school: <strong>no peeking ahead</strong> — it must guess the next letter using
+          only the letters before it.</p>
+        </div>
+
+        <h3>Step 1 — Load data &amp; build the character tokeniser</h3>
+        <p>Grab any plain-text file (a book, your favourite lyrics, the tiny Shakespeare file Karpathy uses). We map
+        each unique character to an integer and back.</p>
+
+<pre><span class="cm"># --- load text ---</span>
+<span class="kw">with</span> <span class="kw">open</span>(<span class="st">'input.txt'</span>, <span class="st">'r'</span>, encoding=<span class="st">'utf-8'</span>) <span class="kw">as</span> f:
+    text = f.read()
+
+chars = <span class="kw">sorted</span>(<span class="kw">list</span>(<span class="kw">set</span>(text)))   <span class="cm"># the vocabulary = unique chars</span>
+vocab_size = <span class="kw">len</span>(chars)
+
+stoi = { ch: i <span class="kw">for</span> i, ch <span class="kw">in</span> <span class="kw">enumerate</span>(chars) }   <span class="cm"># string → int</span>
+itos = { i: ch <span class="kw">for</span> i, ch <span class="kw">in</span> <span class="kw">enumerate</span>(chars) }   <span class="cm"># int → string</span>
+encode = <span class="kw">lambda</span> s: [stoi[c] <span class="kw">for</span> c <span class="kw">in</span> s]            <span class="cm"># "hi" → [40, 41]</span>
+decode = <span class="kw">lambda</span> l: <span class="st">''</span>.join([itos[i] <span class="kw">for</span> i <span class="kw">in</span> l])    <span class="cm"># [40, 41] → "hi"</span>
+
+data = torch.tensor(encode(text), dtype=torch.long)
+n = <span class="kw">int</span>(<span class="nm">0.9</span> * <span class="kw">len</span>(data))                <span class="cm"># 90% train, 10% validation</span>
+train_data, val_data = data[:n], data[n:]</pre>
+
+        <h3>Step 2 — Batches of (input, target) pairs</h3>
+        <p>For training we grab random chunks of length <code class="inl">block_size</code>. The clever trick: the
+        <strong>target</strong> is the same chunk shifted one character to the right. So at every position the model
+        learns "given everything up to here, what's the next char?" — that's <span class="term">next-token
+        prediction</span>, and it gives us <code class="inl">block_size</code> training signals per chunk.</p>
+
+<pre>batch_size = <span class="nm">32</span>   <span class="cm"># how many chunks per step</span>
+
+<span class="kw">def</span> get_batch(split):
+    d = train_data <span class="kw">if</span> split == <span class="st">'train'</span> <span class="kw">else</span> val_data
+    ix = torch.randint(<span class="kw">len</span>(d) - block_size, (batch_size,))  <span class="cm"># random start points</span>
+    x = torch.stack([d[i      : i+block_size  ] <span class="kw">for</span> i <span class="kw">in</span> ix])  <span class="cm"># (B, T) inputs</span>
+    y = torch.stack([d[i+<span class="nm">1</span>    : i+block_size+<span class="nm">1</span>] <span class="kw">for</span> i <span class="kw">in</span> ix])  <span class="cm"># (B, T) targets (shifted by 1)</span>
+    <span class="kw">return</span> x.to(device), y.to(device)</pre>
+
+        <h3>Step 3 — Causal masking (why the model can't cheat)</h3>
+        <p>Because each position is asked to predict its <em>next</em> character, the model must not be allowed to see
+        that character (or any later one) when making the prediction — otherwise it would just copy the answer and
+        learn nothing. <span class="term">Causal masking</span> enforces this. Recall the
+        <code class="inl">tril</code> (lower-triangular) buffer in our <code class="inl">Head</code>: we set every
+        score for a <em>future</em> position to <code class="inl">-inf</code> before softmax, so after softmax those
+        weights become exactly 0.</p>
+
+        <div class="callout example">
+          <span class="c-title">The mask, visually (for T = 4)</span>
+          <p>A ✓ means "allowed to attend"; a ✗ means "masked out (future)":</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>query ↓ / key →</th><th>t0</th><th>t1</th><th>t2</th><th>t3</th></tr></thead>
+              <tbody>
+                <tr><td>token 0</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td></tr>
+                <tr><td>token 1</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td></tr>
+                <tr><td>token 2</td><td>✓</td><td>✓</td><td>✓</td><td>✗</td></tr>
+                <tr><td>token 3</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Each token sees only itself and the past. This single triangular mask is the <em>only</em> structural
+          difference between a GPT-style decoder and a bidirectional encoder like BERT.</p>
+        </div>
+
+        <h3>Step 4 — The full model</h3>
+        <p>Now we assemble everything: the two embedding tables, a stack of <code class="inl">n_layer</code> Blocks, a
+        final LayerNorm, and a "language-model head" — a linear layer mapping each token's vector to one
+        <span class="term">logit</span> (raw score) per vocabulary character.</p>
+
+<pre><span class="kw">class</span> MiniGPT(nn.Module):
+    <span class="kw">def</span> __init__(self):
+        <span class="kw">super</span>().__init__()
+        self.token_embedding    = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(n_layer)])
+        self.ln_f   = nn.LayerNorm(n_embd)              <span class="cm"># final norm</span>
+        self.lm_head = nn.Linear(n_embd, vocab_size)    <span class="cm"># → one score per char</span>
+
+    <span class="kw">def</span> forward(self, idx, targets=<span class="kw">None</span>):
+        B, T = idx.shape
+        tok = self.token_embedding(idx)                              <span class="cm"># (B, T, C)</span>
+        pos = self.position_embedding(torch.arange(T, device=device))<span class="cm"># (T, C)</span>
+        x = tok + pos                                                <span class="cm"># (B, T, C)</span>
+        x = self.blocks(x)                                           <span class="cm"># (B, T, C)</span>
+        x = self.ln_f(x)
+        logits = self.lm_head(x)                                     <span class="cm"># (B, T, vocab_size)</span>
+
+        <span class="kw">if</span> targets <span class="kw">is</span> <span class="kw">None</span>:
+            loss = <span class="kw">None</span>
+        <span class="kw">else</span>:
+            B, T, V = logits.shape
+            <span class="cm"># cross-entropy expects (N, V) logits and (N,) targets</span>
+            loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
+        <span class="kw">return</span> logits, loss</pre>
+
+        <div class="callout note">
+          <span class="c-title">Why cross-entropy?</span>
+          <p><span class="term">Cross-entropy loss</span> measures how surprised the model is by the true next
+          character. If it put 90% probability on the correct char, loss is small; if it was confidently wrong, loss
+          is large. Minimising it = "be less surprised by real text." With a vocab of V chars, a totally untrained
+          model has loss ≈ <code class="inl">ln(V)</code> — a handy sanity check for your first print-out.</p>
+        </div>
+
+        <h3>Step 5 — The training loop</h3>
+        <p>This is the same pattern from Session 15: forward pass → compute loss → backward pass (autograd) →
+        optimiser step. We use <span class="term">AdamW</span>, the go-to optimiser for Transformers.</p>
+
+<pre>model = MiniGPT().to(device)
+<span class="kw">print</span>(<span class="kw">sum</span>(p.numel() <span class="kw">for</span> p <span class="kw">in</span> model.parameters())/<span class="nm">1e6</span>, <span class="st">'M parameters'</span>)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=<span class="nm">3e-4</span>)
+max_iters, eval_interval = <span class="nm">5000</span>, <span class="nm">500</span>
+
+<span class="nm">@torch.no_grad()</span>
+<span class="kw">def</span> estimate_loss():           <span class="cm"># average loss over a few batches, no gradients</span>
+    out = {}
+    model.eval()
+    <span class="kw">for</span> split <span class="kw">in</span> [<span class="st">'train'</span>, <span class="st">'val'</span>]:
+        losses = torch.zeros(<span class="nm">50</span>)
+        <span class="kw">for</span> k <span class="kw">in</span> <span class="kw">range</span>(<span class="nm">50</span>):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    <span class="kw">return</span> out
+
+<span class="kw">for</span> step <span class="kw">in</span> <span class="kw">range</span>(max_iters):
+    <span class="kw">if</span> step % eval_interval == <span class="nm">0</span>:
+        l = estimate_loss()
+        <span class="kw">print</span>(<span class="kw">f</span><span class="st">"step {step}: train {l['train']:.4f}, val {l['val']:.4f}"</span>)
+
+    xb, yb = get_batch(<span class="st">'train'</span>)
+    logits, loss = model(xb, yb)        <span class="cm"># forward</span>
+    optimizer.zero_grad(set_to_none=<span class="kw">True</span>)
+    loss.backward()                     <span class="cm"># backward (autograd computes all gradients)</span>
+    optimizer.step()                    <span class="cm"># nudge every parameter</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">What healthy training looks like</span>
+          <p>On the tiny-Shakespeare file with these settings, you'd see something like:</p>
+<pre>0.21 M parameters
+step 0:    train 4.36, val 4.36     <span class="cm"># ≈ ln(65), basically random</span>
+step 500:  train 2.42, val 2.45
+step 1000: train 2.05, val 2.08
+step 2500: train 1.70, val 1.74
+step 5000: train 1.52, val 1.57     <span class="cm"># now it has learned real structure</span></pre>
+          <p>If <strong>val</strong> loss starts climbing while <strong>train</strong> keeps dropping, that's
+          <span class="term">overfitting</span> — the model is memorising. More dropout, more data, or a smaller model
+          helps (concepts from Session 15).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We tokenise text by character, build (input, target-shifted-by-one) batches, and enforce causal masking so
+          the model can't peek at the answer. The <code class="inl">MiniGPT</code> stacks embeddings → N Blocks →
+          final LayerNorm → linear head producing per-char logits, scored by cross-entropy. Training is the familiar
+          loop: forward, loss, <code class="inl">backward()</code>, AdamW step — repeated thousands of times while
+          watching train/val loss.
+        </div>
+      </section>
+
+      <!-- ===================== 4. GENERATE ===================== -->
+      <section id="generate">
+        <h2><span class="sec-num">4</span> Generating &amp; understanding</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The parrot is trained. Now we play a game: we whisper a starting letter, it guesses the next one, we add
+          that to what it heard, and it guesses again — over and over, building a sentence one letter at a time. If we
+          let it pick its <em>favourite</em> guess every time it's a bit repetitive; if we let it roll a slightly
+          random dice it's more creative. That dice is the "temperature" knob.</p>
+        </div>
+
+        <h3>Autoregressive sampling</h3>
+        <p><span class="term">Autoregressive generation</span> means the model feeds its own output back in: predict a
+        token, append it, predict the next using the longer context, and repeat. Crucially, we only need the logits
+        for the <strong>last</strong> position (the prediction for "what comes next"), and we must crop the context to
+        the last <code class="inl">block_size</code> tokens since our positional table only goes that far.</p>
+
+<pre>    <span class="nm">@torch.no_grad()</span>
+    <span class="kw">def</span> generate(self, idx, max_new_tokens, temperature=<span class="nm">1.0</span>, top_k=<span class="kw">None</span>):
+        <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(max_new_tokens):
+            idx_cond = idx[:, -block_size:]          <span class="cm"># crop to context window</span>
+            logits, _ = self(idx_cond)               <span class="cm"># (B, T, vocab_size)</span>
+            logits = logits[:, -<span class="nm">1</span>, :] / temperature  <span class="cm"># keep last step; apply temperature</span>
+            <span class="kw">if</span> top_k <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:                  <span class="cm"># optional: keep only top-k options</span>
+                v, _ = torch.topk(logits, top_k)
+                logits[logits &lt; v[:, [-<span class="nm">1</span>]]] = -<span class="kw">float</span>(<span class="st">'Inf'</span>)
+            probs = F.softmax(logits, dim=-<span class="nm">1</span>)         <span class="cm"># (B, vocab_size)</span>
+            idx_next = torch.multinomial(probs, num_samples=<span class="nm">1</span>)  <span class="cm"># sample one token</span>
+            idx = torch.cat((idx, idx_next), dim=<span class="nm">1</span>)   <span class="cm"># append → loop</span>
+        <span class="kw">return</span> idx</pre>
+
+        <p>Add that method inside the <code class="inl">MiniGPT</code> class, then generate:</p>
+<pre>context = torch.zeros((<span class="nm">1</span>, <span class="nm">1</span>), dtype=torch.long, device=device)  <span class="cm"># start token (index 0)</span>
+out = model.generate(context, max_new_tokens=<span class="nm">500</span>, temperature=<span class="nm">0.8</span>, top_k=<span class="nm">40</span>)
+<span class="kw">print</span>(decode(out[<span class="nm">0</span>].tolist()))</pre>
+
+        <div class="callout note">
+          <span class="c-title">The sampling knobs (recall from your GenAI notes)</span>
+          <p><strong>temperature</strong> &lt; 1 sharpens toward the top choice (safe, repetitive); &gt; 1 flattens the
+          odds (creative, riskier). <strong>top-k</strong> keeps only the k most likely characters before sampling, so
+          bizarre choices can't sneak in. <code class="inl">torch.multinomial</code> then rolls a weighted dice. Using
+          <code class="inl">argmax</code> instead would be "greedy" and tends to loop on itself.</p>
+        </div>
+
+        <h3>Inspecting attention — looking inside the box</h3>
+        <p>One of the joys of building it yourself: you can peek at what the model attends to. The attention weights
+        <code class="inl">wei</code> are literally a probability grid. We can expose and visualise them:</p>
+
+<pre><span class="cm"># quick hack: have Head.forward stash its weights, then read them after a forward pass</span>
+<span class="cm"># in Head.forward, before returning:  self.last_attn = wei.detach()</span>
+
+model.eval()
+xb, _ = get_batch(<span class="st">'val'</span>)
+_ = model(xb)
+attn = model.blocks[<span class="nm">0</span>].sa.heads[<span class="nm">0</span>].last_attn   <span class="cm"># (B, T, T) for layer 0, head 0</span>
+<span class="kw">print</span>(attn[<span class="nm">0</span>].shape)                            <span class="cm"># (T, T) — one row per query position</span>
+
+<span class="cm"># row i shows how token i distributed its attention over tokens 0..i</span>
+<span class="kw">import</span> matplotlib.pyplot <span class="kw">as</span> plt
+plt.imshow(attn[<span class="nm">0</span>].cpu(), cmap=<span class="st">'viridis'</span>); plt.xlabel(<span class="st">'key'</span>); plt.ylabel(<span class="st">'query'</span>); plt.show()</pre>
+
+        <div class="callout example">
+          <span class="c-title">What you'll typically see</span>
+          <p>The plot is a triangle (the upper-right is dark — masked future). Early-layer heads often attend strongly
+          to the <strong>immediately previous</strong> character (a bright diagonal just below the main diagonal) —
+          learning simple local patterns like "after 'q' comes 'u'." Deeper-layer heads spread attention to track
+          longer structures like word boundaries or matching brackets. Different heads specialise differently — that's
+          multi-head attention earning its keep.</p>
+        </div>
+
+        <h3>What scales up to real LLMs</h3>
+        <p>Our 0.2M-parameter character model and a 200-billion-parameter frontier model are <strong>the same
+        architecture</strong>. The differences are quantitative, not structural:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Knob</th><th>Our MiniGPT</th><th>A real LLM</th></tr></thead>
+            <tbody>
+              <tr><td>Tokeniser</td><td>1 char = 1 token (~65 vocab)</td><td>Sub-word BPE (~50k–200k vocab)</td></tr>
+              <tr><td>Context (block_size)</td><td>128</td><td>tens of thousands → millions</td></tr>
+              <tr><td>Width (n_embd) &amp; heads</td><td>128, 4 heads</td><td>thousands, dozens of heads</td></tr>
+              <tr><td>Depth (n_layer)</td><td>4 blocks</td><td>dozens to 100+ blocks</td></tr>
+              <tr><td>Parameters</td><td>~0.2 million</td><td>billions to trillions</td></tr>
+              <tr><td>Training data</td><td>one small text file</td><td>trillions of tokens of the internet</td></tr>
+              <tr><td>After pre-training</td><td>(none)</td><td>instruction tuning + RLHF to make it a helpful assistant</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Production models also add efficiency tricks (e.g. faster positional schemes like RoPE, attention kernels
+        like FlashAttention, a key/value cache for fast generation), but the core <code class="inl">Block</code> you
+        wrote is exactly what's inside them. This is the bridge to the <strong>GenAI subject</strong>: everything
+        there — prompting, tokens-as-money, context windows, temperature/top-p, RAG, agents — sits on top of the very
+        machine you just built. You now know what's under the hood.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>You built a complete, runnable GPT. Generation is just the trained model in an autoregressive loop;
+          sampling knobs (temperature, top-k) control its style; and the attention grids let you literally see it
+          working. Scaling to ChatGPT is "more of the same, much bigger, on much more data, plus alignment tuning" —
+          not a different kind of machine.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We generate by feeding the model's own output back in, cropping to the context window and sampling the last
+          position's logits (with temperature and top-k). We can inspect the attention weight grids to see heads
+          specialise. Frontier LLMs use this identical architecture — just wider, deeper, with bigger vocab/context,
+          far more data, and post-training alignment.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You went from a pile of components to a working baby-GPT. Here's the one-paragraph story that connects the
+        whole project:</p>
+        <div class="bigidea">
+          <p>We tokenised text into characters, turned each into a <strong>token embedding</strong> plus a
+          <strong>positional embedding</strong> (meaning + order), then ran them through a stack of
+          <strong>Transformer Blocks</strong>. Each block lets tokens <strong>communicate</strong> via
+          <strong>scaled dot-product self-attention</strong> — many <strong>heads</strong> in parallel, with a
+          <strong>causal mask</strong> so no token sees the future — and then <strong>think</strong> via a 4×-wide
+          <strong>feed-forward MLP</strong>, all wrapped in <strong>residual connections + LayerNorm</strong> for
+          stable deep training. A final linear head produces a <strong>logit</strong> per character; we train it to
+          minimise <strong>cross-entropy</strong> on next-character prediction with <strong>AdamW</strong>. To
+          generate, we run the trained model <strong>autoregressively</strong>, sampling with
+          <strong>temperature</strong> and <strong>top-k</strong>. That is, in miniature, exactly how every modern
+          LLM works.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why do we add positional embeddings to token embeddings?</summary>
+          <p class="ans">Because the Transformer processes all positions in parallel and is otherwise order-blind.
+          The token embedding says "what I am"; the positional embedding says "where I am." Without it, "dog bites
+          man" and "man bites dog" would look identical to the model.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does the causal mask do, and why is it essential during training?</summary>
+          <p class="ans">It sets the attention scores for all future positions to −∞ before softmax (so their weights
+          become 0), meaning each token only attends to itself and earlier tokens. It's essential because each
+          position is being trained to predict its <em>next</em> character — if it could see the future it would just
+          copy the answer and learn nothing.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why divide the attention scores by √d_k?</summary>
+          <p class="ans">As the head dimension grows, raw dot products grow large, which makes softmax extremely
+          peaky and squashes the gradients (vanishing gradients). Scaling by 1/√d_k keeps the scores in a reasonable
+          range so attention stays trainable.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the role of the residual connection (x = x + layer(x))?</summary>
+          <p class="ans">It gives gradients a direct "highway" back through the network and lets each layer learn only
+          a small correction to the existing signal, which is what makes it possible to stack many Transformer blocks
+          without training collapsing.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the difference between temperature near 0 and temperature above 1 at generation time?</summary>
+          <p class="ans">Low temperature sharpens the probabilities toward the single most likely character — safe,
+          repetitive output. High temperature flattens them so less-likely characters get a real chance — more
+          creative but riskier and more prone to gibberish.</p>
+        </details>
+        <details class="quiz">
+          <summary>Structurally, what's the main thing that separates our MiniGPT from a frontier LLM?</summary>
+          <p class="ans">Almost nothing structural — it's the same stacked-Block architecture. The differences are
+          scale (vocab, context length, width, depth, parameter count), the amount of training data, and post-training
+          alignment (instruction tuning + RLHF). The core block is identical.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 19) — your course handout for this project session, covering the
+          mini-Transformer build.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning — Neural Nets (course site)</a> — the companion site for this course's Neural Nets track.</li>
+          <li><a href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank" rel="noopener">Andrej Karpathy — "Let's build GPT: from scratch, in code, spelled out"</a> — the definitive line-by-line video this project is modelled on; watch it alongside the code here.</li>
+          <li><a href="https://github.com/karpathy/minGPT" target="_blank" rel="noopener">karpathy/minGPT (GitHub)</a> — a clean, minimal reference implementation of a GPT in PyTorch; great to read once your own version runs.</li>
+          <li><a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener">"The Annotated Transformer" (Harvard NLP)</a> — the original Transformer paper re-implemented with code beside every equation.</li>
+          <li><a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Vaswani et al., "Attention Is All You Need" (2017)</a> — the paper that introduced the Transformer and scaled dot-product attention.</li>
+          <li><a href="https://pytorch.org/docs/stable/index.html" target="_blank" rel="noopener">PyTorch documentation</a> — official reference for <code class="inl">nn.Module</code>, <code class="inl">nn.Embedding</code>, autograd, and the optimisers used here.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="" href="session-18.html"><div class="dir">← Previous</div><div class="ttl">Session 18: Project — Text Generation &amp; Translation</div></a>
+        <a class="next" href="session-20.html"><div class="dir">Next →</div><div class="ttl">Session 20: Project — Train a Small LM</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 19 — Project Week — A Mini-Transformer from Scratch · You built a GPT from scratch 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

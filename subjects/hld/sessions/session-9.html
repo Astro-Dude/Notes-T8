@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 9 — SQL vs NoSQL &amp; Choosing a Sharding Key</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 9</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 09 · SQL vs NoSQL &amp; Sharding</span>
+      <h1>When to trust a relational database — and when to walk away</h1>
+      <p class="lead">
+        Up to now we've treated "the database" as one trusty box. In this session we open the box.
+        We'll see what relational (SQL) databases give you for free, why those gifts quietly disappear
+        the moment you split data across many machines, what NoSQL offers instead, and how to choose the
+        single most important setting of a sharded system — the <em>sharding key</em>. As always, every
+        topic starts with a tiny "explain like I'm 5" story, then we go deep with real schemas and queries.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 40 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#sql-strengths">Strengths of SQL databases</a></li>
+          <li><a href="#sharding-breaks-sql">Why sharding breaks SQL</a></li>
+          <li><a href="#sql-vs-nosql">SQL vs NoSQL, BASE &amp; the four families</a></li>
+          <li><a href="#sharding-key">Choosing a sharding key</a></li>
+          <li><a href="#sharding-examples">Sharding key worked examples</a></li>
+          <li><a href="#storage">How storage works (sequential vs random)</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. SQL STRENGTHS ===================== -->
+      <section id="sql-strengths">
+        <h2><span class="sec-num">1</span> The strengths of SQL / relational databases</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a very strict, very tidy librarian. Every book must go on the right shelf, in the
+          right format, with a proper label — no exceptions. If you try to file a book that breaks the
+          rules, she says "no" and hands it back. She also has a magic guarantee: if she's moving ten
+          books at once and trips halfway, she puts <em>all ten</em> back exactly where they were, as if
+          nothing happened — never five moved and five lost. A relational database is that librarian:
+          obsessively organised, rule-enforcing, and all-or-nothing.</p>
+        </div>
+
+        <p>A <span class="term">relational database</span> stores data in <strong>tables</strong>: rows
+        (records) and columns (fields), like a spreadsheet. You talk to it using
+        <span class="term">SQL</span> (Structured Query Language). The big-name examples are PostgreSQL,
+        MySQL, Oracle, and SQL Server. Their power comes from four pillars: <strong>ACID transactions,
+        normalization, a fixed schema, and joins backed by indexes.</strong> Let's take each one.</p>
+
+        <div class="callout note">
+          <span class="c-title">SQL is a <em>query language</em>, not a database type</span>
+          <p>SQL is just a way of <em>specifying what to fetch</em> from the DB — it is not itself a kind of
+          database. It happens to be the de-facto query language for relational databases, so when people say
+          "SQL" they almost always mean "relational DB." You can even query relational DBs with other languages
+          (for example <code class="inl">GraphQL</code>). Common relational implementations:
+          <span class="term">MySQL</span>, <span class="term">PostgreSQL</span>, <span class="term">OracleDB</span>,
+          <span class="term">MSSQL</span>, <span class="term">SQLite</span>, <span class="term">IBM DB2</span>,
+          <span class="term">Amazon RDS</span>.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">All of these strengths apply <em>at low scale</em></span>
+          <p><span class="term">Low scale</span> means the "queries/second + amount of data" is small enough to
+          be handled by a <strong>single server</strong>. Keep this caveat in mind — in Topic 2 we'll see that
+          when scale gets large, <em>every one of these strengths turns into a weakness.</em></p>
+        </div>
+
+        <h3>Pillar 1 — ACID transactions</h3>
+        <p>A <span class="term">transaction</span> is a group of operations that must succeed or fail as a
+        single unit. <span class="term">ACID</span> is the promise the database makes about them:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Letter</th><th>Means</th><th>In plain English</th></tr></thead>
+            <tbody>
+              <tr><td><strong>A</strong>tomicity</td><td>All-or-nothing.</td><td>Either every step happens, or none does. No half-finished money transfer.</td></tr>
+              <tr><td><strong>C</strong>onsistency</td><td>Rules always hold.</td><td>The data obeys every constraint before and after (no negative balances, no orphan rows).</td></tr>
+              <tr><td><strong>I</strong>solation</td><td>No interference.</td><td>Two transactions running at once don't see each other's half-done work.</td></tr>
+              <tr><td><strong>D</strong>urability</td><td>It sticks.</td><td>Once committed, it survives a crash or power cut.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Atomicity — the classic money transfer</span>
+          <p>Imagine Khushboo is transferring $1 million to Vishudh. The transfer is three steps:</p>
+          <ol>
+            <li>Check that Khushboo has sufficient balance</li>
+            <li>Deduct $1 million from Khushboo's account</li>
+            <li>Add $1 million to Vishudh's account</li>
+          </ol>
+          <p>It must <strong>never</strong> happen that the money leaves Khushboo but is not credited to Vishudh.
+          Either the money is not deducted at all, or — if deducted — it must be successfully credited. The same
+          idea in SQL: two updates must both happen or neither.</p>
+          <pre><span class="kw">BEGIN</span>;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="nm">100</span> <span class="kw">WHERE</span> id = <span class="nm">1</span>;  <span class="cm">-- debit Alice</span>
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="nm">100</span> <span class="kw">WHERE</span> id = <span class="nm">2</span>;  <span class="cm">-- credit Bob</span>
+<span class="kw">COMMIT</span>;</pre>
+          <p>If the server crashes after the debit but before the credit, <strong>atomicity</strong> rolls
+          the whole thing back — Alice's $100 reappears. No money vanishes. That guarantee is the
+          superpower banks, shops, and ticketing systems are built on.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">ACID Consistency ≠ CAP Consistency (don't mix them up!)</span>
+          <p>This trips everyone up. The "C" in ACID is a <em>different thing</em> from the "C" in CAP:</p>
+          <ul>
+            <li><strong>CAP consistency = no stale reads.</strong> When we have multiple copies of the data
+            (replicas/cache) and one copy is out of sync, we should not read from the stale copy.</li>
+            <li><strong>ACID consistency = DB constraints are enforced.</strong> The schema (columns &amp;
+            data-types), <code class="inl">NOT NULL</code> / <code class="inl">UNIQUE</code> / foreign-key
+            constraints, custom constraints (e.g. "this column must be lowercase"), and triggers all hold.
+            Every transaction must leave the database in a consistent state.</li>
+          </ul>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Isolation — what goes wrong without it</span>
+          <p>Isolation means simultaneous transactions don't mess with each other. (There are several
+          <span class="term">isolation levels</span> — worth reading up on as homework.) Suppose Khushboo starts
+          with exactly $1 million, and two transfers run at once, each reading the balance before either writes:</p>
+          <pre>Transaction 1: Khushboo -- $1M --> Vishudh   Transaction 2: Khushboo -- $1M --> Nandani
+  balance = get_balance(Khushboo)             balance = get_balance(Khushboo)
+  assert balance &gt;= $1M                        assert balance &gt;= $1M
+  new = balance - $1M                          new = balance - $1M
+  set_balance(Khushboo, new)                   set_balance(Khushboo, new)
+  rb = get_balance(Vishudh)                    rb = get_balance(Nandani)
+  set_balance(Vishudh, rb + $1M)               set_balance(Nandani, rb + $1M)</pre>
+          <p>Now interleave them badly:</p>
+          <pre>Khushboo started with $1M
+  T1: steps 1..3
+  T2: steps 1..3
+  T1: step 4   --&gt; Khushboo's new balance = 0
+  T2: step 4   --&gt; Khushboo's new balance = 0   (overwrites!)
+  T1: steps 5..6
+  T2: steps 5..6</pre>
+          <p>Both receivers got $1M but Khushboo only ever had $1M — $1M was created from thin air. This is a
+          <strong>lack of isolation</strong>, and it should NOT happen. Proper isolation prevents the two
+          transactions from interleaving like this.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Durability ≠ protection against disk failure</span>
+          <p>Durability means any committed transaction is stored in non-volatile storage (HDD/SSD), not just
+          volatile RAM, so it survives a crash. But note: durability does <strong>not</strong> protect you
+          against a hard-disk failure — only <span class="term">replication</span> does that.</p>
+        </div>
+
+        <h3>Pillar 2 — Normalization</h3>
+        <p><span class="term">Normalization</span> means storing each fact exactly once, in one place, and
+        linking to it instead of copying it. You split data into focused tables and connect them with
+        <span class="term">foreign keys</span> (a column that points at another table's primary key).</p>
+        <div class="callout note">
+          <span class="c-title">Why bother?</span>
+          <p>If a customer's email lived in 10,000 order rows and they changed it, you'd have to update
+          10,000 places — and if you missed one, your data now disagrees with itself (an
+          <span class="term">update anomaly</span>). Store the email <em>once</em> in a <code class="inl">customers</code>
+          table, and orders just reference the customer's id. One update, one source of truth.</p>
+        </div>
+
+        <h3>Pillar 3 — Fixed schema</h3>
+        <p>A <span class="term">schema</span> is the blueprint: which tables exist, what columns they have,
+        what type each column is, and what rules apply. In SQL the schema is <strong>fixed and enforced</strong>
+        — the database rejects anything that doesn't fit (a letter in a number column, a missing required
+        field). It's a strict contract, which makes the data predictable and safe to rely on.</p>
+
+        <h3>Pillar 4 — Joins (backed by indexes)</h3>
+        <p>Because data is split across normalized tables, you need a way to stitch it back together. A
+        <span class="term">join</span> combines rows from two tables wherever a column matches. To do this
+        fast, the database uses an <span class="term">index</span> — a sorted lookup structure (usually a
+        <span class="term">B-tree</span>) that finds matching rows in roughly O(log n) time instead of
+        scanning every row.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — a tiny shop</span>
+          <p>Two normalized tables linked by a foreign key:</p>
+          <pre><span class="kw">CREATE TABLE</span> customers (
+  id     <span class="kw">SERIAL PRIMARY KEY</span>,
+  name   <span class="kw">TEXT NOT NULL</span>,
+  email  <span class="kw">TEXT UNIQUE NOT NULL</span>
+);
+
+<span class="kw">CREATE TABLE</span> orders (
+  id           <span class="kw">SERIAL PRIMARY KEY</span>,
+  customer_id  <span class="kw">INT</span> <span class="kw">REFERENCES</span> customers(id),  <span class="cm">-- foreign key</span>
+  total_cents  <span class="kw">INT NOT NULL</span>,
+  created_at   <span class="kw">TIMESTAMPTZ DEFAULT</span> now()
+);
+
+<span class="cm">-- index so the join below is fast</span>
+<span class="kw">CREATE INDEX</span> idx_orders_customer <span class="kw">ON</span> orders(customer_id);</pre>
+          <p>Now ask "how much has each customer spent?" — the join recombines the split data:</p>
+          <pre><span class="kw">SELECT</span> c.name, <span class="kw">SUM</span>(o.total_cents) <span class="kw">AS</span> spent
+<span class="kw">FROM</span> customers c
+<span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id = c.id
+<span class="kw">GROUP BY</span> c.name
+<span class="kw">ORDER BY</span> spent <span class="kw">DESC</span>;</pre>
+          <p>The email is stored once, the relationship is enforced, the join is index-fast, and if you
+          wrapped order-writing in a transaction it would be ACID-safe. All four pillars in one screen.</p>
+        </div>
+
+        <h3>More strengths — and one more thing about the schema</h3>
+        <p>Beyond the four pillars, the fixed schema is <strong>well-defined</strong> (you know exactly which
+        tables exist, which columns, and each column's data type — which lets the DB allocate a fixed amount of
+        space per row on disk), <strong>static</strong> (it doesn't change row-to-row, and changing it is
+        discouraged and hard), and <strong>enforced</strong> (a row that violates the schema is rejected — the
+        write won't succeed).</p>
+        <div class="callout warn">
+          <span class="c-title">Changing the schema is slow</span>
+          <p>You <em>can</em> add/remove columns from an existing table, but it requires a complete table
+          re-write (a <span class="term">table migration</span>): extremely slow, and it normally requires the
+          service to be down. There are ways around the downtime (a <span class="term">rolling migration</span>),
+          but it's never free.</p>
+        </div>
+
+        <p>Relational DBs also have an enormous feature set: powerful querying (joins, filtering by column,
+        aggregate calculations, grouping, nested queries, recursive queries via <span class="term">CTEs</span>)
+        plus extras like full-text search, geospatial queries, and JSON. They offer pretty much every feature
+        any other database in the world provides — just at low scale. And they are <strong>extremely
+        mature</strong>: relational database theory predates modern computer hardware, and they've been
+        battle-tested across millions of companies and thousands of scenarios.</p>
+
+        <div class="callout note">
+          <span class="c-title">Keep rows small (&lt; ~1 KB)</span>
+          <p>You should only use a relational DB if each individual item (one row) is "small" — under ~1 KB, or
+          a few KB at most. If your rows are routinely &gt; 10 KB, you probably shouldn't use a SQL DB. The DB
+          won't <em>complain</em> if you try to store a 100 MB row, it's just a bad choice. This does NOT mean
+          SQL can only handle 10 KB total — SQL can handle <strong>terabytes</strong>, as long as that data is
+          spread across many rows and tables, and individual rows stay small.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>SQL databases trade some flexibility for very strong <strong>guarantees</strong>: correctness
+          (ACID), no duplicated facts (normalization), enforced structure (schema), and the ability to ask
+          rich, ad-hoc questions across related data (joins + indexes). For a single powerful machine,
+          this is a fantastic deal.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Relational databases store data in linked tables and give you four big wins: <strong>ACID</strong>
+          (all-or-nothing, crash-safe correctness), <strong>normalization</strong> (each fact stored once),
+          a <strong>fixed schema</strong> (enforced structure), and <strong>joins + indexes</strong> (fast,
+          flexible queries across tables). Remember these four — the next topic is about losing them.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SHARDING BREAKS SQL ===================== -->
+      <section id="sharding-breaks-sql">
+        <h2><span class="sec-num">2</span> Why sharding breaks SQL's benefits</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Our tidy librarian worked great while everything was in one building. But the library got so
+          popular that one building can't hold all the books or all the visitors. So we open ten branches
+          across the city and split the books between them. Now a problem appears: if a book in Branch A
+          mentions a book in Branch G, checking both at once means phone calls between branches — slow and
+          fragile. And the "all-or-nothing" promise is much harder when ten different buildings have to
+          agree. Splitting up <em>scaled</em> the library, but it <em>broke the easy guarantees</em>.</p>
+        </div>
+
+        <p>Recall from earlier sessions that a single database server eventually hits a ceiling — too much
+        data, too many requests. <span class="term">Sharding</span> (also called horizontal partitioning)
+        is the fix: split the rows of a table across multiple machines, called <span class="term">shards</span>,
+        so each shard holds a slice of the data and handles a slice of the load. The trouble is that the
+        four SQL pillars from Topic 1 quietly assumed <em>all the data lives in one place</em>. Spread it
+        out and they crack.</p>
+
+        <h3>What breaks, and why</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>SQL pillar</th><th>What sharding does to it</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Joins</strong></td><td>If the two rows you want to join sit on different shards, the database can't just walk an index — it must fetch from multiple machines over the network and combine. This <span class="term">cross-shard join</span> is slow and often disabled entirely.</td></tr>
+              <tr><td><strong>ACID transactions</strong></td><td>A transaction touching rows on several shards becomes a <span class="term">distributed transaction</span>. To stay atomic, every shard must agree to commit together (a protocol called <span class="term">two-phase commit / 2PC</span>) — slow, and it stalls if any shard is unreachable.</td></tr>
+              <tr><td><strong>Uniqueness &amp; constraints</strong></td><td>A <code class="inl">UNIQUE</code> column or auto-increment id is trivial on one machine. Across shards, no single shard can <em>see</em> all the others, so guaranteeing global uniqueness needs extra coordination (or central id generators).</td></tr>
+              <tr><td><strong>Normalization</strong></td><td>Since joins are now expensive, you're pushed to <span class="term">denormalize</span> — copy related data together so a query hits one shard. That reintroduces the duplicated-fact problems normalization was designed to prevent.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the join that crosses shards</span>
+          <p>Say we shard <code class="inl">orders</code> by <code class="inl">order_id</code> and
+          <code class="inl">customers</code> by <code class="inl">customer_id</code>. Now run our earlier query:</p>
+          <pre><span class="kw">SELECT</span> c.name, <span class="kw">SUM</span>(o.total_cents)
+<span class="kw">FROM</span> customers c
+<span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id = c.id
+<span class="kw">GROUP BY</span> c.name;</pre>
+          <p>A customer lives on, say, shard 3, but their orders are scattered across shards 1, 4, and 7
+          (because they were placed by <code class="inl">order_id</code>). To answer, the system must query
+          <em>every</em> shard, ship partial results back, and merge them — a <span class="term">scatter-gather</span>
+          query. What was one index lookup is now a network-wide fan-out. Do this at scale and it crawls.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The deeper trade-off (CAP)</span>
+          <p>Once data spans many machines, the network <em>will</em> sometimes drop messages between them
+          (a <span class="term">partition</span>). The <span class="term">CAP theorem</span> says that during
+          a partition you must choose: keep every node perfectly <strong>Consistent</strong> (reject some
+          requests) or stay <strong>Available</strong> (answer, but possibly with stale data). You can't have
+          both at that moment. Single-machine SQL never had to make this choice; distributed systems must.</p>
+        </div>
+
+        <h3>Why ACID needs a single server</h3>
+        <p>SQL databases give ACID guarantees <em>only within a single server</em>, because everything ACID
+        needs is easy there but hard once you spread out:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Inside a single server</th><th>Across multiple servers</th></tr></thead>
+            <tbody>
+              <tr><td>Locks are easy (OS &amp; hardware provide locks/semaphores)</td><td><span class="term">Distributed locks</span> are extremely hard &amp; slow (PACELC) — need 2PC / Zookeeper</td></tr>
+              <tr><td>Shared memory (RAM, HDD) — no network overhead, no stale-read issues between threads</td><td>Can't share memory — you keep copies, which leads to consistency challenges</td></tr>
+              <tr><td>You know immediately whether a write succeeded or failed</td><td>You don't know if a write succeeded — you must pass acknowledgements</td></tr>
+              <tr><td>Writes mostly always succeed</td><td>Networks &amp; servers regularly fail</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Providing ACID guarantees across shards is <em>possible</em> — but very slow and very complex.
+        In short: <strong>sharding nullifies ACID.</strong></p>
+
+        <h3>Strong schema breaks too: the Amazon product-listing problem</h3>
+        <p>What if the data is <em>inherently unstructured</em>? Consider modeling product listings for Amazon:
+        10 million+ products across 10,000+ categories, where <strong>every category has a different attribute
+        set</strong>:</p>
+        <ul>
+          <li><strong>T-shirts:</strong> Brand, Price, Color, Fabric, Neck-shape, Sleeve length</li>
+          <li><strong>Laptops:</strong> Brand, Price, Screen Size, RAM, CPU, GPU, OS</li>
+          <li><strong>Notebooks:</strong> Brand, Price, Page thickness, Number of Pages, Ruled</li>
+        </ul>
+        <p>There are four ways to force this into SQL, and all of them hurt at scale:</p>
+
+        <p><strong>Approach 1 — one giant table with all columns.</strong></p>
+        <pre>products: id, name, brand, price, Color, Fabric, Neck-shape, Sleeve length,
+          Screen Size, RAM, CPU, GPU, OS, Page thickness, Number of Pages, Ruled, ...</pre>
+        <p>10,000 categories × ~10 unique cols each ⇒ ~100,000 columns. Every row only fills ~10 of them; the
+        other 100,000 are <code class="inl">NULL</code>. And <code class="inl">NULL</code> is itself bad because
+        it's ambiguous — it can mean <em>missing data</em> (the value exists, we just don't know it) or
+        <em>undefined</em> (what's the page-thickness of a t-shirt?). Worse, SQL pre-allocates space for the
+        entire row including the NULL columns, so you waste 99.99% of the disk space.</p>
+
+        <p><strong>Approach 2 — multiple tables, one per product type.</strong></p>
+        <pre>products:   id, name, brand, price
+tshirts:    product_id, Color, Fabric, Neck-shape, Sleeve length
+laptops:    product_id, Screen Size, RAM, CPU, GPU, OS
+notebooks:  product_id, Page thickness, Number of Pages, Ruled
+... 10,000 such tables</pre>
+        <p>Now a query like "find the top 10 most expensive products that are color red" must join across 10,000
+        tables. SQL can handle lots of rows and terabytes of data (few tables, lots of data <em>in</em> them) —
+        but it cannot handle lots of "schema" (many tables).</p>
+
+        <p><strong>Approach 3 — an attribute list (EAV).</strong></p>
+        <pre>products:            id, name, brand, price
+product_attributes:  product_id, attribute_name, attribute_value</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>product_id</th><th>attribute_name</th><th>attribute_value</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>RAM</td><td>16GB</td></tr>
+              <tr><td>1</td><td>CPU</td><td>i9 14400k</td></tr>
+              <tr><td>1</td><td>Screen Size</td><td>17"</td></tr>
+              <tr><td>1</td><td>Fabric</td><td>cotton</td></tr>
+              <tr><td>2</td><td>Neck Type</td><td>Rounded</td></tr>
+              <tr><td>2</td><td>Sleeve Length</td><td>full</td></tr>
+              <tr><td>2</td><td>Fabric</td><td>cotton</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Notice product 1 has <em>both</em> RAM and Fabric — <strong>schema enforcement is lost</strong>: a
+        laptop can now have a fabric. You could enforce attributes in the application layer, but that breaks
+        separation of concerns (validation now lives partly in the DB and partly in the app). Also, fetching a
+        single entry is expensive — to show one laptop you must fetch all its attribute rows and join them into
+        an array.</p>
+
+        <p><strong>Approach 4 — JSON columns.</strong> Modern relational DBs (Postgres, MySQL) have first-class
+        JSON support, so can't we just use that? <em>Yes and no.</em> It works, but it still isn't designed to
+        handle scale.</p>
+
+        <div class="callout key">
+          <span class="c-title">The lesson</span>
+          <p>Because Amazon's product data is inherently <em>semi-structured</em>, SQL is a poor fit. At low
+          scale (only 2–3 product categories) any of these approaches would've worked fine — the problem is
+          scale plus schema variety, which is exactly what NoSQL was built for.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Sharding is what lets you scale past one machine — but it is precisely the <strong>joins,
+          transactions, and global constraints</strong> that get expensive or impossible across shards. You
+          haven't done anything "wrong"; these guarantees simply cost coordination that a single box gave you
+          for free. This pain is exactly what motivated a new family of databases: <strong>NoSQL</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Sharding splits a table's rows across machines to scale. But cross-shard <strong>joins</strong> turn
+          into slow scatter-gather, cross-shard <strong>transactions</strong> need expensive coordination (2PC),
+          global <strong>uniqueness</strong> needs extra machinery, and you're pushed to <strong>denormalize</strong>.
+          Add the CAP trade-off and you see why people reach for NoSQL — our next topic.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SQL VS NOSQL ===================== -->
+      <section id="sql-vs-nosql">
+        <h2><span class="sec-num">3</span> SQL vs NoSQL — and the four NoSQL families</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>SQL is the strict librarian who insists every book follows the rules. <strong>NoSQL</strong> is a
+          big, relaxed warehouse with different kinds of storage: numbered lockers you grab by their tag,
+          folders that can each hold whatever papers you like, giant pinboards organised by column, and a
+          web of string connecting people who know each other. The warehouse doesn't fuss over rules — it's
+          built to be <em>huge</em> and <em>fast</em> for one job at a time, and to spread across many
+          buildings easily. You give up the strict tidiness; you gain enormous scale.</p>
+        </div>
+
+        <p><span class="term">NoSQL</span> is an umbrella term for databases that drop some
+        relational rules to scale out across many machines more easily. They typically favour
+        <span class="term">horizontal scaling</span> (add cheap machines) over the SQL habit of
+        <span class="term">vertical scaling</span> (buy one bigger machine), and many offer
+        <span class="term">eventual consistency</span> — after a write, replicas converge to the same value
+        "eventually" rather than instantly — in exchange for staying available. There are four main families.</p>
+
+        <div class="callout note">
+          <span class="c-title">NoSQL ≠ "No SQL"</span>
+          <p>NoSQL does <strong>not</strong> mean "don't use SQL." It stands for <strong>Not Only SQL</strong> —
+          we keep using relational databases and <em>augment</em> them with additional non-relational ones.
+          A bit of history: SQL theory predates modern computers, whereas NoSQL is recent — the first NoSQL DB
+          was Google's <span class="term">BigTable</span>, and NoSQL only got popular after ~2005 (most internet
+          giants didn't even exist before then). Around 2009/2010 there was a conference on non-relational DBs;
+          the promoters needed a Twitter hashtag to go viral, and picked <code class="inl">#NoSQL</code> — that's
+          literally where the name comes from.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Don't jump to NoSQL</span>
+          <p>Your de-facto choice should <strong>always</strong> be a relational (SQL) database. Use NoSQL only
+          if you can <em>justify</em> the need. Modern SQL DBs (Postgres, MySQL) can do absolutely everything
+          NoSQL can — and more — just at low scale, and the bar for "low scale" rises every day. For up to a
+          ~1 million userbase, a SQL DB will just work flawlessly. <strong>99% of companies use SQL, and 99% do
+          not primarily need NoSQL.</strong></p>
+        </div>
+
+        <h3>SQL vs NoSQL in one breath</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>SQL</th><th>NoSQL</th></tr></thead>
+            <tbody>
+              <tr><td>ACID</td><td>BASE</td></tr>
+              <tr><td>Normalization</td><td>Denormalized data &amp; redundancy</td></tr>
+              <tr><td>Do everything, decently well (<strong>Jack of all trades</strong>)</td><td>Do one thing, extremely well (<strong>Master of one</strong>)</td></tr>
+              <tr><td>1 server</td><td>Multiple servers (built-in sharding, auto-scaling, load balancing)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The four families at a glance</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔑</div><div class="s-t">Key-Value</div><div class="s-d">tag → blob</div></div>
+          <div class="arrow">·</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">Document</div><div class="s-d">JSON-like docs</div></div>
+          <div class="arrow">·</div>
+          <div class="step"><div class="s-ico">🧱</div><div class="s-t">Wide-Column</div><div class="s-d">rows of sparse columns</div></div>
+          <div class="arrow">·</div>
+          <div class="step"><div class="s-ico">🕸️</div><div class="s-t">Graph</div><div class="s-d">nodes + edges</div></div>
+        </div>
+
+        <ul>
+          <li><strong>Key-value</strong> — the simplest: store a value under a key and fetch it back by that
+          key. Blazing fast, but you can only look things up <em>by the key</em>. Examples: Redis, DynamoDB,
+          Riak. Great for caches, sessions, feature flags.</li>
+          <li><strong>Document</strong> — store self-contained <span class="term">documents</span> (usually
+          JSON). Each document can have its own shape (a <span class="term">flexible schema</span>), and you
+          can query on fields inside it. Examples: MongoDB, Couchbase, Firestore. Great for catalogs, user
+          profiles, content.</li>
+          <li><strong>Wide-column</strong> — rows are identified by a key, but each row can hold a huge,
+          sparse set of columns grouped into families; built to write and read enormous volumes across many
+          nodes. Examples: Cassandra, HBase, Bigtable. Great for time-series, logs, write-heavy feeds.</li>
+          <li><strong>Graph</strong> — data is <span class="term">nodes</span> (things) connected by
+          <span class="term">edges</span> (relationships); you traverse the connections directly. Examples:
+          Neo4j, Amazon Neptune. Great for social networks, fraud rings, recommendations — anything where the
+          <em>relationships</em> are the point.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — the same customer, three ways</span>
+          <p>SQL needs a row that matches the table's columns exactly:</p>
+          <pre><span class="cm">-- SQL row (fixed schema)</span>
+<span class="kw">INSERT INTO</span> customers (name, email) <span class="kw">VALUES</span> (<span class="st">'Mia'</span>, <span class="st">'mia@x.com'</span>);</pre>
+          <p>A document store keeps the whole customer as one flexible object — note the second customer has
+          extra fields and no schema change was needed:</p>
+          <pre><span class="cm">// Document store (e.g. MongoDB)</span>
+{ <span class="st">"name"</span>: <span class="st">"Mia"</span>, <span class="st">"email"</span>: <span class="st">"mia@x.com"</span> }
+{ <span class="st">"name"</span>: <span class="st">"Leo"</span>, <span class="st">"email"</span>: <span class="st">"leo@x.com"</span>,
+  <span class="st">"address"</span>: { <span class="st">"city"</span>: <span class="st">"Pune"</span> }, <span class="st">"tags"</span>: [<span class="st">"vip"</span>] }</pre>
+          <p>A key-value store just stashes the blob under a key for instant lookup by that key:</p>
+          <pre><span class="cm"># Key-value store (e.g. Redis)</span>
+<span class="kw">SET</span> customer:42 <span class="st">'{"name":"Mia","email":"mia@x.com"}'</span></pre>
+        </div>
+
+        <h3>SQL vs NoSQL — the comparison</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Dimension</th><th>SQL (relational)</th><th>NoSQL (typical)</th></tr></thead>
+            <tbody>
+              <tr><td>Data model</td><td>Tables of rows &amp; columns</td><td>Key-value, document, wide-column, or graph</td></tr>
+              <tr><td>Schema</td><td>Fixed &amp; enforced</td><td>Flexible / schema-on-read</td></tr>
+              <tr><td>Scaling</td><td>Mostly vertical (bigger box)</td><td>Mostly horizontal (more boxes)</td></tr>
+              <tr><td>Consistency</td><td>Strong (ACID)</td><td>Often eventual (tunable)</td></tr>
+              <tr><td>Joins</td><td>First-class, index-backed</td><td>Limited or absent; you denormalize</td></tr>
+              <tr><td>Best for</td><td>Complex, related data needing correctness (finance, orders)</td><td>Massive scale, simple access patterns, flexible data</td></tr>
+              <tr><td>Query style</td><td>Rich, ad-hoc (any join, any filter)</td><td>Optimised for <em>known</em> access patterns</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>BASE — the NoSQL counterpart to ACID</h3>
+        <p>Where SQL gives ACID, NoSQL gives <span class="term">BASE</span>:</p>
+        <ul>
+          <li><strong>Ba</strong>sically Available — the system <em>as a whole</em> stays available, even if some
+          services are unavailable to a small fraction of users for a short time. High availability for the
+          whole system, not for every individual service/user.</li>
+          <li><strong>S</strong>oft State — unlike ACID's all-or-nothing atomicity, transactions can sit in a
+          <em>partial</em> state for some time (even weeks!) — but eventually the data becomes consistent and
+          atomic. (We'll see this in the last HLD class: distributed transactions via the
+          <span class="term">Saga pattern</span>.)</li>
+          <li><strong>E</strong>ventually Consistent — there may be stale reads, but eventually (if we wait long
+          enough) every write is reflected across all replicas.</li>
+        </ul>
+
+        <h3>Horizontally scalable by design</h3>
+        <p>SQL databases require <strong>manual sharding</strong> — they don't provide built-in sharding (most
+        modern SQL DBs <em>do</em> have built-in replication, but not sharding). To shard a SQL DB you either use
+        a 3rd-party extension, do it manually (write the LB code, manage server state), or use a managed cloud
+        service like Amazon RDS. NoSQL DBs, by contrast, are <strong>automatically sharded</strong>: you get a
+        bunch of servers, install the database, and it figures out load balancing, autoscaling, sharding, data
+        distribution, replication, and fault tolerance itself.</p>
+
+        <h3>Denormalization &amp; replication, on purpose</h3>
+        <p>SQL discourages denormalization &amp; redundancy to remove anomalies. NoSQL embraces the opposite,
+        because it realises that (1) the frontend is going to show denormalized data anyway, and (2) to prevent
+        data loss you're going to keep multiple copies anyway. So NoSQL DBs <em>encourage</em> storing data in a
+        denormalized, semi-structured (sometimes even schemaless) manner.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Weaknesses of NoSQL — the flip side of scale</span>
+          <p>SQL has tons of features: joins, powerful data structuring, enforceable constraints, triggers, ACID,
+          powerful indexing &amp; filtering, recursive queries, plus modern ones (full-text search, first-class
+          JSON, spatial/nearest-neighbor indexing, vector/KNN, denormalized views). Its only con is that it's
+          <em>feasible only at low scale</em> — it <strong>generalizes</strong> (jack of all trades, master of
+          none). NoSQL can work at massive scale <em>precisely because</em> it drops most of those features:
+          it's hard to do everything perfectly, but easy to do a few things flawlessly. NoSQL
+          <strong>specializes</strong> — jack of one trade, and master of it.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Pick by access pattern, not by hype</span>
+          <p>The most important rule: <strong>SQL lets you store first and figure out queries later; NoSQL
+          asks you to know your queries first and shape the data around them.</strong> So choose by how you'll
+          <em>read</em> the data. Always fetching one item by a known id? Key-value. Storing varied,
+          self-contained objects? Document. Writing torrents of time-stamped data? Wide-column. Chasing
+          relationships hop-by-hop? Graph. Need correctness and flexible ad-hoc queries over related data?
+          Stay with SQL.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">It's not either/or</span>
+          <p>Real systems mix both — this is <span class="term">polyglot persistence</span>. A shop might keep
+          orders and payments in PostgreSQL (needs ACID), the product catalog in MongoDB (flexible), and
+          sessions in Redis (fast key-value). Use the right tool per job.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          NoSQL drops some relational rules to scale horizontally and stay available, usually with eventual
+          consistency. Its four families are <strong>key-value</strong> (tag→blob), <strong>document</strong>
+          (flexible JSON), <strong>wide-column</strong> (sparse, write-heavy), and <strong>graph</strong>
+          (nodes &amp; edges). SQL wins on correctness and ad-hoc queries; NoSQL wins on scale and flexibility.
+          Choose by your <strong>access pattern</strong>. We'll dig into how a NoSQL engine actually stores data
+          (the LSM tree) in <em>Session 10</em>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SHARDING KEY ===================== -->
+      <section id="sharding-key">
+        <h2><span class="sec-num">4</span> Choosing a sharding key</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine sorting a giant class of kids into ten lunch lines. If you sort by the first letter of
+          their name, one line might be packed with all the "S" kids while another is empty — uneven and
+          unfair. If instead you sort by the last digit of their student number, the lines come out roughly
+          equal. The rule you pick for "which line do you join" is the <strong>sharding key</strong>. A good
+          rule spreads everyone evenly and still lets you find a kid quickly; a bad rule jams everyone into
+          one line.</p>
+        </div>
+
+        <p>When you shard (Topic 2), you must decide: <em>for a given row, which shard does it live on?</em>
+        That decision is driven by the <span class="term">sharding key</span> (also called the partition
+        key) — a column whose value is run through a function to pick a shard, e.g.
+        <code class="inl">shard = hash(key) % number_of_shards</code>. The sharding key decides how data gets
+        <strong>distributed</strong> across DB servers, and also how queries get <strong>routed</strong> to find
+        the data. This single choice quietly decides whether your system stays fast and balanced or falls over.</p>
+
+        <h3>Primary key vs sharding key</h3>
+        <p>These are two different things that <strong>coexist</strong>:</p>
+        <ul>
+          <li><span class="term">Primary key (PK)</span> — uniquely identifies an item (a row). It's <em>what
+          you're talking about.</em></li>
+          <li><span class="term">Sharding key (SK)</span> — tells you how to distribute data: what data goes to
+          what server. It's <em>where to find the data.</em></li>
+        </ul>
+        <div class="callout note">
+          <span class="c-title">Two quick PK questions</span>
+          <p><strong>Must a PK be unique across tables?</strong> No. It's fine to have <code class="inl">user_id = 1</code>
+          and <code class="inl">product_id = 1</code> — they're different entities in different tables.<br>
+          <strong>Must a PK be unique across shards, for the same table?</strong> Yes! A PK must be unique for
+          each row in a table whether or not the table is sharded. It would be <em>wrong</em> for Shard 1 to have
+          <code class="inl">user_id=1 name=Sai</code> while Shard 2 has <code class="inl">user_id=1 name=Abhishek</code>.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — sharding three related tables by <code class="inl">user_id</code></span>
+          <p>Three tables. For <code class="inl">users</code>, PK = id and SK = id. For both
+          <code class="inl">user_posts</code> and <code class="inl">user_friendship</code>, PK = id but SK = user_id:</p>
+          <pre>users(id, name, gender)               user_posts(id, user_id, title, content)
+  A, Akshay,   Male                     1, A, Hi,       Hello World
+  B, Balaji,   Male                     2, A, Bye,      Going to sleep
+  C, Chandani, Female                   3, B, Wassup,   What's everyone doing
+                                        4, C, Context?, Who are you guys?
+user_friendship(id, user_id, friend_id, affinity)
+  1, A, B, 100%   2, B, A, 100%   3, A, C, 50%   4, C, A, 50%</pre>
+          <p>If we shard by <code class="inl">user_id</code>, <strong>every table must carry user_id</strong>, and
+          a user's rows from all three tables land together:</p>
+          <pre>Shard 1 (user A)                  Shard 2 (user B)            Shard 3 (user C)
+  users: A, Akshay, Male            users: B, Balaji, Male      users: C, Chandani, Female
+  posts: 1,A,Hi / 2,A,Bye           posts: 3,B,Wassup           posts: 4,C,Context?
+  friends: 1,A,B / 3,A,C            friends: 2,B,A              friends: 4,C,A</pre>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Common sharding-key Q&amp;A</span>
+          <ul>
+            <li><strong>Must the SK be unique across tables?</strong> No — the question is odd, since all tables
+            are sharded the same way.</li>
+            <li><strong>Must the SK be unique across shards?</strong> Yes — if it weren't, we couldn't route to
+            different shards.</li>
+            <li><strong>PK or SK — which do we use to read/write?</strong> <em>Both!</em> The SK tells you which
+            server to go to (routing); the PK tells you which entry to touch inside that server. It's common
+            (but not required) to use the same column for both — e.g. <code class="inl">user_id</code> as both PK
+            and SK of <code class="inl">users</code>, while <code class="inl">posts</code> has PK
+            <code class="inl">post_id</code> but SK <code class="inl">user_id</code>.</li>
+            <li><strong>Can you omit the SK?</strong> Yes — the PK alone uniquely identifies a row. But without
+            the SK, the query becomes a <span class="term">fan-out</span> (you must hit all shards).</li>
+            <li><strong>Can a DB have more than one SK?</strong> No. The SK can be <em>composite</em> (multiple
+            columns), but it must be the same group of columns across the whole database. Need a different SK?
+            Use a different database.</li>
+            <li><strong>Must <em>all</em> tables have the SK column?</strong> Yes. For data that doesn't need
+            splitting (or is needed everywhere), either replicate it across all shards (only safe for small,
+            rarely-modified tables) or give it a separate database.</li>
+            <li><strong>Can the SK be composite?</strong> Yes — e.g. <code class="inl">(class-number, gender)</code>
+            in a non-co-ed school.</li>
+            <li><strong>Can you change the SK later?</strong> Possible, but not recommended — it requires a
+            complete re-shuffle of all data across servers (very expensive, likely needs downtime). Choose well
+            up front.</li>
+            <li><strong>What if a row's SK value is null?</strong> Bad idea, but the LB doesn't care — it treats
+            "null" like any other value, so all <code class="inl">SK = null</code> rows end up in the same shard.</li>
+          </ul>
+        </div>
+
+        <div class="callout eli5">
+          <span class="c-title">The "find your sister at school" analogy</span>
+          <p>You go to school to find your little sister. The <strong>primary key</strong> is her name &amp;
+          student id (which person). The <strong>sharding key</strong> is her class number (which room). You
+          <em>must</em> know the PK to find her. If you also know the SK, you go straight to the right classroom
+          (server). If you don't know the SK, you fan-out and search every classroom.</p>
+        </div>
+
+        <p>Now, what makes a sharding key <em>good</em>? Several goals guide it.</p>
+
+        <div class="callout note">
+          <span class="c-title">Mental model</span>
+          <p>Suppose you shard by column <code class="inl">SK</code> and consider two rows R1 and R2:</p>
+          <ul>
+            <li>If <code class="inl">R1.SK == R2.SK</code> → they land on the <strong>same shard, guaranteed.</strong></li>
+            <li>If <code class="inl">R1.SK != R2.SK</code> → they <em>most likely</em> land on different shards
+            (assume so), though they <em>can</em> share a shard, because one shard holds many sharding-key values
+            (consistent hashing).</li>
+          </ul>
+        </div>
+
+        <h3>Goal 1 — Equal data &amp; load distribution</h3>
+        <p>Data and traffic should spread roughly equally across shards — all key values should be equally
+        likely. If some values are more likely than others, you get <span class="term">hot shards</span>.
+        Examples of skew:</p>
+        <ul>
+          <li><strong>Age:</strong> ages 0–5 and 50+ are less likely, 15–30 most likely, and almost nobody is
+          100+. Sharding by age gives poor distribution.</li>
+          <li><strong>Gender:</strong> depending on the app, you get hot shards — e.g. most Scaler students are
+          male (gender disparity in higher technical studies).</li>
+          <li><strong>User id:</strong> some users post a lot, some post zero — but since each server houses
+          100,000s of users, the normal users and influencers average out, so distribution stays even. (Caveat:
+          not always true — the <em>celebrity problem</em>, especially for notification systems.)</li>
+        </ul>
+        <div class="callout note">
+          <span class="c-title">Does sharding by user_id mean one server per user?</span>
+          <p>No! 2 billion users does not mean 2 billion servers. A single server houses many users, because
+          multiple key values hash to the same server. If Post_13 is by User_1 and Post_20 is by User_2, they
+          most likely land on different servers — but each server still holds millions of users.</p>
+        </div>
+
+        <h3>Goal 2 — High cardinality</h3>
+        <p><span class="term">Cardinality</span> is the count of possible distinct values. It doesn't define how
+        many servers you have, but it caps how many you can ever scale to:</p>
+        <ul>
+          <li><strong>Age</strong> {0..123} → ~124 possibilities max. With 125 servers, one gets nothing —
+          you're limited to ~124 shards.</li>
+          <li><strong>Gender</strong> {Male, Female, LGBTQ+} → 3 possibilities. With 4 servers, one is idle; max
+          scaling is 3 shards, even with a billion users.</li>
+          <li><strong>User_Id</strong> (64-bit) → ~16 quintillion possibilities. No practical limit — 10 million
+          servers? No problem. (We won't actually have quintillions of servers; one server houses millions of
+          users.)</li>
+        </ul>
+
+        <h3>Goal 3 — Avoid hotspots &amp; support your common queries (no fan-outs)</h3>
+        <p>A <span class="term">hotspot</span> is one shard getting far more traffic than the others, becoming
+        a bottleneck while the rest sit idle. Relatedly, the SK should be <strong>part of every read/write
+        request</strong> — otherwise you can't route, and you fan-out to every shard. The fastest query hits a
+        <strong>single shard</strong>; the rule is that the <em>most frequent</em> queries should hit only 1
+        (at most 2) shards, and no frequent query should fan out. (Rare queries are okay to fan out — you can't
+        optimize everything.)</p>
+        <div class="callout example">
+          <span class="c-title">Why "part of the request" matters — sharding by gender</span>
+          <p>Suppose we shard by gender and want Tanisq's profile page:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> user_profiles <span class="kw">WHERE</span> user_id = <span class="nm">1234</span>;</pre>
+          <p>This <strong>fans out</strong> — the DB LB doesn't know Tanisq's gender, so it can't pick a shard.
+          We could add the gender:</p>
+          <pre><span class="kw">SELECT</span> * <span class="kw">FROM</span> user_profiles
+<span class="kw">WHERE</span> user_id = <span class="nm">1234</span> <span class="kw">AND</span> gender = <span class="st">'MALE'</span>;</pre>
+          <p>This won't fan out — but how would the app server even <em>know</em> Tanisq's gender while rendering
+          his profile? It usually doesn't, which is exactly why a low-info key like gender is a poor SK.</p>
+        </div>
+
+        <h3>Goal 4 — Immutable</h3>
+        <p>The SK value should never change for a row. If it changes, you must re-shuffle that row to a different
+        server. Example: <strong>age</strong> — what happens on the user's birthday? The age changes, so you'd
+        have to move them to a different server. (Timestamps have the same problem, plus they create write
+        hotspots — see below.)</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — good key vs bad key</span>
+          <p>We're building a feed where the hot query is "get this user's recent posts."</p>
+          <p><strong>Bad key — <code class="inl">created_at</code> (a timestamp):</strong></p>
+          <pre><span class="cm">-- every brand-new post has "now" as its key →</span>
+<span class="cm">-- all writes hammer the single newest shard = HOTSPOT.</span>
+<span class="cm">-- and "this user's posts" are scattered by time across ALL shards.</span>
+shard = hash(created_at) % N   <span class="cm">-- ✗ skewed writes, scatter-gather reads</span></pre>
+          <p><strong>Good key — <code class="inl">user_id</code>:</strong></p>
+          <pre><span class="cm">-- millions of distinct users → high cardinality → even spread.</span>
+<span class="cm">-- one user's posts all land on ONE shard → single-shard read.</span>
+shard = hash(user_id) % N      <span class="cm">-- ✓ balanced writes, fast reads</span></pre>
+          <p>The query "get user 42's recent posts" now routes to exactly one shard and uses its local index —
+          fast and balanced. Same data, opposite outcome, decided entirely by the key.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Watch the cardinality trap</span>
+          <p>Sharding by something like <code class="inl">country</code> feels natural but has low cardinality
+          and heavy skew — a "USA" or "India" shard can dwarf a "Luxembourg" shard. Low-cardinality keys can't
+          spread data evenly no matter how clever the hash. Prefer high-cardinality keys.</p>
+        </div>
+
+        <h3>Composite keys — getting both balance and locality</h3>
+        <p>Sometimes one column isn't enough. A <span class="term">composite key</span> combines columns,
+        commonly a <em>partition</em> part (decides the shard) and a <em>sort</em> part (orders rows within
+        that shard). This is the heart of wide-column stores like Cassandra and DynamoDB.</p>
+        <div class="callout example">
+          <span class="c-title">Example — composite key for a chat app</span>
+          <pre><span class="cm">-- partition by chat_id (spreads chats across shards),</span>
+<span class="cm">-- sort by created_at (messages within a chat stay ordered).</span>
+<span class="kw">PARTITION KEY</span> = chat_id
+<span class="kw">SORT KEY</span>      = created_at</pre>
+          <p>All of one chat's messages live together on one shard (single-shard, in-order reads), while
+          different chats spread across shards (even load). You get balance <em>and</em> locality.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Resharding is painful — choose carefully now</span>
+          <p>If <code class="inl">shard = hash(key) % N</code> and you grow from N=4 to N=5, almost
+          <em>every</em> key now hashes to a different shard, so nearly all data must physically move while the
+          system is live — slow, risky, and disruptive. Two mitigations are standard:
+          <span class="term">consistent hashing</span> (only a small fraction of keys move when you add a node)
+          and over-provisioning many small <span class="term">virtual shards</span> up front. Either way:
+          <strong>picking the right key early is far cheaper than changing it later.</strong></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The <strong>sharding key</strong> (where to find data) and <strong>primary key</strong> (which row)
+          coexist — the SK routes you to a server, the PK finds the row inside it. A good SK gives
+          <strong>even data &amp; load distribution</strong> (equally-likely values), <strong>high
+          cardinality</strong> (so you can scale to many servers), is <strong>part of every request</strong>
+          with <strong>no frequent fan-outs</strong> (single-shard common queries), and is
+          <strong>immutable</strong> (never re-shuffle). Shard by what you filter on (e.g.
+          <code class="inl">user_id</code>, not <code class="inl">created_at</code> or low-cardinality
+          gender/age). Use <strong>composite keys</strong> for balance plus locality, and choose well from the
+          start because <strong>resharding</strong> is expensive.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SHARDING KEY EXAMPLES ===================== -->
+      <section id="sharding-examples">
+        <h2><span class="sec-num">5</span> Choosing a sharding key — worked examples</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picking a sharding key is like deciding how to split toys into boxes so you can always find one
+          fast. For your <em>own</em> toys, split by "whose toy is it" — all your toys in one box. But for a
+          board game where everyone shares the pieces, split by "which game," not "which person," or you'd have
+          to open everyone's box to find all the pieces. The right rule depends on <em>what you'll look for
+          most.</em></p>
+        </div>
+
+        <p>The same theory applied to four real systems. For each, list the most frequent operations first, then
+        test candidate keys against the four goals.</p>
+
+        <h3>Example 1 — Banking system</h3>
+        <p>Users can have active bank accounts across cities. Most frequent operations:</p>
+        <ul>
+          <li>Balance query <code class="inl">(user_id, account_id)</code></li>
+          <li>Fetch transaction history <code class="inl">(user_id, account_id, date_range)</code></li>
+          <li>Fetch a user's list of accounts <code class="inl">(user_id)</code></li>
+          <li>Create transaction <code class="inl">(sender_id, receiver_id, amount)</code> — note sender_id and
+          receiver_id are composite <code class="inl">(user_id, account_id)</code></li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Candidate key</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td><strong>location (city_id)</strong></td><td>Bad. A user can have accounts across cities, so their data splits across shards; "list of accounts" fan-outs; large cities are hot shards; not part of request; low cardinality.</td></tr>
+              <tr><td><strong>branch_id</strong></td><td>Same issues as location, just more granular.</td></tr>
+              <tr><td><strong>account_balance</strong></td><td>Bad. Changes constantly (move data on every deposit), not in the request, poor distribution.</td></tr>
+              <tr><td><strong>timestamp</strong></td><td>NEVER. Unequal load (recent = hot, future = empty), mutable (updated_at), not in request.</td></tr>
+              <tr><td><strong>transaction_id</strong></td><td>Bad. Generated in the response, not part of the request. Any system-generated id (ticket/booking/transaction) can't be the SK.</td></tr>
+              <tr><td><strong>account_id</strong></td><td>Fine for most queries, but breaks the dashboard: a user's different accounts could land on different servers → fan-out for "list my accounts."</td></tr>
+              <tr><td><strong>user_id</strong> ✓</td><td><strong>Ideal.</strong> One user's data lives entirely on one server (still 1000s of users/server). Balance, history, and account-list all hit just 1 shard.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Transactions touch two shards (and that's okay)</span>
+          <p>A transaction is data about both sender and receiver, so it's stored in 2 shards (sender's +
+          receiver's). Hitting 2 shards is <em>not</em> a fan-out and is acceptable — but it's still hard: it must
+          be done atomically (<span class="term">2-Phase Commit</span>), giving high latency and low
+          availability.</p>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Isn't user_id also system-generated?</span>
+          <p>Yes — but only once, at registration. On every subsequent request the client already has the
+          user_id and sends it along (cookie / auth-token), so it <em>is</em> part of the request. A
+          transaction_id, by contrast, only exists <em>after</em> the request.</p>
+        </div>
+
+        <h3>Example 2 — IRCTC (Indian railway ticket booking)</h3>
+        <p>Requirements: prevent double-booking of seats (at least for confirmed, non-RAC tickets), and handle
+        peak <span class="term">Tatkal</span> load (20×+ the average). Core call:</p>
+        <pre>book_ticket(user_id, train_id, date_of_journey, class,
+            seat_preference, meal_preference, ...) => ticket: {id, details}</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Candidate key</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td><strong>ticket_id</strong></td><td>Bad — generated in the response, not part of the request.</td></tr>
+              <tr><td><strong>date of travel</strong></td><td>It's a timestamp → big no. Past dates become immutable; you can't book/modify a journey already completed.</td></tr>
+              <tr><td><strong>user_id</strong></td><td>Bad <em>for de-duplication.</em> Booked tickets are spread across users' shards, so to check whether a seat on Rajdhani 15-Feb is taken (Sanjana's, Rohit's, ...), you must hit every shard → fan-out.</td></tr>
+              <tr><td><strong>train_id</strong> ✓</td><td><strong>Ideal.</strong> All tickets for one train live in one shard. Sanjana &amp; Rohit (Rajdhani 15-Feb) are co-located; Vijay (Shatabdi) can't collide — different trains. Duplicate-check hits just 1 shard. IRCTC runs ~13k passenger trains → decent cardinality.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">But a user books across many trains — where's their data?</span>
+          <p>Use <strong>two databases</strong>. The user-dashboard service shards user data by
+          <code class="inl">user_id</code>; the booking microservice shards ticket data by
+          <code class="inl">train_id</code>. Each ticket is stored in 2 DBs — the tickets DB (by train_id) and
+          the user's DB (by user_id).</p>
+        </div>
+        <div class="callout note">
+          <span class="c-title">"All journeys on a given day" would fan out — is that a problem?</span>
+          <p>It's a fan-out, but it's <em>not</em> a frequent query, so it's acceptable. If it <em>were</em>
+          frequent, we wouldn't change the SK (train_id is ideal for de-dup) — we'd add another database sharded
+          by date to serve it. (IRCTC actually does this!)</p>
+        </div>
+
+        <h3>Example 3 — Facebook Messenger (1-1 chat)</h3>
+        <p>Operations: <code class="inl">sendMessage(sender_id, recipient_id, message) → Ack/Failure</code> and
+        <code class="inl">viewMessages(user_id, other_person_id) → list of messages</code>.</p>
+        <ul>
+          <li><strong>user_id ✓</strong> — all messages Sanjana sends <em>and</em> receives live in her shard.
+          To view her conversation with Sachin, only her shard is hit. A "Sanjana → Sachin" message is stored in
+          both Sanjana's and Sachin's shards — that's 2 shards, not a fan-out.</li>
+          <li><strong>message_id</strong> — created in the response (not in the request). Even if generated
+          client-side, sharding by it scatters messages across all servers, so "all messages Sanjana sent
+          Sachin" becomes a fan-out.</li>
+        </ul>
+
+        <h3>Example 4 — Slack (1-1 <em>and</em> group chat)</h3>
+        <p>Groups can have up to 100,000 participants. Consider an "Announcements" group of 100,000 people where
+        Sanjana sends "Hi".</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Candidate key</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td><strong>user_id</strong></td><td>Two bad designs: (a) store "Hi" only in Sanjana's shard → any reader must hit all 100,000 member shards (writes:1, reads:100,000); or (b) store "Hi" in all receivers' shards → writes:100,000, reads:1. Both are terrible.</td></tr>
+              <tr><td><strong>group_id</strong> ✓</td><td>All of a group's messages live in one shard. Sanjana's "Hi" to Announcements → write 1 shard, read 1 shard.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">So what's the final key for Slack (which has both 1-1 and groups)?</span>
+          <p>Two approaches: <strong>(1)</strong> two databases — group conversations sharded by group_id, 1-1
+          conversations sharded by user_id; or <strong>(2)</strong> treat every 1-1 chat as an "ad-hoc" group of
+          2 participants, so "Sanjana → Hi → Tarun" is just a message in conversation
+          <code class="inl">(sanjana_id, tarun_id)</code> — then everything shards by conversation_id.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Always start from the <strong>most frequent operations</strong>, then test keys against the goals.
+          Reject system-generated ids (ticket/transaction/message id), timestamps, mutable values, and
+          low-cardinality/skewed columns (location, gender, account_balance). Banking → <strong>user_id</strong>;
+          IRCTC de-dup → <strong>train_id</strong> (with a separate user DB by user_id); Messenger →
+          <strong>user_id</strong>; Slack → <strong>group_id</strong> (or conversation_id). When two access
+          patterns conflict, use <strong>two databases</strong> sharded differently rather than compromising one
+          key.
+        </div>
+      </section>
+
+      <!-- ===================== 6. HOW STORAGE WORKS ===================== -->
+      <section id="storage">
+        <h2><span class="sec-num">6</span> How storage works — sequential vs random access</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a record player. Reading a whole song straight through is quick — the needle just rides
+          along. But if you wanted to hear one second from this song, then one second from a different track, the
+          needle would have to keep lifting and jumping around — slow! Reading data <em>in order</em>
+          (sequential) is way faster than hopping all over (random), no matter what storage we use.</p>
+        </div>
+
+        <p>Storage comes in layers — Magnetic (HDD), Solid State (SSD), and RAM — each faster and pricier than
+        the last (see the videos in References). The key idea spans all of them: <strong>sequential access is
+        far faster than random access.</strong> Let's prove it with HDD math.</p>
+
+        <div class="callout example">
+          <span class="c-title">HDD math — spin time, seek time, bandwidth</span>
+          <p>A hard disk spinning at <strong>7200 RPM</strong>:</p>
+          <pre>7200 rpm = 7200/60 = 120 rotations/sec
+time for 1 rotation = 1 / 120 s = ~8 ms
+time to move the spindle (read head, "seek") = ~10 ms</pre>
+          <p><strong>Reading an entire track (100 MB of sequential data):</strong></p>
+          <pre>10 ms  to move the spindle to the correct track
+ 8 ms  to spin the disk once
+----
+bandwidth = 100 MB / 18 ms = 100 MB / 0.018 s = ~5.5 Gbps</pre>
+          <p><strong>Reading 4 KB of random data</strong> (why 4 KB? the disk is not byte-addressable — every
+          read/write happens in 4 KB chunks). The data is on some other track:</p>
+          <pre>10 ms  to move the spindle to the correct track
+ 8 ms  to spin the disk once
+----
+bandwidth = 4 KB / 18 ms = ~222 kbps</pre>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Sequential is up to 10,000× faster than random</span>
+          <p>5.5 Gbps vs 222 kbps — that's the gap between sequential and random access on an HDD. And this is
+          true <em>irrespective</em> of the storage technology: HDD, SSD, RAM, L3 cache — even your brain. This
+          single fact drives huge amounts of database design (and is exactly why the LSM tree in Session 10
+          turns random writes into sequential ones).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Disks read/write in <strong>4 KB chunks</strong>, not bytes. On a 7200-RPM HDD, one rotation is ~8 ms
+          and a seek is ~10 ms, so reading 100 MB sequentially hits ~5.5 Gbps while reading 4 KB at random is
+          ~222 kbps. The takeaway: <strong>sequential access can be up to 10,000× faster than random</strong> —
+          across every storage tier.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was really one continuous story about scale and trade-offs. Here it is in a paragraph:</p>
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A <strong>relational (SQL)</strong> database gives you wonderful guarantees on one machine —
+          <strong>ACID</strong> correctness, <strong>normalized</strong> single-source-of-truth data, an enforced
+          <strong>schema</strong>, and fast <strong>joins</strong> over indexes. But to scale past one machine you
+          must <strong>shard</strong>, and sharding is exactly what makes cross-shard joins, transactions, and
+          global uniqueness expensive — so people reach for <strong>NoSQL</strong>, which trades strict rules for
+          horizontal scale and (often) eventual consistency, in four flavours: <strong>key-value, document,
+          wide-column, and graph</strong>. Whichever sharded system you build, its single most important knob is
+          the <strong>sharding key</strong>: pick a high-cardinality key that spreads load evenly, avoids
+          hotspots, and keeps your common queries on one shard — because changing it later (resharding) hurts.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What do the four letters of ACID stand for, in one phrase each?</summary>
+          <p class="ans">Atomicity (all-or-nothing), Consistency (rules always hold), Isolation (concurrent
+          transactions don't interfere), Durability (committed data survives crashes).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does normalization save you from "update anomalies"?</summary>
+          <p class="ans">Each fact (like a customer's email) is stored exactly once, so changing it is a single
+          update. If it were copied into many rows, you'd risk missing some and leaving the data contradicting itself.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name two SQL features that become hard or slow once you shard, and why.</summary>
+          <p class="ans">Joins (rows to combine may sit on different machines → slow scatter-gather) and
+          transactions (atomicity across shards needs costly coordination like two-phase commit). Global
+          uniqueness is another, since no single shard sees all the others.</p>
+        </details>
+        <details class="quiz">
+          <summary>You always fetch a single object by a known id and never run joins. Which NoSQL family fits?</summary>
+          <p class="ans">A key-value store. It's optimised for exactly that: fetch a value by its key, extremely fast.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is a timestamp usually a terrible sharding key?</summary>
+          <p class="ans">It's monotonic, so every new write has roughly the same "latest" value and lands on one
+          shard — a write hotspot — while reads for a single entity get scattered across all shards by time.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does a composite (partition + sort) key buy you?</summary>
+          <p class="ans">Both balance and locality: the partition part spreads groups across shards evenly, while
+          the sort part keeps a group's rows together and in order on one shard for fast single-shard reads.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is resharding with <code class="inl">hash(key) % N</code> so disruptive?</summary>
+          <p class="ans">Changing N changes the result for almost every key, so nearly all data must move at once.
+          Consistent hashing or many virtual shards reduce how much moves — which is why you choose the key carefully up front.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1Pdck0k2_GpUoHGFQ_dmcH0pSPwKIdssuPsnKyyidUso/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] Sql vs NoSql + Sharding Key</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li>📄 <a href="https://www.postgresql.org/docs/current/tutorial-transactions.html" target="_blank" rel="noopener">PostgreSQL docs — Transactions</a> — how ACID transactions work in a real relational database.</li>
+    <li>📄 <a href="https://www.mongodb.com/docs/manual/data-modeling/" target="_blank" rel="noopener">MongoDB — Data Modeling</a> — modeling documents and denormalization in a NoSQL document store.</li>
+    <li>📄 <a href="https://www.mongodb.com/nosql-explained" target="_blank" rel="noopener">NoSQL Databases Explained (MongoDB)</a> — overview of the NoSQL families and when to use them.</li>
+    <li>📘 <a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications (Kleppmann)</a> — the definitive deep dive on replication, partitioning (sharding), and consistency.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-8.html"><div class="dir">← Previous</div><div class="ttl">Session 8: Master-Slave Replication</div></a>
+        <a class="next" href="session-10.html"><div class="dir">Next →</div><div class="ttl">Session 10: NoSQL Internals — LSM Tree 1</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 9 — SQL vs NoSQL &amp; Choosing a Sharding Key · You scaled past one machine 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Nets · Session 17 — Project Week — Neural Style Transfer (VGG19)</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="nn">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / Session 17</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 17 · Project — Neural Style Transfer</span>
+      <h1>Turn your photo into a Van Gogh painting</h1>
+      <p class="lead">
+        This is a <em>project</em> week — we build something real and beautiful from scratch.
+        By the end you'll have working PyTorch code that takes a photo and repaints it in the
+        style of any artwork you like. We start with a tiny "explain like I'm 5" story for every
+        idea, then build up the full technique, with complete, runnable code you can paste and try.
+        No prior computer-vision experience assumed — just the convolutional-network basics from
+        earlier sessions.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 19 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what">What neural style transfer is</a></li>
+          <li><a href="#reps">Content &amp; style representations</a></li>
+          <li><a href="#optim">The optimization &amp; full code</a></li>
+          <li><a href="#tuning">Running, tuning &amp; results</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHAT IS NST ===================== -->
+      <section id="what">
+        <h2><span class="sec-num">1</span> What is neural style transfer?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a photo of your dog, and you have a famous swirly painting by Van Gogh.
+          You hand both to a magical artist and say: <em>"Paint my dog — but use Van Gogh's swirls and
+          colours."</em> The artist keeps <strong>what's in your photo</strong> (the dog, where it sits,
+          its shape) but borrows <strong>how the painting looks</strong> (the brushstrokes, the colours,
+          the texture). The result is your dog, painted like a Van Gogh. That's exactly what neural
+          style transfer does — automatically, with a computer.</p>
+        </div>
+
+        <p><span class="term">Neural style transfer</span> (NST) is a technique that takes <strong>two
+        images</strong> and blends them in a very specific way:</p>
+        <ul>
+          <li>A <span class="term">content image</span> — the photo whose <em>subject and layout</em> you
+          want to keep (your dog, a city skyline, a selfie).</li>
+          <li>A <span class="term">style image</span> — the artwork whose <em>look and feel</em> you want
+          to borrow (Van Gogh's <em>Starry Night</em>, a watercolour, a comic-book panel).</li>
+        </ul>
+        <p>The output is a brand-new image that has the <strong>content of the first</strong> and the
+        <strong>style of the second</strong>. It was introduced in 2015 by Gatys, Ecker, and Bethge in a
+        paper called <em>"A Neural Algorithm of Artistic Style"</em> — one of the most fun and visual
+        results in deep learning.</p>
+
+        <h3>The key insight: content and style can be separated</h3>
+        <p>This sounds almost impossible — how do you pull apart "what's in a picture" from "how it
+        looks"? The breakthrough idea is that a <strong>pretrained convolutional neural network</strong>
+        (recall <span class="term">CNNs</span> from our earlier vision sessions) already learned to
+        represent images in layers, and those layers happen to separate these two things naturally:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🖼️</div><div class="s-t">Content image</div><div class="s-d">Your photo (the subject)</div></div>
+          <div class="arrow">+</div>
+          <div class="step"><div class="s-ico">🎨</div><div class="s-t">Style image</div><div class="s-d">The artwork (the look)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">Pretrained CNN</div><div class="s-d">Measures content &amp; style</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✨</div><div class="s-t">Output</div><div class="s-d">Photo painted in the style</div></div>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>We never <em>train</em> a network here. We take an <strong>already-trained</strong> image
+          network, use it as a <strong>measuring instrument</strong> for "how much content" and "how much
+          style" an image has, and then we <strong>slowly edit a single image</strong> until it matches the
+          content of one photo and the style of another. The thing we optimize is the <em>image itself</em>,
+          not the network.</p>
+        </div>
+
+        <h3>Why this is different from a normal neural network task</h3>
+        <p>In every session so far, "learning" meant <strong>adjusting the network's weights</strong> to fit
+        data. Here it's flipped: the network's weights are <strong>frozen</strong> forever, and instead the
+        <strong>pixels of the output image are the thing we adjust</strong>. The network just tells us how
+        far off we are. That single mental flip is the heart of this whole project — keep it in mind.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example</span>
+          <p>Content = a photo of the Brandenburg Gate. Style = Van Gogh's <em>Starry Night</em>. The output
+          keeps the gate's columns, arches, and overall composition perfectly recognisable, but every surface
+          is rendered with thick swirling brushstrokes and deep blues and yellows. You can still tell exactly
+          what building it is — it just looks hand-painted by Van Gogh. Swap in a different style image (say,
+          a Japanese woodblock print) and the same gate comes out looking like a woodblock print instead.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two flavours of style transfer</span>
+          <p>What we build today is the <strong>original, optimization-based</strong> method: slow (seconds to
+          minutes per image) but needs no training and works on any style. There's also a faster family —
+          <span class="term">fast neural style transfer</span> — where you train a small network once per style
+          so it can repaint images instantly. We focus on the original because it teaches the core ideas most
+          clearly; the fast version is just a speed optimization on top.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Neural style transfer blends the <strong>content</strong> of one image with the <strong>style</strong>
+          of another. The trick is to use a <em>frozen, pretrained CNN</em> as a measuring tool and then
+          optimize the <em>output image's pixels</em> — not the network — until it matches both. We never train
+          anything.
+        </div>
+      </section>
+
+      <!-- ===================== 2. REPRESENTATIONS ===================== -->
+      <section id="reps">
+        <h2><span class="sec-num">2</span> Content &amp; style representations</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a CNN as a stack of filters that look at a picture and notice things — early filters
+          notice tiny stuff (edges, dots, little colours), and deeper filters notice big stuff (eyes, wheels,
+          whole shapes). To capture <strong>content</strong> ("what's in the picture and where"), we listen to
+          a <em>deep</em> filter layer that knows about big shapes. To capture <strong>style</strong> ("what
+          textures and colours, ignoring where"), we listen to <em>several</em> layers but only pay attention
+          to <em>which patterns appear together</em>, not where they are.</p>
+        </div>
+
+        <p>We use <span class="term">VGG19</span> — a famous, simple, deep CNN trained on millions of images
+        (ImageNet). It's just a long stack of <span class="term">convolutional layers</span> (recall these
+        from our CNN sessions: small filters sliding over the image, each producing a
+        <span class="term">feature map</span>) interleaved with pooling. Because it was trained to recognise
+        objects, its internal feature maps are rich descriptions of images — and we mine them.</p>
+
+        <h3>Part A — Content representation</h3>
+        <p>When you push an image through VGG19, each layer outputs a stack of feature maps. <strong>Deeper
+        layers</strong> respond to high-level structure (the arrangement of objects and shapes) while throwing
+        away exact pixel detail. So to describe <em>content</em>, we simply record the raw feature-map values
+        at one deep layer (a common choice is the layer called <code class="inl">conv4_2</code>).</p>
+
+        <div class="callout note">
+          <span class="c-title">Why a deep layer for content?</span>
+          <p>If we matched content at an <em>early</em> layer, the output would be forced to copy the photo
+          almost pixel-for-pixel, leaving no room for style. A deep layer says "there's a gate-shaped thing
+          here, columns there" without dictating the exact brushstrokes — leaving freedom for the style to
+          take over the texture. That freedom is what makes the effect work.</p>
+        </div>
+
+        <h3>Part B — Style representation: the Gram matrix</h3>
+        <p>Style is trickier. We want "the textures and colours and brushstroke patterns" but explicitly
+        <strong>not</strong> "where they are." The clever trick from the paper is the
+        <span class="term">Gram matrix</span>.</p>
+
+        <p>At a chosen layer, the feature maps are a stack of <em>C</em> channels, each a grid of numbers. Each
+        channel is like a detector for one kind of pattern (one channel might fire on swirls, another on a
+        certain yellow, another on diagonal strokes). The Gram matrix measures, for every <strong>pair</strong>
+        of channels, <em>how much they tend to fire together across the whole image</em> — that is, the
+        <strong>correlations</strong> between feature detectors.</p>
+
+        <div class="bigidea">
+          <span class="c-title">Why correlations = style</span>
+          <p>Saying "the swirl detector and the yellow detector fire together a lot, everywhere" describes a
+          <strong>texture</strong> — swirly yellow stuff — <em>without</em> saying where it is. Throwing away
+          position is exactly what turns "the specific picture" into "the general look." That's why correlations
+          between channels capture style and discard content.</p>
+        </div>
+
+        <p>Concretely: take a layer's feature maps, flatten each channel into a long vector, and stack them
+        into a matrix <code class="inl">F</code> of shape <em>(C × N)</em>, where <em>C</em> is the number of
+        channels and <em>N</em> is the number of pixels per channel. The Gram matrix is the matrix product
+        <code class="inl">G = F · F&#x1D40;</code>, giving a <em>(C × C)</em> matrix. Entry
+        <code class="inl">G[i][j]</code> is the dot product of channel <em>i</em> with channel <em>j</em> —
+        their correlation. Note its size depends only on <em>C</em>, not on the image size — so position is
+        gone, exactly as we wanted.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example — Gram matrix in code</span>
+          <p>Here's the Gram matrix computed in PyTorch. We'll reuse this function in the full program in the
+          next section.</p>
+<pre><span class="kw">import</span> torch
+
+<span class="kw">def</span> gram_matrix(feature):
+    <span class="cm"># feature has shape (batch=1, C, H, W)</span>
+    b, c, h, w = feature.size()
+    <span class="cm"># flatten each channel into one long row -> shape (C, H*W)</span>
+    f = feature.view(c, h * w)
+    <span class="cm"># G[i,j] = how much channel i and channel j fire together</span>
+    g = torch.mm(f, f.t())            <span class="cm"># (C, C)</span>
+    <span class="cm"># normalize so big feature maps don't dominate</span>
+    <span class="kw">return</span> g.div(c * h * w)</pre>
+          <p>The normalisation by <code class="inl">c * h * w</code> keeps the numbers in a sane range so that
+          layers with bigger feature maps don't overwhelm smaller ones when we add up the style loss.</p>
+        </div>
+
+        <h3>Which layers do we use?</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Purpose</th><th>VGG19 layers (typical)</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Content</td><td><code class="inl">conv4_2</code> (one deep layer)</td><td>Captures high-level layout without locking in pixels.</td></tr>
+              <tr><td>Style</td><td><code class="inl">conv1_1, conv2_1, conv3_1, conv4_1, conv5_1</code> (five layers)</td><td>Mixing shallow + deep layers captures style at many scales — fine grain to coarse shapes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Using <em>several</em> layers for style is what gives you both the fine brush texture (from shallow
+        layers) and the larger compositional feel (from deep layers). We'll see how to weight them shortly.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p><strong>Content</strong> = raw feature-map values at a deep layer (keeps "what &amp; where").
+          <strong>Style</strong> = Gram matrices (channel correlations) at several layers (keeps "look",
+          discards "where"). These two different ways of reading the <em>same</em> network are what let us pull
+          content and style apart.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We read a frozen VGG19. For content we record feature maps at one deep layer. For style we compute
+          <strong>Gram matrices</strong> — correlations between channels — at several layers, which describe
+          texture while throwing away position. These are the two "rulers" we'll match against.
+        </div>
+      </section>
+
+      <!-- ===================== 3. THE OPTIMIZATION ===================== -->
+      <section id="optim">
+        <h2><span class="sec-num">3</span> The optimization &amp; full code</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a "wrongness meter." We start with a blurry guess image. The meter tells us two things:
+          "your picture doesn't show the dog enough" (content wrongness) and "your picture doesn't look swirly
+          enough" (style wrongness). We nudge the picture's colours a tiny bit to make both numbers smaller,
+          check again, nudge again — hundreds of times — until both numbers are small. Slowly, the dog appears
+          <em>and</em> it becomes swirly. We're not teaching a brain; we're sculpting one picture.</p>
+        </div>
+
+        <p>Now we put it together. We turn "match the content and match the style" into numbers we can minimise.
+        These numbers are <span class="term">loss functions</span> (recall from training: a loss is a single
+        number measuring how wrong we are, which we push down with <span class="term">gradient descent</span>).</p>
+
+        <h3>The three losses</h3>
+        <p><strong>1. Content loss.</strong> How different the output's content features are from the content
+        image's. It's the mean-squared difference of the feature maps at the content layer:</p>
+        <p style="text-align:center"><code class="inl">L_content = mean( (F_output − F_content)² )</code></p>
+
+        <p><strong>2. Style loss.</strong> How different the output's Gram matrices are from the style image's,
+        summed over all the style layers:</p>
+        <p style="text-align:center"><code class="inl">L_style = Σ_layers  weight · mean( (G_output − G_style)² )</code></p>
+
+        <p><strong>3. Total variation loss.</strong> A gentle "smoothness" term that penalises neighbouring
+        pixels being wildly different. It tames the speckled, noisy artefacts that optimization can introduce,
+        giving a cleaner result:</p>
+        <p style="text-align:center"><code class="inl">L_tv = Σ |pixel − right_neighbour| + |pixel − below_neighbour|</code></p>
+
+        <p>The <strong>total loss</strong> is a weighted sum, and the weights are the main dials you tune:</p>
+        <p style="text-align:center"><code class="inl">L_total = α·L_content + β·L_style + γ·L_tv</code></p>
+
+        <div class="callout note">
+          <span class="c-title">What does "optimize the image" mean?</span>
+          <p>Normally PyTorch computes gradients with respect to the <em>weights</em>. Here we set the network's
+          parameters to not require gradients (frozen) and instead make the <strong>output image a tensor that
+          requires gradients</strong>. Then <code class="inl">loss.backward()</code> computes "which way should
+          each pixel move to reduce the loss," and the optimizer nudges the pixels. The image <em>is</em> the
+          parameter being trained.</p>
+        </div>
+
+        <h3>Why L-BFGS instead of Adam?</h3>
+        <p>Because we're optimizing a single fixed image (not a dataset), we can use a powerful classical
+        optimizer called <span class="term">L-BFGS</span>, which converges in far fewer steps than Adam for
+        this kind of problem. It's the optimizer used in the original paper and the official PyTorch tutorial.
+        (Adam works too if you prefer; you'll just need more steps.)</p>
+
+        <div class="callout example">
+          <span class="c-title">Complete, runnable PyTorch program</span>
+          <p>This is the whole project in one file. It loads a content image and a style image, builds the loss
+          using VGG19, and optimizes the output image. Save it as <code class="inl">style_transfer.py</code>,
+          put two images next to it, and run it. (Requires <code class="inl">torch</code>,
+          <code class="inl">torchvision</code>, and <code class="inl">Pillow</code>.)</p>
+<pre><span class="cm"># style_transfer.py — optimization-based neural style transfer with VGG19</span>
+<span class="kw">import</span> torch
+<span class="kw">import</span> torch.nn <span class="kw">as</span> nn
+<span class="kw">import</span> torch.optim <span class="kw">as</span> optim
+<span class="kw">import</span> torchvision.transforms <span class="kw">as</span> T
+<span class="kw">from</span> torchvision.models <span class="kw">import</span> vgg19, VGG19_Weights
+<span class="kw">from</span> PIL <span class="kw">import</span> Image
+
+device = torch.device(<span class="st">"cuda"</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="st">"cpu"</span>)
+IMG_SIZE = <span class="nm">512</span> <span class="kw">if</span> torch.cuda.is_available() <span class="kw">else</span> <span class="nm">256</span>   <span class="cm"># smaller on CPU for speed</span>
+
+<span class="cm"># ---------- 1. load &amp; preprocess images ----------</span>
+loader = T.Compose([
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ToTensor(),                       <span class="cm"># pixels -> [0,1], shape (C,H,W)</span>
+])
+
+<span class="kw">def</span> load_image(path):
+    img = Image.open(path).convert(<span class="st">"RGB"</span>)
+    <span class="kw">return</span> loader(img).unsqueeze(<span class="nm">0</span>).to(device)   <span class="cm"># add batch dim -> (1,C,H,W)</span>
+
+content_img = load_image(<span class="st">"content.jpg"</span>)
+style_img   = load_image(<span class="st">"style.jpg"</span>)
+
+<span class="cm"># VGG was trained on ImageNet-normalized inputs; normalize the same way.</span>
+cnn_mean = torch.tensor([<span class="nm">0.485</span>, <span class="nm">0.456</span>, <span class="nm">0.406</span>]).view(<span class="nm">1</span>, <span class="nm">3</span>, <span class="nm">1</span>, <span class="nm">1</span>).to(device)
+cnn_std  = torch.tensor([<span class="nm">0.229</span>, <span class="nm">0.224</span>, <span class="nm">0.225</span>]).view(<span class="nm">1</span>, <span class="nm">3</span>, <span class="nm">1</span>, <span class="nm">1</span>).to(device)
+
+<span class="kw">def</span> normalize(x):
+    <span class="kw">return</span> (x - cnn_mean) / cnn_std
+
+<span class="cm"># ---------- 2. load frozen VGG19 feature extractor ----------</span>
+vgg = vgg19(weights=VGG19_Weights.DEFAULT).features.to(device).eval()
+<span class="kw">for</span> p <span class="kw">in</span> vgg.parameters():
+    p.requires_grad_(<span class="kw">False</span>)        <span class="cm"># freeze the network — we never train it</span>
+
+<span class="cm"># Map torchvision's numeric layer indices to the names from the paper.</span>
+LAYER_NAMES = {
+    <span class="nm">0</span>: <span class="st">"conv1_1"</span>, <span class="nm">5</span>: <span class="st">"conv2_1"</span>, <span class="nm">10</span>: <span class="st">"conv3_1"</span>,
+    <span class="nm">19</span>: <span class="st">"conv4_1"</span>, <span class="nm">21</span>: <span class="st">"conv4_2"</span>, <span class="nm">28</span>: <span class="st">"conv5_1"</span>,
+}
+CONTENT_LAYERS = {<span class="st">"conv4_2"</span>}
+STYLE_LAYERS   = {<span class="st">"conv1_1"</span>, <span class="st">"conv2_1"</span>, <span class="st">"conv3_1"</span>, <span class="st">"conv4_1"</span>, <span class="st">"conv5_1"</span>}
+
+<span class="kw">def</span> get_features(x):
+    <span class="cm"># run x through vgg, collecting the layers we care about</span>
+    feats = {}
+    x = normalize(x)
+    <span class="kw">for</span> i, layer <span class="kw">in</span> enumerate(vgg):
+        x = layer(x)
+        <span class="kw">if</span> i <span class="kw">in</span> LAYER_NAMES:
+            feats[LAYER_NAMES[i]] = x
+    <span class="kw">return</span> feats
+
+<span class="kw">def</span> gram_matrix(feature):
+    b, c, h, w = feature.size()
+    f = feature.view(c, h * w)
+    <span class="kw">return</span> torch.mm(f, f.t()).div(c * h * w)
+
+<span class="cm"># ---------- 3. precompute the targets (these never change) ----------</span>
+content_feats = get_features(content_img)
+style_feats   = get_features(style_img)
+style_grams   = {l: gram_matrix(style_feats[l]) <span class="kw">for</span> l <span class="kw">in</span> STYLE_LAYERS}
+
+<span class="cm"># ---------- 4. the image we optimize: start from the content photo ----------</span>
+output = content_img.clone().requires_grad_(<span class="kw">True</span>)   <span class="cm"># THIS is our parameter</span>
+optimizer = optim.LBFGS([output])
+
+<span class="cm"># ---------- 5. loss weights (tune these!) ----------</span>
+CONTENT_WEIGHT = <span class="nm">1.0</span>
+STYLE_WEIGHT   = <span class="nm">1e6</span>      <span class="cm"># style needs a big weight; Grams are small numbers</span>
+TV_WEIGHT      = <span class="nm">1e-4</span>     <span class="cm"># gentle smoothing</span>
+STYLE_LAYER_WEIGHTS = {<span class="st">"conv1_1"</span>: <span class="nm">1.0</span>, <span class="st">"conv2_1"</span>: <span class="nm">0.8</span>,
+                       <span class="st">"conv3_1"</span>: <span class="nm">0.5</span>, <span class="st">"conv4_1"</span>: <span class="nm">0.3</span>, <span class="st">"conv5_1"</span>: <span class="nm">0.1</span>}
+
+<span class="kw">def</span> total_variation(x):
+    dh = torch.abs(x[:, :, <span class="nm">1</span>:, :] - x[:, :, :-<span class="nm">1</span>, :]).mean()
+    dw = torch.abs(x[:, :, :, <span class="nm">1</span>:] - x[:, :, :, :-<span class="nm">1</span>]).mean()
+    <span class="kw">return</span> dh + dw
+
+<span class="cm"># ---------- 6. optimization loop ----------</span>
+STEPS = <span class="nm">300</span>
+step = [<span class="nm">0</span>]
+<span class="kw">while</span> step[<span class="nm">0</span>] &lt;= STEPS:
+
+    <span class="kw">def</span> closure():
+        <span class="cm"># keep pixels in the valid [0,1] range</span>
+        <span class="kw">with</span> torch.no_grad():
+            output.clamp_(<span class="nm">0</span>, <span class="nm">1</span>)
+        optimizer.zero_grad()
+        feats = get_features(output)
+
+        <span class="cm"># content loss</span>
+        c_loss = <span class="nm">0.0</span>
+        <span class="kw">for</span> l <span class="kw">in</span> CONTENT_LAYERS:
+            c_loss = c_loss + nn.functional.mse_loss(feats[l], content_feats[l])
+
+        <span class="cm"># style loss</span>
+        s_loss = <span class="nm">0.0</span>
+        <span class="kw">for</span> l <span class="kw">in</span> STYLE_LAYERS:
+            g = gram_matrix(feats[l])
+            layer_loss = nn.functional.mse_loss(g, style_grams[l])
+            s_loss = s_loss + STYLE_LAYER_WEIGHTS[l] * layer_loss
+
+        <span class="cm"># total variation (smoothness)</span>
+        tv_loss = total_variation(output)
+
+        loss = (CONTENT_WEIGHT * c_loss
+                + STYLE_WEIGHT * s_loss
+                + TV_WEIGHT   * tv_loss)
+        loss.backward()
+
+        step[<span class="nm">0</span>] += <span class="nm">1</span>
+        <span class="kw">if</span> step[<span class="nm">0</span>] % <span class="nm">50</span> == <span class="nm">0</span>:
+            print(<span class="st">f"step {step[0]:4d}  "</span>
+                  <span class="st">f"content {c_loss.item():.4f}  "</span>
+                  <span class="st">f"style {s_loss.item():.6f}"</span>)
+        <span class="kw">return</span> loss
+
+    optimizer.step(closure)
+
+<span class="cm"># ---------- 7. save the result ----------</span>
+<span class="kw">with</span> torch.no_grad():
+    output.clamp_(<span class="nm">0</span>, <span class="nm">1</span>)
+result = output.squeeze(<span class="nm">0</span>).cpu()
+T.ToPILImage()(result).save(<span class="st">"output.jpg"</span>)
+print(<span class="st">"saved output.jpg"</span>)</pre>
+          <p>Run it with <code class="inl">python style_transfer.py</code>. After a few hundred steps you'll
+          have <code class="inl">output.jpg</code> — your content photo repainted in the style image's look.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — common mistakes</span>
+          <p>(1) <strong>Forgetting to freeze VGG</strong> or forgetting <code class="inl">requires_grad_(True)</code>
+          on the output means nothing changes. (2) <strong>Forgetting the ImageNet normalization</strong> gives
+          washed-out, wrong results — VGG expects it. (3) <strong>L-BFGS calls the closure multiple times per
+          <code class="inl">step()</code></strong>, which is why we count steps inside the closure, not outside.
+          (4) Always <code class="inl">clamp_</code> pixels back to <code class="inl">[0,1]</code> or colours
+          drift out of range.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          We define three losses — <strong>content</strong> (deep feature match), <strong>style</strong> (Gram
+          matrix match across layers), and <strong>total variation</strong> (smoothness) — combine them with
+          weights, and minimise the total by gradient descent on the <em>output image's pixels</em> using
+          L-BFGS. Freeze the network, make the image require gradients, and loop.
+        </div>
+      </section>
+
+      <!-- ===================== 4. RUNNING / TUNING ===================== -->
+      <section id="tuning">
+        <h2><span class="sec-num">4</span> Running, tuning &amp; results</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of two volume knobs: one for "show the photo" and one for "make it arty." Turn up the arty
+          knob and your dog gets <em>very</em> painty — maybe so painty you can barely see the dog. Turn it down
+          and you mostly see the dog with just a hint of paint. Tuning style transfer is mostly just turning
+          these two knobs until it looks the way you like. There's no single "correct" setting — it's taste.</p>
+        </div>
+
+        <p>Now that the program runs, getting <em>good-looking</em> results is about adjusting a handful of
+        dials. Here are the ones that matter, in order of impact.</p>
+
+        <h3>The content / style weight trade-off</h3>
+        <p>This is the single most important knob. It's the ratio <code class="inl">STYLE_WEIGHT / CONTENT_WEIGHT</code>
+        (often written α/β in the paper). It decides how much the result leans toward "faithful photo" versus
+        "abstract painting."</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Ratio (style ÷ content)</th><th>Result</th><th>When to use</th></tr></thead>
+            <tbody>
+              <tr><td>Low (e.g. 1e3)</td><td>Photo dominates — subtle stylisation, very recognisable.</td><td>Portraits, when you want to keep the subject clear.</td></tr>
+              <tr><td>Medium (e.g. 1e5–1e6)</td><td>Balanced — clear subject, strong painterly texture. A good default.</td><td>Most images. Start here.</td></tr>
+              <tr><td>High (e.g. 1e7+)</td><td>Style dominates — heavy, abstract, the subject starts dissolving.</td><td>Bold artistic effects, when content can blur.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Because Gram matrices produce small numbers, the style weight usually needs to be <strong>much
+        larger</strong> than the content weight (often a factor of a million) just to make the two losses
+        comparable in size. Don't be alarmed by the big number — it's normal.</p>
+
+        <h3>Layer choices</h3>
+        <ul>
+          <li><strong>Content layer.</strong> Deeper (e.g. <code class="inl">conv4_2</code>) = more freedom for
+          style, looser fidelity. Shallower = tighter copy of the photo, less room for style.</li>
+          <li><strong>Style layers.</strong> Including <em>shallow</em> layers (<code class="inl">conv1_1</code>,
+          <code class="inl">conv2_1</code>) captures fine brush texture; <em>deep</em> layers
+          (<code class="inl">conv5_1</code>) capture larger swirling shapes. Using the full set gives the richest
+          result. Down-weighting deep style layers (as in our <code class="inl">STYLE_LAYER_WEIGHTS</code>) keeps
+          the texture from getting too blobby.</li>
+        </ul>
+
+        <h3>Number of steps &amp; starting image</h3>
+        <ul>
+          <li><strong>Steps.</strong> With L-BFGS, <strong>200–500 steps</strong> is usually plenty; the result
+          often looks good by ~200. More steps = sharper style match but diminishing returns.</li>
+          <li><strong>Starting image.</strong> Starting from the <em>content photo</em> (as our code does)
+          converges fast and keeps composition. Starting from <em>random noise</em> gives a more "from scratch
+          painting" feel but needs more steps. Both are valid — try both.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Example tuning session</span>
+          <p>You run with the defaults and the dog looks too abstract — you can barely see it. Fix: <strong>lower
+          <code class="inl">STYLE_WEIGHT</code></strong> (say from <code class="inl">1e6</code> to
+          <code class="inl">1e5</code>) so content matters relatively more. Now it's recognisable but the swirls
+          are weak — fix: <strong>raise the shallow style-layer weights</strong> to bring back fine texture. The
+          output is grainy/speckled — fix: <strong>raise <code class="inl">TV_WEIGHT</code></strong> a little
+          (e.g. to <code class="inl">1e-3</code>) to smooth it. Three small adjustments and it looks great.</p>
+        </div>
+
+        <h3>Common issues &amp; quick fixes</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>Output looks like the plain photo</td><td>Style weight too low</td><td>Increase <code class="inl">STYLE_WEIGHT</code>.</td></tr>
+              <tr><td>Subject unrecognisable / too abstract</td><td>Style weight too high</td><td>Decrease <code class="inl">STYLE_WEIGHT</code> or raise content weight.</td></tr>
+              <tr><td>Grainy, speckled noise</td><td>Too little smoothing</td><td>Increase <code class="inl">TV_WEIGHT</code>.</td></tr>
+              <tr><td>Washed-out / strange colours</td><td>Missing ImageNet normalization, or pixels not clamped</td><td>Normalize inputs; clamp output to [0,1].</td></tr>
+              <tr><td>Very slow</td><td>Large image on CPU</td><td>Use a smaller <code class="inl">IMG_SIZE</code>, or run on a GPU.</td></tr>
+              <tr><td>Out-of-memory error</td><td>Image resolution too large for the GPU</td><td>Reduce <code class="inl">IMG_SIZE</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Tips for nicer results</span>
+          <p>Pick a style image with <strong>strong, clear texture</strong> (paintings work better than flat
+          photos). Match the rough colour palette if you want a natural feel. Higher resolution gives crisper
+          brushwork but costs time and memory. And remember: this is art — keep an eye on the saved image and
+          stop when <em>you</em> like it, not when a metric says so.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The big dial is the <strong>style÷content weight ratio</strong> (photo-faithful vs abstract). Style
+          needs a much larger weight than content. Use shallow style layers for fine texture, deep ones for big
+          shapes; 200–500 L-BFGS steps suffice; tune <code class="inl">TV_WEIGHT</code> to fight graininess.
+          Most "bad" results trace back to weights, missing normalization, or unclamped pixels.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just built a complete computer-vision project. Here's the one-paragraph story tying the four
+        topics together:</p>
+        <div class="bigidea">
+          <p><strong>Neural style transfer</strong> recombines the <em>content</em> of one image with the
+          <em>style</em> of another. We use a <strong>frozen, pretrained VGG19</strong> as a measuring tool:
+          its deep feature maps describe <strong>content</strong> ("what &amp; where"), while
+          <strong>Gram matrices</strong> of its feature maps across several layers describe <strong>style</strong>
+          ("look, not where"). We define a <strong>content loss</strong>, a <strong>style loss</strong>, and a
+          <strong>total-variation</strong> smoothness loss, combine them with weights, and then — the crucial
+          flip — we run <strong>gradient descent on the output image's pixels</strong> (not on the network) with
+          <strong>L-BFGS</strong> until the picture matches both targets. Tuning is mostly about the
+          <strong>style-to-content weight ratio</strong> and the choice of layers. In Session 18 we move from
+          images back to sequences with <em>text generation &amp; translation</em>.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>In style transfer, what exactly is being "trained"?</summary>
+          <p class="ans">The <strong>output image's pixels</strong>, not the network. VGG19 is frozen; we make
+          the image a tensor that requires gradients and optimize it to minimise the combined loss.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do we use a Gram matrix for style instead of the raw feature maps?</summary>
+          <p class="ans">The Gram matrix measures <em>correlations between channels</em> — which patterns appear
+          together — while throwing away <em>where</em> they appear. Discarding position is exactly what turns a
+          specific picture into a general "texture/look," i.e. style.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use a deep layer (e.g. conv4_2) for content rather than a shallow one?</summary>
+          <p class="ans">A deep layer encodes high-level layout ("a gate here, columns there") without forcing an
+          exact pixel copy, leaving freedom for the style to repaint the textures. A shallow layer would lock the
+          output too tightly to the original photo.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your stylised image is so abstract you can't tell what it is. What do you change?</summary>
+          <p class="ans">Lower the <strong>style weight</strong> (or raise the content weight) — the style÷content
+          ratio is too high. That brings the recognisable subject back.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does the style weight have to be such a huge number (e.g. 1e6)?</summary>
+          <p class="ans">Gram-matrix values are small, so the raw style loss is tiny compared to the content
+          loss. A large multiplier just rescales it so the two losses are comparable and both actually influence
+          the result.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does the total-variation loss do, and when do you increase it?</summary>
+          <p class="ans">It penalises big differences between neighbouring pixels, smoothing the image. Increase
+          it when the output looks grainy or speckled with high-frequency noise.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>SST Deep Learning handout (Session 17) — your course handout for this project week, covering neural style transfer end to end.</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://www.priyanshsaxena.com/sst-deep-learning-nn" target="_blank" rel="noopener">SST Deep Learning handout (online)</a> — the companion online version of the class notes for this session.</li>
+          <li><a href="https://arxiv.org/abs/1508.06576" target="_blank" rel="noopener">Gatys, Ecker &amp; Bethge — "A Neural Algorithm of Artistic Style" (2015)</a> — the original paper that introduced everything in this session; surprisingly readable.</li>
+          <li><a href="https://pytorch.org/tutorials/advanced/neural_style_tutorial.html" target="_blank" rel="noopener">PyTorch Neural Style Transfer tutorial</a> — the official, well-documented implementation our code is based on; great for going step by step.</li>
+          <li><a href="https://pytorch.org/vision/stable/models/generated/torchvision.models.vgg19.html" target="_blank" rel="noopener">torchvision VGG19 docs</a> — reference for loading the pretrained network and its layer structure.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-16.html"><div class="dir">← Previous</div><div class="ttl">Session 16: Transformers in Practice</div></a>
+        <a class="next" href="session-18.html"><div class="dir">Next →</div><div class="ttl">Session 18: Project — Text Generation &amp; Translation</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">Neural Nets · Session 17 — Project Week: Neural Style Transfer (VGG19) · You painted with math 🎨</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

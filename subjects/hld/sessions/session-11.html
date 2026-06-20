@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLD · Session 11 — NoSQL Internals — LSM Trees (Part 2): Reads, Sparse Index &amp; Bloom Filters</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="hld">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">HLD</a> / Session 11</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 11 · NoSQL Internals — LSM Tree 2</span>
+      <h1>How LSM-tree databases read data fast</h1>
+      <p class="lead">
+        Last session we learned how LSM-tree databases write data blazingly fast by only ever
+        appending. But there's a catch: if you just keep dumping data into more and more files,
+        how do you ever <em>find</em> anything again? This session is all about the read side. We
+        start with a story, then build up — step by step, from scratch — the three clever tricks
+        (the read path, the sparse index, and the bloom filter) that make reads fast again. No prior
+        knowledge needed.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 30 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#read-problem">The read problem in LSM trees</a></li>
+          <li><a href="#read-path">The read path &amp; tombstones</a></li>
+          <li><a href="#disk-cost">The cost of disk reads &amp; why we need an index</a></li>
+          <li><a href="#sparse-index">Sparse index</a></li>
+          <li><a href="#bloom">Bloom filters</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. READ PROBLEM ===================== -->
+      <section id="read-problem">
+        <h2><span class="sec-num">1</span> The read problem in LSM trees</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you write every new fact you learn on a fresh sticky note and toss it into a big
+          box. Writing is super easy — just scribble and drop it in! But now a friend asks, <em>"What's
+          Grandma's phone number?"</em> Uh oh. You have to dig through <strong>every single sticky note</strong>
+          in the box, newest first, hoping to find it. With ten notes that's fine. With ten thousand,
+          you'll be there all day. That's exactly the problem LSM-tree databases have: writing is easy,
+          but <strong>finding things again is hard</strong>.</p>
+        </div>
+
+        <p>Quick recall from <strong>Session 10</strong>: an <span class="term">LSM tree</span>
+        (Log-Structured Merge tree) never updates data in place. Instead it:</p>
+        <ul>
+          <li>Buffers new writes in memory in a sorted structure called the
+          <span class="term">MemTable</span>.</li>
+          <li>When the MemTable fills up, it gets <strong>flushed</strong> to disk as an immutable,
+          sorted file called an <span class="term">SSTable</span> (Sorted String Table).</li>
+          <li>Over time you accumulate <em>many</em> SSTables, each a frozen snapshot of writes from a
+          different point in time.</li>
+        </ul>
+
+        <p>This append-only design is what makes writes so fast (we covered that last session). But it
+        creates a brand-new headache on the <strong>read</strong> side. When someone asks for the value
+        of a key, <strong>where is it?</strong></p>
+
+        <h3>Why a key could be anywhere</h3>
+        <p>A single key — say <code class="inl">user:42</code> — might live in several places at once,
+        because every write created a new copy somewhere newer:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Location</th><th>Could the key be here?</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>The MemTable (in memory)</td><td>Yes</td><td>It may have been written very recently and not flushed yet.</td></tr>
+              <tr><td>The newest SSTable on disk</td><td>Yes</td><td>It may have been flushed a moment ago.</td></tr>
+              <tr><td>An older SSTable</td><td>Yes</td><td>It may have been written long ago and never touched since.</td></tr>
+              <tr><td>Nowhere at all</td><td>Yes</td><td>The key may simply not exist — but we don't know that until we've looked everywhere!</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>In an LSM tree, a key has no single fixed home. The same key can appear in the MemTable
+          <em>and</em> in many SSTables, each version written at a different time. A read must somehow
+          locate the <strong>newest</strong> version — or prove the key doesn't exist — <em>without</em>
+          scanning every file end-to-end.</p>
+        </div>
+
+        <h3>The naive read: check everything</h3>
+        <p>The simplest possible read works like this:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">MemTable</div><div class="s-d">Look here first</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">SSTable #9</div><div class="s-d">Newest on disk</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">SSTable #8</div><div class="s-d">Scan it too</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">…</div><div class="s-d">…and all the rest</div></div>
+        </div>
+        <p>If we check newest-to-oldest and stop the moment we find the key, that's <em>correct</em> —
+        but it can be agonisingly slow. The truly painful case is a key that <strong>doesn't exist</strong>:
+        to be sure, we'd have to read <em>every</em> SSTable completely before giving up.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Why naive reads hurt</span>
+          <p>With <em>N</em> SSTables, a naive lookup can cost up to <em>N</em> disk searches per read.
+          Disk reads are thousands of times slower than memory, so this is the LSM tree's Achilles'
+          heel. A database that's fast to write but slow to read is only half a database. The rest of
+          this session is the toolkit that fixes reads.</p>
+        </div>
+
+        <h3>The three tools we'll build</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tool</th><th>Job</th><th>Topic</th></tr></thead>
+            <tbody>
+              <tr><td>The read path</td><td>A correct, ordered way to search MemTable → newest → oldest, handling deletes.</td><td>Topic 2</td></tr>
+              <tr><td>Sparse index</td><td>Jump straight to the right <em>block</em> inside one SSTable instead of scanning the whole file.</td><td>Topic 3</td></tr>
+              <tr><td>Bloom filter</td><td>Skip entire SSTables that <em>definitely</em> don't contain the key.</td><td>Topic 4</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          LSM trees write fast by appending, but that scatters each key's versions across the MemTable
+          and many SSTables. A naive read may have to check all of them — up to <em>N</em> files,
+          especially for keys that don't exist. The read path, sparse index, and bloom filter are the
+          three optimisations that make reads fast again.
+        </div>
+      </section>
+
+      <!-- ===================== 2. READ PATH ===================== -->
+      <section id="read-path">
+        <h2><span class="sec-num">2</span> The read path &amp; tombstones</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Back to the sticky-note box. The smart way to find Grandma's phone number is to read the
+          <strong>newest notes first</strong>. Why? Because if you wrote her new number yesterday and her
+          old number last year, the newest note is the one that's actually true now. The moment you find
+          a note with her number, you stop — you don't care about the older ones. And if a note says
+          <em>"Grandma — number deleted"</em>, then she has no number, and you stop there too, even though
+          older notes still have the old number.</p>
+        </div>
+
+        <p>The <span class="term">read path</span> is the exact ordered procedure the database follows to
+        answer "give me the value for key K." The golden rule is <strong>newest wins</strong>: because
+        newer data was written later, it overrides anything older.</p>
+
+        <h3>The order of search</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">1. MemTable</div><div class="s-d">Newest data of all — in memory</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">2. Newest SSTable</div><div class="s-d">Most recently flushed</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">3. Older SSTables</div><div class="s-d">In descending age</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛑</div><div class="s-t">4. Stop</div><div class="s-d">On first match — return it</div></div>
+        </div>
+
+        <p>We always look in the MemTable first because it holds the very latest writes (they haven't even
+        been flushed yet). If the key isn't there, we move to disk and check SSTables from
+        <strong>newest to oldest</strong>. The <em>first</em> place we find the key has the current value —
+        we return it immediately and never look at older copies.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Searching newest-first isn't just an optimisation — it's required for <strong>correctness</strong>.
+          The newest version of a key is the true current value; older versions are stale leftovers waiting
+          to be cleaned up. Stop at the first hit and you automatically get the right answer.</p>
+        </div>
+
+        <h3>Deletes are tricky — meet the tombstone</h3>
+        <p>Here's a puzzle. SSTables are <strong>immutable</strong> — once written, you can never go back and
+        erase a key from them. So how do you <em>delete</em> something? You can't reach into an old, frozen
+        file and rub it out.</p>
+
+        <p>The trick: a delete is just another <em>write</em>. To delete key K, the database writes a special
+        marker called a <span class="term">tombstone</span> — a record that says "K has been deleted" instead
+        of a real value. Because it's the newest write for K, the read path finds it first and reports the key
+        as gone, even though older SSTables still contain the old value.</p>
+
+        <h3>Two naive deletion ideas (and why they fail)</h3>
+        <p>Before we land on tombstones, it's worth seeing why the obvious approaches don't work:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Naive approach</th><th>What it does</th><th>Does it work?</th></tr></thead>
+            <tbody>
+              <tr><td><strong>1. Delete from MemTable only</strong></td><td>Remove the key from the in-memory MemTable.</td><td><strong>No.</strong> After the delete, a read falls through to the SSTables and finds the old value there. This doesn't really delete the key — it merely <em>undoes the last write</em>, exposing the stale copy underneath.</td></tr>
+              <tr><td><strong>2. Delete from MemTable + WAL + all SSTables</strong></td><td>Physically erase the key everywhere it lives.</td><td><strong>Technically yes, but unacceptable.</strong> It's incredibly expensive, and SSTables are <em>immutable</em> — you can't shift the surrounding data, so erasing leaves <strong>gaps</strong> on disk.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea: any delete happens via a write</span>
+          <p>A <span class="term">tombstone</span> (also called a <em>sentinel</em>, <em>flag</em>, <em>marker</em>,
+          or <em>guard</em>) is a special value that means "this key has been deleted." In practice it's a long,
+          random, essentially-unguessable string so that real user data can never collide with it by chance:</p>
+          <pre>TOMBSTONE = "PZpaIBk8rbaIQVoUqGD2NS04qD3gONn0QH1Cm2DKBkoktwGuEt"
+<span class="cm">// it is practically impossible for your data to contain this exact string by chance</span></pre>
+        </div>
+
+        <p>With a tombstone constant, <code class="inl">delete</code> is implemented as a <code class="inl">set</code>,
+        and <code class="inl">get</code> simply treats the tombstone as "not found":</p>
+        <pre><span class="kw">void</span> set(key, value) {
+    ...
+}
+
+<span class="kw">void</span> delete(key) {
+    set(key, TOMBSTONE)          <span class="cm">// a delete is just a write</span>
+}
+
+<span class="kw">string</span> _get(key) {
+    <span class="cm">// check memtable</span>
+    <span class="cm">// check sstables</span>
+    <span class="cm">// ...</span>
+}
+
+<span class="kw">string</span> get(key) {
+    value = _get(key)
+    <span class="kw">if</span> (value == TOMBSTONE) {
+        <span class="kw">raise</span> KeyNotFoundError!
+    }
+    <span class="kw">return</span> value
+}</pre>
+
+        <div class="callout key">
+          <span class="c-title">Key rule: when can a tombstone be dropped?</span>
+          <p>Compaction can only delete a tombstone from the <strong>oldest</strong> SSTable (the one starting from
+          SSTable&nbsp;0). If an SSTable is <em>not</em> the oldest, its tombstone entries must be kept — because an
+          even older SSTable could still hold a live value for that key, and dropping the tombstone too early would
+          let that stale value resurface.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: write, delete, read</span>
+          <p>Suppose these things happen to key <code class="inl">"color"</code> over time:</p>
+          <ul>
+            <li><strong>Long ago</strong> → wrote <code class="inl">color = "blue"</code> → now sits in old SSTable&nbsp;#3.</li>
+            <li><strong>Later</strong> → wrote <code class="inl">color = "green"</code> → now sits in SSTable&nbsp;#7.</li>
+            <li><strong>Recently</strong> → deleted <code class="inl">color</code> → a <strong>tombstone</strong> sits in the MemTable.</li>
+          </ul>
+          <p>Now someone reads <code class="inl">color</code>. The read path checks the MemTable first, finds
+          the <strong>tombstone</strong>, and immediately answers <em>"this key does not exist."</em> It never
+          even looks at SSTable&nbsp;#7 or #3 — and that's correct, because the delete is the newest fact.</p>
+        </div>
+
+        <h3>The read path in pseudocode</h3>
+        <pre><span class="kw">function</span> read(key):
+    <span class="cm"># 1. Check the in-memory MemTable first (newest data)</span>
+    result = memtable.get(key)
+    <span class="kw">if</span> result <span class="kw">is not</span> NONE:
+        <span class="kw">return</span> unwrap(result)   <span class="cm"># could be a value OR a tombstone</span>
+
+    <span class="cm"># 2. Walk SSTables from newest to oldest</span>
+    <span class="kw">for</span> sstable <span class="kw">in</span> sstables_newest_to_oldest:
+        <span class="cm"># (bloom filter + sparse index go here — Topics 3 &amp; 4)</span>
+        result = sstable.get(key)
+        <span class="kw">if</span> result <span class="kw">is not</span> NONE:
+            <span class="kw">return</span> unwrap(result)
+
+    <span class="kw">return</span> NOT_FOUND          <span class="cm"># looked everywhere; key truly absent</span>
+
+<span class="kw">function</span> unwrap(result):
+    <span class="kw">if</span> result.is_tombstone:
+        <span class="kw">return</span> NOT_FOUND      <span class="cm"># a delete marker means "gone"</span>
+    <span class="kw">return</span> result.value</pre>
+
+        <h3>How compaction helps reads</h3>
+        <p>Recall <span class="term">compaction</span> from Session 10: a background process that merges several
+        SSTables into one, keeping only the newest version of each key and physically dropping tombstones (and
+        the dead values they shadow). It runs while writes keep flowing, so it never blocks the user.</p>
+        <p>Compaction is the read side's best friend for three reasons:</p>
+        <ul>
+          <li><strong>Fewer files to search.</strong> Merging 10 SSTables into 1 means a read checks 1 file
+          instead of 10.</li>
+          <li><strong>Less duplication.</strong> Old, overwritten versions of a key are thrown away, so reads
+          don't waste time stepping over stale copies.</li>
+          <li><strong>Tombstones eventually disappear.</strong> Once a tombstone has out-lived every older
+          copy of its key, compaction drops it entirely, reclaiming disk space.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">The write/read tension</span>
+          <p>This is the classic LSM trade-off: writes are cheap because we defer the work, but that deferred
+          work (sorting, merging, de-duplicating) has to happen <em>sometime</em> — and that's compaction.
+          More aggressive compaction = faster reads but more background disk work; less compaction = cheaper
+          writes but slower reads. Tuning this balance is a core job of any LSM-based database.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Until compaction runs, a heavily-deleted dataset can pile up <strong>many tombstones</strong>.
+          A range scan must still read past every tombstone, so a table that's mostly deletes can read slowly
+          even though it "contains nothing." This is a real, well-known LSM gotcha.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The read path searches MemTable → newest SSTable → oldest SSTable and stops at the first match,
+          because newest wins. Deletes are recorded as <strong>tombstones</strong> (special "deleted" markers)
+          since immutable SSTables can't be edited. Compaction merges files, keeps only the newest version of
+          each key, and eventually removes tombstones — making reads steadily faster.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DISK COST & INDEX MOTIVATION ===================== -->
+      <section id="disk-cost">
+        <h2><span class="sec-num">3</span> The cost of disk reads &amp; why we need an index</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Binary search is like the "guess my number" game: every guess cuts the range in half, so even a
+          <em>huge</em> range gets solved in only a few guesses. That sounds great! But here's the catch — for an
+          SSTable, every "guess" means walking across the room to a giant filing cabinet (the disk) and pulling out
+          a folder. The thinking is fast; the <strong>walking is slow</strong>. So even ~30 guesses can take half a
+          second. We want to do the thinking in our head (RAM) and walk to the cabinet just <strong>once</strong>.</p>
+        </div>
+
+        <h3>Binary search is wonderful… in theory</h3>
+        <p>Binary search runs in <code class="inl">O(log n)</code>, which is ultra-fast compared to linear search's
+        <code class="inl">O(n)</code>. Consider a database with <strong>1 trillion</strong> entries:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Search</th><th>Steps for 1 trillion entries</th></tr></thead>
+            <tbody>
+              <tr><td>Binary search — <code class="inl">O(log₂ 1 trillion)</code></td><td><strong>≈ 40 steps</strong></td></tr>
+              <tr><td>Linear search — <code class="inl">O(n)</code></td><td>1 trillion steps</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>That makes binary search about <strong>25 billion times faster</strong> than linear search here. So why
+        not just binary-search the SSTable and call it a day?</p>
+
+        <h3>How big do SSTables get?</h3>
+        <p>SSTables grow as they're compacted up the levels. With a typical <strong>WAL size of 100&nbsp;MB</strong>,
+        each level roughly doubles (because each SSTable is compacted from two SSTables of the level below):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Level</th><th>Max SSTable size</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>WAL</td><td>100&nbsp;MB</td><td>Typical write-ahead-log size</td></tr>
+              <tr><td>Level 1</td><td>≤ 100&nbsp;MB</td><td>Compacted directly from the WAL</td></tr>
+              <tr><td>Level 2</td><td>≤ 200&nbsp;MB</td><td>Compacted from 2× Level-1 SSTables</td></tr>
+              <tr><td>Level 3</td><td>≤ 400&nbsp;MB</td><td>Compacted from 2× Level-2 SSTables</td></tr>
+              <tr><td>…</td><td>…</td><td>…keeps doubling</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the true cost of binary-searching a big SSTable</span>
+          <p>Take an SSTable of size <strong>100&nbsp;GB</strong>, with each entry
+          <code class="inl">(key, value, timestamp)</code> averaging <strong>100&nbsp;bytes</strong>:</p>
+          <ul>
+            <li>Number of entries = 100&nbsp;GB / 100&nbsp;bytes = <strong>1 billion</strong> (10⁹).</li>
+            <li>Binary search iterations = <code class="inl">log₂(10⁹)</code> = 9 × log₂(10) ≈ <strong>30 iterations</strong>.</li>
+            <li>Each iteration is a <strong>random read</strong> on disk, and each random read takes <strong>~18&nbsp;ms</strong>.</li>
+            <li>Time to check <em>one</em> SSTable = 30 × 18&nbsp;ms = <strong>540&nbsp;ms</strong>.</li>
+          </ul>
+          <p>Now scale up: with <strong>10 SSTables</strong>, a single read can cost up to
+          <strong>5.4 seconds</strong> in the worst case. That's unacceptable. <strong>We need an index.</strong></p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The idea</span>
+          <p>What if we get rid of the <code class="inl">O(log n)</code> binary search on disk and instead keep an
+          <strong>in-memory (RAM) index</strong> that pin-points the location of an entry in the SSTable in
+          <code class="inl">O(1)</code>? In the example above, that's a <strong>30× speedup</strong>: each SSTable
+          lookup drops from 540&nbsp;ms to a single <strong>18&nbsp;ms</strong> disk read. Across 10 SSTables, worst-case
+          reads fall from 5.4&nbsp;s to <strong>180&nbsp;ms</strong>.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">It's even better than 180 ms in practice</span>
+          <p>That 180&nbsp;ms is a worst case. In reality the MemTable acts as a <strong>read cache</strong>: ~90% of
+          reads are served directly from RAM (≤ 0.1&nbsp;ms at worst). Only ~10% of the time do we hit the disk, and only
+          in <em>that</em> case do we pay up to 180&nbsp;ms. So the <strong>effective read latency is ~20&nbsp;ms on
+          average.</strong></p>
+        </div>
+
+        <h3>Attempt 1: a full index (and why it's too big)</h3>
+        <p>The simplest index: keep a hashmap of <code class="inl">{key: offset}</code> in RAM for each SSTable. Given
+        a key, we don't binary-search the SSTable at all — we look it up in the index, which hands us the exact byte
+        offset to read. Reads become <code class="inl">O(1)</code> per SSTable — the 30× speedup.</p>
+        <p>The problem is <strong>memory</strong>. A full index has one entry per SSTable entry:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Quantity</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>Entries in the SSTable</td><td>1 billion</td></tr>
+              <tr><td>Bytes per index entry</td><td>~20 bytes (key) + 8 bytes (offset) = 28 bytes</td></tr>
+              <tr><td>Full index for 1 SSTable</td><td>1 billion × 28 bytes = <strong>28&nbsp;GB</strong></td></tr>
+              <tr><td>Full index for 10 SSTables</td><td><strong>280&nbsp;GB</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Too much RAM</span>
+          <p>280&nbsp;GB of RAM just for indexes is wildly impractical. We need an index that gives us the
+          <code class="inl">O(1)</code>-ish speedup <strong>without</strong> storing an entry for every key. That's the
+          sparse index — the subject of the next section.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Binary search is fast in step-count (~30 iterations for a billion entries) but brutal on disk, because each
+          iteration is an ~18&nbsp;ms random read — 540&nbsp;ms per SSTable, up to 5.4&nbsp;s across 10. An in-memory index turns
+          each SSTable lookup into a single 18&nbsp;ms disk read (30× faster). A <strong>full</strong> index does this but
+          costs ~28&nbsp;GB per SSTable (280&nbsp;GB for 10) — far too much RAM. We need something smaller: the sparse index.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SPARSE INDEX ===================== -->
+      <section id="sparse-index">
+        <h2><span class="sec-num">4</span> Sparse index</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a giant dictionary. To find the word "octopus," you don't read every page from the start.
+          You use the little tabs on the edge — A, B, C… — to flip straight to "O," then scan just that part.
+          You only need a <em>few</em> tabs, not one tab per word, because once you're on the right page you can
+          read it quickly with your eyes. A <strong>sparse index</strong> is exactly those edge tabs for an
+          SSTable: a few signposts that get you close, so you only have to read one small chunk.</p>
+        </div>
+
+        <p>Topic 2 told us <em>which</em> SSTables to search and in what order. But there's a second problem:
+        once we've picked an SSTable, how do we find a key <em>inside</em> it without reading the whole file?
+        SSTables can be huge — gigabytes. We need a way to jump close to the key.</p>
+
+        <h3>The crucial advantage: SSTables are sorted</h3>
+        <p>Remember the "Sorted" in Sorted String Table. Inside an SSTable, the keys are stored in
+        <strong>sorted order</strong>. That single fact is what makes everything fast, because sorted data lets
+        us use <span class="term">binary search</span> (repeatedly halving the search range) instead of reading
+        linearly. But binary search over data on disk still means many separate disk seeks. The sparse index
+        cuts that down further.</p>
+
+        <h3>Dense vs sparse: why "sparse"?</h3>
+        <p>A <span class="term">dense index</span> would store the exact disk position (the
+        <span class="term">offset</span> — the byte location in the file) of <strong>every single key</strong>.
+        That's a lot of index — potentially as big as the data itself, and too big to keep in memory.</p>
+        <p>A <span class="term">sparse index</span> stores the offset of only <strong>some</strong> keys — say,
+        the first key of every disk <span class="term">block</span> (a fixed-size chunk of the file, e.g. 4&nbsp;KB
+        read in one shot). It's small enough to live entirely in memory.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Dense index</th><th>Sparse index</th></tr></thead>
+            <tbody>
+              <tr><td>Stores</td><td>An offset for <em>every</em> key</td><td>An offset for <em>some</em> keys (e.g. one per block)</td></tr>
+              <tr><td>Size</td><td>Large (often must stay on disk)</td><td>Small (fits in memory)</td></tr>
+              <tr><td>Lookup</td><td>Find exact key directly</td><td>Find the <em>block</em>, then scan a little</td></tr>
+              <tr><td>LSM uses</td><td>Rarely</td><td><strong>Yes — the standard choice</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How a lookup works with a sparse index</h3>
+        <p>Suppose an SSTable's sparse index (held in memory) looks like this — only the first key of each
+        block, with its byte offset:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Indexed key</th><th>Offset (byte position in file)</th></tr></thead>
+            <tbody>
+              <tr><td>apple</td><td>0</td></tr>
+              <tr><td>cherry</td><td>4096</td></tr>
+              <tr><td>mango</td><td>8192</td></tr>
+              <tr><td>peach</td><td>12288</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: finding "lemon"</span>
+          <p>We want the key <code class="inl">"lemon"</code>. Steps:</p>
+          <ul>
+            <li><strong>Binary search the sparse index</strong> (it's in memory, so this is instant). We need the
+            largest indexed key that is <em>≤ "lemon"</em>. Comparing alphabetically:
+            <code class="inl">cherry ≤ lemon &lt; mango</code>.</li>
+            <li>So <code class="inl">"lemon"</code>, if it exists, must be in the block that starts at
+            <strong>offset 4096</strong> (the "cherry" block) and ends just before offset 8192 (where "mango"
+            begins).</li>
+            <li><strong>One disk read</strong>: load that single ~4&nbsp;KB block from offset 4096.</li>
+            <li><strong>Scan within the block</strong> (a tiny, in-memory linear scan of maybe a few dozen keys)
+            to find <code class="inl">"lemon"</code> — or to conclude it isn't there.</li>
+          </ul>
+          <p>Total cost: a free in-memory binary search plus <strong>exactly one disk read</strong>. Compare that
+          to scanning the entire multi-gigabyte file!</p>
+        </div>
+
+        <h3>Just how much smaller is a sparse index?</h3>
+        <p>A sparse index is built for each SSTable, kept in RAM, and constructed once <strong>when the SSTable is
+        created</strong>. The key insight: because data is always read/written in fixed-size <span class="term">blocks</span>,
+        we only need to index the <strong>first key of each block</strong>, not every key. Reusing the 100&nbsp;GB SSTable
+        from the previous section:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Quantity</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>Typical block size</td><td>4&nbsp;KB</td></tr>
+              <tr><td>Avg entry size <code class="inl">(key, value, timestamp)</code></td><td>100 bytes</td></tr>
+              <tr><td>Keys per block</td><td>4&nbsp;KB / 100 bytes = <strong>40 keys</strong></td></tr>
+              <tr><td>Shrink factor vs. full index</td><td><strong>40×</strong> (one indexed key per 40)</td></tr>
+              <tr><td>Sparse index entries (was 1 billion full)</td><td><strong>~25 million</strong></td></tr>
+              <tr><td>Sparse index size (was 28&nbsp;GB full)</td><td><strong>~100&nbsp;MB</strong> per SSTable</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The sparse index is just a <strong>sorted list of the first key of each block</strong>, held in RAM. By
+          indexing one key per block instead of every key, it shrinks by the number of keys per block (~40×) — turning
+          a 28&nbsp;GB full index into a ~100&nbsp;MB sparse index per SSTable, while still letting us reach any key with a
+          single disk read.</p>
+        </div>
+
+        <h3>The picture</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔑</div><div class="s-t">Want "lemon"</div><div class="s-d">Key to find</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">Binary search index</div><div class="s-d">cherry ≤ lemon &lt; mango</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Read block @4096</div><div class="s-d">One disk read</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">Scan block</div><div class="s-d">Find lemon / not present</div></div>
+        </div>
+
+        <h3>Sparse index lookup in pseudocode</h3>
+        <pre><span class="kw">function</span> sstable_get(key):
+    <span class="cm"># sparse_index is a sorted list of (indexed_key, offset),</span>
+    <span class="cm"># kept in memory. Find the block that COULD contain key.</span>
+    start_offset = floor_entry(sparse_index, key)   <span class="cm"># largest indexed_key &lt;= key</span>
+    end_offset   = next_entry_offset(sparse_index, key)  <span class="cm"># start of next block</span>
+
+    <span class="kw">if</span> start_offset <span class="kw">is</span> NONE:
+        <span class="kw">return</span> NONE        <span class="cm"># key sorts before the very first key</span>
+
+    block = disk_read(file, start_offset, end_offset)   <span class="cm"># ONE disk read</span>
+
+    <span class="kw">for</span> (k, v) <span class="kw">in</span> block:        <span class="cm"># small in-memory scan</span>
+        <span class="kw">if</span> k == key:
+            <span class="kw">return</span> v
+    <span class="kw">return</span> NONE                  <span class="cm"># not in this SSTable</span></pre>
+
+        <div class="callout note">
+          <span class="c-title">A nice side effect</span>
+          <p>Because keys are sorted and blocks are contiguous, the sparse index also makes <strong>range
+          queries</strong> (e.g. "all keys from <code class="inl">lemon</code> to <code class="inl">orange</code>")
+          efficient: find the starting block, then just read forward through consecutive blocks. This is one
+          reason LSM stores are great for ordered scans.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The trade-off</span>
+          <p>Sparser index = smaller in-memory index but bigger blocks to scan; denser index = faster scans but
+          more memory. The block size (how far apart the signposts are) is a tuning knob. Either way, a sparse
+          index turns "search a huge file" into "binary-search a tiny table, then read one block."</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SSTables store keys sorted, so we can binary search. A <strong>sparse index</strong> keeps in memory
+          the offset of just the first key of each block. To find a key: binary-search the index for the block
+          that could hold it, do <strong>one</strong> disk read of that block, then scan it. This turns a
+          whole-file scan into a single block read, and also makes range scans fast.
+        </div>
+      </section>
+
+      <!-- ===================== 5. BLOOM FILTERS ===================== -->
+      <section id="bloom">
+        <h2><span class="sec-num">5</span> Bloom filters</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine each toy box has a little magic sign on it. Ask the sign, "Is my red car in here?" and it
+          can say two things. It can say <em>"Definitely NOT in this box — don't bother opening it!"</em> or it
+          can say <em>"Maybe! Better look inside."</em> The sign is never wrong when it says NO. It's only
+          sometimes wrong when it says MAYBE (you open the box and the car isn't there after all). That magic
+          sign lets you skip opening most boxes — and that's a <strong>bloom filter</strong>.</p>
+        </div>
+
+        <p>The sparse index made searching <em>inside</em> one SSTable fast. But there's still the problem from
+        Topic 1: a key might be in <em>any</em> of the SSTables, and looking for a non-existent key means
+        touching them all. A <span class="term">bloom filter</span> fixes this. It's a tiny, fast,
+        <em>probabilistic</em> structure that answers one question per SSTable: <strong>"Could this key be in
+        here?"</strong> If the answer is "no," we skip that SSTable entirely — no disk read at all.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A bloom filter gives one-sided answers: <strong>"definitely not present"</strong> or
+          <strong>"possibly present."</strong> It can have <span class="term">false positives</span> (says
+          "maybe" when the key is actually absent) but <strong>never false negatives</strong> (it will never say
+          "no" for a key that is really there). That guarantee is exactly what makes it safe to skip an
+          SSTable when it says "no."</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: the worst-case read — a key that was never inserted</span>
+          <p>If we call <code class="inl">get(key)</code> for a key that was <em>never inserted</em>, we hit the
+          slowest possible read: we check the MemTable (miss), then scan <strong>every single SSTable</strong> one by
+          one (all misses) before finally giving up. And this case is <em>common</em>. Think of <strong>signing up to a
+          website</strong>: a user picks the username <code class="inl">pragy1234</code>, and we must confirm it doesn't
+          already exist — i.e. a read for a key that (hopefully) was never inserted. A bloom filter turns this
+          worst-case read into a near-instant in-memory "no."</p>
+        </div>
+
+        <h3>What kind of structure is a bloom filter?</h3>
+        <p>A bloom filter is a <span class="term">probabilistic data structure</span>. It supports only two operations
+        — <strong>insert</strong> and <strong>containment check</strong>. It does <strong>not</strong> support reads,
+        updates, deletes, or iteration. And its containment check can "lie" — but only in one direction:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Outcome</th><th>Possible?</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><strong>False positive</strong></td><td>Yes</td><td>A key that was <em>not</em> inserted can still be reported as "exists."</td></tr>
+              <tr><td><strong>False negative</strong></td><td><strong>Never</strong></td><td>A key that <em>was</em> inserted will never be reported as "does not exist."</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How it's built: a bit array + k hash functions</h3>
+        <p>A bloom filter is just two things:</p>
+        <ul>
+          <li>A <span class="term">bit array</span> of <em>m</em> bits, all starting at 0.</li>
+          <li>A set of <em>k</em> independent <span class="term">hash functions</span>. (A hash function turns
+          any key into a number; here we use the result, modulo <em>m</em>, as an index into the bit array.)</li>
+        </ul>
+
+        <p><strong>To add a key</strong> (done when the SSTable is written): run the key through all <em>k</em>
+        hash functions to get <em>k</em> positions, and set those bits to 1.</p>
+        <p><strong>To test a key</strong> (done at read time): hash it the same way to get <em>k</em> positions.
+        If <em>all</em> of those bits are 1 → answer "<strong>maybe</strong>." If <em>any</em> bit is 0 →
+        answer "<strong>definitely not</strong>" (because if the key had been added, that bit would have been
+        set).</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: m = 10 bits, k = 2 hashes</span>
+          <p>Start with an empty 10-bit array (indices 0–9):</p>
+          <pre>index:  0 1 2 3 4 5 6 7 8 9
+bits:   0 0 0 0 0 0 0 0 0 0</pre>
+          <p><strong>Add "apple"</strong>: say h1("apple")=2, h2("apple")=7. Set bits 2 and 7:</p>
+          <pre>index:  0 1 2 3 4 5 6 7 8 9
+bits:   0 0 1 0 0 0 0 1 0 0</pre>
+          <p><strong>Add "mango"</strong>: say h1("mango")=4, h2("mango")=7. Set bits 4 and 7 (bit 7 was
+          already 1):</p>
+          <pre>index:  0 1 2 3 4 5 6 7 8 9
+bits:   0 0 1 0 1 0 0 1 0 0</pre>
+          <p>Now query keys:</p>
+          <ul>
+            <li><strong>Test "grape"</strong>: say h1=1, h2=5. Check bits 1 and 5 → both 0. At least one is 0 →
+            <strong>"definitely NOT present."</strong> We skip this SSTable. ✅ Correct — "grape" was never added.</li>
+            <li><strong>Test "apple"</strong>: bits 2 and 7 → both 1 → <strong>"maybe present."</strong> We go look.
+            ✅ Correct — "apple" really is there.</li>
+            <li><strong>Test "cherry"</strong>: say h1=2, h2=4. Check bits 2 and 4 → both happen to be 1 (set by
+            "apple" and "mango")! → <strong>"maybe present."</strong> But "cherry" was never added — this is a
+            <strong>false positive</strong>. We waste one lookup, but we never give a <em>wrong</em> final answer
+            because the SSTable read itself confirms "cherry" isn't there.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway: why no false negatives</span>
+          <p>If a key <em>was</em> added, every one of its <em>k</em> bits was set to 1 and bits are
+          <strong>never cleared</strong>. So when we test that same key, all its bits are still 1 → it can
+          never be reported as "absent." A "no" is therefore always trustworthy. A "maybe," however, can be a
+          coincidence of bits set by <em>other</em> keys — that's a false positive.</p>
+        </div>
+
+        <h3>Bloom filter in pseudocode</h3>
+        <pre><span class="kw">class</span> BloomFilter:
+    bits = array of m zeros
+    k    = number of hash functions
+
+    <span class="kw">function</span> add(key):
+        <span class="kw">for</span> i <span class="kw">in</span> 0 .. k-1:
+            pos = hash_i(key) % m
+            bits[pos] = 1
+
+    <span class="kw">function</span> might_contain(key):
+        <span class="kw">for</span> i <span class="kw">in</span> 0 .. k-1:
+            pos = hash_i(key) % m
+            <span class="kw">if</span> bits[pos] == 0:
+                <span class="kw">return</span> FALSE     <span class="cm"># definitely NOT present</span>
+        <span class="kw">return</span> TRUE              <span class="cm"># possibly present (might be a false positive)</span></pre>
+
+        <h3>Plugging it into set() and get()</h3>
+        <p>Every write inserts the key into the bloom filter; every read first asks the bloom filter and bails out
+        immediately on a "no":</p>
+        <pre><span class="kw">void</span> set(key, value) {
+    bloom_filter.insert(key)
+    <span class="cm">// … proceed with the DB insertion</span>
+}
+
+<span class="kw">string</span> get(key) {
+    <span class="kw">if</span> (! bloom_filter.contains(key))
+        <span class="kw">raise</span> KeyNotFound!       <span class="cm">// guaranteed never inserted</span>
+    <span class="cm">// if bloom filter says key found, the DB might or might not have the key</span>
+    <span class="cm">// proceed with normal DB check</span>
+}</pre>
+
+        <h3>Plugging it into the read path</h3>
+        <p>Now we can complete the read path from Topic 2. Each SSTable keeps its own small bloom filter in
+        memory. Before doing any disk work on an SSTable, we ask its bloom filter:</p>
+        <pre>    <span class="kw">for</span> sstable <span class="kw">in</span> sstables_newest_to_oldest:
+        <span class="kw">if not</span> sstable.bloom.might_contain(key):
+            <span class="kw">continue</span>              <span class="cm"># skip — no disk read at all!</span>
+        result = sstable.get(key)    <span class="cm"># uses the sparse index (Topic 3)</span>
+        <span class="kw">if</span> result <span class="kw">is not</span> NONE:
+            <span class="kw">return</span> unwrap(result)</pre>
+
+        <div class="callout key">
+          <span class="c-title">Why this is the key to fast LSM reads</span>
+          <p>Remember the worst case: reading a key that doesn't exist meant touching <em>every</em> SSTable.
+          With bloom filters, almost all of those SSTables answer "definitely not" instantly from memory and
+          are skipped with <strong>zero disk reads</strong>. A lookup for a missing key drops from "search N
+          files on disk" to "check N tiny in-memory bit arrays." This is what makes LSM reads — especially for
+          absent keys — fast in practice.</p>
+        </div>
+
+        <h3>Tuning: false-positive rate</h3>
+        <p>The chance of a false positive depends on three things: the number of bits <em>m</em>, the number of
+        keys <em>n</em> stored, and the number of hash functions <em>k</em>. More bits per key → fewer
+        collisions → fewer false positives. A common target is around <strong>1%</strong>, which costs only
+        about <strong>10 bits per key</strong> — astonishingly cheap.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Bits per key (m/n)</th><th>Approx. false-positive rate</th></tr></thead>
+            <tbody>
+              <tr><td>~5 bits</td><td>~10%</td></tr>
+              <tr><td>~10 bits</td><td>~1%</td></tr>
+              <tr><td>~15 bits</td><td>~0.1%</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why deletes need care</span>
+          <p>A standard bloom filter can't <em>remove</em> a key — clearing bits could break another key that
+          shares them (and reintroduce false negatives). That's fine for LSM trees: each SSTable is immutable
+          and gets a fresh bloom filter built once at flush time, and compaction simply builds new filters for
+          the merged output. No deletion from the filter is ever needed.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Bloom filters only answer membership for <em>exact</em> keys. They can't help a <strong>range
+          query</strong> ("all keys between X and Y"), because a range isn't a single key to hash. Range scans
+          still rely on the sorted SSTables and the sparse index (Topic 3), not on bloom filters.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A bloom filter is a bit array plus <em>k</em> hash functions. Adding a key sets <em>k</em> bits;
+          testing a key checks those bits — any 0 means "definitely not present," all 1 means "maybe." It has
+          false positives but <strong>never</strong> false negatives, so a "no" is always safe to trust. Giving
+          each SSTable a tiny in-memory bloom filter lets reads skip files that can't contain the key with no
+          disk access — the single biggest win for LSM read performance.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You now understand how LSM-tree databases turn their fast-write design into fast reads too. Here's
+        the one-paragraph story that connects all four topics:</p>
+        <div class="bigidea">
+          <p>Because an LSM tree only ever <strong>appends</strong>, a key's versions are scattered across the
+          <strong>MemTable</strong> and many <strong>SSTables</strong>, so a naive read might scan everything —
+          especially for a key that doesn't exist. The <strong>read path</strong> fixes correctness by searching
+          newest-to-oldest and stopping at the first hit, treating a <strong>tombstone</strong> as "deleted,"
+          while <strong>compaction</strong> quietly merges files and drops stale data to keep the file count low.
+          Within a chosen SSTable, the <strong>sparse index</strong> binary-searches a tiny in-memory table to
+          jump to the one block that could hold the key, costing a single disk read. And before touching an
+          SSTable at all, its <strong>bloom filter</strong> answers "definitely not / maybe" from memory —
+          skipping files that can't contain the key with zero disk reads. Together: fewer files (compaction),
+          skip impossible files (bloom filter), and jump straight to the right block in the rest (sparse index).</p>
+        </div>
+
+        <h3>The final structure &amp; algorithm</h3>
+        <p>Here is the complete picture of how a mature LSM tree handles a write and a read, pulling every piece
+        together.</p>
+
+        <div class="callout key">
+          <span class="c-title">Writes</span>
+          <ol>
+            <li><strong>Append to the WAL</strong> file first (for durability).</li>
+            <li><strong>Set the value in the MemTable</strong> (for fast reads).</li>
+          </ol>
+          <p>Deletions are writes that set the value to <code class="inl">TOMBSTONE</code>, and the
+          <strong>bloom filter is updated on every write</strong>. After any write, three events may trigger:</p>
+          <ul>
+            <li><strong>Flush:</strong> if the WAL file is full, flush it into a new SSTable.</li>
+            <li><strong>Compaction:</strong> if there are too many SSTables on any level, trigger compaction.</li>
+            <li><strong>Eviction:</strong> if the MemTable is full, use <span class="term">LRU</span> eviction to remove the oldest entry.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Reads</span>
+          <ol>
+            <li><strong>Check the MemTable</strong> (it acts as a cache). If found, the value is guaranteed to be the
+            latest — every change goes write-through to the MemTable + WAL, so MemTable data can never be stale.
+            Most reads are <code class="inl">O(1)</code> from RAM and never touch the disk. After reading, update the
+            key's <strong>last-accessed timestamp</strong> in the MemTable.</li>
+            <li><strong>If not in the MemTable</strong>, we do <em>not</em> need to check the WAL — the MemTable is much
+            larger than the WAL and uses LRU eviction, so anything in the WAL is also in the MemTable. Instead, scan
+            <strong>all SSTables newest → oldest</strong>. For each one:
+              <ul>
+                <li>Binary-search (<strong>lowerbound</strong>) the key in that SSTable's <strong>sparse index in
+                RAM</strong> — no disk reads — to learn which block to read.</li>
+                <li><strong>Read that one block into RAM</strong> — a single disk access.</li>
+                <li>Binary-search the block <strong>in RAM</strong> (RAM is ~1 million times faster than disk, so this
+                is effectively free).</li>
+                <li>If the key is found, it's the latest value (we're scanning recent → old) → return it.
+                If not, move to the next older SSTable.</li>
+              </ul>
+            </li>
+            <li>If the key is found <strong>nowhere</strong>, raise <code class="inl">KeyNotFoundError</code>. If the
+            value found is <code class="inl">TOMBSTONE</code>, also raise <code class="inl">KeyNotFoundError</code>.</li>
+            <li>Once a value is found on disk, <strong>update the MemTable</strong> so subsequent reads of this key are fast.</li>
+          </ol>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Isn't scanning all SSTables slow?</span>
+          <p>Yes — which is exactly why we have the optimisations from this session:
+          <strong>Compaction</strong> keeps the SSTable count small (typically ≤ 10);
+          the <strong>sparse index</strong> turns slow on-disk binary search into an <code class="inl">O(1)</code>-ish
+          single block read; and the <strong>bloom filter</strong> lets us skip SSTables that can't contain the key.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why must the read path search SSTables from newest to oldest?</summary>
+          <p class="ans">Because newest wins: the most recently written version of a key is its true current
+          value. Searching newest-first and stopping at the first match guarantees you return the correct
+          (latest) value — including a recent delete.</p>
+        </details>
+        <details class="quiz">
+          <summary>How do you delete a key if SSTables are immutable?</summary>
+          <p class="ans">You write a <strong>tombstone</strong> — a special "deleted" marker — as a new write.
+          Since it's the newest record for that key, the read path finds it first and reports the key as gone.
+          Compaction later removes the tombstone and the dead value it shadows.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does a sparse index store, and how does it speed up a lookup?</summary>
+          <p class="ans">It stores the disk offset of only some keys (e.g. the first key of each block) in
+          memory. A lookup binary-searches it to find the one block that could contain the key, then does a
+          single disk read of that block and scans it — instead of scanning the whole file.</p>
+        </details>
+        <details class="quiz">
+          <summary>A bloom filter says "maybe present." Could the key actually be absent?</summary>
+          <p class="ans">Yes — that's a false positive (other keys happened to set the same bits). You then do
+          the real lookup, which confirms the truth. Bloom filters never produce false <em>negatives</em>, so a
+          "definitely not" is always trustworthy.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is the bloom filter the biggest win for reading non-existent keys?</summary>
+          <p class="ans">Without it, proving a key is absent means searching every SSTable on disk. With one
+          per SSTable, almost all answer "definitely not" instantly from memory, so those files are skipped with
+          zero disk reads — turning N disk searches into N tiny in-memory checks.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't a bloom filter help with a range query like "keys between X and Y"?</summary>
+          <p class="ans">A bloom filter only answers membership for an exact key it can hash. A range isn't a
+          single key, so there's nothing to hash. Range scans instead use the sorted SSTables and the sparse
+          index to find a starting block and read forward.</p>
+        </details>
+      </section>
+
+<section id="refs">
+  <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+  <hr class="section-rule" />
+  <h4>Class material</h4>
+  <ul>
+    <li>📄 <a href="https://docs.google.com/document/d/1U8E-VUnnCDyiQYjiRThqEGFbNAxFr_H_1npiK-_lD1Y/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
+    <li>Class handout: "<em>[SST-2028] NoSQL Internals - LSM Tree + Bloom Filter + Sparse Index</em>".</li>
+  </ul>
+  <h4>Papers, docs &amp; deep dives</h4>
+  <ul>
+    <li>📄 <a href="https://dl.acm.org/doi/10.1145/362686.362692" target="_blank" rel="noopener">Bloom, B. H. — "Space/time trade-offs in hash coding with allowable errors" (1970)</a> — the original bloom filter paper.</li>
+    <li>📄 <a href="https://llimllib.github.io/bloomfilter-tutorial/" target="_blank" rel="noopener">Bloom Filters by Example (interactive tutorial)</a> — a visual, hands-on explainer of how bloom filters work.</li>
+    <li>📄 <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter" target="_blank" rel="noopener">RocksDB — Bloom Filter docs</a> — how a production LSM engine uses per-SSTable bloom filters to skip files.</li>
+    <li>📘 <a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications (Kleppmann), Ch. 3</a> — SSTables, sparse indexes, and bloom filters in LSM storage.</li>
+  </ul>
+  <h4>Interactive tools &amp; visualizations</h4>
+  <ul>
+    <li>🌳 <a href="https://kshitijmishra23.github.io/lsm-tree-visualizer/" target="_blank" rel="noopener">LSM Tree Visualizer</a> — watch writes, flushes, and compaction happen live (<a href="https://github.com/kshitijmishra23/lsm-tree-visualizer" target="_blank" rel="noopener">source on GitHub</a>).</li>
+    <li>🧮 <a href="https://hur.st/bloomfilter/" target="_blank" rel="noopener">Bloom filter calculator (hur.st)</a> — compute the optimal bit-array size <em>m</em> and number of hashes <em>k</em> for a target false-positive rate.</li>
+    <li>📐 <a href="https://brilliant.org/wiki/bloom-filter/" target="_blank" rel="noopener">Bloom filter — math &amp; code (Brilliant.org)</a> — the probability math behind false-positive rates.</li>
+  </ul>
+</section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-10.html"><div class="dir">← Previous</div><div class="ttl">Session 10: NoSQL Internals — LSM Tree 1</div></a>
+        <a class="next" href="session-12.html"><div class="dir">Next →</div><div class="ttl">Session 12: Case Study — Search Typeahead</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">HLD · Session 11 — NoSQL Internals — LSM Trees (Part 2): Reads, Sparse Index &amp; Bloom Filters · Reads are fast again 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

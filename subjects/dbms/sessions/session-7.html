@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 7 — Index Structures — B+ Trees (Part 2) &amp; Hash Indexes</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 7</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 07 · Index Structures — B+ Trees 2</span>
+      <h1>How databases delete, build, and choose the right index</h1>
+      <p class="lead">
+        Welcome back! In Session 6 we built B+ trees and learned how they stay balanced while we
+        <em>insert</em> keys. Today we finish the story: what happens when you <em>delete</em> keys,
+        how to build a huge index from scratch the fast way, how to index on more than one column,
+        and when a totally different structure — a hash index — beats a tree. As always, every topic
+        starts with a tiny "explain like I'm 5" story, then we go deep with real diagrams, SQL, and
+        pseudocode. No prior knowledge assumed beyond Session 6.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#deletion">Deletion, underflow, borrow &amp; merge</a></li>
+          <li><a href="#bulk">Bulk loading a B+ tree</a></li>
+          <li><a href="#composite">Composite &amp; covering indexes</a></li>
+          <li><a href="#hash">Hash indexes vs B+ trees</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. DELETION ===================== -->
+      <section id="deletion">
+        <h2><span class="sec-num">1</span> Deletion &amp; merges — underflow, borrowing, and shrinking</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine egg cartons on a shelf, and the rule is "every carton must be at least half
+          full." If you take an egg out and a carton drops below half, you don't leave it nearly
+          empty. First you ask the carton next door: "Spare me an egg?" If the neighbour has plenty,
+          it lends one — easy. If the neighbour is <em>also</em> only half full, lending would break
+          <em>it</em>, so instead you just tip both cartons into one and throw the empty carton away.
+          B+ tree deletion is exactly this: borrow if you can, otherwise merge.</p>
+        </div>
+
+        <p>Recall from Session 6 that a B+ tree of <span class="term">order</span> (also called the
+        <span class="term">fan-out</span>) <code class="inl">n</code> has these rules: every node holds
+        at most <code class="inl">n&minus;1</code> keys, and every node except the root must stay at least
+        <strong>half full</strong>. Inserting could make a node too <em>full</em>, so we
+        <strong>split</strong>. Deleting can make a node too <em>empty</em> — a condition called
+        <span class="term">underflow</span> — and the cures are the mirror image of a split:
+        <strong>borrow</strong> (also called redistribution) or <strong>merge</strong> (also called
+        coalescing).</p>
+
+        <h3>The minimum-occupancy rule</h3>
+        <p>The whole reason a B+ tree gives us guaranteed <code class="inl">O(log n)</code> lookups is
+        that it stays <span class="term">balanced</span> and reasonably full. If we let nodes drain to
+        almost empty, the tree would get tall and wasteful. So the structure enforces a floor:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Node type</th><th>Max keys</th><th>Minimum keys (the floor)</th></tr></thead>
+            <tbody>
+              <tr><td>Leaf node</td><td><code class="inl">n&minus;1</code></td><td><code class="inl">&lceil;(n&minus;1)/2&rceil;</code></td></tr>
+              <tr><td>Internal node</td><td><code class="inl">n&minus;1</code></td><td><code class="inl">&lceil;n/2&rceil; &minus; 1</code> (i.e. at least <code class="inl">&lceil;n/2&rceil;</code> children)</td></tr>
+              <tr><td>Root</td><td><code class="inl">n&minus;1</code></td><td>1 key (the root is exempt from the floor)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>When a deletion drops a node below its floor, we have underflow and must fix it before we
+        finish.</p>
+
+        <h3>The deletion algorithm, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">1. Find leaf</div><div class="s-d">Walk down to the leaf holding the key</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">2. Remove key</div><div class="s-d">Delete the entry from that leaf</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📏</div><div class="s-t">3. Check fill</div><div class="s-d">Still at least half full? Done.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🤝</div><div class="s-t">4. Borrow?</div><div class="s-d">A sibling has spare keys? Redistribute.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">5. Merge</div><div class="s-d">Else fuse with a sibling, fix parent</div></div>
+        </div>
+
+        <p>Two important details that beginners trip over:</p>
+        <ul>
+          <li>In a B+ tree, <strong>all real data lives in the leaves</strong>. Internal nodes only hold
+          <em>copies</em> of keys used as signposts. So a deleted key might still appear in an internal
+          node as a separator — and that's fine; it's just a routing label, not a missing/duplicate row.</li>
+          <li>After a borrow or merge, the <strong>parent's separator key may need updating</strong>, and a
+          merge <em>removes</em> a key from the parent — which can make the <em>parent</em> underflow too. So
+          fixes can cascade upward, exactly the way splits cascade upward during insertion.</li>
+        </ul>
+
+        <h3>Borrowing (redistribution)</h3>
+        <p>If an underflowing node has an <strong>adjacent sibling with keys to spare</strong> (i.e. the
+        sibling is more than half full), we move one key across and patch the parent's separator. This is
+        cheap and local — no nodes are deleted.</p>
+
+        <h3>Merging (coalescing)</h3>
+        <p>If <em>neither</em> sibling can spare a key (both are exactly at the floor), borrowing would just
+        push the problem to the sibling. Instead we <strong>merge</strong> the underflowing node with a
+        sibling into one node. Because two half-full nodes combine to at most one full node, this is always
+        legal. Merging two children means the parent loses one child <em>and</em> one separator key — which is
+        why the parent can underflow and the fix may climb the tree.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: delete from an order-4 B+ tree</span>
+          <p>Order <code class="inl">n = 4</code> means each node holds up to 3 keys, and leaves must keep at
+          least <code class="inl">&lceil;3/2&rceil; = 2</code> keys. Start with this tree (leaves chained
+          left→right; the root holds separator keys):</p>
+<pre>          <span class="cm">root:        [ 13 | 25 ]</span>
+                     /     |      \
+   leaf A:[5, 9]  leaf B:[13,17]  leaf C:[25,30,33]
+       (chained:  A &lt;-&gt; B &lt;-&gt; C)</pre>
+
+          <p><strong>Case 1 — easy delete (no underflow).</strong> Delete <code class="inl">30</code> from
+          leaf C. C had 3 keys, now has <code class="inl">[25, 33]</code> — still ≥ 2. Done, nothing else
+          changes.</p>
+
+          <p><strong>Case 2 — borrow from a sibling.</strong> Now delete <code class="inl">17</code> from
+          leaf B. B drops to <code class="inl">[13]</code> — only 1 key, that's underflow. Look at a sibling:
+          C is <code class="inl">[25, 33]</code> (2 keys, exactly the floor — can't spare). But suppose
+          instead C still held <code class="inl">[25, 30, 33]</code> (3 keys, one to spare). Then B
+          <strong>borrows</strong> C's smallest key, 25:</p>
+<pre>          <span class="cm">root:        [ 13 | 30 ]   &larr; separator updated 25&rarr;30</span>
+                     /     |      \
+   leaf A:[5, 9]  leaf B:[13,25]  leaf C:[30,33]</pre>
+          <p>Notice the parent's separator between B and C changed from 25 to 30 — it must always equal the
+          smallest key in the right child.</p>
+
+          <p><strong>Case 3 — merge (no sibling can spare).</strong> Back to the original tree, delete
+          <code class="inl">17</code> from B so B = <code class="inl">[13]</code> (underflow), and C is only
+          <code class="inl">[25, 30, 33]</code>… actually let's force the merge case: say C = <code class="inl">[25, 30]</code>
+          (at the floor, can't lend). Now B can't borrow, so B and C <strong>merge</strong> into one leaf
+          <code class="inl">[13, 25, 30]</code>. The parent loses the separator <code class="inl">25</code> and one
+          child pointer:</p>
+<pre>          <span class="cm">root:        [ 13 ]          &larr; lost separator 25</span>
+                     /      \
+        leaf A:[5,9]   leaf BC:[13,25,30]</pre>
+          <p>If that left the parent below its own floor, we'd repeat borrow-or-merge one level up.</p>
+        </div>
+
+        <h3>When the height actually shrinks</h3>
+        <p>Splits during insertion grow the tree taller only in one special case: when the <strong>root</strong>
+        itself splits. Deletion shrinks the tree in the mirror case: when a merge propagates all the way up and
+        the <strong>root ends up with no keys left</strong> (only a single child pointer). Then we
+        <strong>discard the old root and promote its only child to be the new root</strong> — the tree loses one
+        level.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — the height only changes at the root</span>
+          <p>A common misconception is that any merge makes the tree shorter. It doesn't. Most merges just
+          fuse two nodes at one level. The <strong>height drops only when a merge empties the root</strong>, just
+          as the height grows only when a split overflows the root. Everywhere in between, the tree quietly
+          rebalances at a single level.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A practical shortcut real databases take</span>
+          <p>Strictly enforcing merges on every delete is expensive. Many real systems (including the
+          B-tree in PostgreSQL and others) use <strong>lazy deletion</strong>: they mark entries as dead and
+          let pages sit under-full, only reclaiming or merging space later during a cleanup pass (e.g.
+          PostgreSQL's <code class="inl">VACUUM</code>). The textbook algorithm above is the <em>logical</em>
+          model; production systems optimise around it. We'll touch on storage reclamation in a later session.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deleting a key can cause <strong>underflow</strong> (a node drops below half full). Fix it by
+          <strong>borrowing</strong> a key from a sibling that has spares, or by <strong>merging</strong> with a
+          sibling when no one can spare. Merges remove a separator from the parent, so fixes can cascade upward.
+          The tree's <strong>height shrinks only when a merge empties the root</strong> and its single child is
+          promoted.
+        </div>
+      </section>
+
+      <!-- ===================== 2. BULK LOADING ===================== -->
+      <section id="bulk">
+        <h2><span class="sec-num">2</span> Bulk loading — building a B+ tree the fast way</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you have a thousand library books to shelve. One way: pick up each book, walk to the
+          right shelf, squeeze it in, and shuffle the whole row over to make room — a thousand separate
+          trips. The faster way: first sort all the books into neat piles on the floor, then fill each shelf
+          completely from left to right, then write the shelf labels last. Same books, way less walking.
+          Bulk loading builds an index that second way.</p>
+        </div>
+
+        <p>If you already have a big pile of data (say you're creating an index on an existing table, or
+        loading millions of rows), you <em>could</em> just call <code class="inl">insert</code> once per key.
+        But each insert from Session 6 walks from the root to a leaf and may trigger splits — that's
+        <code class="inl">O(log n)</code> work and lots of random page touches, <em>per key</em>.
+        <span class="term">Bulk loading</span> (also called <span class="term">bulk insertion</span> or
+        <span class="term">bottom-up construction</span>) builds the tree far faster.</p>
+
+        <h3>The algorithm</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔢</div><div class="s-t">1. Sort</div><div class="s-d">Sort all keys (with their record pointers)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">2. Pack leaves</div><div class="s-d">Fill leaf pages left-to-right</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔗</div><div class="s-t">3. Chain</div><div class="s-d">Link leaves into the sequence set</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⬆️</div><div class="s-t">4. Build up</div><div class="s-d">Make a parent level from leaf min-keys</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🌳</div><div class="s-t">5. Repeat</div><div class="s-d">Until one node remains: the root</div></div>
+        </div>
+
+        <p>The key idea is <strong>bottom-up</strong>: instead of growing the tree top-down one insert at a
+        time, you lay down the entire bottom row of leaves first (each filled to a chosen capacity), then build
+        each higher level by taking the <em>smallest key of each child</em> as a separator in its parent. You
+        repeat until a single node — the root — remains.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: bulk-load 10 sorted keys</span>
+          <p>Keys (already sorted): <code class="inl">2, 3, 5, 7, 11, 13, 17, 19, 23, 29</code>. Suppose leaves
+          hold up to 3 keys and we choose to fill them ~2/3 full to leave room for later inserts.</p>
+
+          <p><strong>Step 1 — pack and chain the leaves</strong> left to right:</p>
+<pre>  L1:[2,3]  L2:[5,7]  L3:[11,13]  L4:[17,19]  L5:[23,29]
+     (chained: L1 &lt;-&gt; L2 &lt;-&gt; L3 &lt;-&gt; L4 &lt;-&gt; L5)</pre>
+
+          <p><strong>Step 2 — build the parent level.</strong> Each internal entry routes to a child, and a
+          B+ tree separator equals the smallest key reachable in the child to its right. Taking the first key
+          of L2, L3, L4, L5 gives separators <code class="inl">5, 11, 17, 23</code>. With fan-out 4 we can fit
+          them in one internal node — which becomes the root:</p>
+<pre>  <span class="cm">root: [ 5 | 11 | 17 | 23 ]</span>
+         /    |    |    |    \
+       L1    L2   L3   L4    L5</pre>
+          <p>Done — a complete, balanced 2-level tree built in essentially one sorted pass, with no splits at
+          all. (If the separators didn't fit in one node, we'd pack <em>them</em> into several internal nodes and
+          build yet another level on top, repeating until one root remains.)</p>
+        </div>
+
+        <h3>Why bulk loading is faster</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Repeated inserts</th><th>Bulk loading</th></tr></thead>
+            <tbody>
+              <tr><td>Cost per key</td><td>Root-to-leaf descent + possible splits, each time</td><td>One sort, then a single sequential pass</td></tr>
+              <tr><td>Total cost</td><td>~<code class="inl">O(k · log k)</code> with random I/O per insert</td><td>~<code class="inl">O(k · log k)</code> for the sort, then <code class="inl">O(k)</code> sequential build</td></tr>
+              <tr><td>Disk access pattern</td><td>Random page reads/writes (cache-unfriendly)</td><td>Sequential scans (cache- and disk-friendly)</td></tr>
+              <tr><td>Node splits</td><td>Many, scattered through the build</td><td>None — leaves are filled in order</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway — better packing</span>
+          <p>Random inserts tend to leave B+ tree pages only about <strong>~67% full</strong> on average (a
+          classic result), because splits cut a full page in half. Bulk loading lets you choose the
+          <span class="term">fill factor</span> deliberately — pack pages 100% full for a read-only index (fewer
+          pages, fewer I/Os, shallower tree), or leave headroom (e.g. 67–90%) if you expect future inserts so you
+          don't immediately trigger splits. <strong>You control the packing instead of leaving it to chance.</strong></p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off: pack too tight and the next insert splits</span>
+          <p>A 100%-full index is wonderfully compact for reads, but the very first insert into any full leaf
+          forces an immediate split. If the table will keep growing, set a lower fill factor (PostgreSQL exposes
+          exactly this as the <code class="inl">fillfactor</code> storage parameter on an index). Read-mostly?
+          Pack tight. Write-heavy? Leave slack.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Bulk loading builds a B+ tree <strong>bottom-up from sorted data</strong>: sort once, fill leaf pages
+          left-to-right, chain them, then build parent levels from each child's smallest key until one root
+          remains. It's far faster than repeated inserts (sequential I/O, no scattered splits) and lets you
+          <strong>choose the fill factor</strong> for better, deliberate packing.
+        </div>
+      </section>
+
+      <!-- ===================== 3. COMPOSITE & COVERING ===================== -->
+      <section id="composite">
+        <h2><span class="sec-num">3</span> Composite &amp; covering indexes</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a phone book sorted by <strong>last name, then first name</strong>. It's brilliant for
+          "find all the Smiths" and "find John Smith" — because last name comes first. But it's useless for
+          "find everyone named John," because all the Johns are scattered across every letter. The
+          <em>order of the columns</em> in a multi-column index is just like the order in that phone book: it
+          decides which questions are easy and which are impossible.</p>
+        </div>
+
+        <p>So far our index keys were a single column. A <span class="term">composite index</span> (also called
+        a <span class="term">compound</span> or <span class="term">multi-column index</span>) uses
+        <strong>several columns combined into one key</strong>. The B+ tree sorts rows by the first column, then
+        breaks ties with the second, then the third, and so on — exactly the phone-book ordering. This is also
+        called <span class="term">lexicographic</span> (dictionary) order.</p>
+
+        <h3>Column order matters — a lot</h3>
+        <p>Consider an index on <code class="inl">(last_name, first_name)</code>. Because the tree is sorted by
+        <code class="inl">last_name</code> first, here is what it can and can't accelerate:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Query</th><th>Uses the index?</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">WHERE last_name = 'Smith'</code></td><td>✅ Yes</td><td>Matches the leading column — one contiguous range.</td></tr>
+              <tr><td><code class="inl">WHERE last_name = 'Smith' AND first_name = 'John'</code></td><td>✅ Yes</td><td>Uses both columns; pins down an exact spot.</td></tr>
+              <tr><td><code class="inl">WHERE last_name = 'Smith' AND first_name LIKE 'J%'</code></td><td>✅ Yes</td><td>Leading column exact, second column is a range — still contiguous.</td></tr>
+              <tr><td><code class="inl">WHERE first_name = 'John'</code></td><td>❌ No (usually)</td><td>Skips the leading column; the Johns are scattered everywhere.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">The leftmost-prefix rule</span>
+          <p>A composite index on <code class="inl">(A, B, C)</code> can efficiently serve queries that filter on
+          a <span class="term">leftmost prefix</span> of the columns: <code class="inl">A</code>;
+          <code class="inl">A, B</code>; or <code class="inl">A, B, C</code>. It generally <strong>cannot</strong>
+          serve a query that filters only on <code class="inl">B</code>, or only on <code class="inl">C</code>, or
+          on <code class="inl">B, C</code> without <code class="inl">A</code> — because those columns aren't the
+          thing the tree is sorted by first. Put the column you most often filter by <em>first</em>.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: same data, two column orders</span>
+          <p>Say we frequently run <code class="inl">WHERE city = ? AND age &gt; ?</code>. Compare:</p>
+<pre>  <span class="cm">-- Index option A: city first, then age</span>
+  <span class="kw">CREATE INDEX</span> idx_city_age <span class="kw">ON</span> users (city, age);
+
+  <span class="cm">-- Index option B: age first, then city</span>
+  <span class="kw">CREATE INDEX</span> idx_age_city <span class="kw">ON</span> users (age, city);
+
+  <span class="cm">-- The query:</span>
+  <span class="kw">SELECT</span> * <span class="kw">FROM</span> users
+  <span class="kw">WHERE</span> city = <span class="st">'Delhi'</span> <span class="kw">AND</span> age &gt; <span class="nm">30</span>;</pre>
+          <p><strong>Option A (city, age)</strong> is ideal: the tree jumps straight to the contiguous block of
+          Delhi rows, and within Delhi the rows are already sorted by age, so <code class="inl">age &gt; 30</code>
+          is one clean range scan from age 31 onward. <strong>Option B (age, city)</strong> is poor for this
+          query: it would scan every age &gt; 30 and then filter for Delhi inside each age, touching far more of
+          the index. Same columns — the <em>order</em> decided everything.</p>
+        </div>
+
+        <h3>Covering indexes — answering a query from the index alone</h3>
+        <p>Normally an index entry gets you to the right <em>location</em>, and then the database does an extra
+        step: it follows the pointer to the actual table row to fetch the other columns you asked for. That extra
+        hop is the slow part for big result sets. A <span class="term">covering index</span> contains
+        <strong>every column the query needs</strong> — both the columns it filters on <em>and</em> the columns it
+        returns — so the database can answer the query <strong>entirely from the index</strong>, never touching
+        the table. This is called an <span class="term">index-only scan</span>.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: turning a query into an index-only scan</span>
+          <p>The query we want to make fast:</p>
+<pre>  <span class="kw">SELECT</span> email
+  <span class="kw">FROM</span> users
+  <span class="kw">WHERE</span> city = <span class="st">'Delhi'</span>;</pre>
+          <p>A plain index on <code class="inl">(city)</code> finds the Delhi rows fast, but must then visit each
+          table row to read <code class="inl">email</code>. Make it a <strong>covering index</strong> by including
+          <code class="inl">email</code> too:</p>
+<pre>  <span class="cm">-- email is part of the sorted key here</span>
+  <span class="kw">CREATE INDEX</span> idx_city_email <span class="kw">ON</span> users (city, email);
+
+  <span class="cm">-- PostgreSQL: keep email as a non-key "payload" via INCLUDE</span>
+  <span class="kw">CREATE INDEX</span> idx_city_inc <span class="kw">ON</span> users (city) <span class="kw">INCLUDE</span> (email);</pre>
+          <p>Now both <code class="inl">city</code> (to filter) and <code class="inl">email</code> (to return) live
+          in the index, so the query is answered <strong>index-only</strong> — no table lookups at all. The
+          <code class="inl">INCLUDE</code> form (PostgreSQL, SQL Server) stores <code class="inl">email</code> only
+          in the <em>leaf</em> level as extra payload, so it covers the query without bloating the upper tree or
+          affecting sort order.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Prefix queries, one more time</span>
+          <p>"Prefix" shows up in two senses here and they're related: (1) a <strong>column prefix</strong> — using
+          a leftmost subset of a composite index's columns; and (2) a <strong>value prefix</strong> — a search like
+          <code class="inl">name LIKE 'Sha%'</code>, which a B+ tree handles as a single range scan because all
+          strings starting with "Sha" sort next to each other. Both work <em>because</em> the tree keeps keys in
+          sorted order. (A leading-wildcard search like <code class="inl">LIKE '%ya'</code> can't use the tree — the
+          start is unknown, so there's no contiguous range.)</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off: indexes aren't free</span>
+          <p>Wider composite and covering indexes make reads faster but <strong>cost more to store and to keep
+          updated</strong> — every <code class="inl">INSERT</code>/<code class="inl">UPDATE</code>/<code class="inl">DELETE</code>
+          on the table must also maintain every index. Add the columns a query truly needs, not every column "just
+          in case."</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>composite index</strong> sorts by its columns left to right, so <strong>column order
+          matters</strong>: it serves any <em>leftmost prefix</em> of the columns but not a non-leading column
+          alone. A <strong>covering index</strong> contains every column a query touches, enabling an
+          <strong>index-only scan</strong> with no trip to the table — at the cost of a wider, pricier-to-maintain
+          index.
+        </div>
+      </section>
+
+      <!-- ===================== 4. HASH INDEXES ===================== -->
+      <section id="hash">
+        <h2><span class="sec-num">4</span> Hash indexes vs B+ trees</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A B+ tree is like a sorted bookshelf — great for "give me every book between G and M." A
+          <strong>hash index</strong> is like a coat-check: you hand over your ticket number, the attendant
+          instantly knows the exact peg, and fetches your coat in one move. Lightning fast for "<em>this exact
+          ticket</em>" — but if you ask "give me all the coats with tickets between 40 and 60," the attendant is
+          useless, because the pegs aren't in number order at all.</p>
+        </div>
+
+        <p>A <span class="term">hash index</span> is built on a <span class="term">hash function</span>: a little
+        formula that turns a key (like <code class="inl">user_id = 8421</code>) into a <span class="term">bucket</span>
+        number — a slot where the matching entry is stored. To look up a key, you hash it, jump straight to that
+        bucket, and scan the (usually tiny) bucket. No tree to descend.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A hash index trades <strong>order for speed</strong>. By scattering keys into buckets by a hash, it
+          gives roughly <strong>O(1)</strong> exact-match lookups — faster than a tree's
+          <code class="inl">O(log n)</code> descent. But the scattering destroys sorted order, so it
+          <strong>cannot do range scans, prefix matches, or sorted output at all</strong>. That single trade-off
+          drives every "which should I use?" decision.</p>
+        </div>
+
+        <h3>Static hashing — and why it's not enough</h3>
+        <p>The simplest scheme, <span class="term">static hashing</span>, fixes the number of buckets up front:
+        <code class="inl">bucket = hash(key) mod N</code>. That's fine until the table grows. When buckets fill up,
+        new entries spill into <span class="term">overflow chains</span> (extra linked pages hanging off a bucket),
+        and lookups degrade from O(1) toward O(chain length). Sizing too big wastes space; too small causes
+        overflows. We need a scheme that <strong>grows gracefully</strong>.</p>
+
+        <h3>Extendible hashing</h3>
+        <p><span class="term">Extendible hashing</span> uses a <strong>directory</strong> that points to buckets,
+        and looks at the first <code class="inl">d</code> bits of the hash (<code class="inl">d</code> is the
+        <span class="term">global depth</span>). When one bucket overflows, only <em>that</em> bucket is
+        <strong>split</strong> (and the directory doubles only if needed), so the structure grows one bucket at a
+        time rather than rehashing everything. Lookups stay close to a single bucket access.</p>
+
+        <h3>Linear hashing</h3>
+        <p><span class="term">Linear hashing</span> grows the table <strong>one bucket at a time in a fixed
+        round-robin order</strong>, with <em>no</em> directory at all. A "split pointer" marches across the
+        buckets; whenever the table gets too full overall, the next bucket in line is split. It avoids the
+        directory entirely and spreads the cost of growth smoothly, which is why several real systems use it.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a static hash lookup &amp; a bucket split</span>
+          <p>Suppose <code class="inl">N = 4</code> buckets and <code class="inl">hash(k) = k</code> (identity, for
+          clarity). Insert keys 5, 9, 13, 7:</p>
+<pre>  bucket = key mod 4
+  5  mod 4 = 1   &rarr; bucket 1
+  9  mod 4 = 1   &rarr; bucket 1
+  13 mod 4 = 1   &rarr; bucket 1   <span class="cm">(bucket 1 now: [5, 9, 13])</span>
+  7  mod 4 = 3   &rarr; bucket 3
+
+  Buckets:  0:[ ]   1:[5,9,13]   2:[ ]   3:[7]</pre>
+          <p><strong>Lookup</strong> <code class="inl">key = 9</code>: compute <code class="inl">9 mod 4 = 1</code>,
+          jump straight to bucket 1, scan its 3 entries, find 9. That's a single bucket access — O(1) expected,
+          independent of how many <em>total</em> keys exist.</p>
+          <p>Now suppose buckets hold at most 2 entries. Bucket 1 has 3 — it overflowed. Under <strong>static
+          hashing</strong> the third entry goes to an overflow page chained off bucket 1 (lookups for bucket 1 now
+          cost 2 page reads). Under <strong>extendible/linear hashing</strong> we'd instead split bucket 1 using one
+          more hash bit, redistributing <code class="inl">[5, 9, 13]</code> into two buckets so each stays small and
+          lookups stay ~O(1).</p>
+        </div>
+
+        <h3>The comparison table — when to use which</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Capability</th><th>B+ tree index</th><th>Hash index</th></tr></thead>
+            <tbody>
+              <tr><td>Exact match (<code class="inl">=</code>)</td><td>Good — <code class="inl">O(log n)</code></td><td>Excellent — <code class="inl">O(1)</code> expected</td></tr>
+              <tr><td>Range scan (<code class="inl">&lt;, &gt;, BETWEEN</code>)</td><td>✅ Excellent — leaves are chained in order</td><td>❌ Not supported — buckets aren't ordered</td></tr>
+              <tr><td>Prefix match (<code class="inl">LIKE 'abc%'</code>)</td><td>✅ Yes (range scan)</td><td>❌ No</td></tr>
+              <tr><td>Sorted output / <code class="inl">ORDER BY</code></td><td>✅ Free — already sorted</td><td>❌ Needs a separate sort</td></tr>
+              <tr><td>Min / Max</td><td>✅ Walk to leftmost/rightmost leaf</td><td>❌ Must scan all buckets</td></tr>
+              <tr><td>Composite leftmost-prefix queries</td><td>✅ Yes</td><td>⚠️ Only on the full key</td></tr>
+              <tr><td>Growth behaviour</td><td>Self-balancing via split/merge</td><td>Needs extendible/linear hashing to grow well</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">The decision rule</span>
+          <p>Use a <strong>hash index</strong> only when <em>all</em> you ever do is exact-equality lookups on the
+          key (e.g. a pure key-value cache, a join on an ID). Use a <strong>B+ tree</strong> for essentially
+          everything else — anything with ranges, sorting, prefixes, min/max, or partial-key queries. Because B+
+          trees handle equality <em>well enough</em> and ranges <em>brilliantly</em>, they are the
+          <strong>default index in every major database</strong> (it's what you get from a plain
+          <code class="inl">CREATE INDEX</code>).</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">In the real world</span>
+          <p>PostgreSQL ships both: the default <code class="inl">btree</code> and an explicit
+          <code class="inl">USING hash</code> (<code class="inl">CREATE INDEX ... USING hash (col)</code>), useful
+          for large equality-only columns. MySQL's <code class="inl">MEMORY</code> engine uses hash indexes by
+          default, while <code class="inl">InnoDB</code> uses B+ trees (with an automatic "adaptive hash index" layered
+          on top for hot equality lookups). The takeaway: B+ trees are the workhorse; hash indexes are a
+          specialist tool.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>hash index</strong> maps keys to buckets for ~<strong>O(1)</strong> exact-match lookups but
+          <strong>no range scans, prefixes, sorting, or min/max</strong>. <strong>Static hashing</strong> can't grow
+          well (overflow chains), so we use <strong>extendible hashing</strong> (a doubling directory + split one
+          bucket) or <strong>linear hashing</strong> (round-robin splits, no directory). Reach for a hash index only
+          for pure equality workloads; otherwise the <strong>B+ tree is the default</strong> for its range power.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You've now seen the full life of an index — building it, shrinking it, shaping it for multiple
+        columns, and choosing a completely different structure when the workload calls for it. Here's the
+        one-paragraph story tying today's four topics together:</p>
+        <div class="bigidea">
+          <p>A B+ tree stays balanced not just on insert (Session 6) but on <strong>delete</strong>: when a node
+          underflows we <strong>borrow</strong> from a sibling or <strong>merge</strong>, and the tree only loses
+          height when a merge empties the root. When we have lots of data up front, <strong>bulk loading</strong>
+          builds the tree bottom-up from sorted keys — faster and with deliberate <strong>packing</strong> via the
+          fill factor. To serve real queries we use <strong>composite indexes</strong>, where column order obeys the
+          leftmost-prefix rule, and <strong>covering indexes</strong>, which carry every column a query needs so it
+          runs index-only. And when a workload is pure equality lookups with no ranges, a <strong>hash index</strong>
+          (extendible or linear) gives O(1) access — but for everything involving order, the <strong>B+ tree
+          remains the default</strong>. These structures are exactly what the query planner reasons about when it
+          decides how to run your SQL — which is where we head next in Session 8.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>A leaf underflows and both its siblings are exactly at the minimum. Borrow or merge?</summary>
+          <p class="ans">Merge. Neither sibling can spare a key without underflowing itself, so you fuse the node
+          with a sibling into one node and remove the now-unneeded separator from the parent (which may cause the
+          parent to underflow too).</p>
+        </details>
+        <details class="quiz">
+          <summary>When does a B+ tree's height actually decrease?</summary>
+          <p class="ans">Only when a merge propagates all the way up and empties the root, leaving it with a single
+          child. That child is promoted to be the new root and the tree loses one level. Ordinary merges lower down
+          don't change the height.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is bulk loading faster than inserting keys one by one?</summary>
+          <p class="ans">It sorts once, then fills leaves left-to-right in a single sequential pass with no scattered
+          node splits and disk-friendly sequential I/O. It also lets you pick the fill factor for deliberate packing,
+          instead of leaving pages ~67% full from random splits.</p>
+        </details>
+        <details class="quiz">
+          <summary>You have an index on <code class="inl">(country, city)</code>. Which query can't use it efficiently: filtering by country, or filtering only by city?</summary>
+          <p class="ans">Filtering only by city. The tree is sorted by country first, so cities are scattered across
+          every country — there's no contiguous range. Filtering by country (the leftmost prefix) works great.</p>
+        </details>
+        <details class="quiz">
+          <summary>What makes an index a "covering" index, and what does it avoid?</summary>
+          <p class="ans">It contains every column a query needs — both the filter columns and the returned columns —
+          so the query is answered index-only. It avoids the extra hop from the index entry to the actual table row
+          (the table lookups).</p>
+        </details>
+        <details class="quiz">
+          <summary>Your query is <code class="inl">WHERE price BETWEEN 100 AND 200 ORDER BY price</code>. B+ tree or hash index?</summary>
+          <p class="ans">B+ tree. It's a range query that also wants sorted output — both impossible for a hash index,
+          which has no order. The B+ tree finds the start of the range and walks the chained leaves in sorted order
+          for free.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 7 — Index Structures 2 (your course handout for this session).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 Database Systems — tree &amp; hash index lectures</a> — Andy Pavlo's free course; the B+ tree and hashing lectures cover deletion, bulk loading, and extendible/linear hashing with excellent slides and videos.</li>
+          <li><a href="https://www.postgresql.org/docs/current/indexes-types.html" target="_blank" rel="noopener">PostgreSQL Documentation — Index Types</a> — the official rundown of B-tree vs hash (and GIN/GiST/BRIN), with exactly when each is appropriate; pairs directly with Topics 3 and 4.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Silberschatz, Korth &amp; Sudarshan — <em>Database System Concepts</em> (the "Indexing" &amp; hashing chapters)</a> — the standard textbook treatment of B+ tree deletion, bulk loading, and static/dynamic hashing with full worked examples.</li>
+          <li><a href="https://use-the-index-luke.com/" target="_blank" rel="noopener">Markus Winand — <em>Use The Index, Luke!</em></a> — a famously clear, practical guide to composite indexes, the leftmost-prefix rule, and covering/index-only scans across real SQL databases.</li>
+          <li><a href="https://www.postgresql.org/docs/current/sql-createindex.html" target="_blank" rel="noopener">PostgreSQL — <code class="inl">CREATE INDEX</code> reference</a> — documents <code class="inl">INCLUDE</code> (covering indexes), <code class="inl">fillfactor</code> (packing), and <code class="inl">USING hash</code>, the exact features used in this session's examples.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-6.html"><div class="dir">← Previous</div><div class="ttl">Session 6: Index Structures — B+ Trees</div></a>
+        <a class="next" href="session-8.html"><div class="dir">Next →</div><div class="ttl">Session 8: Query Parsing</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 7 — Index Structures — B+ Trees (Part 2) &amp; Hash Indexes · Nicely done — you can now build, shrink, and choose indexes 🌳</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

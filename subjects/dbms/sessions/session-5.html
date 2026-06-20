@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DBMS · Session 5 — Buffer Pool — Replacement Policies &amp; Prefetching</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="dbms">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DBMS</a> / Session 5</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 05 · Buffer Pool — Replacement</span>
+      <h1>Keeping the right pages in memory</h1>
+      <p class="lead">
+        In Session 4 we built the buffer pool — the database's in-memory cache of disk pages — and we used
+        plain <strong>LRU</strong> to decide what to throw out. This session is about a surprising weakness:
+        one big query can wreck that cache and slow everything down. We'll see why, meet smarter eviction
+        policies like <strong>LRU-K</strong>, learn how real databases stay "scan-resistant," and finish with
+        <strong>prefetching</strong> tricks that hide disk latency. We assume you've studied <em>none</em> of
+        this before — every topic starts with a tiny everyday story before we go deep.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#lru-weakness">The weakness of plain LRU</a></li>
+          <li><a href="#lru-k">LRU-K: counting references</a></li>
+          <li><a href="#scan-resistance">Sequential flooding &amp; scan resistance</a></li>
+          <li><a href="#prefetching">Prefetching &amp; I/O optimizations</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References &amp; further reading</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. LRU WEAKNESS ===================== -->
+      <section id="lru-weakness">
+        <h2><span class="sec-num">1</span> The weakness of plain LRU</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your desk only fits 5 books. You keep the books you used most <em>recently</em> on the desk
+          and shove the oldest one back on the shelf when you need room. That's a good habit — until you spend
+          one afternoon flipping through <strong>500 reference books one time each</strong> for a single report.
+          By the end, your 5 favourite everyday books are all gone — pushed off the desk by 500 books you'll
+          <em>never open again</em>. You wrecked your nice desk for one big task. That's exactly what one giant
+          database query can do to memory.</p>
+        </div>
+
+        <p>First, let's recall the setup from Session 4. The <span class="term">buffer pool</span> is a region of
+        the database's RAM divided into fixed-size slots called <span class="term">frames</span>. Each frame can
+        hold one disk <span class="term">page</span> (a fixed-size block, often 4&nbsp;KB–16&nbsp;KB). When a
+        query needs a page, the system checks the buffer pool first:</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">1. Look up</div><div class="s-d">Is the page already in a frame?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">2a. Hit</div><div class="s-d">Found in RAM — return it fast</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💽</div><div class="s-t">2b. Miss</div><div class="s-d">Not in RAM — read from disk</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗑️</div><div class="s-t">3. Evict</div><div class="s-d">No free frame? Pick a victim to remove</div></div>
+        </div>
+
+        <p>That step 3 — choosing which page to kick out — is the job of the <span class="term">replacement
+        policy</span> (also called the eviction policy). A <span class="term">cache hit</span> means the page was
+        already in RAM (cheap, nanoseconds); a <span class="term">cache miss</span> forces a disk read (expensive,
+        often thousands of times slower). The whole game is to <strong>maximise the hit rate</strong> by keeping
+        the pages we're most likely to reuse.</p>
+
+        <h3>Recalling LRU</h3>
+        <p><span class="term">LRU (Least Recently Used)</span> is the classic policy: when you must evict, throw
+        out the page that hasn't been touched for the longest time. The bet is simple and usually good —
+        <strong>recently used pages are likely to be used again soon</strong> (this is called
+        <span class="term">temporal locality</span>). LRU is typically implemented with a doubly-linked list (or
+        an equivalent) where every access moves the page to the "most recently used" front; the victim is always
+        the page at the "least recently used" back.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Operation</th><th>What LRU does</th><th>Cost</th></tr></thead>
+            <tbody>
+              <tr><td>Access a page</td><td>Move it to the front (most-recently-used end)</td><td>O(1)</td></tr>
+              <tr><td>Evict</td><td>Remove the page at the back (least-recently-used end)</td><td>O(1)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>So where does LRU break?</h3>
+        <p>LRU has one fatal blind spot: it only looks at <strong>how recently</strong> a page was touched, never
+        at <strong>how often</strong>. To LRU, a page touched once a moment ago looks more valuable than a page
+        touched a thousand times but a little while back. A single large query that reads many pages exactly once
+        — a <span class="term">full table scan</span> — can therefore stream a flood of "use-once" pages through
+        the cache, each marked "most recently used," pushing out the genuinely hot pages.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>This failure has a name: <span class="term">sequential flooding</span> (sometimes "cache pollution"
+          or "scan thrashing"). A one-time sequential scan evicts the frequently-reused working set, so after the
+          scan the database has to re-read everything from disk. LRU mistook "just touched" for "valuable" — and
+          got fooled by a scan that touches each page only once.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a scan poisons a 3-frame cache</span>
+          <p>Buffer pool with <strong>3 frames</strong>, plain LRU. Pages <code class="inl">A</code>,
+          <code class="inl">B</code>, <code class="inl">C</code> are hot — they get used constantly. A reporting
+          query then scans new pages <code class="inl">P1, P2, P3</code> once each.</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Step</th><th>Access</th><th>Cache (MRU→LRU)</th><th>Hit/Miss</th></tr></thead>
+              <tbody>
+                <tr><td>0</td><td>warm</td><td>A, B, C</td><td>hot set loaded</td></tr>
+                <tr><td>1</td><td>P1</td><td>P1, A, B</td><td>miss → evict C</td></tr>
+                <tr><td>2</td><td>P2</td><td>P2, P1, A</td><td>miss → evict B</td></tr>
+                <tr><td>3</td><td>P3</td><td>P3, P2, P1</td><td>miss → evict A</td></tr>
+                <tr><td>4</td><td>A (hot again)</td><td>A, P3, P2</td><td><strong>miss!</strong> A was evicted</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>After three throwaway pages, every hot page is gone. When the app goes back to its bread-and-butter
+          pages <code class="inl">A, B, C</code>, they all miss and must be re-read from disk. The scan touched
+          <code class="inl">P1, P2, P3</code> exactly once, yet it cost us our entire working set.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>This is worst when the scan is <strong>bigger than the buffer pool</strong>. If you sequentially read
+          a table with more pages than you have frames, plain LRU evicts every earlier page before you ever reuse
+          it — so even re-scanning the same table from the top gives a <strong>0% hit rate</strong>. We'll see the
+          clean fix (MRU for scans) in Topic 3.</p>
+        </div>
+
+        <p>The takeaway is not "LRU is bad" — for ordinary workloads it's great. The takeaway is that LRU has a
+        known failure mode under large scans, and smarter policies try to tell "used once by accident" apart from
+        "genuinely hot." That's exactly what Topic 2 builds.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The buffer pool caches disk pages in frames; the replacement policy picks eviction victims. Plain LRU
+          evicts the least-recently-touched page and works well on locality — but it only tracks <em>recency</em>,
+          not <em>frequency</em>. A single large scan of use-once pages floods the cache (<strong>sequential
+          flooding</strong>) and evicts the hot working set, tanking the hit rate. We need policies that resist this.
+        </div>
+      </section>
+
+      <!-- ===================== 2. LRU-K ===================== -->
+      <section id="lru-k">
+        <h2><span class="sec-num">2</span> LRU-K: counting references, not just recency</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine deciding which friends to keep on speed-dial. A bad rule is "whoever I called <em>last</em>"
+          — that puts a wrong-number stranger ahead of your best friend. A smarter rule: "look at the
+          <strong>last two times</strong> I called each person." Your best friend was called twice, recently and
+          often. The stranger was called only once, ever. Now it's obvious who to keep. LRU-K does this with disk
+          pages: it remembers the last <em>K</em> times each page was used, so a page touched once can't fool it.</p>
+        </div>
+
+        <p><span class="term">LRU-K</span> (O'Neil, O'Neil &amp; Weikum, 1993) generalises LRU. Plain LRU only
+        remembers the <em>single</em> most recent access to each page. LRU-K instead remembers the timestamps of
+        the <strong>last K accesses</strong>. From those it estimates each page's <span class="term">reuse
+        distance</span> — roughly, "how long until I'd expect to touch this page again." It evicts the page whose
+        predicted next use is <em>farthest</em> away.</p>
+
+        <h3>The key quantity: backward K-distance</h3>
+        <p>For each page, look back through history and find the timestamp of its <strong>K-th most recent</strong>
+        access. The gap between "now" and that timestamp is the <span class="term">backward K-distance</span>. A
+        page with a small K-distance has been hit K times recently (it's hot); a page with a huge K-distance
+        hasn't accumulated K recent hits (it's cold, or brand-new). The victim is the page with the
+        <strong>largest backward K-distance</strong>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Why K = 1 is just plain LRU</span>
+          <p>If K = 1, the "K-th most recent access" is simply the most recent access — so LRU-1 evicts the page
+          with the oldest single access, which is exactly LRU. Increasing K adds memory of <em>how often</em> a
+          page is reused, not only when it was last touched.</p>
+        </div>
+
+        <h3>Why LRU-2 resists flooding</h3>
+        <p>The popular choice is <span class="term">LRU-2</span> (K = 2): track the last <strong>two</strong>
+        references. Here's the magic. A scan touches each page exactly <em>once</em>, so a scanned page has only a
+        first reference — it has <strong>no second-most-recent access</strong>, so its backward 2-distance is
+        treated as infinite (or as the oldest possible time). That makes scanned, use-once pages the
+        <strong>first to be evicted</strong>, while a hot page that was genuinely referenced twice keeps a small
+        finite K-distance and survives. The scan can no longer push out the working set.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A page must "prove itself" by being referenced at least K times before LRU-K treats it as worth
+          keeping. One accidental touch is no longer enough to look valuable. That single change is what makes
+          LRU-2 <strong>scan-resistant</strong> where LRU is not.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: LRU vs LRU-2 on the same trace</span>
+          <p>3 frames. Hot pages <code class="inl">A, B</code> are touched repeatedly; a scan brings in
+          <code class="inl">P1, P2, P3</code> once each. Reference string:
+          <code class="inl">A B A B P1 P2 P3 A B</code>.</p>
+
+          <p><strong>Plain LRU</strong> (recency only):</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Access</th><th>Cache (MRU→LRU)</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td>A B A B</td><td>B, A</td><td>warm hot set</td></tr>
+                <tr><td>P1</td><td>P1, B, A</td><td>miss</td></tr>
+                <tr><td>P2</td><td>P2, P1, B</td><td>miss → evict A</td></tr>
+                <tr><td>P3</td><td>P3, P2, P1</td><td>miss → evict B</td></tr>
+                <tr><td>A</td><td>A, P3, P2</td><td><strong>miss</strong> (A was evicted)</td></tr>
+                <tr><td>B</td><td>B, A, P3</td><td><strong>miss</strong> (B was evicted)</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Both hot pages were lost: 2 extra misses on the re-access of A and B.</p>
+
+          <p><strong>LRU-2</strong> (evict largest backward 2-distance; scanned pages have an infinite 2-distance
+          because they were touched only once):</p>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Access</th><th>What LRU-2 keeps</th><th>Result</th></tr></thead>
+              <tbody>
+                <tr><td>A B A B</td><td>A and B each have <em>two</em> references → small, finite K-distance</td><td>both protected</td></tr>
+                <tr><td>P1</td><td>P1 has one ref → ∞ 2-distance; cache = {A, B, P1}</td><td>miss</td></tr>
+                <tr><td>P2</td><td>evict <strong>P1</strong> (∞ distance), not A or B; cache = {A, B, P2}</td><td>miss → evict P1</td></tr>
+                <tr><td>P3</td><td>evict <strong>P2</strong> (∞ distance); cache = {A, B, P3}</td><td>miss → evict P2</td></tr>
+                <tr><td>A</td><td>A is still resident</td><td><strong>HIT</strong> ✅</td></tr>
+                <tr><td>B</td><td>B is still resident</td><td><strong>HIT</strong> ✅</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>LRU-2 sacrifices the throwaway scan pages among themselves and <strong>keeps A and B the whole
+          time</strong>. The two re-accesses are hits instead of misses. The use-once pages couldn't accumulate a
+          second reference, so they were always the cheapest to discard.</p>
+        </div>
+
+        <h3>Pseudocode sketch</h3>
+        <p>Each page keeps a small history of its last K access timestamps. <code class="inl">HIST(p, K)</code> is
+        the timestamp of the K-th most recent access to page <code class="inl">p</code>, or
+        <code class="inl">0</code> (treated as ∞ distance) if it has fewer than K accesses.</p>
+        <pre><span class="cm"># now = current logical time (a counter that ticks on every access)</span>
+<span class="kw">def</span> access(p):
+    <span class="kw">if</span> p <span class="kw">in</span> buffer_pool:
+        record_reference(p, now)        <span class="cm"># shift its K-history, append `now`</span>
+        <span class="kw">return</span> HIT
+    <span class="kw">if</span> buffer_is_full():
+        victim = <span class="nm">None</span>
+        max_dist = <span class="nm">-1</span>
+        <span class="kw">for</span> q <span class="kw">in</span> buffer_pool:
+            dist = now - HIST(q, K)     <span class="cm"># HIST = 0 ⇒ dist is effectively ∞</span>
+            <span class="kw">if</span> dist &gt; max_dist:
+                max_dist = dist
+                victim = q              <span class="cm"># largest backward K-distance loses</span>
+        evict(victim)
+    load_from_disk(p)
+    record_reference(p, now)
+    <span class="kw">return</span> MISS</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-offs &amp; the &quot;Correlated Reference Period&quot;</span>
+          <p>LRU-K is not free. (1) It stores <strong>K timestamps per page</strong>, so it uses more bookkeeping
+          memory than LRU. (2) A naive eviction scan over all frames is O(n); real implementations use a priority
+          queue or heap. (3) Bursts of accesses close together — e.g. an index lookup immediately followed by the
+          row fetch — shouldn't each count as a "real" separate reference. The original paper adds a
+          <span class="term">Correlated Reference Period</span>: references within a short window are collapsed into
+          one, so a single logical operation doesn't artificially inflate a page's reference count. Because of this
+          overhead, many production systems use cheaper LRU-2 <em>approximations</em> rather than the exact
+          algorithm.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          LRU-K remembers the last K accesses per page and evicts the one with the largest <strong>backward
+          K-distance</strong> (predicted-farthest reuse). LRU-2 is the sweet spot: a use-once scan page never earns
+          a second reference, so its K-distance is infinite and it's evicted first — protecting the hot set. The
+          cost is extra per-page state and a correlated-reference rule to avoid over-counting bursts. K = 1 is just
+          plain LRU.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SCAN RESISTANCE ===================== -->
+      <section id="scan-resistance">
+        <h2><span class="sec-num">3</span> Sequential flooding &amp; scan-resistant policies</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Suppose you're handing out and re-shelving library books, and one person asks to flip through every
+          book on a whole shelf, in order, once. You wouldn't put each of those books on your tiny "favourites"
+          cart — they'll never be asked for again on this trip! Instead you'd keep them in a small
+          <strong>"just passing through"</strong> pile and reuse that same pile's space over and over. Databases
+          do the same: they detect a big one-time scan and quarantine it in a small corner so it can't disturb the
+          favourites.</p>
+        </div>
+
+        <p>We met <span class="term">sequential flooding</span> in Topic 1: a scan larger than the buffer pool
+        reads each page once and, under LRU, evicts everything useful — including pages it will need again later in
+        the <em>same</em> scan if it loops. Let's look at the problem precisely and then at the family of fixes.</p>
+
+        <h3>Why the problem is fundamental</h3>
+        <p>For a repeated sequential scan of <code class="inl">N</code> pages through a buffer holding
+        <code class="inl">B</code> frames where <code class="inl">N &gt; B</code>, LRU is <strong>pessimal</strong>
+        — the worst possible policy. By the time the scan comes back to page 1, LRU evicted it long ago to make
+        room for the most recent pages, so <em>every</em> access misses. This is sometimes called the
+        <span class="term">"one bigger than the cache"</span> pathology and it's a textbook example of LRU's
+        weakness.</p>
+
+        <div class="callout example">
+          <span class="c-title">The counter-intuitive fix: MRU for scans</span>
+          <p>For a looping sequential scan of <code class="inl">N</code> pages with <code class="inl">B</code>
+          frames (<code class="inl">N &gt; B</code>), the <em>right</em> victim is the page you <strong>just</strong>
+          used — <span class="term">MRU (Most Recently Used)</span> eviction. Why? The page you just read is the
+          one you'll need <em>last</em> on the next loop, while the oldest pages in the cache are the ones you'll
+          need <em>soonest</em>. So MRU keeps the front of the table resident and only cycles the newest frame.
+          With <code class="inl">B</code> frames you get hits on the first <code class="inl">B</code> pages every
+          loop instead of zero. MRU is terrible for normal locality but ideal for a known repeating scan — the
+          policy should match the access pattern.</p>
+        </div>
+
+        <h3>The family of scan-resistant techniques</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Technique</th><th>Idea</th><th>Used where</th></tr></thead>
+            <tbody>
+              <tr><td>LRU-K / LRU-2</td><td>Require K references before a page is "hot"; use-once pages evicted first.</td><td>Topic 2; foundational, widely approximated.</td></tr>
+              <tr><td>Ring buffer (buffer ring)</td><td>Give a big scan a tiny fixed set of frames it reuses cyclically, so it can't touch the main pool.</td><td>PostgreSQL bulk reads/writes.</td></tr>
+              <tr><td>MRU for scans</td><td>Evict the most-recently-used page during a detected sequential scan.</td><td>Classic textbook fix; some engines for known scans.</td></tr>
+              <tr><td>Midpoint / two-list LRU</td><td>New pages enter at the <em>middle</em> of the LRU list and only get promoted to the "young/hot" end on a <em>second</em> access.</td><td>MySQL InnoDB; Linux page cache (active/inactive lists).</td></tr>
+              <tr><td>Touch-count / clock variants</td><td>Track a small reference counter per frame; a single touch isn't enough to keep a page.</td><td>PostgreSQL clock-sweep; Oracle touch-count LRU.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How real databases handle large scans</h3>
+        <p><strong>PostgreSQL — the ring buffer.</strong> When PostgreSQL runs a large sequential scan, bulk
+        <code class="inl">COPY</code>, or <code class="inl">VACUUM</code>, it doesn't let those pages roam the
+        whole pool. It allocates a small private <span class="term">ring buffer</span> (a "buffer access strategy"
+        — for seq scans the default is a 256&nbsp;KB ring, i.e. only 32 8&nbsp;KB buffers) and recycles those few
+        frames over and over. The scan thus reads at most that handful of frames' worth of pollution, leaving the
+        shared buffers full of hot pages. The ring is the engineering form of "quarantine the scan."</p>
+
+        <p><strong>MySQL InnoDB — midpoint insertion.</strong> InnoDB splits its LRU list into a
+        <span class="term">"young" (new)</span> sublist and an <span class="term">"old" (free-to-evict)</span>
+        sublist, joined at a midpoint (by default 3/8 of the way down). A freshly read page is inserted at the
+        <em>midpoint</em>, into the old sublist — not at the hot front. It is only promoted to the young end if it
+        is accessed <em>again</em> after a short delay. A one-pass scan therefore parks its pages in the old
+        sublist, where they age out quickly without ever displacing the genuinely hot young pages.</p>
+
+        <p><strong>Oracle &amp; PostgreSQL clock-sweep — touch counts.</strong> Rather than an exact LRU list,
+        PostgreSQL uses a <span class="term">clock-sweep</span> algorithm: each frame has a small
+        <code class="inl">usage_count</code>, incremented on access and decremented as a circular "clock hand"
+        passes; a frame is evictable only when its count reaches 0. A scan page touched once has count 1, so it's
+        reclaimed almost immediately, while hot pages keep being bumped back up. Oracle similarly uses a
+        touch-count LRU. These are cheap, approximate ways to get LRU-2-like "must be used more than once" behaviour
+        without per-page timestamp histories.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">New page</div><div class="s-d">Enters at midpoint / count = 1</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⏳</div><div class="s-t">Wait</div><div class="s-d">Used only once? It ages toward eviction</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">Reused?</div><div class="s-d">Touched again → promote / bump count</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛡️</div><div class="s-t">Protected</div><div class="s-d">Hot pages survive the scan</div></div>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A note on LRU-K's modern cousins</span>
+          <p>The same "frequency + recency" insight powers later policies you may meet: <span class="term">2Q</span>
+          (a fast approximation of LRU-2 using two simple queues), <span class="term">ARC</span> (Adaptive
+          Replacement Cache, which self-tunes between recency and frequency), and <span class="term">LIRS</span>.
+          They all descend from the LRU-K idea that one accidental touch shouldn't make a page look valuable.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A scan bigger than the pool makes plain LRU pessimal — a re-scan can hit 0%. Fixes detect or quarantine
+          scans: <strong>MRU</strong> eviction for a known looping scan, PostgreSQL's small <strong>ring
+          buffer</strong>, InnoDB's <strong>midpoint insertion</strong> (promote only on a second touch), and
+          touch-count / clock-sweep approximations. All share LRU-K's lesson: protect pages that prove themselves
+          by being reused.
+        </div>
+      </section>
+
+      <!-- ===================== 4. PREFETCHING ===================== -->
+      <section id="prefetching">
+        <h2><span class="sec-num">4</span> Prefetching &amp; related I/O optimizations</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a chef who reads a recipe out loud, one step at a time, while a helper fetches ingredients. A
+          slow helper waits to hear each step, then walks to the pantry — the chef stands idle a lot. A clever
+          helper notices "we're going down the list in order," so they grab the <em>next few</em> ingredients
+          <strong>before</strong> the chef even asks. Now the chef never waits. Prefetching is the database being
+          that clever helper: it spots that you're reading pages in order and fetches upcoming pages from disk
+          early, so the CPU isn't stuck waiting.</p>
+        </div>
+
+        <p>Eviction policy decides <em>what to keep</em>. <span class="term">Prefetching</span> attacks a different
+        cost: the brutal latency of a disk read. A page miss can stall the query for the time it takes the disk to
+        respond. Prefetching <strong>overlaps that I/O with computation</strong> by reading pages into the buffer
+        pool <em>before</em> they're explicitly requested. This is also called <span class="term">read-ahead</span>.</p>
+
+        <h3>Sequential read-ahead</h3>
+        <p>When the buffer manager detects a <strong>sequential access pattern</strong> — say a full table scan or
+        a range scan reading pages 100, 101, 102… — it issues asynchronous reads for the <em>next</em> chunk of
+        pages while the query is still processing the current one. By the time the query asks for page 103, it's
+        already in RAM: the miss became a hit. The wait for the disk happened in the background, hidden behind
+        useful work.</p>
+
+        <pre><span class="cm"># Naive: query stalls on every page read</span>
+<span class="kw">for</span> pid <span class="kw">in</span> scan_range:          <span class="cm"># 100, 101, 102, ...</span>
+    page = read_page(pid)        <span class="cm"># BLOCKS on disk every miss 😴</span>
+    process(page)
+
+<span class="cm"># With read-ahead: fetch ahead so the next page is ready</span>
+prefetch(scan_range[<span class="nm">0</span> : PREFETCH_DEPTH])   <span class="cm"># kick off async reads</span>
+<span class="kw">for</span> i, pid <span class="kw">in</span> enumerate(scan_range):
+    page = read_page(pid)        <span class="cm"># usually a HIT now — already in RAM ✅</span>
+    <span class="kw">if</span> i + PREFETCH_DEPTH &lt; len(scan_range):
+        prefetch(scan_range[i + PREFETCH_DEPTH])  <span class="cm"># stay one window ahead</span>
+    process(page)                <span class="cm"># CPU works while disk fetches next</span></pre>
+
+        <div class="callout note">
+          <span class="c-title">Sequential vs random prefetch</span>
+          <p>Read-ahead shines for <strong>sequential</strong> patterns because nearby pages are likely physically
+          adjacent on disk, so one big request is far cheaper than many small ones. For <strong>random</strong>
+          access (e.g. chasing index pointers all over the table), engines may instead use
+          <span class="term">scattered / list prefetch</span>: collect the page IDs the query will need, sort them
+          by physical location, and issue them together so the disk visits them in an efficient order.</p>
+        </div>
+
+        <h3>Buffer pool bypass for scans</h3>
+        <p>Topic 3 taught us to keep a scan out of the main pool. <span class="term">Buffer pool bypass</span> (or
+        <span class="term">direct I/O</span> for the scan) takes this further: for a large one-time scan the engine
+        reads pages into a small <em>local</em> working area and discards them immediately after use, never
+        inserting them into the shared buffer pool at all. PostgreSQL's ring buffer (Topic 3) is essentially this.
+        It both <strong>prevents cache pollution</strong> and avoids the overhead of managing those throwaway pages
+        in the global structures.</p>
+
+        <h3>Parallel &amp; asynchronous I/O</h3>
+        <p>A single disk request leaves a lot of hardware idle. Modern storage (especially SSDs and disk arrays)
+        can service <strong>many requests at once</strong>. <span class="term">Parallel I/O</span> issues multiple
+        page reads concurrently — across several disks or queue slots — so total wait time is the time of one
+        request, not the sum of all of them. Combined with <span class="term">asynchronous I/O</span> (the query
+        thread fires a read and keeps working instead of blocking), the database can keep both the CPU and the
+        disks busy at the same time.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: why overlap wins</span>
+          <p>A scan must read <strong>8 pages</strong>. Suppose each disk read takes <strong>10 ms</strong> and
+          processing a page takes <strong>2 ms</strong>.</p>
+          <ul>
+            <li><strong>No prefetch (serial):</strong> for each page, wait 10 ms then process 2 ms →
+            <code class="inl">8 × (10 + 2) = 96 ms</code>.</li>
+            <li><strong>Read-ahead (overlap I/O with compute):</strong> pay the first 10 ms read, then each
+            following read overlaps the previous page's processing → roughly
+            <code class="inl">10 + 8 × 2 ≈ 26 ms</code> (the disk stays ahead of the CPU).</li>
+            <li><strong>Parallel I/O (4 reads at once):</strong> the eight 10 ms reads run in 2 waves of 10 ms →
+            <code class="inl">≈ 20 ms + processing</code>, hiding even more latency.</li>
+          </ul>
+          <p>Same data, same disk speed — the difference is purely from <em>not standing idle</em> while the disk
+          works.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — don't over-prefetch</span>
+          <p>Prefetching is a bet. If you guess wrong (the query doesn't read those pages), you've wasted disk
+          bandwidth and possibly evicted useful pages to make room for ones you never needed. The prefetch window
+          must be tuned: too small and you still stall; too large and you pollute the cache and saturate the disk.
+          This is why read-ahead is usually triggered only once a <em>clear</em> sequential pattern is detected.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">Milestone M1 — wrap-up</span>
+          <p>This session closes <strong>Milestone M1: storage &amp; memory management</strong>. Across Sessions
+          1–5 you built the path a byte travels: from disk pages and files, up through the buffer pool, the
+          replacement policy that decides what to keep, scan-resistance to protect the working set, and prefetching
+          to hide I/O latency. You now understand <em>how a database moves data between disk and memory
+          efficiently</em>. Next we move <strong>up the stack</strong> to how that data is <em>organised for fast
+          lookup</em> — index structures — starting with B+ Trees in Session 6.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Prefetching (read-ahead) overlaps slow disk I/O with computation by fetching upcoming pages early — huge
+          for sequential scans, with scattered/list prefetch for random access. Buffer-pool bypass reads big scans
+          through a small local area to avoid polluting the cache. Parallel and async I/O keep CPU and multiple
+          disks busy at once. Tune the prefetch window so you hide latency without wasting bandwidth or cache.
+          That wraps Milestone M1.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session was one connected story about <em>which pages live in memory and when</em>. Here it is in
+        a single paragraph:</p>
+        <div class="bigidea">
+          <p>The buffer pool caches disk <strong>pages</strong> in <strong>frames</strong>, and a
+          <strong>replacement policy</strong> picks eviction victims to maximise the hit rate. Plain
+          <strong>LRU</strong> tracks only recency, so a single large scan causes <strong>sequential
+          flooding</strong> — it evicts the hot working set with use-once pages. <strong>LRU-K</strong> fixes this
+          by remembering the last K references and evicting by <strong>backward K-distance</strong>;
+          <strong>LRU-2</strong> is scan-resistant because a use-once page never earns a second reference. Real
+          systems approximate this with <strong>ring buffers</strong> (PostgreSQL), <strong>midpoint
+          insertion</strong> (InnoDB), and <strong>touch-count / clock-sweep</strong> (PostgreSQL, Oracle), plus
+          <strong>MRU</strong> for known looping scans. Finally, <strong>prefetching / read-ahead</strong>,
+          <strong>buffer-pool bypass</strong>, and <strong>parallel I/O</strong> hide disk latency so the CPU
+          never waits. Together these close <strong>Milestone M1</strong> — efficient movement of data between
+          disk and memory.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>In one sentence, why does plain LRU fail on a big sequential scan?</summary>
+          <p class="ans">LRU tracks only recency, so a scan's use-once pages all look "most recently used" and evict
+          the genuinely hot working set — sequential flooding.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is LRU-2 scan-resistant but LRU is not?</summary>
+          <p class="ans">A scanned page is touched only once, so it has no second-most-recent access; its backward
+          2-distance is effectively infinite, making it the first to be evicted. A page must be referenced ≥ 2 times
+          to look valuable, so a single touch can't fool LRU-2.</p>
+        </details>
+        <details class="quiz">
+          <summary>For a looping sequential scan of N pages with only B &lt; N frames, which eviction policy is best, and why?</summary>
+          <p class="ans">MRU. The page you just read is needed last on the next loop, while the oldest cached pages
+          are needed soonest — so evicting the most-recently-used page keeps the front of the table resident and
+          gives hits on the first B pages each loop instead of zero.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does PostgreSQL stop a large sequential scan from polluting its shared buffers?</summary>
+          <p class="ans">It uses a small ring buffer (buffer access strategy) — a handful of frames the scan recycles
+          cyclically — so the scan never displaces hot pages in the main pool.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does prefetching / read-ahead actually save, given the disk speed is unchanged?</summary>
+          <p class="ans">It overlaps disk I/O with computation: upcoming pages are read asynchronously while the CPU
+          processes the current page, so misses become hits and the query stops standing idle waiting on the disk.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name one risk of prefetching too aggressively.</summary>
+          <p class="ans">Wrong guesses waste disk bandwidth and can evict useful pages to make room for ones never
+          used — polluting the cache and possibly saturating the disk. The prefetch window must be tuned.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References &amp; Further Reading</h2>
+        <hr class="section-rule" />
+
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1ZBRR1epIUoSO2WJ32Fi6qcoWC2cWtmXFVOr80wfE1RE/edit?gid=1253177384" target="_blank" rel="noopener">Original course notes / handout (source sheet)</a> — open the shared class material for this session.</li>
+          <li>DBMS Session 5 — Buffer Pool 2 (class handout for this session).</li>
+        </ul>
+
+        <h4>Papers, docs &amp; deep dives</h4>
+        <ul>
+          <li><a href="https://15445.courses.cs.cmu.edu/" target="_blank" rel="noopener">CMU 15-445 — Database Systems (buffer pool lectures)</a> — Andy Pavlo's course; the buffer-pool and replacement-policy lectures cover LRU, clock, LRU-K, and scan handling clearly.</li>
+          <li><a href="https://dl.acm.org/doi/10.1145/170035.170081" target="_blank" rel="noopener">O'Neil, O'Neil &amp; Weikum — "The LRU-K Page Replacement Algorithm for Database Disk Buffering" (1993)</a> — the original LRU-K paper; defines backward K-distance and the correlated reference period.</li>
+          <li><a href="https://www.postgresql.org/docs/current/runtime-config-resource.html" target="_blank" rel="noopener">PostgreSQL documentation — Resource Consumption (shared_buffers &amp; buffer management)</a> — official docs for PostgreSQL's buffer pool, clock-sweep, and the ring-buffer access strategies for scans and VACUUM.</li>
+          <li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html" target="_blank" rel="noopener">MySQL Reference Manual — The InnoDB Buffer Pool</a> — explains InnoDB's midpoint-insertion LRU (young/old sublists) and read-ahead, the production form of scan resistance.</li>
+          <li><a href="https://dl.acm.org/doi/10.5555/1083592.1083719" target="_blank" rel="noopener">Megiddo &amp; Modha — "ARC: A Self-Tuning, Low Overhead Replacement Cache" (2003)</a> — a modern descendant of LRU-K that adapts between recency and frequency automatically.</li>
+          <li><a href="https://www.db-book.com/" target="_blank" rel="noopener">Silberschatz, Korth &amp; Sudarshan — Database System Concepts (Storage &amp; Buffer Management chapters)</a> — the standard textbook treatment of buffer replacement, MRU-for-scans, and prefetching.</li>
+        </ul>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a class="prev" href="session-4.html"><div class="dir">← Previous</div><div class="ttl">Session 4: Buffer Pool</div></a>
+        <a class="next" href="session-6.html"><div class="dir">Next →</div><div class="ttl">Session 6: Index Structures — B+ Trees</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DBMS · Session 5 — Buffer Pool — Replacement Policies &amp; Prefetching · Milestone M1 complete 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>
