@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 6 — LangChain Fundamentals &amp; LangGraph</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 6</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 06 · LangChain &amp; LangGraph</span>
+      <h1>Building real apps: LangChain &amp; LangGraph</h1>
+      <p class="lead">
+        So far you've learned what a model <em>is</em> (Session 1), how to talk to it well (Session 2),
+        how to give it tools and turn it into an agent (Session 3), and how to feed it your own documents
+        with RAG (Sessions 4 &amp; 5). Now we glue all of that into real software. This session introduces
+        two popular tools — <strong>LangChain</strong> (for wiring model steps together) and
+        <strong>LangGraph</strong> (for building agents that loop, branch, and remember). As always, we
+        start every topic with a tiny "explain like I'm 5" story, then build up the real detail with code.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why">Why use a framework at all?</a></li>
+          <li><a href="#blocks">LangChain core building blocks</a></li>
+          <li><a href="#lcel">Chains &amp; LCEL (the pipe)</a></li>
+          <li><a href="#tools">Tool calling in LangChain</a></li>
+          <li><a href="#langgraph">LangGraph: agents as graphs</a></li>
+          <li><a href="#routing">Conditional branching &amp; routing</a></li>
+          <li><a href="#cycles">Multi-step reasoning &amp; cycles</a></li>
+          <li><a href="#persistence">Persistence &amp; checkpointing</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY A FRAMEWORK ===================== -->
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why use a framework at all?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you want to build a toy car. You <em>could</em> melt your own plastic, cut your own wheels,
+          and make every screw by hand. Or you could grab a LEGO kit where the wheels, axles, and bricks already
+          snap together. A <strong>framework</strong> is the LEGO kit for AI apps: lots of ready-made pieces that
+          click together, so you spend your time building the fun part instead of re-making the same little parts
+          every single time.</p>
+        </div>
+
+        <p>In Session 3 you called a model's API "by hand": you built a request, sent it, read the reply, and wrote
+        your own loop to handle tool calls. That works! But as your app grows, you keep writing the <em>same plumbing</em>
+        over and over. A <span class="term">framework</span> is a library that packages those repeated patterns into
+        reusable parts. <span class="term">LangChain</span> is the most popular framework for building apps on top of
+        LLMs.</p>
+
+        <h3>The pain a framework removes</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pain when doing it by hand</th><th>What the framework gives you</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Boilerplate.</strong> Formatting messages, parsing JSON out of replies, retrying on errors — the same code in every project.</td><td>Pre-built helpers for prompts, parsing, and retries you just plug in.</td></tr>
+              <tr><td><strong>Swapping models.</strong> Each provider (OpenAI, Anthropic, Google) has a slightly different API shape, so changing models means rewriting code.</td><td>A common interface — change one line to swap <code class="inl">ChatOpenAI</code> for <code class="inl">ChatAnthropic</code>, the rest stays the same.</td></tr>
+              <tr><td><strong>Chaining steps.</strong> "Summarise, then translate the summary, then rate it" means manually passing the output of one call into the next.</td><td>A clean way to compose steps into a pipeline (Topic 3).</td></tr>
+              <tr><td><strong>Tools.</strong> Wiring functions the model can call, and looping until it's done (Session 3).</td><td>Standard tool-binding and ready-made agent loops (Topics 4 &amp; 7).</td></tr>
+              <tr><td><strong>Memory.</strong> Re-sending conversation history every turn (remember, the model is stateless — Session 1).</td><td>Built-in memory and state management (Topic 8).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>A framework doesn't make the model smarter. It removes the <strong>repetitive glue code</strong> around
+          the model, so you can build complex, multi-step, tool-using, memory-having apps without reinventing the
+          plumbing each time.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Be balanced — frameworks aren't free</span>
+          <p>Abstractions have a cost. A framework adds another layer between you and the raw API, which means:
+          more concepts to learn, occasionally confusing error messages buried deep in the library, and sometimes
+          fighting the framework when you want to do something it didn't anticipate. For a <em>tiny</em> script —
+          one prompt, one reply — calling the API directly is often simpler and clearer. Reach for a framework when
+          the gluing-together starts to hurt, not before.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: the same task, two ways</span>
+          <p><strong>By hand (sketch):</strong> build a messages list, call the provider's SDK, dig the text out of
+          the nested response object, then write your own code to extract the JSON you asked for and handle the case
+          where it's malformed.</p>
+          <p><strong>With LangChain:</strong> describe a prompt template, pick a model, attach an output parser, and
+          connect them with a pipe. Swapping the model later is a one-line change. We'll write this exact pipeline in
+          Topic 3.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A framework like LangChain packages the repetitive plumbing around LLMs — formatting, parsing, model-swapping,
+          chaining, tools, memory — into reusable pieces. It makes big apps easier, but adds a learning curve and an
+          abstraction layer, so for trivial scripts the raw API can still be the better choice.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CORE BUILDING BLOCKS ===================== -->
+      <section id="blocks">
+        <h2><span class="sec-num">2</span> LangChain's core building blocks</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a sandwich. You have a <strong>recipe card</strong> that says how to fill in the blanks
+          ("bread + ___ + bread"), a <strong>chef</strong> who actually makes it, and a <strong>plate</strong> that
+          arranges it neatly so you can eat it. LangChain has the same three helpers: a recipe card for your prompt,
+          the model that does the work, and a tidier-upper that arranges the answer into a useful shape.</p>
+        </div>
+
+        <p>LangChain is made of a few small, reusable parts. Once you know these four, almost everything else is just
+        combinations of them.</p>
+
+        <h3>A — Prompt templates</h3>
+        <p>A <span class="term">prompt template</span> is a fill-in-the-blanks version of a prompt. Instead of gluing
+        strings together by hand, you write the prompt once with <code class="inl">{placeholders}</code> and fill them
+        in later. This connects straight to the prompt-engineering ideas from Session 2 — your carefully crafted prompt
+        becomes a reusable, versionable template.</p>
+        <pre><span class="kw">from</span> langchain_core.prompts <span class="kw">import</span> ChatPromptTemplate
+
+<span class="cm"># A reusable recipe with one blank: {topic}</span>
+prompt = ChatPromptTemplate.from_template(
+    <span class="st">"Explain {topic} to a complete beginner in 2 sentences."</span>
+)
+
+<span class="cm"># Fill the blank in later, as many times as you like</span>
+prompt.invoke({<span class="st">"topic"</span>: <span class="st">"embeddings"</span>})</pre>
+
+        <h3>B — Models / LLMs</h3>
+        <p>The <span class="term">model</span> (or "chat model") is the object that actually talks to the LLM. LangChain
+        wraps each provider behind a common interface, so they all share the same <code class="inl">.invoke()</code> method.
+        This is the model-swapping superpower from Topic 1.</p>
+        <pre><span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+
+model = ChatAnthropic(model=<span class="st">"claude-sonnet-4-5"</span>)
+
+<span class="cm"># Swapping providers is a one-line change — the rest of your code is identical:</span>
+<span class="cm"># from langchain_openai import ChatOpenAI</span>
+<span class="cm"># model = ChatOpenAI(model="gpt-4o")</span>
+
+model.invoke(<span class="st">"Say hello in one word."</span>)</pre>
+
+        <div class="callout note">
+          <span class="c-title">Two model "shapes"</span>
+          <p>LangChain has older plain <span class="term">LLMs</span> (text in, text out) and modern
+          <span class="term">chat models</span> (a list of role-tagged messages in — system / user / assistant — exactly
+          the message structure from Session 1). Today you'll almost always use <strong>chat models</strong>; they match
+          how every current provider actually works.</p>
+        </div>
+
+        <h3>C — Output parsers</h3>
+        <p>A model returns a message object, but you usually want something cleaner — just the text, or a Python
+        dictionary, or a validated structure. An <span class="term">output parser</span> takes the raw model output and
+        converts it into the shape your code wants, and can complain if the shape is wrong.</p>
+        <pre><span class="kw">from</span> langchain_core.output_parsers <span class="kw">import</span> StrOutputParser
+
+parser = StrOutputParser()   <span class="cm"># pulls the plain text string out of the model's reply</span></pre>
+        <p>There are fancier parsers too — e.g. one that forces the output into a typed object so you reliably get
+        <code class="inl">{"name": ..., "age": ...}</code> instead of a paragraph you'd have to scrape.</p>
+
+        <h3>D — Runnables (the secret that ties it all together)</h3>
+        <p>Here's the clever bit. Prompt templates, models, and parsers all follow <em>one shared contract</em> called the
+        <span class="term">Runnable</span> interface. A <span class="term">runnable</span> is simply "any LangChain piece you
+        can call with <code class="inl">.invoke(input)</code> and get an output." Because every piece speaks this same
+        language, they all snap together like LEGO bricks — which is exactly what makes the next topic possible.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Everything in modern LangChain is a <strong>Runnable</strong>: it has an <code class="inl">.invoke()</code>
+          method, takes an input, and returns an output. Prompts, models, parsers, and whole chains all share this one
+          interface — that uniformity is the whole trick.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: each block on its own</span>
+          <pre>prompt_value = prompt.invoke({<span class="st">"topic"</span>: <span class="st">"tokens"</span>})  <span class="cm"># fill the template</span>
+message      = model.invoke(prompt_value)              <span class="cm"># ask the model</span>
+text         = parser.invoke(message)                  <span class="cm"># extract clean text</span>
+print(text)</pre>
+          <p>It works, but notice we manually pass each output into the next call. The next topic makes this elegant.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The four core blocks are <strong>prompt templates</strong> (fill-in-the-blanks prompts),
+          <strong>models</strong> (the common interface to any LLM), <strong>output parsers</strong> (shape the reply),
+          and the unifying idea of <strong>runnables</strong> — every block shares the same <code class="inl">.invoke()</code>
+          contract, which lets them all click together.
+        </div>
+      </section>
+
+      <!-- ===================== 3. LCEL ===================== -->
+      <section id="lcel">
+        <h2><span class="sec-num">3</span> Chains &amp; LCEL — composing with the pipe <code class="inl">|</code></h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a water slide made of connected tubes. You drop in at the top, and you slide through tube after
+          tube until you splash out at the bottom. A <strong>chain</strong> is like that: your input drops in, slides
+          through the prompt, then the model, then the parser, and pops out as a finished answer. The little
+          <code class="inl">|</code> symbol is the connector that joins one tube to the next.</p>
+        </div>
+
+        <p>A <span class="term">chain</span> is several runnables joined into a pipeline so the output of one becomes the
+        input of the next. LangChain lets you build chains with a wonderfully simple syntax called
+        <span class="term">LCEL (LangChain Expression Language)</span>, using the pipe operator <code class="inl">|</code>
+        — the same symbol you may know from the Unix command line, where <code class="inl">cat file | grep x</code> pipes
+        one program's output into the next.</p>
+
+        <h3>Building a chain</h3>
+        <pre><span class="kw">from</span> langchain_core.prompts <span class="kw">import</span> ChatPromptTemplate
+<span class="kw">from</span> langchain_core.output_parsers <span class="kw">import</span> StrOutputParser
+<span class="kw">from</span> langchain_anthropic <span class="kw">import</span> ChatAnthropic
+
+prompt = ChatPromptTemplate.from_template(
+    <span class="st">"Explain {topic} to a beginner in 2 sentences."</span>
+)
+model  = ChatAnthropic(model=<span class="st">"claude-sonnet-4-5"</span>)
+parser = StrOutputParser()
+
+<span class="cm"># Join them with | — read it left to right like a sentence:</span>
+<span class="cm"># "fill the prompt, then run the model, then parse the output"</span>
+chain = prompt | model | parser
+
+<span class="cm"># Now the whole pipeline is itself ONE runnable you call once:</span>
+chain.invoke({<span class="st">"topic"</span>: <span class="st">"attention"</span>})
+<span class="cm"># -> "Attention lets a model weigh which words matter most..."</span></pre>
+
+        <p>Compare this to the manual version at the end of Topic 2 — same result, but the plumbing vanished. And because
+        a chain is <em>itself</em> a runnable, you can pipe a chain into another chain, building bigger pipelines out of
+        smaller ones.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea of LCEL</span>
+          <p>Because every piece is a runnable, <code class="inl">a | b | c</code> means "send the input through a, then b,
+          then c." The pipe builds a new, bigger runnable out of smaller ones. <strong>Composition</strong> — small pieces
+          combining into bigger pieces — is the heart of LangChain.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: a two-step chain</span>
+          <p>Summarise some text, then turn that summary into a tweet — two prompts, one pipeline:</p>
+          <pre>summarise = summary_prompt | model | parser
+tweetify  = tweet_prompt   | model | parser
+
+pipeline = summarise | tweetify     <span class="cm"># the summary flows into the tweet step</span>
+pipeline.invoke({<span class="st">"text"</span>: long_article})</pre>
+          <p>The output of <code class="inl">summarise</code> becomes the input of <code class="inl">tweetify</code> —
+          no manual hand-off needed.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Free perks you get for chaining this way</span>
+          <p>Because chains are built on the runnable interface, you automatically get extra abilities for free:
+          <code class="inl">.stream()</code> to get the answer token-by-token as it generates (the "typing out" effect
+          from Session 1), <code class="inl">.batch()</code> to run many inputs at once, and async versions — all without
+          writing extra code.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A chain pipes runnables together so each output feeds the next. LCEL expresses this with the
+          <code class="inl">|</code> operator: <code class="inl">prompt | model | parser</code> is a full, callable
+          pipeline that is itself a runnable — so chains nest into bigger chains, and you get streaming and batching for free.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TOOL CALLING ===================== -->
+      <section id="tools">
+        <h2><span class="sec-num">4</span> Tool calling in LangChain</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a very smart friend who's great at talking but can't do math in their head. So you hand them a
+          calculator and say, "If you ever need to multiply, use this." Now when a math question comes up, your friend
+          reaches for the calculator instead of guessing. <strong>Tool calling</strong> is handing the model a set of
+          little gadgets (a calculator, a search box, a weather lookup) and letting it decide when to grab one.</p>
+        </div>
+
+        <p>Back in Session 3 you met <span class="term">tools</span>: functions the model can ask to run when it can't (or
+        shouldn't) answer from memory alone — like looking up live data, doing exact math, or calling another system.
+        LangChain makes wiring tools to a model very tidy.</p>
+
+        <h3>Step 1 — Define a tool</h3>
+        <p>A tool is just a normal Python function plus a clear description, so the model knows <em>what it does</em> and
+        <em>when to use it</em>. The <code class="inl">@tool</code> decorator turns a function into a LangChain tool. Note
+        how important the docstring is — that text is what the model reads to decide whether to call it (a direct echo of
+        the "describe your tools clearly" lesson from Session 3).</p>
+        <pre><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+
+<span class="kw">@tool</span>
+<span class="kw">def</span> get_weather(city: str) -> str:
+    <span class="st">"""Get the current weather for a given city."""</span>
+    <span class="cm"># In real life this would call a weather API.</span>
+    <span class="kw">return</span> <span class="st">f"It is 22C and sunny in {city}."</span></pre>
+
+        <h3>Step 2 — Bind the tool to the model</h3>
+        <p><span class="term">Binding</span> means "tell the model these tools exist." After binding, the model can choose
+        to <em>request</em> a tool call in its reply instead of answering directly.</p>
+        <pre>model_with_tools = model.bind_tools([get_weather])
+
+response = model_with_tools.invoke(<span class="st">"What's the weather in Paris?"</span>)
+
+<span class="cm"># The model doesn't run the function itself. It REQUESTS it:</span>
+print(response.tool_calls)
+<span class="cm"># -> [{'name': 'get_weather', 'args': {'city': 'Paris'}, 'id': '...'}]</span></pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>The model never executes your code. It only <strong>asks</strong> to run a tool, returning the tool's name
+          and arguments. <em>Your</em> program reads that request, actually runs the function, and sends the result back to
+          the model so it can finish its answer. Whose hands are on the keyboard matters — the LLM only points; your code
+          pulls the trigger.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: the full round-trip</span>
+          <pre><span class="kw">from</span> langchain_core.messages <span class="kw">import</span> HumanMessage
+
+messages = [HumanMessage(<span class="st">"What's the weather in Paris?"</span>)]
+ai_msg   = model_with_tools.invoke(messages)
+messages.append(ai_msg)                          <span class="cm"># the model's tool request</span>
+
+<span class="cm"># Run each tool the model asked for, and feed results back:</span>
+<span class="kw">for</span> call <span class="kw">in</span> ai_msg.tool_calls:
+    result = get_weather.invoke(call[<span class="st">"args"</span>])
+    messages.append(get_weather.invoke(call))    <span class="cm"># a ToolMessage with the result</span>
+
+final = model_with_tools.invoke(messages)        <span class="cm"># now it can answer for real</span>
+print(final.content)   <span class="cm"># -> "It's currently 22C and sunny in Paris."</span></pre>
+          <p>Notice the rhythm: ask → model requests tool → you run it → feed the result back → model answers. Doing this
+          <em>by hand</em> works, but you can see it wants to be a <strong>loop</strong> — which is exactly what LangGraph
+          is built to manage. On to it.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Define tools as documented functions (the docstring tells the model when to use them), then
+          <code class="inl">bind_tools</code> them to the model. The model only <em>requests</em> a tool with a name and
+          arguments; your code runs it and feeds the result back so the model can finish. This ask-run-return cycle
+          naturally becomes a loop.
+        </div>
+      </section>
+
+      <!-- ===================== 5. LANGGRAPH ===================== -->
+      <section id="langgraph">
+        <h2><span class="sec-num">5</span> LangGraph — modelling agents as graphs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A chain is like a straight train track — you go station 1, 2, 3 and you're done. But a real agent is more
+          like a board game: sometimes you move forward, sometimes you go back a few squares, sometimes you take a
+          shortcut, and you carry a little notepad of what's happened so far. <strong>LangGraph</strong> lets you draw
+          that board game — squares (steps) connected by arrows (which square to go to next) — and the notepad is the
+          agent's memory of the game so far.</p>
+        </div>
+
+        <p>Chains (Topic 3) are <strong>linear</strong>: A → B → C, always in that order, always once. But agents need to
+        <em>loop</em> (try again), <em>branch</em> (decide what to do next), and <em>remember</em>. For that, LangChain has
+        a sibling library: <span class="term">LangGraph</span>. It models your app as a <span class="term">graph</span> —
+        a set of steps connected by arrows that can point anywhere, including backwards.</p>
+
+        <h3>The three pieces of a graph</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Piece</th><th>What it is</th><th>Board-game analogy</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">State</span></td><td>A shared "notepad" of data that flows through the whole graph. Every step can read it and write to it.</td><td>The game board's current situation — where your pieces are, your score.</td></tr>
+              <tr><td><span class="term">Nodes</span></td><td>The steps that do work — usually a function or an LLM call. Each node takes the state and returns an update to it.</td><td>The squares you land on, each with an action.</td></tr>
+              <tr><td><span class="term">Edges</span></td><td>The arrows connecting nodes — they decide which node runs next.</td><td>The lines telling you which square to move to.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>What "state" really means</h3>
+        <p>The <span class="term">state</span> is the heart of a LangGraph app. It's a single object (often a dictionary or
+        a typed structure) that holds everything the agent knows <em>right now</em>: the conversation so far, any retrieved
+        documents (Sessions 4 &amp; 5), intermediate results, counters, flags. Each node receives the current state and
+        returns an update, which LangGraph merges back in. Remember from Session 1 that the model itself is
+        <strong>stateless</strong> — the graph's state object is how we give the <em>app</em> a memory.</p>
+
+        <pre><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> TypedDict
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+
+<span class="cm"># The shared notepad: here it just holds a growing list of messages.</span>
+<span class="kw">class</span> State(TypedDict):
+    messages: Annotated[list, add_messages]   <span class="cm"># new messages get appended</span>
+
+<span class="kw">def</span> chatbot(state: State):
+    <span class="cm"># a node: read state, call the model, return an update</span>
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [model.invoke(state[<span class="st">"messages"</span>])]}
+
+graph = StateGraph(State)
+graph.add_node(<span class="st">"chatbot"</span>, chatbot)   <span class="cm"># add a square</span>
+graph.add_edge(START, <span class="st">"chatbot"</span>)     <span class="cm"># start here</span>
+graph.add_edge(<span class="st">"chatbot"</span>, END)       <span class="cm"># then finish</span>
+
+app = graph.compile()
+app.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">"Hi!"</span>)]})</pre>
+
+        <div class="bigidea">
+          <span class="c-title">Why graphs beat linear chains for agents</span>
+          <p>A chain can only go forward, once. A graph's edges can point to <em>any</em> node — forward, sideways, or
+          back to a previous one. That single freedom unlocks the three things real agents need: <strong>branching</strong>
+          (choose the next step based on the situation), <strong>cycles</strong> (loop until done), and a persistent
+          <strong>state</strong> that carries context through it all. Topics 6–8 are each one of these powers.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: picturing the simplest graph</span>
+          <div class="flow">
+            <div class="step"><div class="s-ico">▶️</div><div class="s-t">START</div><div class="s-d">user message enters</div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">🤖</div><div class="s-t">chatbot node</div><div class="s-d">call the model</div></div>
+            <div class="arrow">→</div>
+            <div class="step"><div class="s-ico">🏁</div><div class="s-t">END</div><div class="s-d">return the reply</div></div>
+          </div>
+          <p>This trivial graph behaves just like a chain. The power appears the moment we add a <em>decision</em> — next.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          LangGraph models an app as a <strong>graph</strong>: <strong>nodes</strong> (steps that do work),
+          <strong>edges</strong> (arrows choosing the next node), and a shared <strong>state</strong> (the notepad every
+          node reads and updates). Because edges can point anywhere, graphs handle the branching, looping, and memory that
+          linear chains can't — which is why agents are built as graphs.
+        </div>
+      </section>
+
+      <!-- ===================== 6. ROUTING ===================== -->
+      <section id="routing">
+        <h2><span class="sec-num">6</span> Conditional branching &amp; routing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a "choose your own adventure" book. At the bottom of a page it says: "If you have the key, turn to
+          page 40. If not, turn to page 12." A <strong>conditional edge</strong> is exactly that — a fork in the road
+          where the graph looks at what's happening and decides which page (node) to turn to next.</p>
+        </div>
+
+        <p>The first real superpower of graphs is the <span class="term">conditional edge</span> (also called
+        <span class="term">routing</span>). Instead of always going to a fixed next node, a conditional edge runs a little
+        function that <em>looks at the current state</em> and returns the <em>name</em> of the node to visit next.</p>
+
+        <h3>How it works</h3>
+        <p>You write a plain Python function — the <span class="term">router</span> — that reads the state and returns a
+        string. LangGraph then jumps to whichever node matches that string. This is where the agent's "decisions" live.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🤖</div><div class="s-t">model node</div><div class="s-d">looks at the question</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔀</div><div class="s-t">router</div><div class="s-d">need more info?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">retrieve node</div><div class="s-d">if YES: fetch docs</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">answer node</div><div class="s-d">if NO: just answer</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: route to retrieval only when needed</span>
+          <p>A smart RAG agent (Sessions 4 &amp; 5) shouldn't search your documents for "hello" — that wastes time and
+          money. So we let it decide:</p>
+          <pre><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="kw">def</span> route(state: State) -> str:
+    <span class="cm"># Look at the latest model message and decide where to go.</span>
+    last = state[<span class="st">"messages"</span>][-1]
+    <span class="kw">if</span> last.tool_calls:            <span class="cm"># model asked to search the docs</span>
+        <span class="kw">return</span> <span class="st">"retrieve"</span>
+    <span class="kw">return</span> <span class="st">"answer"</span>             <span class="cm"># it can answer directly</span>
+
+graph.add_conditional_edges(
+    <span class="st">"model"</span>,          <span class="cm"># from this node...</span>
+    route,            <span class="cm"># ...run this function to pick the next node...</span>
+    {<span class="st">"retrieve"</span>: <span class="st">"retrieve"</span>, <span class="st">"answer"</span>: <span class="st">"answer"</span>},  <span class="cm"># map result -> node</span>
+)</pre>
+          <p>Now the same graph behaves differently depending on the question: simple greetings go straight to
+          <code class="inl">answer</code>; fact-finding questions detour through <code class="inl">retrieve</code> first.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two common routing styles</span>
+          <p><strong>Rule-based:</strong> the router checks simple conditions (Does the message contain a tool call? Is a
+          counter over 3?). Cheap and predictable. <strong>LLM-based:</strong> you ask the model itself "which path fits
+          best?" and route on its answer. More flexible, but it's another model call, so it costs tokens and can be less
+          predictable (recall the temperature trade-offs from Session 1 — keep routing decisions low-temperature).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>conditional edge</strong> runs a <strong>router</strong> function that reads the state and returns the
+          name of the next node, so the graph can branch — e.g. "need more info? → retrieve, else → answer." Routers can be
+          simple rules or an LLM's own decision. This is where an agent's choices live.
+        </div>
+      </section>
+
+      <!-- ===================== 7. CYCLES ===================== -->
+      <section id="cycles">
+        <h2><span class="sec-num">7</span> Multi-step reasoning &amp; cycles</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think about solving a jigsaw puzzle. You try a piece — does it fit? No? Try another. Fit? Great, keep going.
+          You keep <em>repeating</em> the same "try and check" move until the picture is done. A <strong>cycle</strong> in a
+          graph is that repeating loop: the agent does a step, checks if it's finished, and if not, loops back and tries
+          again.</p>
+        </div>
+
+        <p>The second superpower of graphs is the <span class="term">cycle</span> — an edge that points <em>back</em> to an
+        earlier node, creating a loop. This is impossible in a linear chain, and it's exactly what turns a one-shot model
+        call into a real, multi-step <span class="term">agent</span> (Session 3).</p>
+
+        <h3>The ReAct loop, in a graph</h3>
+        <p>The classic agent pattern from Session 3 is <span class="term">ReAct</span> (Reason + Act): the model
+        <em>reasons</em> about what to do, <em>acts</em> by calling a tool, sees the result, and <em>reasons again</em> — over
+        and over until it has enough to answer. In LangGraph that's just two nodes with a loop between them.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">▶️</div><div class="s-t">START</div><div class="s-d">user asks</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🤖</div><div class="s-t">model</div><div class="s-d">reason: tool or done?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛠️</div><div class="s-t">tools</div><div class="s-d">act: run the tool</div></div>
+          <div class="arrow">↩︎</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">loop back</div><div class="s-d">feed result to model</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🏁</div><div class="s-t">END</div><div class="s-d">when no tool needed</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: wiring the loop</span>
+          <pre><span class="kw">def</span> should_continue(state: State) -> str:
+    <span class="cm"># If the model asked for a tool, run it; otherwise we're done.</span>
+    <span class="kw">if</span> state[<span class="st">"messages"</span>][-1].tool_calls:
+        <span class="kw">return</span> <span class="st">"tools"</span>
+    <span class="kw">return</span> END
+
+graph.add_node(<span class="st">"model"</span>, call_model)
+graph.add_node(<span class="st">"tools"</span>, run_tools)
+
+graph.add_edge(START, <span class="st">"model"</span>)
+graph.add_conditional_edges(<span class="st">"model"</span>, should_continue)
+graph.add_edge(<span class="st">"tools"</span>, <span class="st">"model"</span>)   <span class="cm"># THE LOOP: after a tool, go back to the model</span>
+
+app = graph.compile()</pre>
+          <p>That single line <code class="inl">add_edge("tools", "model")</code> is the whole magic: after every tool run we
+          return to the model, which looks at the new result and decides whether to call another tool or finish. The agent
+          can take 1 step or 10 — it loops as long as it needs to.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out — infinite loops</span>
+          <p>A cycle can spin forever if the agent never decides it's done (or keeps calling the same failing tool). Always
+          add a brake: a step counter in the state that forces an exit after, say, 10 iterations, and/or a
+          <code class="inl">recursion_limit</code> when you run the graph. Loops are powerful, but an agent with no
+          stopping condition will happily burn tokens (and money — Session 1) in circles.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Good news: a shortcut exists</span>
+          <p>This ReAct loop is so common that LangGraph ships a ready-made builder,
+          <code class="inl">create_react_agent(model, tools)</code>, that wires up exactly this graph for you. Knowing the
+          pieces underneath (nodes, the conditional edge, the loop-back edge) means you can customise it when the prebuilt
+          version isn't quite right.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>cycle</strong> is an edge pointing back to an earlier node, creating a loop. It powers multi-step agents
+          like the <strong>ReAct</strong> pattern: model reasons → calls a tool → loops back with the result → reasons again,
+          until no tool is needed. Always add a stopping condition so the loop can't run forever.
+        </div>
+      </section>
+
+      <!-- ===================== 8. PERSISTENCE ===================== -->
+      <section id="persistence">
+        <h2><span class="sec-num">8</span> Agent persistence &amp; checkpointing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You know how a video game lets you <strong>save</strong> so you can turn it off and come back tomorrow right
+          where you left off? Without saving, every time you start the game you'd begin from the very first level again.
+          <strong>Checkpointing</strong> is the "save game" button for an agent — it remembers the whole adventure so far,
+          so the agent can pause, come back later, and keep going as if no time passed.</p>
+        </div>
+
+        <p>Remember the most important fact from Session 1: the model is <span class="term">stateless</span> — it has no
+        memory between requests. The graph's <strong>state</strong> (Topic 5) gives memory <em>during a single run</em>, but
+        once the run ends, that state vanishes. <span class="term">Persistence</span> (saving) and
+        <span class="term">checkpointing</span> fix this by saving the state so it survives across turns, sessions, even
+        restarts.</p>
+
+        <h3>How checkpointing works</h3>
+        <p>You attach a <span class="term">checkpointer</span> when you compile the graph. After <em>every node</em>, LangGraph
+        automatically saves a snapshot of the state — a <span class="term">checkpoint</span>. Each conversation gets a
+        <span class="term">thread_id</span> (think: a save-slot name). When you run the graph again with the same
+        <code class="inl">thread_id</code>, it loads the saved state and continues from there.</p>
+
+        <pre><span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> MemorySaver
+
+checkpointer = MemorySaver()                 <span class="cm"># a simple in-memory save store</span>
+app = graph.compile(checkpointer=checkpointer)
+
+<span class="cm"># A "save slot" name for this conversation:</span>
+config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"user-42"</span>}}
+
+app.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">"My name is Medha."</span>)]}, config)
+<span class="cm"># ...later, even after a restart, same thread_id:</span>
+app.invoke({<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">"What's my name?"</span>)]}, config)
+<span class="cm"># -> "Your name is Medha."  (it loaded the earlier state!)</span></pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Persistence is how the <em>app</em> gains memory even though the <em>model</em> stays stateless. The model still
+          re-reads the whole history each turn (Session 1) — but now the graph is what reliably <strong>stores and reloads</strong>
+          that history for you, keyed by a <code class="inl">thread_id</code>, instead of you re-sending it by hand.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: what persistence unlocks</span>
+          <ul>
+            <li><strong>Multi-turn memory:</strong> the agent remembers earlier messages across separate calls — real chat,
+            not goldfish memory.</li>
+            <li><strong>Pause &amp; resume:</strong> a long task can stop and pick up later exactly where it left off.</li>
+            <li><strong>Human-in-the-loop:</strong> the graph can pause before a risky step (e.g. "send this email?"), wait for
+            a human to approve, then resume — because the state is safely saved while it waits.</li>
+            <li><strong>Time travel / debugging:</strong> since every step is checkpointed, you can rewind to an earlier
+            checkpoint and see (or replay) what the agent was thinking.</li>
+          </ul>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">In-memory vs durable saving</span>
+          <p><code class="inl">MemorySaver</code> keeps checkpoints in RAM — great for learning, but everything is lost when
+          the program stops. For real apps you swap in a durable checkpointer backed by a database (e.g. SQLite or
+          Postgres). Same code, same idea — just a sturdier save store that survives restarts and serves many users.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The model is stateless and graph state vanishes when a run ends — so <strong>checkpointing</strong> saves a
+          snapshot of the state after every node, keyed by a <strong>thread_id</strong>. Re-running with the same id reloads
+          the state, giving the app durable memory, pause/resume, human-in-the-loop approvals, and debugging — all without
+          making the model itself remember anything.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just went from "calling the API by hand" to "building looping, branching, remembering agents." Here's the
+        one-paragraph story that connects all 8 topics:</p>
+        <div class="bigidea">
+          <p>A <strong>framework</strong> like <strong>LangChain</strong> removes the repetitive plumbing around LLMs. Its
+          core <strong>building blocks</strong> — prompt templates, models, and output parsers — all share one
+          <strong>runnable</strong> interface, which lets you snap them together with the <strong>LCEL</strong> pipe into
+          <strong>chains</strong> (<code class="inl">prompt | model | parser</code>). To let the model act on the world you
+          <strong>bind tools</strong> to it; the model only <em>requests</em> a tool and your code runs it, a cycle that wants
+          to be a loop. Linear chains can't loop or branch, so <strong>LangGraph</strong> models your app as a
+          <strong>graph</strong> of <strong>nodes</strong> and <strong>edges</strong> sharing a <strong>state</strong>.
+          <strong>Conditional edges</strong> let it <strong>route</strong> (need info? → retrieve, else → answer),
+          <strong>cycles</strong> let it loop for multi-step <strong>ReAct</strong> reasoning, and
+          <strong>checkpointing</strong> saves the state by <strong>thread_id</strong> so the app gains durable memory even
+          though the model itself stays <strong>stateless</strong> — exactly the gap we first spotted in Session 1.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What single interface lets LangChain pieces snap together with the <code class="inl">|</code> pipe?</summary>
+          <p class="ans">The <strong>Runnable</strong> interface. Prompts, models, parsers, and whole chains all share the
+          same <code class="inl">.invoke()</code> contract, so the output of one can flow into the next — that uniformity is
+          what makes LCEL composition work.</p>
+        </details>
+        <details class="quiz">
+          <summary>When the model "calls a tool," does it actually run your function?</summary>
+          <p class="ans">No. It only <em>requests</em> the tool, returning a name and arguments. Your own code runs the
+          function and sends the result back so the model can finish its answer. The model points; your code pulls the trigger.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use LangGraph instead of a plain LCEL chain for an agent?</summary>
+          <p class="ans">Chains are linear — A → B → C, once. Agents need to branch (decide), cycle (loop until done), and
+          carry a shared state. LangGraph's edges can point anywhere, including back to an earlier node, which unlocks all three.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is a conditional edge, in one sentence?</summary>
+          <p class="ans">An edge that runs a small router function on the current state and returns the name of the next node
+          to visit — so the graph branches based on what's happening (e.g. "need more info? → retrieve, else → answer").</p>
+        </details>
+        <details class="quiz">
+          <summary>The model is stateless — so how does a LangGraph agent "remember" me across turns?</summary>
+          <p class="ans">Checkpointing. A checkpointer saves a snapshot of the graph's state after each node, keyed by a
+          <code class="inl">thread_id</code>. Re-running with the same id reloads that state, so the <em>app</em> has memory even
+          though the model never does.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-5.html"><div class="dir">← Previous</div><div class="ttl">Session 5: RAG 2 — Advanced Retrieval</div></a>
+        <a class="next" href="session-7.html"><div class="dir">Next →</div><div class="ttl">Session 7: Agent SDK — Fundamentals</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 6 — LangChain Fundamentals &amp; LangGraph · You can now build looping, remembering agents 🎉</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

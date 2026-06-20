@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 4 — RAG 1: Introduction to Retrieval-Augmented Generation</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 4</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 04 · RAG 1 — Retrieval-Augmented Generation</span>
+      <h1>Giving an AI an open book: how RAG works</h1>
+      <p class="lead">
+        In Session 1 you learned that an LLM only knows what it absorbed during training — so it has a
+        <em>knowledge cutoff</em>, can't see your private files, and sometimes confidently makes things up
+        (<em>hallucinates</em>). This session fixes all three. We'll build up <strong>RAG</strong>
+        (Retrieval-Augmented Generation) from absolute zero — what it is, why it beats fine-tuning for
+        knowledge, and exactly how documents flow through the pipeline. As always: every topic starts with a
+        tiny "explain like I'm 5" story, then we go deeper with real examples.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what-rag">What is RAG &amp; why it exists</a></li>
+          <li><a href="#vs-finetune">RAG vs fine-tuning</a></li>
+          <li><a href="#embeddings">Embeddings for retrieval</a></li>
+          <li><a href="#vectordb">Vector databases</a></li>
+          <li><a href="#indexing">Indexing</a></li>
+          <li><a href="#chunking">Chunking strategies</a></li>
+          <li><a href="#pipeline">The basic RAG pipeline</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHAT IS RAG ===================== -->
+      <section id="what-rag">
+        <h2><span class="sec-num">1</span> What is RAG &amp; why it exists</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a really smart friend taking a quiz. They've read tons of books, but they can't remember
+          everything, and some books came out <em>after</em> they finished studying. Now imagine you let them
+          take the quiz <strong>with the textbook open</strong>. Before answering each question, they flip to the
+          right page, read it, and <em>then</em> answer. They're still the same smart friend — but now they look
+          things up instead of guessing. <strong>RAG turns a closed-book AI into an open-book AI.</strong></p>
+        </div>
+
+        <p><span class="term">RAG</span> stands for <span class="term">Retrieval-Augmented Generation</span>.
+        The name is literally the recipe, in order:</p>
+        <ul>
+          <li><strong>Retrieval</strong> — first, go <em>find</em> relevant information from an outside source
+          (your documents, a database, the web).</li>
+          <li><strong>Augmented</strong> — take that found information and <em>add</em> it into the prompt you
+          send to the LLM.</li>
+          <li><strong>Generation</strong> — the LLM then <em>generates</em> its answer using that fresh
+          information, instead of relying only on what it memorised during training.</li>
+        </ul>
+
+        <h3>The three problems RAG solves</h3>
+        <p>Recall from Session 1 that an LLM is a frozen, pre-trained model doing <em>inference</em>. That
+        creates three painful limitations — RAG was invented to fix all of them:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Problem (from Session 1)</th><th>What goes wrong</th><th>How RAG fixes it</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Knowledge cutoff</span></td><td>The model only knows facts up to its training date. Ask about last week and it can't know.</td><td>Retrieve up-to-date documents at <em>query time</em> and feed them in.</td></tr>
+              <tr><td>No private knowledge</td><td>The model never saw <em>your</em> company wiki, contracts, or emails — they weren't in its training data.</td><td>Retrieve from your own private files and inject them into the prompt.</td></tr>
+              <tr><td><span class="term">Hallucination</span></td><td>When unsure, the model <em>predicts</em> plausible-sounding text that may be wrong (Session 1).</td><td>Give it the real source text so it answers <em>from evidence</em>, and can even cite it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>RAG doesn't change the model's brain at all. It changes the model's <strong>prompt</strong>. Right
+          before the LLM answers, RAG quietly slips the most relevant text into the
+          <span class="term">context window</span> (Session 1) so the model has the facts sitting right in
+          front of it. The model still just predicts the next token — but now it's predicting <em>from your
+          documents</em> instead of from fuzzy memory.</p>
+        </div>
+
+        <h3>The open-book exam analogy, in full</h3>
+        <p>A closed-book exam tests what's in your head — that's a plain LLM. An <strong>open-book exam</strong>
+        lets you bring the textbook: you're not memorising every fact, you're skilled at <em>finding</em> the
+        right passage and using it. RAG makes the LLM an open-book exam taker:</p>
+        <ul>
+          <li>The "textbook" = your collection of documents (the <span class="term">knowledge base</span>).</li>
+          <li>"Flipping to the right page" = the retrieval step.</li>
+          <li>"Reading the page, then answering in your own words" = the generation step.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: a company help-desk bot</span>
+          <p>Your company has a 400-page internal HR handbook updated every month. An employee asks the chatbot:
+          <code class="inl">"How many vacation days do I get after 3 years?"</code></p>
+          <ul>
+            <li><strong>Without RAG:</strong> the base model never saw your handbook. It guesses "probably 15–20"
+            — a hallucination. Wrong and dangerous.</li>
+            <li><strong>With RAG:</strong> the system searches the handbook, finds the exact paragraph
+            ("Employees with 3+ years of service accrue 22 days…"), pastes that paragraph into the prompt, and
+            the model answers <strong>"22 days, per the current handbook"</strong> — correct, current, and
+            grounded in a real source.</li>
+          </ul>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A term you'll hear: "grounding"</span>
+          <p><span class="term">Grounding</span> means tying the model's answer to real, retrieved evidence
+          instead of its own memory. A grounded answer can quote and cite its sources — which is why RAG is the
+          go-to technique for trustworthy, factual AI apps.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          RAG = <strong>R</strong>etrieve relevant text → <strong>A</strong>ugment the prompt with it →
+          <strong>G</strong>enerate an answer from it. It fixes the knowledge cutoff, gives the model access to
+          private/up-to-date data, and reduces hallucination by grounding answers in real sources — all without
+          retraining the model. Think open-book exam.
+        </div>
+      </section>
+
+      <!-- ===================== 2. RAG VS FINE-TUNING ===================== -->
+      <section id="vs-finetune">
+        <h2><span class="sec-num">2</span> RAG vs fine-tuning — a decision framework</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Say you want your friend to be more helpful. There are two very different ways. One: send them
+          <strong>back to school</strong> to learn new habits and a new way of talking — that's slow and
+          expensive, but it changes <em>how they behave</em>. Two: just hand them <strong>the right notes</strong>
+          right before they answer — fast and cheap, and it changes <em>what they know right now</em>. The first
+          is <strong>fine-tuning</strong>. The second is <strong>RAG</strong>. They solve different problems.</p>
+        </div>
+
+        <p>We met <span class="term">fine-tuning</span> briefly in Session 1: it's a small, extra round of
+        <em>training</em> on top of a pre-trained model to specialise it. RAG, by contrast, never touches the
+        model — it works purely at <em>inference</em> time by editing the prompt. Beginners constantly ask "do I
+        need to fine-tune?" — usually the answer is "no, you need RAG." Here's how to decide properly.</p>
+
+        <h3>What each one actually does</h3>
+        <ul>
+          <li><strong>Fine-tuning changes the model's <em>weights</em></strong> (the parameters from Session 1).
+          It bakes new <em>behaviour, style, tone, or output format</em> into the model itself. It's good at
+          teaching the model <em>how</em> to respond.</li>
+          <li><strong>RAG changes the model's <em>input</em></strong>. It supplies fresh <em>facts/knowledge</em>
+          at query time. It's good at teaching the model <em>what</em> to talk about right now.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The rule of thumb that settles most debates</span>
+          <p>Use <strong>RAG for knowledge</strong> (facts that change, are private, or must be current). Use
+          <strong>fine-tuning for behaviour</strong> (a consistent style, tone, format, or skill the model
+          should always exhibit). Many serious systems use <em>both</em>: fine-tune for how it talks, RAG for
+          what it knows.</p>
+        </div>
+
+        <h3>Side-by-side comparison</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>RAG</th><th>Fine-tuning</th></tr></thead>
+            <tbody>
+              <tr><td>What it changes</td><td>The prompt (model untouched)</td><td>The model's parameters</td></tr>
+              <tr><td>Best for</td><td>Facts, knowledge, documents</td><td>Behaviour, style, tone, output format</td></tr>
+              <tr><td>Update speed</td><td>Instant — just add/edit a document</td><td>Slow — re-run a training job</td></tr>
+              <tr><td>Cost to set up</td><td>Low — build a search index</td><td>Higher — needs labelled data + GPU training</td></tr>
+              <tr><td>Cost per query</td><td>Slightly higher (extra retrieved tokens in the prompt)</td><td>Same as normal inference</td></tr>
+              <tr><td>Keeps current?</td><td>Yes — re-index new data anytime</td><td>No — fixed until you retrain</td></tr>
+              <tr><td>Can cite sources?</td><td>Yes — it has the real text</td><td>No — knowledge is baked in invisibly</td></tr>
+              <tr><td>Handles private data?</td><td>Yes, easily</td><td>Yes, but the data is absorbed into weights (harder to remove)</td></tr>
+              <tr><td>Risk</td><td>Bad retrieval → irrelevant context</td><td>Overfitting; expensive mistakes; data hard to update</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>A simple decision flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">Is it about facts/knowledge?</div><div class="s-d">Especially changing or private data</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📚</div><div class="s-t">Use RAG</div><div class="s-d">Retrieve &amp; inject documents</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎭</div><div class="s-t">Is it about style/behaviour?</div><div class="s-d">Tone, format, a repeated skill</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛠️</div><div class="s-t">Fine-tune</div><div class="s-d">Train the model on examples</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Three real scenarios</span>
+          <ul>
+            <li><strong>"Answer questions about our constantly-changing product catalogue."</strong> → <strong>RAG.</strong>
+            The catalogue changes weekly; you can't retrain weekly. Retrieve the current product page.</li>
+            <li><strong>"Always reply in our brand's playful, emoji-light voice, in this exact JSON schema."</strong>
+            → <strong>Fine-tuning.</strong> That's behaviour/format you want baked in permanently.</li>
+            <li><strong>"A support bot that sounds on-brand AND quotes the latest policy docs."</strong> →
+            <strong>Both.</strong> Fine-tune the voice, use RAG for the policies.</li>
+          </ul>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common beginner mistake</span>
+          <p>People try to fine-tune to teach the model <em>facts</em> ("just train it on our docs!"). This works
+          poorly: the model may still hallucinate, can't cite sources, and goes stale the moment a doc changes —
+          forcing an expensive retrain. For knowledge, reach for <strong>RAG first</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Fine-tuning changes the model's parameters to alter <em>behaviour/style</em> — slow, costly, baked in.
+          RAG changes the prompt to supply <em>knowledge</em> — instant, cheap, current, citable. Rule of thumb:
+          RAG for what it knows, fine-tuning for how it acts; combine both for the best systems.
+        </div>
+      </section>
+
+      <!-- ===================== 3. EMBEDDINGS FOR RETRIEVAL ===================== -->
+      <section id="embeddings">
+        <h2><span class="sec-num">3</span> Embeddings for retrieval</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine every sentence gets a colour based on what it <em>means</em>. Sentences about dogs are
+          shades of blue; sentences about cooking are shades of red. Now when you ask "how do I feed a puppy?",
+          the computer turns <em>your question</em> into a colour too — a bluish one — and grabs the sentences
+          with the closest colour. It never matched the exact words; it matched the <strong>meaning</strong>.
+          Those "meaning colours" are called <strong>embeddings</strong>.</p>
+        </div>
+
+        <p>In Session 1 you met <span class="term">embeddings</span>: a token's meaning turned into a list of
+        numbers (a <span class="term">vector</span>) where similar meanings sit close together
+        ("king − man + woman ≈ queen"). RAG uses the exact same idea, but for <em>whole pieces of text</em> — a
+        sentence, a paragraph, a chunk of a document. Each piece gets one embedding vector that summarises its
+        meaning.</p>
+
+        <h3>Why embeddings, and not keyword search?</h3>
+        <p>Old-school search matches <em>words</em>. If a document says "automobile" and you search "car," plain
+        keyword search misses it. Embeddings match <em>meaning</em>, so "car," "automobile," and "vehicle" all
+        land near each other in meaning-space. This is called <span class="term">semantic search</span> — search
+        by sense, not by spelling.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The core trick of retrieval</span>
+          <p>Convert <strong>both</strong> your documents <em>and</em> the user's question into embedding vectors
+          using the <em>same</em> embedding model. Then a question and a relevant chunk will have
+          <strong>nearby vectors</strong> — even if they share no words. Retrieval is just "find the chunks whose
+          vectors are closest to the question's vector."</p>
+        </div>
+
+        <h3>Measuring "closeness": cosine similarity</h3>
+        <p>How do we tell if two vectors are "close"? The most common measure in RAG is
+        <span class="term">cosine similarity</span>: it looks at the <em>angle</em> between two vectors rather
+        than how long they are. The intuition:</p>
+        <ul>
+          <li>Vectors pointing in the <strong>same direction</strong> (small angle) → very similar meaning →
+          cosine similarity near <strong>1.0</strong>.</li>
+          <li>Vectors at a right angle → unrelated → cosine similarity near <strong>0</strong>.</li>
+          <li>Vectors pointing opposite → opposite meaning → near <strong>−1</strong>.</li>
+        </ul>
+        <p>You'll also hear <span class="term">cosine distance</span>, which is just <code class="inl">1 −
+        cosine similarity</code> — a smaller distance means closer/more similar. The retrieval system computes
+        this between your question and every candidate chunk, then keeps the closest ones.</p>
+
+        <div class="callout example">
+          <span class="c-title">Matching by meaning, not keywords</span>
+          <p>Your knowledge base has this chunk:
+          <code class="inl">"Felines often purr when content."</code><br />
+          A user asks: <code class="inl">"Why do cats make that rumbling sound when happy?"</code></p>
+          <p>There's almost <em>no</em> word overlap ("felines" vs "cats", "purr" vs "rumbling sound",
+          "content" vs "happy"). Keyword search would fail. But because the embedding model understands that
+          felines≈cats and purr≈rumbling sound and content≈happy, the two vectors point in nearly the same
+          direction — a high cosine similarity — so the chunk gets retrieved. That's the whole magic.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Embedding model ≠ the chat model</span>
+          <p>The model that <em>creates</em> embeddings (e.g. an "embedding model" like OpenAI's
+          <code class="inl">text-embedding-3</code>) is usually a separate, smaller model from the chat LLM that
+          writes the final answer. Crucial rule: you must embed your documents and your queries with the
+          <strong>same</strong> embedding model, or their vectors won't live in the same meaning-space and
+          comparisons become meaningless.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Embeddings turn whole text chunks into meaning-vectors (Session 1's idea, scaled up). Embedding the
+          question and the chunks the same way lets us find matches by <em>meaning</em> (semantic search), not
+          keywords. Closeness is measured with cosine similarity (angle between vectors): near 1 = similar, near
+          0 = unrelated.
+        </div>
+      </section>
+
+      <!-- ===================== 4. VECTOR DATABASES ===================== -->
+      <section id="vectordb">
+        <h2><span class="sec-num">4</span> Vector databases</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A normal filing cabinet sorts things alphabetically — great if you know the exact name. But we
+          don't want "find the file named X"; we want "find the files that <em>feel similar</em> to this one."
+          A <strong>vector database</strong> is a special filing cabinet that organises things by
+          <em>meaning</em>, so when you walk in holding one note, it instantly hands you the most similar notes.</p>
+        </div>
+
+        <p>Once every chunk is an embedding vector, you need somewhere to <em>store</em> all those vectors and
+        <em>search</em> them fast. That's a <span class="term">vector database</span> (or "vector store"): a
+        database purpose-built to hold high-dimensional vectors and quickly find the ones nearest to a given
+        query vector.</p>
+
+        <h3>Why won't a normal database work?</h3>
+        <p>Regular databases (like a SQL table) are built to match <em>exact values</em> or ranges:
+        "find rows where <code class="inl">name = 'Alice'</code>" or "price &lt; 100." They have no efficient
+        notion of "find the rows whose 1,536-number vector points most similarly to <em>this</em> vector."
+        Doing that naively means comparing your query against <em>every single</em> stored vector — fine for a
+        hundred, hopeless for ten million. Vector databases solve exactly this:</p>
+        <ul>
+          <li>They store vectors efficiently (often thousands of numbers each).</li>
+          <li>They build a special <span class="term">index</span> (next topic) so search doesn't have to scan
+          everything.</li>
+          <li>They return the <span class="term">top-k</span> nearest vectors — the <em>k</em> most similar
+          chunks — in milliseconds.</li>
+          <li>They store <span class="term">metadata</span> alongside each vector (source file, date, author)
+          so you can filter, e.g. "only docs from 2026."</li>
+        </ul>
+
+        <h3>Three vector databases you'll hear about</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tool</th><th>Hosting</th><th>Good first impression</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Chroma</span></td><td>Local / open-source</td><td>Tiny and beginner-friendly; runs on your laptop with a few lines of Python. Perfect for learning and prototypes.</td></tr>
+              <tr><td><span class="term">Pinecone</span></td><td>Managed cloud (SaaS)</td><td>Fully hosted — you don't run servers; it scales to billions of vectors. Popular for production apps that want zero ops.</td></tr>
+              <tr><td><span class="term">Qdrant</span></td><td>Open-source <em>or</em> managed cloud</td><td>Run it yourself <em>or</em> use their cloud. Strong filtering on metadata and good performance; a nice middle ground.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Local vs managed — the real trade-off</span>
+          <p><strong>Local</strong> (Chroma, self-hosted Qdrant): free, private, great for prototyping, but
+          <em>you</em> handle scaling, backups, and uptime. <strong>Managed</strong> (Pinecone, Qdrant Cloud):
+          you pay, but they handle the hard infrastructure and it scales effortlessly. A very common journey:
+          start on Chroma locally while building, then move to a managed store for production.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">What "storing a chunk" looks like</span>
+          <p>For one paragraph of your handbook, the vector DB holds a record roughly like:</p>
+          <pre>{
+  "id": "handbook-p042",
+  "vector": [0.013, -0.221, 0.087, ... 1533 more numbers],
+  "text": "Employees with 3+ years of service accrue 22 days...",
+  "metadata": { "source": "hr_handbook.pdf", "page": 42, "updated": "2026-05" }
+}</pre>
+          <p>At query time you hand the DB your <em>question's</em> vector and say "give me the 4 closest
+          records." It returns the text + metadata of those 4 — ready to drop into the prompt.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A vector database stores embedding vectors and finds the nearest ones to a query vector fast —
+          something normal databases (built for exact matches) can't do efficiently. Chroma is the easy local
+          starter; Pinecone is fully managed cloud; Qdrant offers both. They also store metadata for filtering.
+        </div>
+      </section>
+
+      <!-- ===================== 5. INDEXING ===================== -->
+      <section id="indexing">
+        <h2><span class="sec-num">5</span> Indexing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a library with a million books dumped in a giant pile. To find one, you'd check every
+          single book — forever. So librarians make a <strong>card catalogue</strong>: a clever organisation
+          system that points you straight to roughly the right shelf. <strong>Indexing</strong> is building
+          that catalogue for your vectors, so searching is fast instead of checking every vector one by one.</p>
+        </div>
+
+        <p><span class="term">Indexing</span> is the process of preparing your documents so they can be searched
+        quickly. It has two parts: (1) turning documents into stored, searchable vectors, and (2) organising
+        those vectors so finding the nearest ones is fast.</p>
+
+        <h3>Part A — How documents become a searchable index</h3>
+        <p>Indexing happens <em>ahead of time</em> (before any user asks anything), and follows the same early
+        steps we'll formalise in the pipeline topic:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📄</div><div class="s-t">1. Collect docs</div><div class="s-d">PDFs, wiki pages, etc.</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">2. Chunk</div><div class="s-d">Split into small pieces</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔢</div><div class="s-t">3. Embed</div><div class="s-d">Each chunk → a vector</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">4. Store + index</div><div class="s-d">Save vectors in the vector DB</div></div>
+        </div>
+        <p>The result — all your chunk-vectors organised for fast lookup inside the vector database — is "the
+        index." You build it once (and update it whenever documents change). Searching it later is cheap and
+        instant.</p>
+
+        <h3>Part B — Nearest-neighbour search and the ANN trick</h3>
+        <p>The job at query time is <span class="term">nearest-neighbour search</span>: given the question's
+        vector, find the closest chunk-vectors. The honest, perfect way is to compare against
+        <em>every</em> stored vector and sort — called <strong>exact</strong> or "brute-force" search. It's
+        accurate but slow at scale (millions of comparisons per query).</p>
+
+        <div class="bigidea">
+          <span class="c-title">Why "approximate" is the secret to speed</span>
+          <p>Real systems use <span class="term">ANN — Approximate Nearest Neighbour</span> search. Instead of
+          guaranteeing the <em>perfect</em> closest matches, ANN cleverly organises vectors (into graphs or
+          clusters) so it can find <em>almost certainly</em> the closest ones while checking only a tiny
+          fraction of them. You trade a sliver of accuracy for an enormous speed-up — usually well worth it.</p>
+        </div>
+
+        <p>You don't have to implement ANN yourself — it's exactly what vector databases (Topic 4) do under the
+        hood. You'll sometimes see algorithm names like <span class="term">HNSW</span> (a popular graph-based ANN
+        method); for now, just know "ANN = fast, near-perfect similarity search."</p>
+
+        <div class="callout example">
+          <span class="c-title">Why ANN matters: the numbers</span>
+          <p>Say you have 10,000,000 chunks. Brute-force search compares the query to all 10 million vectors
+          <em>every</em> query — painfully slow. A good ANN index might only inspect a few thousand candidates
+          and still return the right top-k in a few milliseconds. Same answers in practice, thousands of times
+          faster.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Keep the index fresh</span>
+          <p>An index is a snapshot. If your documents change (new policy, deleted page) but you don't
+          re-index, retrieval will serve stale or missing info — quietly defeating the whole point of RAG.
+          Plan to re-embed and update the index whenever the source data changes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Indexing = embedding your chunks and storing them in the vector DB, organised for fast search. At
+          query time we do nearest-neighbour search; because exact search is slow at scale, vector DBs use ANN
+          (Approximate Nearest Neighbour, e.g. HNSW) to find near-perfect matches in milliseconds. Re-index when
+          documents change.
+        </div>
+      </section>
+
+      <!-- ===================== 6. CHUNKING ===================== -->
+      <section id="chunking">
+        <h2><span class="sec-num">6</span> Chunking strategies</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You can't shove a whole giant book into the AI at once — it only has a small desk
+          (the <em>context window</em> from Session 1). So you cut the book into bite-sized pages first. But
+          <em>how</em> you cut matters: chop in the middle of a sentence and the piece stops making sense.
+          <strong>Chunking</strong> is the art of slicing documents into pieces that are small enough to handle
+          but big enough to still mean something.</p>
+        </div>
+
+        <p><span class="term">Chunking</span> is splitting your documents into smaller pieces ("chunks") before
+        embedding them. We chunk because (a) each chunk must fit limits and be small enough to embed cleanly,
+        and (b) retrieval should return a <em>focused</em> passage, not an entire 400-page PDF. The way you
+        chunk hugely affects how good your RAG system is.</p>
+
+        <h3>The four common strategies</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>How it splits</th><th>Pros</th><th>Cons</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Fixed-size</span></td><td>Every N characters or tokens (e.g. every 500 tokens), regardless of meaning.</td><td>Dead simple; predictable sizes.</td><td>Can slice mid-sentence or mid-idea, breaking meaning.</td></tr>
+              <tr><td><span class="term">Sentence-based</span></td><td>Split on sentence boundaries; group a few sentences per chunk.</td><td>Each chunk is grammatically whole; natural.</td><td>Sentence lengths vary, so chunk sizes are uneven.</td></tr>
+              <tr><td><span class="term">Semantic</span></td><td>Split where the <em>topic</em> shifts (using embeddings to detect meaning changes).</td><td>Chunks are topically coherent — great retrieval.</td><td>More complex and compute-heavy to produce.</td></tr>
+              <tr><td><span class="term">Recursive</span></td><td>Try to split on big separators first (paragraphs), then smaller (sentences, words) until chunks fit the target size.</td><td>Respects document structure; a robust default.</td><td>Needs sensible separator rules; still size-driven.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Recursive chunking is the popular default</span>
+          <p>Most beginners start with <strong>recursive</strong> chunking (it's the default in tools like
+          LangChain's text splitter). It tries paragraph breaks first, falls back to sentences, then words —
+          keeping pieces as meaningful as possible while still hitting your size target. It's a great balance of
+          simple and smart.</p>
+        </div>
+
+        <h3>Chunk size &amp; overlap — the two dials that matter most</h3>
+        <p><strong>Chunk size</strong> is how big each piece is (e.g. 500 tokens). It's a balance:</p>
+        <ul>
+          <li><strong>Too small</strong> → each chunk lacks context; the answer might be split across several
+          chunks and you miss the full picture.</li>
+          <li><strong>Too large</strong> → chunks contain lots of irrelevant text, so the embedding is "blurry"
+          (averages many topics) and retrieval gets less precise; you also waste prompt tokens.</li>
+        </ul>
+        <p><span class="term">Overlap</span> means letting consecutive chunks <em>share</em> some text at their
+        edges (e.g. the last 50 tokens of one chunk also start the next). This stops an idea that straddles a
+        boundary from being cut in half and lost. A small overlap (often 10–20% of chunk size) is common.</p>
+
+        <div class="callout example">
+          <span class="c-title">Splitting a document, with and without overlap</span>
+          <p>Source paragraph: <code class="inl">"To reset your password, go to Settings. Then click Security.
+          Finally, choose 'Reset password' and confirm via email."</code></p>
+          <p><strong>Fixed-size, no overlap, naive cut:</strong></p>
+          <ul>
+            <li>Chunk A: <code class="inl">"To reset your password, go to Settings. Then click Secu"</code></li>
+            <li>Chunk B: <code class="inl">"rity. Finally, choose 'Reset password' and confirm via email."</code></li>
+          </ul>
+          <p>"Security" got split — a query about "the security tab" might match neither chunk well. </p>
+          <p><strong>Sentence-based with overlap:</strong></p>
+          <ul>
+            <li>Chunk A: <code class="inl">"To reset your password, go to Settings. Then click Security."</code></li>
+            <li>Chunk B: <code class="inl">"Then click Security. Finally, choose 'Reset password' and confirm via email."</code></li>
+          </ul>
+          <p>Now each chunk is whole, and the overlapped sentence ("Then click Security.") bridges the two so no
+          step is orphaned.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">There's no universal "best" chunk size</span>
+          <p>It depends on your content. Dense legal text, chatty FAQs, and code all chunk differently. Treat
+          chunk size and overlap as things you <em>tune and test</em> (just like prompts in Session 1) — measure
+          retrieval quality and adjust.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Chunking splits documents into embeddable pieces. Strategies: fixed-size (simple but blind),
+          sentence-based (grammatically whole), semantic (topic-aware, best but costly), and recursive (structure-respecting,
+          the popular default). Size is a precision-vs-context trade-off, and overlap keeps boundary-straddling
+          ideas intact. Tune them per dataset.
+        </div>
+      </section>
+
+      <!-- ===================== 7. THE BASIC RAG PIPELINE ===================== -->
+      <section id="pipeline">
+        <h2><span class="sec-num">7</span> The basic RAG pipeline</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two days, two jobs. <strong>Job one (do it once, ahead of time):</strong> take all your books, cut
+          them into pages, and file them in the magic meaning-cabinet. <strong>Job two (every time someone
+          asks):</strong> turn their question into a "meaning note," pull the few most similar pages from the
+          cabinet, staple those pages to the question, and hand the whole bundle to the AI to read and answer.
+          That's the entire RAG pipeline.</p>
+        </div>
+
+        <p>RAG has two phases. The <strong>ingestion</strong> phase (also called indexing) happens once up front;
+        the <strong>query</strong> phase happens every time a user asks something. Every topic in this session
+        is one piece of this pipeline — now we connect them all.</p>
+
+        <h3>Phase 1 — Ingestion (build the knowledge base, once)</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">1. Ingest</div><div class="s-d">Load raw documents</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">2. Chunk</div><div class="s-d">Split into pieces (Topic 6)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔢</div><div class="s-t">3. Embed</div><div class="s-d">Each chunk → vector (Topic 3)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🗄️</div><div class="s-t">4. Store</div><div class="s-d">Save in vector DB + index (Topics 4&amp;5)</div></div>
+        </div>
+
+        <h3>Phase 2 — Query (answer a question, every time)</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">5. Embed question</div><div class="s-d">User query → vector (same model!)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">6. Retrieve top-k</div><div class="s-d">Nearest chunks via ANN (Topic 5)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">7. Augment prompt</div><div class="s-d">Stuff chunks + question together</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">8. Generate</div><div class="s-d">LLM answers from the context</div></div>
+        </div>
+
+        <p>Step 7 is the heart of "augmented." We build a prompt that <em>stuffs</em> the retrieved chunks into
+        the context window alongside the user's question — typically with an instruction like "Answer using only
+        the context below." This grounding is what makes the answer factual and citable.</p>
+
+        <div class="callout note">
+          <span class="c-title">What "top-k" means</span>
+          <p><span class="term">Top-k</span> is simply how many of the closest chunks you retrieve — e.g.
+          <code class="inl">k = 4</code> fetches the 4 most similar chunks. Too few and you might miss the
+          answer; too many and you flood the prompt with noise (and burn tokens — Session 1's token economics).
+          A small k like 3–5 is a common starting point.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Full worked example, end to end</span>
+          <p><strong>Ingestion (done last week):</strong> the 400-page HR handbook is split into ~800 chunks,
+          each embedded and stored in Chroma with metadata (page number, last-updated date).</p>
+          <p><strong>Now an employee asks:</strong> <code class="inl">"How many vacation days after 3 years?"</code></p>
+          <ol>
+            <li><strong>Embed question</strong> → the query becomes a vector with the same embedding model used
+            for the chunks.</li>
+            <li><strong>Retrieve top-k (k=3)</strong> → the vector DB returns the 3 closest chunks. The top hit
+            is the paragraph: <em>"Employees with 3+ years of service accrue 22 days of paid leave annually."</em></li>
+            <li><strong>Augment</strong> → we build the prompt:
+            <pre>System: Answer using ONLY the context. Cite the page.
+
+Context:
+[p.42] "Employees with 3+ years of service accrue 22 days
+of paid leave annually."
+[p.41] "Leave accrues monthly and carries over..."
+[p.43] "Requests must be submitted two weeks in advance."
+
+Question: How many vacation days after 3 years?</pre></li>
+            <li><strong>Generate</strong> → the LLM reads that context and replies:
+            <em>"After 3 years of service you accrue 22 days of paid leave annually (HR Handbook, p.42)."</em></li>
+          </ol>
+          <p>Correct, current, grounded, and cited — exactly what a plain LLM couldn't do.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>RAG adds <em>zero</em> new ability to the model itself — it's still the same next-token predictor
+          from Session 1. All the intelligence of RAG lives in the <strong>plumbing</strong>: chunk well, embed
+          well, retrieve the right top-k, and stuff it into the prompt cleanly. Get the retrieval right and the
+          generation almost takes care of itself. (Session 5 dives into making retrieval much smarter.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The pipeline = <strong>ingest → chunk → embed → store</strong> (once), then
+          <strong>embed question → retrieve top-k → augment the prompt → generate</strong> (every query). Each
+          arrow is a topic from this session. Good retrieval + clean prompt-stuffing = grounded, citable answers.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how to give an AI an open book. Here's the one-paragraph story that connects all 7
+        topics:</p>
+        <div class="bigidea">
+          <p><strong>RAG</strong> exists because a plain LLM has a <em>knowledge cutoff</em>, can't see private
+          data, and <em>hallucinates</em> (all from Session 1). Unlike <strong>fine-tuning</strong> — which
+          retrains the model to change its <em>behaviour</em> — RAG changes the <em>prompt</em> to supply
+          <em>knowledge</em> at query time. To do that, we turn text into <strong>embeddings</strong> (meaning
+          vectors) and find matches by <strong>cosine similarity</strong>, storing them in a
+          <strong>vector database</strong> (Chroma, Pinecone, Qdrant) because normal databases can't search by
+          meaning. We <strong>index</strong> the vectors so <strong>ANN</strong> search is fast, after first
+          <strong>chunking</strong> documents (fixed/sentence/semantic/recursive, tuning size &amp; overlap).
+          Finally the full <strong>pipeline</strong> runs: ingest → chunk → embed → store, then embed the
+          question → retrieve <strong>top-k</strong> → stuff the chunks into the
+          <strong>context window</strong> → generate a grounded, citable answer.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Your data changes every day. Do you reach for RAG or fine-tuning, and why?</summary>
+          <p class="ans">RAG. It supplies knowledge at query time, so you just re-index the new data — no
+          retraining. Fine-tuning bakes facts into the weights and goes stale immediately, forcing expensive
+          retrains. (RAG for knowledge, fine-tuning for behaviour.)</p>
+        </details>
+        <details class="quiz">
+          <summary>A user asks "why do cats purr?" but the doc says "felines purr when content." Why does RAG still find it?</summary>
+          <p class="ans">Because retrieval matches by <em>meaning</em>, not keywords. The embedding vectors for
+          the question and the chunk point in nearly the same direction (high cosine similarity), so the chunk
+          is retrieved despite sharing almost no words — that's semantic search.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't you just use a normal SQL database to store embeddings for RAG?</summary>
+          <p class="ans">Normal databases match exact values or ranges; they have no efficient way to find the
+          vectors "closest in meaning" to a query vector. Vector databases build special (ANN) indexes to do
+          nearest-neighbour search fast, which a SQL table can't.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is chunk "overlap" and why does it help?</summary>
+          <p class="ans">Overlap means consecutive chunks share some text at their edges. It prevents an idea or
+          sentence that straddles a chunk boundary from being cut in half and lost, so retrieval still surfaces
+          the complete thought.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the RAG pipeline, what does "top-k" control, and what's the risk of making it too large?</summary>
+          <p class="ans">Top-k is how many of the closest chunks you retrieve and inject into the prompt. Too
+          large floods the context with irrelevant text (hurting answer quality) and wastes tokens/money. A
+          small k (≈3–5) is a common starting point.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-3.html"><div class="dir">← Previous</div><div class="ttl">Session 3: Introduction to AI Agents</div></a>
+        <a class="next" href="session-5.html"><div class="dir">Next →</div><div class="ttl">Session 5: RAG 2 — Advanced Retrieval</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 4 — RAG 1: Introduction to Retrieval-Augmented Generation · You can give an AI an open book now 📚</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

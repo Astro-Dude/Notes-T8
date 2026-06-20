@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 7 — Agent SDK: Fundamentals</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 7</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 07 · Agent SDK — Fundamentals</span>
+      <h1>Building agents the easy way: the Agent SDK</h1>
+      <p class="lead">
+        In Session 6 you wired up agents by hand with LangChain and LangGraph — drawing every node and
+        edge yourself. It worked, but it was a lot of plumbing. Today we meet a friendlier tool: an
+        <em>Agent SDK</em> (we'll use the popular <strong>OpenAI Agents SDK</strong> as our example). It
+        hands you agents, tools, and hand-offs ready-made, so you can focus on <em>what</em> your agent
+        should do instead of <em>how</em> to glue it together. As always, we start each idea with a tiny
+        story, then go deep, then show real code.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#recap">Why we want an Agent SDK</a></li>
+          <li><a href="#what">What is an Agent SDK?</a></li>
+          <li><a href="#lifecycle">The agent run loop</a></li>
+          <li><a href="#tools">Tool patterns in the SDK</a></li>
+          <li><a href="#orchestration">Orchestrating many agents</a></li>
+          <li><a href="#handoffs">Handoffs</a></li>
+          <li><a href="#vs">SDK vs framework</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. RECAP & MOTIVATION ===================== -->
+      <section id="recap">
+        <h2><span class="sec-num">1</span> Recap &amp; motivation: why we want an Agent SDK</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Last time, building an agent was like making a toy robot from a box of loose wires, motors,
+          and screws. Powerful — you control everything — but slow and easy to get wrong. An
+          <strong>Agent SDK</strong> is like a LEGO Technic kit instead: the wheels, the motor, and the
+          steering already come as ready-made pieces that snap together. You build the <em>same</em>
+          robot, but much faster and with far fewer wires sticking out.</p>
+        </div>
+
+        <h3>A quick recap of where we've been</h3>
+        <p>From <strong>Session 3</strong> you already know the heart of an agent:</p>
+        <ul>
+          <li>An <span class="term">agent</span> is an LLM that can <em>act</em> — it can call
+          <span class="term">tools</span> (functions, APIs, searches) to get things done, not just chat.</li>
+          <li>It runs in a loop sometimes called the <span class="term">agent loop</span> (or "ReAct"
+          style): <em>think → call a tool → read the result → think again → … → answer</em>.</li>
+          <li>It keeps going until it decides it has enough to give a final answer.</li>
+        </ul>
+        <p>From <strong>Session 6</strong> you know one concrete way to build this:
+        <span class="term">LangChain</span> (building blocks for prompts, models, and tools) and
+        <span class="term">LangGraph</span> (a way to express the agent as an explicit
+        <span class="term">graph</span> of <em>nodes</em> and <em>edges</em>, with a shared
+        <span class="term">state</span> object flowing through it).</p>
+
+        <h3>What's hard about building agents directly in LangGraph</h3>
+        <p>LangGraph is brilliant and very flexible — but that flexibility has a cost. When all you want
+        is a "normal" agent that calls a few tools, LangGraph asks you to spell out a lot of low-level
+        machinery yourself.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pain point</th><th>What it means in practice</th></tr></thead>
+            <tbody>
+              <tr><td>Lower-level by design</td><td>You think in nodes, edges, and a graph. That's the right altitude for complex flows, but overkill for "an agent that uses 3 tools."</td></tr>
+              <tr><td>Boilerplate</td><td>You define a state schema, write the model-calling node, write the tool-executing node, add conditional edges to decide "loop again or stop," and wire it all up — before your agent does anything useful.</td></tr>
+              <tr><td>You build the loop</td><td>The "call model → run tools → feed results back → repeat" loop isn't free; you assemble it from nodes and edges (or use a prebuilt helper and then customise).</td></tr>
+              <tr><td>Multi-agent is manual</td><td>Routing between specialised agents (a "triage" agent sending work to others) means more nodes, more edges, more state plumbing.</td></tr>
+              <tr><td>Easy to get subtly wrong</td><td>Forget an edge or mishandle state and your agent loops forever, drops a tool result, or never stops. These bugs are fiddly.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Not a criticism of LangGraph</span>
+          <p>LangGraph's low level <em>is the point</em> — when you genuinely need custom control flow,
+          cycles, branching, human-in-the-loop pauses, that explicit graph is exactly what you want.
+          The issue is only that for the <em>common</em> "agent + tools (+ maybe a few sub-agents)" case,
+          it makes you write a lot that could be handed to you for free.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The motivation in one line</span>
+          <p>Most agents share the <strong>same</strong> shape (an LLM, some tools, a loop, maybe a few
+          sub-agents). An <strong>Agent SDK</strong> packages that shape as ready-made parts, so you
+          write your logic — not the plumbing — and only drop to a lower-level framework when you truly
+          need custom control.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          You already know agents (Session 3) and one way to build them with LangChain/LangGraph
+          (Session 6). LangGraph is powerful but low-level: lots of state, nodes, edges, and a
+          hand-built loop. An Agent SDK exists to take that repetitive plumbing off your hands for the
+          common case.
+        </div>
+      </section>
+
+      <!-- ===================== 2. WHAT IS AN AGENT SDK ===================== -->
+      <section id="what">
+        <h2><span class="sec-num">2</span> What is an Agent SDK? (the OpenAI Agents SDK)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine a kitchen where the four most-used gadgets — a chef, a recipe card, a set of
+          knives, and a way to call another chef for help — already sit on the counter, ready to use.
+          An Agent SDK is that pre-stocked kitchen. The four gadgets have names:
+          <strong>Agents</strong>, <strong>Tools</strong>, <strong>Handoffs</strong>, and a
+          <strong>Runner</strong> that actually does the cooking.</p>
+        </div>
+
+        <p>An <span class="term">Agent SDK</span> is a purpose-built software library whose only job is to
+        help you build LLM agents. Instead of generic building blocks, it gives you a small set of
+        <span class="term">primitives</span> (ready-made core concepts) that map directly onto how agents
+        actually work. Our running example is the <span class="term">OpenAI Agents SDK</span>, a
+        lightweight, open-source Python library (the successor to OpenAI's earlier "Swarm" experiment).
+        It's deliberately tiny — few concepts, fast to learn — yet enough to build real multi-agent
+        apps. (It's also <em>provider-flexible</em>: although it's from OpenAI, it can drive many
+        different LLMs, not only OpenAI's.)</p>
+
+        <h3>The core primitives</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Primitive</th><th>What it is</th><th>Maps to (from earlier sessions)</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Agent</strong></td><td>An LLM bundled with <em>instructions</em> (its system prompt / personality), a list of <em>tools</em> it may call, and optional extras like which sub-agents it can hand off to and its output type.</td><td>The "agent" idea from Session 3, now a single configured object.</td></tr>
+              <tr><td><strong>Tool</strong></td><td>A capability the agent can invoke — most commonly a plain Python function the SDK auto-wraps so the model can call it.</td><td>Tools from Session 3 — but you skip writing the schema by hand.</td></tr>
+              <tr><td><strong>Handoff</strong></td><td>A special action that lets one agent <em>delegate the conversation</em> to another, more specialised agent.</td><td>New here — like routing between LangGraph nodes, but as a first-class feature.</td></tr>
+              <tr><td><strong>Run (Runner)</strong></td><td>The engine that actually <em>executes</em> an agent: it runs the loop, performs the tool calls, follows handoffs, and returns the result.</td><td>The agent loop from Session 3 — now run for you.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Two bonus primitives you'll hear about</span>
+          <p><span class="term">Guardrails</span> are checks that run alongside your agent to validate
+          inputs/outputs and "fail fast" if something looks wrong (e.g. a user asking something
+          off-policy). <span class="term">Sessions</span> automatically keep conversation history across
+          turns so you don't re-thread it by hand. Both build on the four core primitives — we'll meet
+          tracing and threads properly in Session 8.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: your first agent in ~5 lines</span>
+          <p>Here's the whole "hello world" of the OpenAI Agents SDK — an agent with instructions, and a
+          runner that executes it:</p>
+          <pre><span class="kw">from</span> agents <span class="kw">import</span> Agent, Runner
+
+agent = Agent(
+    name=<span class="st">"Assistant"</span>,
+    instructions=<span class="st">"You are a friendly helper. Answer concisely."</span>,
+)
+
+result = Runner.run_sync(agent, <span class="st">"Write a haiku about recursion."</span>)
+<span class="cm"># print the agent's final answer</span>
+<span class="kw">print</span>(result.final_output)</pre>
+          <p>No graph, no state schema, no loop wiring. The <code class="inl">Agent</code> holds the
+          config; <code class="inl">Runner.run_sync</code> does the work and hands back a result object
+          whose <code class="inl">final_output</code> is the answer.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>An Agent SDK trades flexibility for <strong>speed and clarity</strong> on the common path.
+          Learn four small nouns — <strong>Agent, Tool, Handoff, Run</strong> — and you can describe
+          almost any agent system. The SDK fills in the loop, the tool plumbing, and the routing.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An Agent SDK is a focused library for building agents. The OpenAI Agents SDK gives you four
+          primitives: <strong>Agents</strong> (LLM + instructions + tools), <strong>Tools</strong>
+          (functions the agent can call), <strong>Handoffs</strong> (delegating to another agent), and
+          the <strong>Runner</strong> (the engine that runs the loop). Plus guardrails and sessions as
+          extras.
+        </div>
+      </section>
+
+      <!-- ===================== 3. LIFECYCLE / RUN LOOP ===================== -->
+      <section id="lifecycle">
+        <h2><span class="sec-num">3</span> The agent lifecycle: how a single run executes</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture a smart helper doing your homework. They read the question, maybe grab a
+          calculator (a tool), look at the calculator's answer, decide if they're done, and if not,
+          grab another tool — over and over — until they can finally write the answer at the bottom of
+          the page. The <strong>run loop</strong> is exactly that "do I need a tool, or am I done?"
+          cycle, repeated until the helper writes the final answer.</p>
+        </div>
+
+        <p>When you call <code class="inl">Runner.run(...)</code>, the SDK executes an
+        <span class="term">agent loop</span> on your behalf. This is the same think-act-observe loop from
+        Session 3 — but you don't build it; the Runner does. Here's what happens on each turn.</p>
+
+        <h3>The run loop, step by step</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">1. Call the model</div><div class="s-d">Send instructions + history + tool list</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">2. Final or tool?</div><div class="s-d">Did the model answer, or ask for a tool/handoff?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔧</div><div class="s-t">3. Run tools</div><div class="s-d">Execute the requested tool calls</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👀</div><div class="s-t">4. Observe</div><div class="s-d">Append tool results to the conversation</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔁</div><div class="s-t">5. Repeat</div><div class="s-d">Loop back to step 1 until a final answer</div></div>
+        </div>
+
+        <p>More precisely, each iteration of the loop does this:</p>
+        <ol>
+          <li><strong>Call the LLM</strong> for the current agent, passing its instructions, the running
+          conversation, and the schemas of all available tools and handoffs.</li>
+          <li><strong>Inspect the model's reply</strong> and branch on what it asked for:
+            <ul>
+              <li><em>A final output</em> (plain text, or a structured object if you set an output type)
+              → the loop <strong>ends</strong> and that becomes <code class="inl">result.final_output</code>.</li>
+              <li><em>A handoff</em> → switch the "current agent" to the target agent and loop again
+              (covered in Topic 6).</li>
+              <li><em>One or more tool calls</em> → run them, append each result back into the
+              conversation as an <span class="term">observation</span>, and loop again.</li>
+            </ul>
+          </li>
+          <li><strong>Safety brake:</strong> the loop is bounded by a <span class="term">max turns</span>
+          limit so a misbehaving agent can't loop forever (it raises an error if exceeded).</li>
+        </ol>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: watching a run unfold</span>
+          <p>Agent has a <code class="inl">get_weather(city)</code> tool. User asks:
+          <code class="inl">"What should I wear in Paris today?"</code></p>
+          <ul>
+            <li><strong>Turn 1 — model call:</strong> the LLM decides it needs the weather and emits a
+            tool call <code class="inl">get_weather("Paris")</code> (not a final answer).</li>
+            <li><strong>Tool runs:</strong> the SDK executes your Python function → returns
+            <code class="inl">"18°C, light rain"</code>. That string is appended as an observation.</li>
+            <li><strong>Turn 2 — model call:</strong> now the LLM has the weather in its context. This
+            time it produces a <em>final answer</em>: "It's 18°C with light rain in Paris — wear a
+            jacket and bring an umbrella." Loop ends.</li>
+          </ul>
+          <p>Two model calls, one tool call, no plumbing written by you. The Runner orchestrated all of
+          it.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Async, sync, and streaming</span>
+          <p>The same loop is exposed three ways: <code class="inl">Runner.run(...)</code> (async,
+          returns when done), <code class="inl">Runner.run_sync(...)</code> (a blocking convenience
+          wrapper), and <code class="inl">Runner.run_streamed(...)</code> (emits events as they happen,
+          so you can show progress live — like ChatGPT typing out). Same loop underneath; different ways
+          to consume it.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>A "run" is one full pass of the loop — possibly many model calls and tool calls — that ends
+          when the agent produces a final output (or hits the max-turns brake). The loop logic that you
+          hand-built as nodes and edges in LangGraph is provided for you here.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The run loop = call model → is it a final answer, a handoff, or tool calls? → run any tools and
+          feed results back → repeat, bounded by a max-turns limit. The Runner drives it; you just call
+          <code class="inl">run</code> / <code class="inl">run_sync</code> / <code class="inl">run_streamed</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TOOL PATTERNS ===================== -->
+      <section id="tools">
+        <h2><span class="sec-num">4</span> Tool patterns in the SDK</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A tool is a gadget you give your helper — a calculator, a weather-checker, a search box.
+          The tricky part used to be writing a little instruction card telling the helper exactly what
+          the gadget does and what buttons it has. The SDK reads your gadget (your function) and writes
+          that instruction card <em>for</em> you, automatically.</p>
+        </div>
+
+        <p>Recall from Session 3 that for an LLM to call a tool, the model needs a description of it: the
+        tool's name, what it does, and what arguments it takes (its <span class="term">schema</span>).
+        The model reads these descriptions to decide <em>which</em> tool to call and <em>with what
+        arguments</em>. Writing that schema by hand (often as JSON) is exactly the boilerplate the SDK
+        removes.</p>
+
+        <h3>Function tools — turn any function into a tool</h3>
+        <p>The most common pattern is the <span class="term">function tool</span>: you write a normal
+        Python function and add a small decorator. The SDK then:</p>
+        <ul>
+          <li>uses the <strong>function name</strong> as the tool name;</li>
+          <li>reads the <strong>docstring</strong> to describe what the tool does (and even each
+          parameter);</li>
+          <li>reads your <strong>type hints</strong> to build the argument schema automatically;</li>
+          <li>uses <span class="term">Pydantic</span> (a Python data-validation library) to
+          <strong>validate</strong> the model's arguments before your code ever runs.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Defining a function tool</span>
+          <pre><span class="kw">from</span> agents <span class="kw">import</span> Agent, Runner, function_tool
+
+<span class="cm"># The decorator turns this plain function into a tool.</span>
+<span class="cm"># Name, description, and arg schema are all derived automatically.</span>
+@function_tool
+<span class="kw">def</span> get_weather(city: str) -&gt; str:
+    <span class="st">"""Return the current weather for a given city.
+
+    Args:
+        city: The name of the city, e.g. "Paris".
+    """</span>
+    <span class="cm"># (a real version would call a weather API)</span>
+    <span class="kw">return</span> <span class="st">f"18°C, light rain in {city}"</span>
+
+agent = Agent(
+    name=<span class="st">"Weather bot"</span>,
+    instructions=<span class="st">"Help users with weather. Use tools when needed."</span>,
+    tools=[get_weather],          <span class="cm"># just hand it the function</span>
+)
+
+result = Runner.run_sync(agent, <span class="st">"What's it like in Paris?"</span>)
+<span class="kw">print</span>(result.final_output)</pre>
+          <p>Notice: no JSON schema, no manual registration. The type hint <code class="inl">city: str</code>
+          and the docstring become the tool's contract that the model sees.</p>
+        </div>
+
+        <h3>How the SDK exposes tools to the model</h3>
+        <p>Under the hood, on every model call (step 1 of the loop), the SDK includes the generated schema
+        of each tool in the request. The model replies with a structured "I want to call
+        <code class="inl">get_weather</code> with <code class="inl">{"city": "Paris"}</code>" message. The
+        SDK then validates those arguments against your type hints, runs your function, captures the
+        return value, and feeds it back as an observation. If validation fails (say the model sends a
+        number where a string is required), the SDK can surface a clear error back to the model so it can
+        correct itself — far safer than your raw code crashing on bad input.</p>
+
+        <div class="callout note">
+          <span class="c-title">Other kinds of tools</span>
+          <p>Beyond your own functions, SDKs typically also offer <strong>hosted tools</strong> the model
+          provider runs for you (e.g. web search, code execution, file search) and the ability to expose
+          <strong>another agent as a tool</strong> (so a "main" agent can call a specialist and get just
+          its answer back, without fully handing over the conversation — contrast this with handoffs in
+          Topic 6).</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Good tools need good descriptions</span>
+          <p>The model only knows what your name, docstring, and type hints tell it. Vague names
+          (<code class="inl">do_thing</code>) or missing docstrings make the model misuse or skip your
+          tool. Treat the docstring like a tiny prompt — clear, specific, with units and examples where
+          helpful.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The headline tool pattern is the <strong>function tool</strong>: decorate a typed, documented
+          Python function and the SDK auto-generates its schema, validates arguments with Pydantic, and
+          exposes it to the model each turn. You skip the hand-written JSON schema from Session 3 — but
+          clear names and docstrings still matter, because that's all the model sees.
+        </div>
+      </section>
+
+      <!-- ===================== 5. ORCHESTRATION ===================== -->
+      <section id="orchestration">
+        <h2><span class="sec-num">5</span> Orchestration: coordinating many specialised agents</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a hospital front desk. You walk in and tell the receptionist your problem; they
+          don't fix you themselves — they send you to the right specialist (a dentist, an eye doctor,
+          a bone doctor). The receptionist is a <strong>triage agent</strong>: their whole job is to
+          listen, figure out what you need, and route you to the agent who's best at it.</p>
+        </div>
+
+        <p><span class="term">Orchestration</span> means: when you have several agents, how do they work
+        together? A single do-everything agent often performs worse than a team of focused specialists —
+        each with a tight, simple set of instructions and tools. The classic pattern is a
+        <span class="term">triage agent</span> (also called a router or coordinator) that decides which
+        specialist should handle the request.</p>
+
+        <h3>Two flavours of orchestration</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Style</th><th>Who decides the flow</th><th>When to use</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Orchestrate via the LLM</strong></td><td>The model decides — using handoffs and tools — which agent acts next. Flexible and adaptive.</td><td>Open-ended tasks where you can't predict the path; you trust the model to route.</td></tr>
+              <tr><td><strong>Orchestrate via code</strong></td><td>Your Python code decides the order (if/else, loops, running agents in sequence or parallel). Predictable and cheap.</td><td>Known workflows where you want deterministic, repeatable steps.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>You can mix both: code for the overall pipeline, the LLM for the fuzzy routing decisions.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a triage agent routing to specialists</span>
+          <p>A help desk has two specialists — a billing agent and a tech-support agent — and a triage
+          agent that decides who should answer:</p>
+          <pre><span class="kw">from</span> agents <span class="kw">import</span> Agent, Runner
+
+billing_agent = Agent(
+    name=<span class="st">"Billing"</span>,
+    instructions=<span class="st">"You handle invoices, refunds, and payment questions."</span>,
+)
+
+tech_agent = Agent(
+    name=<span class="st">"Tech support"</span>,
+    instructions=<span class="st">"You troubleshoot login, setup, and bug issues."</span>,
+)
+
+triage_agent = Agent(
+    name=<span class="st">"Triage"</span>,
+    instructions=(
+        <span class="st">"Decide which specialist should help, then hand off. "</span>
+        <span class="st">"Use Billing for money questions, Tech support for technical ones."</span>
+    ),
+    handoffs=[billing_agent, tech_agent],   <span class="cm"># the specialists it can route to</span>
+)
+
+result = Runner.run_sync(triage_agent, <span class="st">"My card was charged twice!"</span>)
+<span class="kw">print</span>(result.final_output)   <span class="cm"># answered by the Billing agent</span></pre>
+          <p>The user talks to one entry point (triage). The triage agent reads the message, decides
+          "this is billing," and hands off. The Billing agent produces the final answer.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Link back to LangGraph</span>
+          <p>In Session 6, this same idea was an explicit <strong>graph</strong>: a router node with
+          conditional edges pointing to specialist nodes, all sharing one state object. The SDK
+          expresses the same orchestration with one list — <code class="inl">handoffs=[...]</code> — and
+          lets the model do the routing. Less wiring, but also less fine-grained control over the exact
+          path (the trade-off we'll formalise in Topic 7).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Orchestration = coordinating multiple specialist agents. A common pattern is a
+          <strong>triage agent</strong> that routes work to the right specialist. You can orchestrate via
+          the LLM (flexible, model-driven) or via code (predictable, you control the order) — or mix
+          both. In the SDK, model-driven routing is expressed mostly through <strong>handoffs</strong>.
+        </div>
+      </section>
+
+      <!-- ===================== 6. HANDOFFS ===================== -->
+      <section id="handoffs">
+        <h2><span class="sec-num">6</span> Handoffs: one agent delegating to another</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you call a phone helpline. The first person can't fix your problem, so they say
+          "let me transfer you to someone who can" — and now you're talking to a different, more expert
+          person who takes over the whole conversation. A <strong>handoff</strong> is that transfer:
+          one agent passes the baton (the whole conversation) to another agent.</p>
+        </div>
+
+        <p>A <span class="term">handoff</span> lets one agent <em>delegate control</em> of the run to
+        another agent. After a handoff, the new agent becomes the "current agent" in the loop (Topic 3):
+        it sees the conversation so far and takes over producing the answer. Cleverly, the SDK exposes
+        handoffs <em>to the model as a special kind of tool</em> — so from the model's point of view,
+        "transfer to the Billing agent" looks like just another action it can choose. You can declare
+        them simply by listing target agents, or use the <code class="inl">handoff()</code> helper to
+        customise the name, description, or filter what context gets passed along.</p>
+
+        <h3>Handoff vs a plain tool call — the crucial difference</h3>
+        <p>This is the part beginners mix up. Both are "actions the model can take," but they do very
+        different things:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Plain tool call</th><th>Handoff</th></tr></thead>
+            <tbody>
+              <tr><td>What happens</td><td>Run a function, get a result <em>back</em>.</td><td>Transfer the conversation to another agent.</td></tr>
+              <tr><td>Who's in charge after</td><td>The <em>same</em> agent — it keeps control and reads the tool's result.</td><td>A <em>different</em> agent — it takes over the run.</td></tr>
+              <tr><td>Control returns?</td><td>Yes — back to the calling agent to continue reasoning.</td><td>Not by default — the new agent now drives (it may answer or hand off again).</td></tr>
+              <tr><td>Good for</td><td>Fetching data / doing an action (weather, math, DB lookup).</td><td>Routing to a specialist with different instructions/tools.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The mental model</span>
+          <p>A <strong>tool call</strong> is "go get me something and bring it back." A
+          <strong>handoff</strong> is "you take this from here." One returns a value to the same agent;
+          the other passes the baton to a new agent. (Contrast also with <em>agent-as-a-tool</em> from
+          Topic 4: that calls a sub-agent and brings its answer <em>back</em> — so it behaves like a
+          tool call, not a handoff.)</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Handoffs in action (with a customised handoff)</span>
+          <pre><span class="kw">from</span> agents <span class="kw">import</span> Agent, Runner, handoff
+
+refund_agent = Agent(
+    name=<span class="st">"Refunds"</span>,
+    instructions=<span class="st">"Process refund requests politely and confirm the amount."</span>,
+)
+
+support_agent = Agent(
+    name=<span class="st">"Support"</span>,
+    instructions=<span class="st">"Help users. If they want a refund, hand off to Refunds."</span>,
+    handoffs=[
+        refund_agent,                         <span class="cm"># simple: just list the agent</span>
+        handoff(                              <span class="cm"># or customise the handoff</span>
+            refund_agent,
+            tool_name_override=<span class="st">"escalate_to_refunds"</span>,
+        ),
+    ],
+)
+
+result = Runner.run_sync(support_agent, <span class="st">"I want my money back for order 42."</span>)
+<span class="cm"># The Refunds agent now owns the conversation and produces the answer.</span>
+<span class="kw">print</span>(result.final_output)</pre>
+          <p>The support agent recognises a refund request and hands off. From that point, the Refunds
+          agent — with its own instructions — runs the loop and produces the final output. Control did
+          <em>not</em> bounce back to support.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">What gets passed along</span>
+          <p>By default the receiving agent sees the whole conversation so far, so it has context. You
+          can attach an <span class="term">input filter</span> to trim or reshape that history (e.g. drop
+          earlier tool noise), and add an <code class="inl">on_handoff</code> callback to run code at the
+          moment of transfer (like logging or fetching data). This is the SDK's first-class version of
+          the routing edges you drew by hand in LangGraph.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A handoff transfers control of the run to another agent — the new agent takes over and drives.
+          The model picks handoffs like tools, but the effect is different: a <strong>tool call</strong>
+          returns a value to the <em>same</em> agent, while a <strong>handoff</strong> passes the baton
+          to a <em>different</em> agent. Handoffs are how the SDK does specialist routing.
+        </div>
+      </section>
+
+      <!-- ===================== 7. SDK VS FRAMEWORK ===================== -->
+      <section id="vs">
+        <h2><span class="sec-num">7</span> SDK vs framework: when to pick which</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>An Agent SDK is like a pre-built toy kit: fast, neat, and great for the usual toys. A
+          framework like LangGraph is like a full LEGO box: more work, but you can build <em>anything</em>,
+          exactly how you want. Neither is "better" — it depends on what you're making and how much
+          control you need.</p>
+        </div>
+
+        <p>You now know both worlds: the lower-level <span class="term">framework</span>
+        (LangChain/LangGraph, Session 6) where you assemble the graph yourself, and the higher-level
+        <span class="term">Agent SDK</span> (OpenAI Agents SDK) where the common shape is handed to you.
+        Here's how they compare.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Dimension</th><th>Agent SDK (e.g. OpenAI Agents SDK)</th><th>Framework (LangChain / LangGraph)</th></tr></thead>
+            <tbody>
+              <tr><td>Abstraction level</td><td>High — think in Agents, Tools, Handoffs, Runs.</td><td>Lower — think in nodes, edges, state, and an explicit graph.</td></tr>
+              <tr><td>Boilerplate</td><td>Minimal — loop, schemas, and routing provided.</td><td>More — you build the loop, state schema, and wiring.</td></tr>
+              <tr><td>Control over flow</td><td>Good for standard agent + handoff patterns; less granular for unusual flows.</td><td>Maximum — arbitrary cycles, branching, pauses, human-in-the-loop.</td></tr>
+              <tr><td>Learning curve</td><td>Gentle — a handful of concepts.</td><td>Steeper — more concepts and moving parts.</td></tr>
+              <tr><td>Flexibility / customisation</td><td>Covers the common cases cleanly; custom logic means dropping lower.</td><td>Build essentially any control flow you can imagine.</td></tr>
+              <tr><td>Lock-in</td><td>Lighter (the OpenAI SDK is small, open-source, and works across many model providers), but you adopt its agent model.</td><td>Framework-shaped code and concepts; portable across many models, but tied to the framework's patterns.</td></tr>
+              <tr><td>Best for</td><td>Getting a real agent or small multi-agent app running quickly.</td><td>Complex, bespoke workflows needing precise, custom orchestration.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">A simple rule of thumb</span>
+          <p><strong>Start with the SDK.</strong> If your app is "an agent (or a few) with some tools and
+          handoffs," the SDK gets you there fast and readably. <strong>Reach for the framework</strong>
+          when you hit something the SDK can't express cleanly — custom control flow, intricate
+          branching, long-running stateful graphs, fine-grained human-in-the-loop. Many teams even use
+          both: the framework for a complex backbone, an SDK-style agent inside a node.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Don't over-engineer</span>
+          <p>The most common beginner mistake is reaching for the most powerful tool first. If a simple
+          SDK agent solves the problem, using a full graph framework just adds complexity, bugs, and
+          maintenance cost. Pick the <em>lowest</em> amount of machinery that does the job.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An Agent SDK is high-level, low-boilerplate, and fast for standard agents; a framework like
+          LangGraph is lower-level and maximally flexible for custom flows. Default to the SDK for the
+          common case, and step down to the framework only when you genuinely need its extra control —
+          or combine them.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how to build agents the easy way. Here's the one-paragraph story that ties
+        all seven topics together:</p>
+        <div class="bigidea">
+          <p>Building agents directly in <strong>LangGraph</strong> (Session 6) is powerful but
+          low-level — lots of state, nodes, edges, and a hand-built loop. An <strong>Agent SDK</strong>
+          like the <em>OpenAI Agents SDK</em> packages the common shape for you with four primitives:
+          an <strong>Agent</strong> (an LLM plus instructions, tools, and handoffs), <strong>Tools</strong>
+          (typically typed Python <em>function tools</em> whose schema the SDK auto-generates and
+          validates), <strong>Handoffs</strong> (delegating the whole conversation to a specialist —
+          unlike a tool call, control doesn't come back), and a <strong>Runner</strong> that executes
+          the <strong>run loop</strong> (call model → tool/handoff/final? → run tools → observe →
+          repeat). With these you can <strong>orchestrate</strong> a team of agents — e.g. a triage
+          agent routing to specialists — either model-driven or code-driven. Choose the <strong>SDK</strong>
+          for the common case and speed, and drop to a <strong>framework</strong> only when you need
+          custom, fine-grained control.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the four core primitives of the OpenAI Agents SDK?</summary>
+          <p class="ans">Agents (LLM + instructions + tools/handoffs), Tools (capabilities the agent can
+          call), Handoffs (delegating to another agent), and the Run/Runner (the engine that executes the
+          loop). Guardrails and sessions are useful extras on top.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the run loop, what three things can the model's reply be, and what happens for each?</summary>
+          <p class="ans">A final output → the loop ends and that's the answer. A handoff → switch to the
+          target agent and continue. One or more tool calls → run them, append the results as
+          observations, and loop again (bounded by a max-turns limit).</p>
+        </details>
+        <details class="quiz">
+          <summary>How is a handoff different from a plain tool call?</summary>
+          <p class="ans">A tool call runs a function and returns a result to the <em>same</em> agent,
+          which stays in control. A handoff transfers the whole conversation to a <em>different</em>
+          agent, which then takes over driving the run — control doesn't return by default.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why don't you have to write a JSON schema for a function tool?</summary>
+          <p class="ans">The SDK auto-generates it: the function name becomes the tool name, the docstring
+          becomes the description, and the type hints define the argument schema (validated with
+          Pydantic). You still need clear names and docstrings, since that's all the model sees.</p>
+        </details>
+        <details class="quiz">
+          <summary>When should you reach for LangGraph instead of an Agent SDK?</summary>
+          <p class="ans">When you need custom, fine-grained control flow the SDK can't express cleanly —
+          arbitrary cycles, intricate branching, long-running stateful graphs, or detailed
+          human-in-the-loop. For a standard "agent + tools + handoffs," the SDK is faster and simpler.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-6.html"><div class="dir">← Previous</div><div class="ttl">Session 6: LangChain &amp; LangGraph</div></a>
+        <a class="next" href="session-8.html"><div class="dir">Next →</div><div class="ttl">Session 8: Threads &amp; Tracing in Agent SDK</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 7 — Agent SDK: Fundamentals · You can now build agents the easy way 🤖</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

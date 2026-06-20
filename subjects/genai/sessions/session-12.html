@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 12 — Model Context Protocol &amp; Agent Communication</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 12</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 12 · MCP &amp; Agent Communication</span>
+      <h1>How AI agents plug into tools and talk to each other</h1>
+      <p class="lead">
+        In earlier sessions you taught a single agent to call tools and hand work to other agents.
+        Today we zoom out: how do agents connect to the <em>whole world</em> of tools without rebuilding
+        an adapter every single time, and how do many agents cooperate on one job? We'll meet
+        <strong>MCP</strong> (the "USB-C for AI") and the patterns for agents talking to agents. As
+        always, we start every topic with a tiny "explain like I'm 5" story before going deep.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what-is-mcp">What is MCP?</a></li>
+          <li><a href="#architecture">MCP architecture</a></li>
+          <li><a href="#tool-servers">Tool servers</a></li>
+          <li><a href="#context">Context management</a></li>
+          <li><a href="#a2a">Agent-to-agent communication</a></li>
+          <li><a href="#orchestrator">Orchestrator patterns</a></li>
+          <li><a href="#handoffs">Handoff protocols</a></li>
+          <li><a href="#building">Building MCP tools &amp; production</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHAT IS MCP ===================== -->
+      <section id="what-is-mcp">
+        <h2><span class="sec-num">1</span> What is MCP (Model Context Protocol)?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your phone, your laptop, your headphones, and your camera all used to need a
+          <em>different shaped plug</em>. What a mess — a drawer full of tangled cables! Then someone
+          invented <strong>USB-C</strong>: one little plug that fits everything. Now any device can talk
+          to any other device with the same cable. <strong>MCP is USB-C, but for AI.</strong> It's one
+          standard way for an AI to plug into any tool — a calculator, your email, a database — without
+          needing a special custom cable for each one.</p>
+        </div>
+
+        <p><span class="term">MCP (Model Context Protocol)</span> is an <strong>open standard</strong>
+        (introduced by Anthropic in late 2024 and now widely adopted across the industry) for connecting
+        AI models and agents to external tools and data sources. Back in Session 3 you learned about
+        <span class="term">tool calling</span> (also called function calling): how a model can ask the
+        program around it to run a function — fetch the weather, query a database, send an email. MCP
+        takes that idea and answers a bigger question: <em>how do we make tools shareable and reusable
+        across every app and every model, instead of wiring each one by hand?</em></p>
+
+        <h3>The problem MCP exists to solve: N×M integrations</h3>
+        <p>Before MCP, every AI application had to write its own custom integration code for every tool
+        it wanted to use. If you had <strong>N</strong> AI apps and <strong>M</strong> tools, you could
+        end up writing up to <strong>N × M</strong> separate integrations — a combinatorial explosion.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example of the N×M mess</span>
+          <p>Say 4 different AI apps (a chatbot, a coding assistant, a research agent, a support bot) each
+          want to use 5 tools (GitHub, Slack, a Postgres database, Google Drive, Jira). Without a standard,
+          someone has to build and maintain <strong>4 × 5 = 20</strong> bespoke integrations. Add one new
+          tool and you now owe 4 more. Add one new app and you owe 5 more. It never ends.</p>
+          <p>With MCP, each tool is wrapped <strong>once</strong> as an MCP server (5 servers), and each app
+          speaks MCP <strong>once</strong> (4 clients). Now it's <strong>4 + 5 = 9</strong> pieces, and any
+          app instantly works with any tool. N×M became N+M.</p>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>MCP replaces a tangle of one-off, custom integrations with <strong>one common language</strong>.
+          Build a tool as an MCP server once, and <em>every</em> MCP-compatible model or agent can use it.
+          Teach your app to speak MCP once, and it can use <em>every</em> MCP tool ever made. That's the
+          "USB-C for AI" promise.</p>
+        </div>
+
+        <h3>Why this matters now</h3>
+        <ul>
+          <li><strong>Reusability</strong> — the community builds a library of ready-made servers (filesystem,
+          GitHub, databases, Slack…) that anyone can drop in.</li>
+          <li><strong>Vendor-neutral</strong> — because it's an open standard, an MCP server works whether the
+          model behind it is Claude, GPT, Gemini, or a local model. You're not locked in.</li>
+          <li><strong>Separation of concerns</strong> — the people who build a tool and the people who build an
+          agent don't have to coordinate. They just both speak MCP.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">MCP vs plain function calling</span>
+          <p>Function calling (Session 3) is the <em>model's</em> ability to request a tool. MCP is the
+          <em>plumbing standard</em> for where those tools live and how they're discovered and run. You can
+          think of function calling as "the model can ask for a tool," and MCP as "here's the universal socket
+          those tools plug into." MCP uses function-calling under the hood.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          MCP is an open standard — "USB-C for AI" — for connecting models and agents to tools and data. It
+          exists to kill the N×M integration explosion: wrap a tool as an MCP server once, teach an app MCP
+          once, and any app can use any tool. It builds directly on the tool/function calling idea from
+          Session 3.
+        </div>
+      </section>
+
+      <!-- ===================== 2. ARCHITECTURE ===================== -->
+      <section id="architecture">
+        <h2><span class="sec-num">2</span> MCP architecture: host, client, and server</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of a restaurant. You (the hungry person) are the <strong>host</strong> — you decide what
+          you want. The <strong>waiter</strong> carries your order back and forth; that's the
+          <strong>client</strong>. The <strong>kitchen</strong> actually cooks the food and hands it back;
+          that's the <strong>server</strong>. You never walk into the kitchen yourself — the waiter handles
+          all the talking. MCP works the same way: a tidy little chain of host → client → server.</p>
+        </div>
+
+        <p>MCP has three roles. Getting these straight makes everything else click.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Role</th><th>What it is</th><th>Restaurant analogy</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Host</span></td><td>The AI application the user interacts with (e.g. Claude Desktop, an IDE, your custom agent built on the Agent SDK from Session 7). It contains the LLM and decides what needs doing.</td><td>The diner who decides what to order.</td></tr>
+              <tr><td><span class="term">Client</span></td><td>A connector that lives inside the host. The host spins up <em>one client per server</em>. The client speaks the MCP protocol and manages the connection.</td><td>The waiter assigned to one kitchen.</td></tr>
+              <tr><td><span class="term">Server</span></td><td>A separate program that exposes tools, data, and prompts. It does the actual work (read a file, query GitHub) and returns results.</td><td>The kitchen that cooks the order.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How the model discovers and calls a tool</h3>
+        <p>The beautiful part is <strong>discovery</strong>: the host doesn't need to know in advance what a
+        server offers. When it connects, it simply <em>asks</em>. This is what makes MCP plug-and-play.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔌</div><div class="s-t">1. Connect</div><div class="s-d">Host's client opens a connection to a server</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📋</div><div class="s-t">2. Discover</div><div class="s-d">Client asks "what tools do you have?"</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">3. Decide</div><div class="s-d">Model sees the tool list, picks one to call</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">4. Execute</div><div class="s-d">Server runs the tool with the given inputs</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">5. Return</div><div class="s-d">Result flows back; model uses it in its answer</div></div>
+        </div>
+
+        <p>Under the hood, MCP messages use <span class="term">JSON-RPC</span> — a simple, standard format
+        for "call this function with these arguments, send back this result." The connection can run over
+        different <span class="term">transports</span>: <code class="inl">stdio</code> (the server runs as a
+        local subprocess, talking over standard input/output) for local tools, or HTTP-based transports for
+        remote servers. You usually don't worry about the transport — the client handles it.</p>
+
+        <div class="callout example">
+          <span class="c-title">Walkthrough: "What files are in my project?"</span>
+          <p>You ask your IDE agent that question. (1) The host already connected its client to a
+          <strong>filesystem MCP server</strong>. (2) At connect time the client discovered the server
+          offers a <code class="inl">list_directory</code> tool. (3) The model, seeing this tool exists,
+          decides to call <code class="inl">list_directory("/my/project")</code>. (4) The server reads the
+          folder and (5) returns the list of files. The model then phrases a friendly answer. You never saw
+          any of the plumbing.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">One host, many servers</span>
+          <p>A single host can connect to many MCP servers at once — one for files, one for GitHub, one for
+          your database — each through its own client. The model sees the combined menu of all their tools and
+          mixes and matches as needed. This is exactly the same model that powers an Agent SDK agent (Session 7)
+          choosing among its available tools.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          MCP has three roles: the <strong>host</strong> (the AI app with the model), the <strong>client</strong>
+          (one connector per server, inside the host), and the <strong>server</strong> (the program exposing
+          tools). The flow is connect → discover → decide → execute → return, carried over JSON-RPC. Discovery
+          is what makes tools plug-and-play.
+        </div>
+      </section>
+
+      <!-- ===================== 3. TOOL SERVERS ===================== -->
+      <section id="tool-servers">
+        <h2><span class="sec-num">3</span> Tool servers: tools, resources &amp; prompts</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>An MCP server is like a toolbox you hand the robot. But it doesn't only hold
+          <strong>tools</strong> (things the robot can <em>do</em>, like a hammer). It also holds
+          <strong>resources</strong> (things the robot can <em>read</em>, like a book) and
+          <strong>prompts</strong> (little instruction cards that say "here's a good way to use me"). Three
+          kinds of helpful stuff, all in one box.</p>
+        </div>
+
+        <p>An MCP server can expose three different kinds of capabilities. Knowing the difference helps you
+        understand what a server is really offering.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Capability</th><th>What it is</th><th>Who controls it</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Tools</span></td><td>Actions the model can <em>perform</em> — functions that <em>do</em> something, often with side effects.</td><td>Model-driven (the model decides to call it).</td><td><code class="inl">create_issue</code>, <code class="inl">run_query</code>, <code class="inl">send_message</code></td></tr>
+              <tr><td><span class="term">Resources</span></td><td>Read-only data the model can <em>load</em> as context — like files or records, addressed by a URI.</td><td>App/host-driven (the app chooses what to pull in).</td><td>A file's contents, a row from a database, a webpage</td></tr>
+              <tr><td><span class="term">Prompts</span></td><td>Reusable prompt templates the server suggests for common tasks — pre-written instructions.</td><td>User-driven (the user picks one, e.g. a slash command).</td><td>"Summarise this PR", "Write a SQL query for…"</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The key distinction: <strong>tools <em>act</em></strong> (and the model triggers them),
+        <strong>resources <em>inform</em></strong> (the app feeds them in as context — more on this in
+        Topic 4), and <strong>prompts <em>guide</em></strong> (handy templates the user invokes).</p>
+
+        <h3>Examples of real MCP servers</h3>
+        <ul>
+          <li><strong>Filesystem server</strong> — tools to read, write, list, and search files in a folder.
+          Resources for file contents. The classic "hello world" of MCP.</li>
+          <li><strong>Database server</strong> (e.g. Postgres/SQLite) — a tool to run queries, plus resources
+          exposing table schemas so the model knows what columns exist before writing SQL.</li>
+          <li><strong>GitHub server</strong> — tools to read repositories, open issues, create pull requests,
+          and review code; resources for file contents and issue threads.</li>
+          <li><strong>Web/search servers</strong> — tools to fetch a URL or run a search, giving the model
+          fresh information beyond its knowledge cutoff (recall the cutoff problem from Session 1).</li>
+          <li><strong>Communication servers</strong> — Slack, email, calendars — tools to read and send
+          messages or schedule events.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">A database server in action</span>
+          <p>You ask: "How many orders did we get yesterday?" The model can't guess — it needs your data. It
+          (1) reads the <em>resource</em> describing your <code class="inl">orders</code> table schema, so it
+          knows the column names; (2) writes a SQL query; (3) calls the server's <code class="inl">run_query</code>
+          <em>tool</em>; (4) gets back "1,284" and answers in plain English. The resource taught it the shape of
+          your data; the tool fetched the actual number.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out: servers can be powerful</span>
+          <p>A tool that can write files, run queries, or send messages can also cause real damage if misused
+          or if the server is malicious. Only connect to MCP servers you trust, and prefer read-only or
+          scoped permissions when you can. We'll come back to security in Topic 8.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An MCP server can expose three things: <strong>tools</strong> (actions the model performs),
+          <strong>resources</strong> (read-only data loaded as context), and <strong>prompts</strong> (reusable
+          templates the user picks). Real servers exist for filesystems, databases, GitHub, search, and chat —
+          and you should only trust ones you vet.
+        </div>
+      </section>
+
+      <!-- ===================== 4. CONTEXT MANAGEMENT ===================== -->
+      <section id="context">
+        <h2><span class="sec-num">4</span> Context management: feeding the model cleanly</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Remember the AI has a small "desk" it can lay papers on (its memory for one conversation)? You
+          can't dump the whole library on the desk — it won't fit and the robot gets confused. MCP is like a
+          tidy assistant who fetches <em>only the few pages you actually need</em>, in a neat standard format,
+          and places them on the desk at just the right moment.</p>
+        </div>
+
+        <p>Back in Session 1 we met the <span class="term">context window</span> — the fixed-size "desk" of
+        tokens the model can consider at once (your prompt plus its answer). External data has to be fed
+        <em>into</em> that window to be useful. Doing this messily — dumping huge files, inconsistent formats,
+        stale data — wastes tokens (which cost money, Session 1) and confuses the model. <strong>MCP
+        standardises how external context gets fed in.</strong></p>
+
+        <h3>What "clean" context management means</h3>
+        <ul>
+          <li><strong>On-demand, not all-at-once</strong> — instead of stuffing everything into the prompt up
+          front, the model pulls in a resource only when it's actually needed, keeping the window lean.</li>
+          <li><strong>Standard format</strong> — resources arrive in a consistent MCP shape (a URI, a content
+          type, the data), so the host and model handle every source the same way.</li>
+          <li><strong>Fresh, not frozen</strong> — because resources are fetched live from the server, the
+          model sees current data, sidestepping the knowledge-cutoff limit (Session 1).</li>
+          <li><strong>Addressable</strong> — every resource has a URI (like <code class="inl">file:///report.pdf</code>
+          or <code class="inl">db://orders/schema</code>), so it can be referenced precisely rather than
+          copy-pasted.</li>
+        </ul>
+
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>MCP turns "context" from a messy copy-paste problem into a clean, structured <em>fetch</em>. The
+          right data, in a known format, pulled in only when needed — so the limited context window is spent on
+          what matters.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">The same task, messy vs MCP-clean</span>
+          <p><strong>Messy way:</strong> to answer a question about a 200-page manual, you paste the entire
+          manual into the prompt. It barely fits, costs a fortune in input tokens, and the answer might be
+          about page 3 anyway.</p>
+          <p><strong>MCP way:</strong> the manual is a <em>resource</em> on a server. The model fetches just the
+          relevant section as context when it needs it. Far fewer tokens, cheaper, and the model isn't drowning
+          in irrelevant text. (This pairs naturally with <span class="term">RAG</span> retrieval — MCP is a
+          clean pipe for delivering retrieved chunks.)</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why this beats hard-coding context</span>
+          <p>If every app invented its own way to inject files and data, you'd get inconsistent formats and
+          duplicated effort everywhere. By standardising the <em>shape</em> of context, MCP lets any host feed
+          any server's data to any model uniformly — the same plug-and-play benefit from Topic 1, applied to
+          data instead of actions.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The model's context window (Session 1) is small and costly, so what you feed in matters. MCP
+          standardises context delivery: resources are addressable by URI, fetched on-demand in a consistent
+          format, and always fresh — keeping the window lean and the data current instead of dumping everything
+          in up front.
+        </div>
+      </section>
+
+      <!-- ===================== 5. A2A ===================== -->
+      <section id="a2a">
+        <h2><span class="sec-num">5</span> Agent-to-agent (A2A) communication</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One smart helper is great. But sometimes a job is too big for one. So instead of one robot doing
+          everything, you get a <strong>team of robots</strong>, each good at one thing — one researches, one
+          writes, one checks the math — and they <em>talk to each other</em> to get the job done together. Like
+          a group project where everyone has a role and they pass notes back and forth.</p>
+        </div>
+
+        <p>So far an agent has used <em>tools</em> (Session 3) and the Agent SDK (Session 7). Now we let agents
+        treat <em>each other</em> as collaborators. <span class="term">Agent-to-agent (A2A) communication</span>
+        is the pattern where multiple specialised agents exchange messages and share context to accomplish a
+        task no single agent would handle as well alone.</p>
+
+        <h3>Why split work across many agents?</h3>
+        <ul>
+          <li><strong>Specialisation</strong> — each agent gets a focused role, a tailored system prompt, and
+          only the tools it needs. A "researcher" agent and a "writer" agent each do their job better than one
+          generalist juggling both.</li>
+          <li><strong>Smaller, cleaner context</strong> — each agent's context window (Session 1) holds only
+          what's relevant to its narrow task, instead of one giant overloaded prompt.</li>
+          <li><strong>Modularity</strong> — you can improve, swap, or reuse one agent without rewriting the
+          whole system.</li>
+          <li><strong>Parallelism</strong> — independent sub-tasks can run at the same time.</li>
+        </ul>
+
+        <h3>What actually gets exchanged</h3>
+        <p>When agents communicate, they pass two things:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Thing</th><th>What it carries</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Messages</span></td><td>The request or result in natural language (or structured data) — e.g. "Research the top 3 competitors" or "Here are the findings: …"</td></tr>
+              <tr><td><span class="term">Shared context</span></td><td>The relevant background the receiving agent needs to do its part — the goal, prior results, constraints. Without this, the receiver is working blind.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">MCP, A2A — how do they relate?</span>
+          <p>Easy mix-up. <strong>MCP</strong> connects an agent to <em>tools and data</em> (vertical: agent →
+          tool). <strong>A2A</strong> connects an agent to <em>other agents</em> (horizontal: agent ↔ agent).
+          One is "how do I use a tool"; the other is "how do I delegate to a teammate." There's even an emerging
+          open <em>A2A protocol</em> aiming to standardise agent-to-agent messaging the way MCP standardised
+          tools.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">A research team of agents</span>
+          <p>You ask: "Write me a briefing on electric-vehicle market trends." A <strong>research agent</strong>
+          gathers data (using MCP web/search tools from Topic 3), then sends a message with its findings —
+          plus the shared goal — to a <strong>writer agent</strong>, which drafts the briefing, then passes it
+          to an <strong>editor agent</strong> that polishes it. Three specialists, talking to each other, produce
+          a better result than one agent trying to research, write, and edit in a single overloaded prompt.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A2A communication lets multiple specialised agents collaborate by exchanging <strong>messages</strong>
+          and <strong>shared context</strong>. It enables specialisation, smaller per-agent context windows,
+          modularity, and parallelism. Remember: MCP connects agents to <em>tools</em>; A2A connects agents to
+          <em>each other</em>.
+        </div>
+      </section>
+
+      <!-- ===================== 6. ORCHESTRATOR ===================== -->
+      <section id="orchestrator">
+        <h2><span class="sec-num">6</span> Orchestrator patterns: the manager &amp; the workers</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>On a building site there's one <strong>boss</strong> with the blueprint who tells each worker what
+          to build, then checks the pieces fit together. The workers don't all shout at once — the boss keeps
+          everyone organised. In agent-land, that boss is the <strong>orchestrator</strong>, and the workers are
+          the <strong>worker agents</strong>.</p>
+        </div>
+
+        <p>Once you have many agents (Topic 5), <em>someone</em> has to coordinate them. The most common and
+        reliable design is the <span class="term">orchestrator pattern</span> (also called the
+        <span class="term">supervisor</span> or manager pattern): one lead agent breaks the goal into sub-tasks,
+        delegates each to a worker agent, collects the results, and assembles the final answer.</p>
+
+        <div class="flow">
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">1. Receive goal</div><div class="s-d">Orchestrator gets the user's request</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">2. Plan &amp; split</div><div class="s-d">Breaks it into sub-tasks</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">👷</div><div class="s-t">3. Delegate</div><div class="s-d">Hands each sub-task to a worker agent</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📥</div><div class="s-t">4. Collect</div><div class="s-d">Gathers each worker's result</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧵</div><div class="s-t">5. Synthesise</div><div class="s-d">Combines into one final answer</div></div>
+        </div>
+
+        <p>The orchestrator is itself an LLM-powered agent — it <em>reasons</em> about how to divide the work,
+        which worker fits each piece, and whether the results are good enough or need another pass. This is a
+        direct extension of the <strong>orchestration</strong> ideas from Session 7; the workers are often just
+        other Agent SDK agents, and the orchestrator may even invoke them as if they were tools.</p>
+
+        <h3>A simple text picture of the pattern</h3>
+        <div class="callout note">
+          <span class="c-title">Supervisor topology</span>
+          <pre>                 ┌──────────────────┐
+   User  ──────▶ │   Orchestrator   │  (plans, delegates, synthesises)
+                 └───┬────┬─────┬───┘
+            ┌────────┘    │     └────────┐
+            ▼             ▼              ▼
+      ┌──────────┐  ┌──────────┐  ┌──────────┐
+      │ Worker A │  │ Worker B │  │ Worker C │   (specialists)
+      │ research │  │  write   │  │  verify  │
+      └──────────┘  └──────────┘  └──────────┘</pre>
+          <p>Workers report back <em>up</em> to the orchestrator, which keeps the big picture. Workers usually
+          don't talk to each other directly in this pattern — the supervisor is the hub.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Planning a trip</span>
+          <p>Goal: "Plan a 3-day Tokyo trip under $1,500." The orchestrator splits this into: (A) find flights,
+          (B) find hotels, (C) build a daily itinerary. It sends each to a specialist worker (each using its
+          own MCP tools), collects flight options, hotel options, and an itinerary, then synthesises a single
+          coherent plan that respects the budget — re-delegating if, say, the flights came back too expensive.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>More agents means more LLM calls — which means more cost and more latency (recall token economics,
+          Session 1). Multi-agent orchestration shines on genuinely complex, parallelisable tasks; for a simple
+          request, a single agent is cheaper and faster. Don't reach for a committee to answer "what's 2+2?"</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The orchestrator (supervisor/manager) pattern uses one lead agent to plan, split, delegate to worker
+          agents, collect results, and synthesise the final answer. Workers report up to the hub. It extends
+          Session 7's orchestration, and it's powerful but costs more LLM calls — so use it when the task is
+          genuinely complex.
+        </div>
+      </section>
+
+      <!-- ===================== 7. HANDOFFS ===================== -->
+      <section id="handoffs">
+        <h2><span class="sec-num">7</span> Handoff protocols: passing the baton reliably</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>In a relay race, one runner passes the baton to the next. If they fumble the handoff, the whole
+          team loses — even if everyone runs fast. When one agent passes a job to another, it has to hand over
+          the "baton" cleanly: <em>here's what we're doing, here's what I found, here's what you need to do
+          next.</em> A good <strong>handoff</strong> makes sure nothing gets dropped.</p>
+        </div>
+
+        <p>Back in Session 7 you met <span class="term">handoffs</span> — when one agent passes control of a
+        task to a more suitable agent (e.g. a triage agent routing a refund request to a billing agent). A
+        <span class="term">handoff protocol</span> is the agreed-upon way of doing that transfer
+        <strong>reliably</strong>, so the receiving agent can pick up smoothly without the user repeating
+        themselves or context getting lost.</p>
+
+        <h3>What must transfer in a clean handoff</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>What transfers</th><th>Why it's essential</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Control / who's in charge</strong></td><td>It must be unambiguous which agent now owns the task, so two agents don't both reply or both go silent.</td></tr>
+              <tr><td><strong>The goal &amp; current task</strong></td><td>The receiver needs to know what the user ultimately wants and where things stand right now.</td></tr>
+              <tr><td><strong>Conversation history / state</strong></td><td>What's been said and done so far, so the user doesn't have to re-explain (the model is stateless — Session 1 — so this must be passed explicitly).</td></tr>
+              <tr><td><strong>Collected data &amp; results</strong></td><td>Anything already gathered (search results, a partial draft) so work isn't repeated.</td></tr>
+              <tr><td><strong>Constraints</strong></td><td>Budget, deadlines, user preferences, policies — the rules the new agent must still obey.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Because every LLM is <strong>stateless</strong> (Session 1), the receiving agent remembers
+          <em>nothing</em> on its own. A handoff isn't just "you take over now" — it must carry the full relevant
+          context along with the baton, or the new agent starts blind. The quality of a multi-agent system lives
+          or dies on the quality of its handoffs.</p>
+        </div>
+
+        <h3>Handoff vs orchestration</h3>
+        <p>Two related but different shapes. In <strong>orchestration</strong> (Topic 6), the supervisor stays
+        in charge and delegates pieces, always pulling control back. In a <strong>handoff</strong>, control
+        actually <em>moves</em> to the new agent, which now drives the conversation. Many real systems blend
+        both: an orchestrator that can also fully hand off to a specialist when appropriate.</p>
+
+        <div class="callout example">
+          <span class="c-title">Support-bot handoff</span>
+          <p>A general <strong>triage agent</strong> chats with a customer and realises it's a billing dispute.
+          It hands off to the <strong>billing agent</strong>, passing along: the customer's identity and account
+          (state), the full chat so far (history), the specific complaint (current task), and the company's
+          refund policy (constraints). The billing agent picks up seamlessly — "I see you were charged twice on
+          June 3rd, let me fix that" — without the customer repeating a word. A <em>bad</em> handoff would make
+          the billing agent ask "Hi, how can I help you?" all over again. Frustrating, and a sign the baton was
+          dropped.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A handoff protocol is the reliable way one agent passes a task to another. Because models are
+          stateless, the handoff must carry control, the goal/current task, conversation state, collected data,
+          and constraints — or the new agent starts blind. Unlike orchestration (where the supervisor keeps
+          control), a handoff actually transfers control to the new agent.
+        </div>
+      </section>
+
+      <!-- ===================== 8. BUILDING & PRODUCTION ===================== -->
+      <section id="building">
+        <h2><span class="sec-num">8</span> Building MCP tools &amp; production infrastructure</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Building a tool for the robot is like building a new attachment for a toy robot: you give it a
+          <strong>name</strong> ("grabber"), say <strong>what it does</strong>, list <strong>what buttons it
+          needs</strong> (inputs), and write the bit that actually <strong>makes it work</strong>. Then, before
+          you let lots of people use your robot, you have to make sure it's <em>safe</em> — it can't grab things
+          it shouldn't, and it won't break if a hundred kids play with it at once.</p>
+        </div>
+
+        <h3>Authoring an MCP tool/server (the shape of it)</h3>
+        <p>Thanks to MCP being a standard with official SDKs (in Python, TypeScript, and more), writing a server
+        is mostly about declaring your tools. Each tool needs four things — the same anatomy as the function
+        definitions from Session 3:</p>
+        <ul>
+          <li><strong>A name</strong> — e.g. <code class="inl">get_weather</code>.</li>
+          <li><strong>A description</strong> — plain-English text telling the model <em>when and why</em> to use
+          it. This is read by the model, so write it clearly; a vague description means the model won't know to
+          call your tool.</li>
+          <li><strong>An input schema</strong> — the parameters and their types (usually JSON Schema), e.g.
+          <code class="inl">city: string</code>. This tells the model exactly what to provide.</li>
+          <li><strong>A handler</strong> — the actual code that runs when the tool is called and returns a result.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">A tool definition in spirit</span>
+          <pre>tool: "get_weather"
+description: "Get the current weather for a city.
+             Use when the user asks about weather or temperature."
+input_schema: { city: string (required) }
+handler:  (city) =&gt; call weather API, return temperature</pre>
+          <p>Register that with an MCP server, point a host at it, and <em>every</em> MCP-compatible agent can
+          now check the weather — without anyone writing a custom integration. That's the payoff from Topic 1
+          made concrete.</p>
+        </div>
+
+        <h3>What running this in production involves</h3>
+        <p>A server on your laptop is a demo. Serving real users reliably is a different game — and exactly what
+        <strong>Session 13 (Deployment, Scaling &amp; Final Demos)</strong> dives into. The big concerns:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Concern</th><th>What it means in production</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Authentication &amp; authorization</span></td><td>Verify <em>who</em> is calling (auth) and what they're <em>allowed</em> to do (authz). A remote server must not let just anyone run its tools. Tokens, OAuth, scoped permissions.</td></tr>
+              <tr><td><span class="term">Security</span></td><td>Validate and sanitise all inputs; never expose secrets; beware <span class="term">prompt injection</span> (a malicious resource trying to hijack the agent). Give tools the least privilege they need.</td></tr>
+              <tr><td><span class="term">Scaling</span></td><td>Handle many concurrent connections and tool calls without falling over — load balancing, stateless servers where possible, queuing slow work.</td></tr>
+              <tr><td><span class="term">Reliability</span></td><td>Timeouts, retries, and graceful errors so one slow tool doesn't hang the whole agent. Rate limiting to avoid runaway cost (token economics, Session 1).</td></tr>
+              <tr><td><span class="term">Observability</span></td><td>Logging, tracing, and monitoring every tool call so you can debug what the agent did and why — vital when multiple agents are involved.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Security is not optional</span>
+          <p>An MCP tool can take real actions — delete files, spend money, send emails. Combine that with
+          <strong>prompt injection</strong> (where untrusted text the agent reads tries to trick it into misusing
+          a tool) and the stakes are high. Always scope permissions tightly, require confirmation for dangerous
+          actions, and treat any data an agent ingests as potentially hostile.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Looking ahead to Session 13</span>
+          <p>Everything here — auth, security, scaling, monitoring — is the bridge to our final session, where
+          we deploy these agents and servers as real, running systems and show them off in the final demos.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Authoring an MCP tool means declaring a <strong>name</strong>, <strong>description</strong>,
+          <strong>input schema</strong>, and <strong>handler</strong> — the same anatomy as Session 3 function
+          calling. Running it in production adds authentication/authorization, security (incl. prompt injection
+          defence), scaling, reliability, and observability — all foreshadowing Session 13.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how agents connect to the wider world and to each other. Here's the one-paragraph
+        story that ties all 8 topics together:</p>
+        <div class="bigidea">
+          <p><strong>MCP</strong> is the "USB-C for AI" — an open standard that kills the <strong>N×M</strong>
+          integration mess by letting any model plug into any tool. Its architecture is a tidy chain of
+          <strong>host → client → server</strong>, where the host <em>discovers</em> what a server offers and
+          the model calls it. A server can expose <strong>tools</strong> (actions), <strong>resources</strong>
+          (read-only data), and <strong>prompts</strong> (templates), and it gives us clean
+          <strong>context management</strong> — feeding the right data into the limited context window
+          on-demand. Beyond single agents, <strong>agent-to-agent (A2A)</strong> communication lets specialists
+          exchange messages and shared context, usually coordinated by an <strong>orchestrator</strong>
+          (supervisor) that plans, delegates to workers, and synthesises results. When control truly moves
+          between agents, a reliable <strong>handoff protocol</strong> carries the goal, state, data, and
+          constraints so nothing is dropped — crucial because every model is stateless. Finally, you
+          <strong>author</strong> an MCP tool by declaring its name, description, schema, and handler, and
+          taking it to <strong>production</strong> means handling auth, security, scaling, and monitoring —
+          which is exactly where Session 13 picks up.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why is MCP called the "USB-C for AI," and what problem does it solve?</summary>
+          <p class="ans">Like USB-C is one standard plug for many devices, MCP is one standard way for any
+          model/agent to connect to any tool. It solves the N×M integration explosion: wrap a tool as a server
+          once and teach an app MCP once, so N+M pieces replace N×M custom integrations.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name the three MCP roles and what each does.</summary>
+          <p class="ans">Host (the AI app containing the model, decides what's needed), client (one connector per
+          server, lives in the host, speaks the protocol), and server (a separate program exposing tools,
+          resources, and prompts, and doing the actual work).</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between MCP and A2A communication?</summary>
+          <p class="ans">MCP connects an agent to tools and data (agent → tool, vertical). A2A connects an agent
+          to other agents (agent ↔ agent, horizontal). One is about using a tool; the other is about delegating
+          to a teammate.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why must a handoff carry the conversation state, not just say "you take over"?</summary>
+          <p class="ans">Because LLMs are stateless (Session 1) — the receiving agent remembers nothing on its
+          own. If the goal, history, collected data, and constraints aren't passed along, the new agent starts
+          blind and the user has to repeat themselves.</p>
+        </details>
+        <details class="quiz">
+          <summary>You're taking an MCP server to production. Name two infrastructure concerns beyond just "make it work."</summary>
+          <p class="ans">Any two of: authentication/authorization (who can call it and what they may do),
+          security (input validation, least privilege, prompt-injection defence), scaling (handle concurrent
+          load), reliability (timeouts/retries/rate limits), and observability (logging and tracing tool calls).
+          These all lead into Session 13.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-11.html"><div class="dir">← Previous</div><div class="ttl">Session 11: Voice-Based AI Agents</div></a>
+        <a class="next" href="session-13.html"><div class="dir">Next →</div><div class="ttl">Session 13: Deployment, Scaling &amp; Final Demos</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 12 — Model Context Protocol &amp; Agent Communication · You learned how agents plug in and team up 🤝</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 5 — RAG 2: Advanced Retrieval Strategies</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 5</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 05 · RAG 2 — Advanced Retrieval</span>
+      <h1>Making RAG actually good</h1>
+      <p class="lead">
+        Last time (Session 4) you built a basic RAG system: store documents, find the relevant ones,
+        and feed them to the model. It works… until it doesn't. In this session we fix the cracks.
+        You'll learn the clever tricks real teams use to make retrieval smarter — rewriting questions,
+        breaking them apart, faking answers, re-ranking results, grading documents, and squeezing the
+        best possible context into the window. Same gentle pace as always: every idea gets a tiny story
+        first, then the real detail, then a worked example.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#bottlenecks">Why basic RAG isn't enough</a></li>
+          <li><a href="#rewrite">Query rewriting</a></li>
+          <li><a href="#decompose">Sub-query / query decomposition</a></li>
+          <li><a href="#hyde">HyDE — hypothetical documents</a></li>
+          <li><a href="#rerank">Re-ranking</a></li>
+          <li><a href="#judge">LLM-as-a-judge</a></li>
+          <li><a href="#crag">Corrective RAG (CRAG)</a></li>
+          <li><a href="#context-opt">Context-window &amp; token optimization</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 0. RECAP ===================== -->
+      <div class="recap">
+        <span class="c-title">Quick recap of basic RAG (Session 4)</span>
+        <span class="term">RAG (Retrieval-Augmented Generation)</span> gives an LLM an open book so it
+        doesn't have to answer from memory alone. The basic flow has two halves. <strong>Offline (once):</strong>
+        chop your documents into <span class="term">chunks</span>, turn each chunk into an
+        <span class="term">embedding</span> (a vector of numbers capturing meaning), and store them in a
+        <span class="term">vector database</span>. <strong>Online (per question):</strong> embed the user's
+        question, find the chunks whose vectors are <em>closest</em> to it (this is the
+        <span class="term">retrieval</span> step), paste those chunks into the prompt as context, and let
+        the model generate an answer grounded in them. In short: <strong>retrieve, then generate.</strong>
+        This whole session is about making that "retrieve" step much, much smarter.
+      </div>
+
+      <!-- ===================== 1. BOTTLENECKS ===================== -->
+      <section id="bottlenecks">
+        <h2><span class="sec-num">1</span> Why basic RAG isn't enough</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you ask a friend to fetch books from a library for your homework, but they can only
+          grab whatever has a similar <em>title</em> to your question. If you ask a fuzzy question, they
+          bring back the wrong books. If you ask a big question, they bring back books that each answer
+          only a tiny part. And even when they grab the right book, if they hand you a giant stack, you
+          might not notice the one useful page buried in the middle. Basic RAG is exactly this helpful-but-clumsy
+          friend. Today we teach the friend some tricks.</p>
+        </div>
+
+        <p>Basic RAG follows one rigid recipe: take the question exactly as typed, find the most similar
+        chunks, stuff them into the prompt, generate. The problem is that <strong>each of those steps can
+        fail quietly</strong>, and when retrieval brings back the wrong context, the model confidently
+        produces a wrong answer. Remember from Session 1: the model is a next-token predictor — give it
+        bad context and it'll happily build a fluent, wrong answer on top of it. Garbage in, garbage out.</p>
+
+        <h3>Where naive "retrieve-then-generate" breaks</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Failure</th><th>What goes wrong</th><th>Why it happens</th></tr></thead>
+            <tbody>
+              <tr><td>Bad chunks</td><td>The right information was split across two chunks, or a chunk is too big and dilutes its meaning, or too small and loses context.</td><td>Chunking is done blindly offline, before anyone knows what will be asked.</td></tr>
+              <tr><td>Ambiguous / messy queries</td><td>"How do I reset it?" — reset <em>what</em>? Typos, slang, and missing context make the question's embedding point at the wrong neighbourhood.</td><td>Retrieval matches the question's wording, not the user's true intent.</td></tr>
+              <tr><td>Vocabulary mismatch</td><td>User asks about "car insurance"; the document says "auto policy coverage." Different words, same meaning — but the vectors may not line up.</td><td>Questions and answers are written in different styles.</td></tr>
+              <tr><td>Multi-part questions</td><td>"Compare our 2023 and 2024 revenue and explain the change." One search can't grab both years <em>and</em> the explanation well.</td><td>A single embedding tries to represent several distinct information needs at once.</td></tr>
+              <tr><td><span class="term">Lost-in-the-middle</span></td><td>You retrieve 15 chunks; the crucial one sits at position 8. The model pays most attention to the start and end and skims the middle — so it misses it.</td><td>A real, measured weakness of long-context attention.</td></tr>
+              <tr><td>Irrelevant context</td><td>You retrieve 10 chunks "just in case"; 7 are off-topic. They distract the model and waste tokens.</td><td>More retrieved ≠ more accurate. Noise hurts.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The core tension: speed vs accuracy</span>
+          <p>Every fix in this session adds <strong>extra steps</strong> — more LLM calls, more searches,
+          more re-ordering. Each step makes retrieval more accurate but also <strong>slower and more
+          expensive</strong> (more tokens, more latency). The art of advanced RAG is choosing <em>which</em>
+          tricks are worth their cost for <em>your</em> problem. There's no free lunch — only better trade-offs.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">The "just retrieve more" trap</span>
+          <p>A tempting fix is to retrieve 20 or 50 chunks so the answer is "definitely in there somewhere."
+          This usually makes things <em>worse</em>: it triggers lost-in-the-middle, buries the signal in
+          noise, and burns tokens (which cost money — recall token economics from Session 1). Better retrieval
+          beats more retrieval.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example of a quiet failure</span>
+          <p>A user types <code class="inl">"whats the return window"</code> into a shopping assistant. The
+          relevant document section is titled <em>"Refund &amp; Exchange Eligibility Period."</em> Because the
+          question is short, lowercase, has a typo, and uses different vocabulary ("return window" vs "refund
+          eligibility period"), the closest chunks by embedding are actually about <em>shipping</em> windows.
+          The model dutifully answers with shipping info — fluent, confident, and wrong. Nothing
+          "errored." That's the danger: basic RAG fails <strong>silently</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Basic RAG is rigid: one fixed search on the raw question. It breaks via bad chunks, ambiguous
+          queries, vocabulary mismatch, multi-part questions, lost-in-the-middle, and irrelevant noise —
+          usually <em>silently</em>. Every advanced technique trades extra speed/cost for better accuracy,
+          and "retrieve more" is rarely the answer.
+        </div>
+      </section>
+
+      <!-- ===================== 2. QUERY REWRITING ===================== -->
+      <section id="rewrite">
+        <h2><span class="sec-num">2</span> Query rewriting</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine asking a librarian, "where's the thingy about the war?" A good librarian doesn't run
+          off confused — they first say back to you, "Ah, you mean a book about World War II for a school
+          project?" and <em>then</em> go find it. Query rewriting is the AI doing that helpful tidy-up:
+          before searching, it cleans up and clarifies your messy question so the search finds better stuff.</p>
+        </div>
+
+        <p>The first and cheapest upgrade to basic RAG is to <strong>not search the raw question</strong>.
+        Instead, we pass the user's question to an LLM first and ask it to produce a cleaner, search-friendly
+        version. This is <span class="term">query rewriting</span> (also called query reformulation or query
+        expansion). The rewritten query is what actually goes to the vector database.</p>
+
+        <h3>What rewriting fixes</h3>
+        <ul>
+          <li><strong>Typos &amp; grammar</strong> — "recieve refnd" becomes "receive a refund," so the embedding lands in the right place.</li>
+          <li><strong>Missing context from the chat</strong> — turns a follow-up like "and the second one?" into a standalone question by pulling in earlier turns. (Crucial because retrieval has no memory of the conversation on its own.)</li>
+          <li><strong>Disambiguation</strong> — "reset it" becomes "reset the wireless router to factory settings," resolving what "it" refers to.</li>
+          <li><strong>Vocabulary expansion</strong> — adds synonyms and the formal terms documents actually use ("car insurance" → "car insurance auto policy coverage premium"), bridging the vocabulary-mismatch gap from Topic 1.</li>
+          <li><strong>Style matching</strong> — rephrases a casual question into the kind of declarative wording your documents are written in, so their embeddings line up better.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Where it sits in the pipeline</span>
+          <p>Rewriting is a small extra LLM call that happens <em>before</em> retrieval: <strong>user question
+          → LLM rewrite → search the rewrite → retrieve → generate</strong>. It's cheap (a short prompt and a
+          short output) and often gives the biggest accuracy bump per dollar of any technique here, which is
+          why it's usually the first thing teams add.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Before &amp; after</span>
+          <p><strong>Conversation so far:</strong> the user has been chatting about a Dell XPS 13 laptop.</p>
+          <p><strong>Raw user question:</strong> <code class="inl">"can i upgrade the ram on it later"</code></p>
+          <p>Search this directly and the embedding has no idea what "it" is — it might match generic RAM
+          articles. So we rewrite:</p>
+          <p><strong>Rewritten query:</strong> <code class="inl">"Can the RAM (memory) on the Dell XPS 13
+          laptop be upgraded after purchase? Is the memory soldered or replaceable?"</code></p>
+          <p>Now the search is specific, spells out "memory" as a synonym, and even anticipates the real
+          answer's vocabulary ("soldered"). Retrieval gets the exact spec-sheet chunk it needs.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>An over-eager rewrite can <em>change the meaning</em> of the question or add a wrong assumption,
+          sending retrieval off in the wrong direction. Keep the rewrite prompt tight ("preserve the user's
+          intent; only clarify and add synonyms; do not answer the question"). And remember: it's one more LLM
+          call, so it adds a little latency to every query.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Query rewriting puts an LLM <em>before</em> retrieval to clean up the question — fixing typos,
+          resolving "it"/follow-ups using chat history, disambiguating, and adding synonyms/formal terms.
+          It's cheap, high-impact, and usually the first advanced technique you add — just keep it from
+          accidentally changing the user's intent.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DECOMPOSITION ===================== -->
+      <section id="decompose">
+        <h2><span class="sec-num">3</span> Sub-query enhancement / query decomposition</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If your mom says "clean your room, do your homework, and feed the dog," you don't try to do all
+          three in one confusing motion — you split it into three little jobs and do each one. A big, complex
+          question is the same. Instead of one giant search that does everything badly, the AI breaks the
+          question into smaller questions, searches for each one separately, and then puts the pieces back
+          together.</p>
+        </div>
+
+        <p>Query rewriting cleaned up <em>one</em> question. But some questions are really several questions
+        wearing a trench coat. A single embedding can't faithfully represent "compare A and B and explain why"
+        — it gets pulled in three directions and retrieves muddy results. The fix is
+        <span class="term">query decomposition</span> (also called sub-query enhancement): use an LLM to split
+        the question into smaller, independent <span class="term">sub-queries</span>, retrieve for each one
+        separately, then combine all the retrieved context for the final answer.</p>
+
+        <h3>The flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">1. Complex Q</div><div class="s-d">One multi-part question</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✂️</div><div class="s-t">2. Split</div><div class="s-d">LLM breaks it into sub-queries</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">3. Retrieve each</div><div class="s-d">A separate search per sub-query</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧩</div><div class="s-t">4. Combine</div><div class="s-d">Merge all retrieved chunks</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">5. Generate</div><div class="s-d">One answer over everything</div></div>
+        </div>
+
+        <p>Why this helps: each sub-query is simple and focused, so its embedding points cleanly at the right
+        chunks. You're effectively giving retrieval several sharp, single-topic searches instead of one blurry,
+        multi-topic one.</p>
+
+        <div class="callout note">
+          <span class="c-title">Decomposition vs rewriting</span>
+          <p>They're cousins. <strong>Rewriting</strong> turns one question into one <em>better</em> question.
+          <strong>Decomposition</strong> turns one question into <em>several</em> questions. You often do both:
+          decompose first, then rewrite each sub-query. Decomposition shines for "compare," "and," "list all,"
+          and multi-hop questions where the answer depends on combining separate facts.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p><strong>User question:</strong> <code class="inl">"Which of our products had higher customer
+          satisfaction in 2024, the Pro plan or the Team plan, and what was the main complaint about the
+          loser?"</code></p>
+          <p>One search can't do this well. Decompose into:</p>
+          <ul>
+            <li>Sub-query A: <code class="inl">"Pro plan customer satisfaction score 2024"</code></li>
+            <li>Sub-query B: <code class="inl">"Team plan customer satisfaction score 2024"</code></li>
+            <li>Sub-query C: <code class="inl">"Most common customer complaints about the Pro plan 2024"</code></li>
+            <li>Sub-query D: <code class="inl">"Most common customer complaints about the Team plan 2024"</code></li>
+          </ul>
+          <p>Each search returns clean, on-topic chunks. The model then compares A vs B to find the "loser,"
+          and uses C or D (whichever matches the loser) for the complaint. Notice sub-queries C and D are a
+          little speculative — the system retrieves both because it doesn't yet know which plan lost. That
+          extra search is the cost of being thorough.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>Four sub-queries means four searches and more retrieved chunks to stuff into the prompt — more
+          latency, more tokens, and a higher chance of pulling in noise. Use decomposition when a question is
+          genuinely multi-part; for a simple question it's overkill. (And after combining, you'll often want
+          re-ranking — our next-but-one topic — to trim the merged pile back down.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Query decomposition splits a complex, multi-part question into focused sub-queries, retrieves for
+          each separately, then merges the results for one final answer. It beats a single blurry search on
+          "compare/and/multi-hop" questions — at the cost of more searches, more tokens, and more potential noise.
+        </div>
+      </section>
+
+      <!-- ===================== 4. HyDE ===================== -->
+      <section id="hyde">
+        <h2><span class="sec-num">4</span> HyDE — Hypothetical Document Embeddings</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're looking for a specific page in a giant pile of pages, but you only have a short
+          question. It's hard to match a tiny question to a big page. So instead, you first <em>guess</em> what
+          the answer page might say — you scribble a pretend answer — and then go find the real page that looks
+          most like your scribble. Answers look like answers, so matching answer-to-answer works better than
+          matching question-to-answer. That clever guess-first trick is HyDE.</p>
+        </div>
+
+        <p><span class="term">HyDE (Hypothetical Document Embeddings)</span> tackles a deep mismatch: questions
+        and answers <em>look different</em>. A question is short and interrogative ("What causes a 500 error?");
+        a document chunk is long and declarative ("A 500 Internal Server Error occurs when the server
+        encounters an unexpected condition…"). Their embeddings can sit surprisingly far apart even though one
+        answers the other. HyDE's fix: <strong>don't embed the question — embed a fake answer to it.</strong></p>
+
+        <h3>The flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">❓</div><div class="s-t">1. Question</div><div class="s-d">User's real query</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🤖</div><div class="s-t">2. Imagine answer</div><div class="s-d">LLM writes a plausible (maybe wrong) answer</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔢</div><div class="s-t">3. Embed the answer</div><div class="s-d">Vectorise the fake answer, not the question</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">4. Retrieve</div><div class="s-d">Find real chunks near the fake answer</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">5. Generate</div><div class="s-d">Answer from the real chunks</div></div>
+        </div>
+
+        <p>The key insight is in step 2–3: the hypothetical answer is written in the same <em>style and
+        vocabulary</em> as real documents, so its embedding lands in "answer territory," right next to the
+        genuine chunks that actually answer the question. We then throw the fake answer away and only keep what
+        it helped us <em>find</em>.</p>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway: the fake answer can be wrong!</span>
+          <p>It doesn't matter if the LLM hallucinates details in the hypothetical answer. We never show it to
+          the user. We only use it as a <strong>search probe</strong> — a decoy shaped like a real answer to
+          attract the right neighbours in vector space. The real, trustworthy facts come from the actual chunks
+          we retrieve and then generate from.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p><strong>Question:</strong> <code class="inl">"Why is my sourdough not rising?"</code></p>
+          <p><strong>Step 2 — LLM imagines an answer:</strong> <em>"Sourdough may fail to rise if the starter
+          is inactive or under-fed, the dough is proofed at too cool a temperature, the gluten is
+          under-developed, or fermentation time is too short. An active starter should double in size within
+          4–8 hours…"</em></p>
+          <p>Even if a detail here is slightly off, this paragraph is packed with the exact words real baking
+          articles use — "starter," "proof," "fermentation," "gluten." We embed <em>this</em>, search with it,
+          and pull back the genuine, correct baking-guide chunks — which the original 6-word question would
+          likely have missed. Then we generate the real answer from those chunks.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>HyDE costs an extra LLM generation <em>before</em> you even search, adding noticeable latency. It
+          shines when questions are short and very different in style from your documents; it helps less when
+          questions already resemble the documents. As always, measure whether it earns its keep.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          HyDE fixes the question-vs-answer style gap: have the LLM write a hypothetical (possibly wrong)
+          answer, embed <em>that</em>, and search with it so you match answer-to-answer. The fake answer is
+          just a search probe — real facts come from the chunks it helps retrieve. Cost: one extra LLM call
+          up front.
+        </div>
+      </section>
+
+      <!-- ===================== 5. RE-RANKING ===================== -->
+      <section id="rerank">
+        <h2><span class="sec-num">5</span> Re-ranking</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Picture hiring for a job. First you do a super-fast skim of 100 résumés to grab the 20 that look
+          okay — quick but rough. Then you carefully read those 20 properly and pick the best 3 to actually
+          interview. Re-ranking is that two-step move: a cheap, fast first pass to gather lots of maybes, then
+          a slow, careful judge to pick the true best few.</p>
+        </div>
+
+        <p>Vector search is fast but <em>approximate</em>. It's great at quickly fetching things that are
+        "roughly relevant," but it often gets the <em>exact ordering</em> wrong — the genuinely best chunk
+        might come back ranked 9th. <span class="term">Re-ranking</span> adds a second, more accurate stage:
+        <strong>retrieve many candidates cheaply, then re-score them with a smarter (slower) model and keep
+        only the top few.</strong></p>
+
+        <h3>Why two stages? Bi-encoder vs cross-encoder</h3>
+        <p>The reason this works comes down to two kinds of models. The first stage uses a
+        <span class="term">bi-encoder</span>; the re-ranker is a <span class="term">cross-encoder</span>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Bi-encoder (first-stage retrieval)</th><th>Cross-encoder (re-ranker)</th></tr></thead>
+            <tbody>
+              <tr><td>How it reads them</td><td>Encodes the query and each document <em>separately</em> into vectors, then compares the vectors.</td><td>Reads the query and a document <em>together, as one pair</em>, and outputs a direct relevance score.</td></tr>
+              <tr><td>Accuracy</td><td>Lower — meaning is squashed into one vector before comparison, losing nuance.</td><td>Higher — it sees the query and document interacting word-by-word.</td></tr>
+              <tr><td>Speed</td><td>Very fast — document vectors are computed <em>once, offline</em> and reused.</td><td>Slow — must run the model fresh for every query–document pair, every time.</td></tr>
+              <tr><td>Scales to…</td><td>Millions of documents (just compare vectors).</td><td>Only tens of documents (too slow for millions).</td></tr>
+              <tr><td>Role</td><td>Cast a wide, cheap net: get the top ~50 candidates.</td><td>Carefully re-order those ~50 and keep the top ~5.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Use the <strong>fast-but-rough</strong> bi-encoder to narrow millions down to a few dozen, then the
+          <strong>slow-but-sharp</strong> cross-encoder to pick the true winners from that short list. You get
+          cross-encoder quality at near bi-encoder cost — because the expensive model only ever looks at a
+          handful of candidates. This directly fixes the "lost-in-the-middle" and "irrelevant context" problems
+          from Topic 1: you hand the generator 5 truly relevant chunks instead of 50 noisy ones.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p><strong>Query:</strong> <code class="inl">"How do I cancel my subscription on mobile?"</code></p>
+          <p><strong>Stage 1 (bi-encoder):</strong> fetches 50 candidate chunks. They include the right answer,
+          but also chunks about <em>upgrading</em> on mobile, <em>cancelling on desktop</em>, and general
+          billing — all "roughly similar." The true best chunk happens to land at rank 11.</p>
+          <p><strong>Stage 2 (cross-encoder):</strong> re-reads each of the 50 chunks <em>paired with the
+          question</em> and scores true relevance. The "cancel on mobile" chunk now jumps to rank 1; the
+          "upgrade" and "desktop" chunks sink. We keep the top 5 and discard the rest.</p>
+          <p>Result: the generator sees 5 sharp chunks led by the perfect one, instead of 50 chunks with the
+          answer buried at position 11.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">In practice</span>
+          <p>Re-ranking is one of the highest-value upgrades to basic RAG and is widely used in production.
+          Dedicated re-ranker models (e.g. Cohere Rerank, BGE, and similar cross-encoders) take your query plus
+          a list of candidates and return them re-scored. You can also use an LLM itself as the re-ranker —
+          which leads directly into our next topic.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>The cross-encoder adds latency proportional to how many candidates you re-rank. Re-rank too many
+          and you lose the speed advantage; re-rank too few and the right chunk might not be in the shortlist.
+          A common balance: retrieve ~50, re-rank, keep ~5.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Re-ranking is a two-stage retrieve: a fast <strong>bi-encoder</strong> grabs ~50 rough candidates,
+          then a slow, accurate <strong>cross-encoder</strong> re-scores query–document pairs and keeps the top
+          ~5. You get high accuracy cheaply because the expensive model only sees a shortlist — and the
+          generator receives clean, well-ordered context.
+        </div>
+      </section>
+
+      <!-- ===================== 6. LLM-AS-A-JUDGE ===================== -->
+      <section id="judge">
+        <h2><span class="sec-num">6</span> LLM-as-a-judge</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine one robot does the homework, and a <em>second</em> robot acts like a teacher and grades it:
+          "Did you actually answer the question? Did you use the right facts? No making stuff up?" Using one AI
+          to check another AI's work — that's LLM-as-a-judge. It's how we measure whether our fancy RAG is
+          actually any good, and how the system can catch its own mistakes.</p>
+        </div>
+
+        <p>So far we've made retrieval smarter. But how do we <em>know</em> it's working? And can the system
+        notice when it has retrieved junk? Enter <span class="term">LLM-as-a-judge</span>: using an LLM to
+        <strong>evaluate</strong> text — either the retrieved chunks or the final answer — against criteria, and
+        return a score or verdict. It's both an evaluation tool (offline, for measuring quality) and a runtime
+        component (online, inside self-correcting loops like CRAG in the next topic).</p>
+
+        <h3>What a judge typically scores</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Criterion</th><th>Question it answers</th><th>What it catches</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Relevance</span></td><td>Does this retrieved chunk actually relate to the question?</td><td>Off-topic chunks that slipped through retrieval.</td></tr>
+              <tr><td><span class="term">Faithfulness / Groundedness</span></td><td>Is every claim in the answer supported by the retrieved context?</td><td>Hallucinations — the model inventing facts not in the chunks.</td></tr>
+              <tr><td>Answer relevance</td><td>Does the final answer actually address what the user asked?</td><td>Fluent answers that dodge the real question.</td></tr>
+              <tr><td>Completeness</td><td>Did the answer cover all parts of a multi-part question?</td><td>Half-answers that drop a sub-question.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Faithfulness is the big one for RAG</span>
+          <p>The whole point of RAG is to keep the model honest by grounding it in real documents. A
+          faithfulness judge enforces that: it checks each statement in the answer against the supplied chunks
+          and flags anything unsupported. This is your main defence against the hallucinations we first met in
+          Session 1 — now with an automatic detector.</p>
+        </div>
+
+        <h3>How you actually use it</h3>
+        <p>You write a careful <em>judge prompt</em> that gives the criterion, the inputs (question, chunks,
+        and/or answer), and asks for a structured verdict — typically a score (say 1–5) plus a short
+        justification, or a simple <code class="inl">PASS / FAIL</code>. Two main uses:</p>
+        <ul>
+          <li><strong>Offline evaluation</strong> — run the judge over a test set to compare two RAG pipelines
+          ("does adding re-ranking improve faithfulness?"). This is exactly the prompt-testing idea from
+          Session 1, scaled up: instead of grading outputs by hand, an LLM grades them.</li>
+          <li><strong>Online / corrective loops</strong> — grade chunks <em>during</em> a live query and, if
+          they're poor, trigger a fix (re-search, rewrite, or refuse). That's CRAG, our next topic.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">A judge prompt in action</span>
+          <p><strong>Judge prompt (faithfulness):</strong> <em>"You are grading an answer. CONTEXT: [the 3
+          retrieved chunks]. ANSWER: [the generated answer]. Is every factual claim in the ANSWER directly
+          supported by the CONTEXT? Reply with a score 1–5 and list any unsupported claims."</em></p>
+          <p><strong>Verdict:</strong> <code class="inl">Score: 2/5. Unsupported claim: "offers a 90-day
+          warranty" — the context only mentions a 30-day return window; no warranty is stated.</code></p>
+          <p>The judge just caught a hallucination automatically. In an eval, this lowers the pipeline's score;
+          in a live system, it can trigger a correction or a "I'm not sure" response.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>The judge is itself an LLM — it can be wrong, inconsistent, or biased (e.g. favouring longer or
+          more confident-sounding answers). Use a <strong>low temperature</strong> (Session 1) for repeatable
+          grades, give it crisp criteria and examples, and for important evals, spot-check the judge against
+          human ratings. A judge is a helpful estimate of quality, not absolute truth — and every judge call
+          costs tokens and time.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          LLM-as-a-judge uses an LLM to score text on relevance, faithfulness/groundedness, answer relevance,
+          and completeness. It powers both offline evaluation (comparing pipelines, catching hallucinations at
+          scale) and online corrective loops. Keep it low-temperature, well-prompted, and spot-checked — it's a
+          fallible estimate, not gospel.
+        </div>
+      </section>
+
+      <!-- ===================== 7. CRAG ===================== -->
+      <section id="crag">
+        <h2><span class="sec-num">7</span> Corrective RAG (CRAG)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your helper fetches some books, then <em>pauses</em> and checks: "Wait — are these actually
+          useful?" If yes, great, use them. If they're rubbish, the helper doesn't just shrug and answer anyway
+          — it goes and looks somewhere else (like searching the internet) or asks the question differently.
+          Corrective RAG is RAG that checks its own homework before answering, and fixes itself when the
+          retrieval was bad.</p>
+        </div>
+
+        <p>Basic RAG <em>always trusts</em> whatever it retrieved, even when retrieval failed. That's the silent
+        failure from Topic 1. <span class="term">Corrective RAG (CRAG)</span> adds a checkpoint: after
+        retrieving, it <strong>grades the documents</strong> (using an LLM-as-a-judge, Topic 6) and, based on
+        the grade, takes <strong>corrective action</strong> instead of blindly generating.</p>
+
+        <h3>The flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🔎</div><div class="s-t">1. Retrieve</div><div class="s-d">Get candidate chunks as usual</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚖️</div><div class="s-t">2. Grade</div><div class="s-d">Judge each chunk's relevance</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚦</div><div class="s-t">3. Decide</div><div class="s-d">Good? Ambiguous? Bad?</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛠️</div><div class="s-t">4. Correct</div><div class="s-d">Use / rewrite+re-search / web search</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✍️</div><div class="s-t">5. Generate</div><div class="s-d">Answer from the corrected context</div></div>
+        </div>
+
+        <h3>The three branches (step 3 → 4)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Grade</th><th>Meaning</th><th>Corrective action</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Correct / relevant</strong></td><td>The chunks clearly answer the question.</td><td>Use them as-is (maybe after a light cleanup). Proceed to generate.</td></tr>
+              <tr><td><strong>Ambiguous</strong></td><td>Partly relevant, but not confident or not complete.</td><td>Combine what's good with a fresh source — e.g. rewrite the query and re-search, or add a web search, then generate.</td></tr>
+              <tr><td><strong>Incorrect / irrelevant</strong></td><td>The retrieved chunks miss the point entirely.</td><td>Discard them. Take a different path: rewrite the query, do a <span class="term">web search</span> for outside knowledge, or — if nothing is found — honestly say "I don't know" rather than hallucinate.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">The big shift: RAG becomes a loop, not a line</span>
+          <p>Basic RAG is a straight line (retrieve → generate). CRAG introduces a <strong>feedback loop</strong>:
+          if retrieval was bad, the system loops back and tries again differently before answering. This is the
+          first step toward <em>agentic</em> RAG — systems that reason about their own retrieval and decide what
+          to do next, which we'll build on in the LangGraph session.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example</span>
+          <p><strong>Question:</strong> <code class="inl">"What's the warranty on the 2025 model?"</code> —
+          but your knowledge base only contains 2023–2024 docs.</p>
+          <ul>
+            <li><strong>Retrieve:</strong> returns 2024 warranty chunks (closest available).</li>
+            <li><strong>Grade:</strong> the judge notices the chunks are about 2024, not 2025 → grade =
+            <em>incorrect/irrelevant</em> for this question.</li>
+            <li><strong>Correct:</strong> trigger a web search for "2025 model warranty," which finds the
+            manufacturer's current page.</li>
+            <li><strong>Generate:</strong> answer from the fresh web result, grounded and correct — instead of
+            confidently giving outdated 2024 terms.</li>
+          </ul>
+          <p>Without CRAG, basic RAG would have answered with 2024 info as if it were 2025. The grading
+          checkpoint caught the gap and fixed it.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Trade-off</span>
+          <p>CRAG adds a grading LLM call to <em>every</em> query, and corrective branches add even more steps
+          (extra searches, extra generations) — so it's slower and pricier, and the loop needs a cap so it can't
+          retry forever. The payoff is far fewer confident-but-wrong answers, which is often worth it for
+          high-stakes domains (medical, legal, finance).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          CRAG grades retrieved documents and branches: good → use them; ambiguous → supplement (rewrite/web
+          search); incorrect → discard and fetch elsewhere or admit uncertainty. It turns RAG from a straight
+          line into a self-correcting loop — the gateway to agentic RAG — at the cost of extra latency and tokens.
+        </div>
+      </section>
+
+      <!-- ===================== 8. CONTEXT OPTIMIZATION ===================== -->
+      <section id="context-opt">
+        <h2><span class="sec-num">8</span> Context-window &amp; chunk optimization / token management</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Your AI has a small desk (remember the desk from Session 1?). You can only fit so many papers on
+          it, and you <em>pay</em> for every paper you put down. So you don't dump your whole filing cabinet on
+          the desk — you carefully choose only the best, most useful pages, remove duplicates, and maybe shrink
+          long ones into short notes. Packing the desk wisely is what this last topic is about.</p>
+        </div>
+
+        <p>All those retrieved chunks have to fit into the model's <span class="term">context window</span> — the
+        fixed-size "desk" from Session 1 (prompt + retrieved context + the answer, all together). And from token
+        economics (also Session 1): <strong>every token in that window costs money and time.</strong> So the
+        final skill of advanced RAG is fitting the <em>best</em> context, not the <em>most</em> context.</p>
+
+        <h3>Why not just stuff everything in?</h3>
+        <p>Modern models have huge context windows (hundreds of thousands of tokens), so it's tempting to dump
+        in 50 chunks and let the model sort it out. Three reasons not to:</p>
+        <ul>
+          <li><strong>Cost</strong> — you pay per input token. Stuffing 40 useless chunks into every query
+          multiplies your bill (and remember from Session 1, history is re-sent every turn).</li>
+          <li><strong>Latency</strong> — more input tokens = a longer, slower prefill = the user waits longer.</li>
+          <li><strong>Accuracy</strong> — lost-in-the-middle (Topic 1) means a fat context can <em>lower</em>
+          answer quality. Noise crowds out signal.</li>
+        </ul>
+
+        <h3>Techniques to pack the window well</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Technique</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td>Keep top-K only</td><td>After re-ranking (Topic 5), pass only the best few chunks (e.g. top 3–5), not everything retrieved.</td></tr>
+              <tr><td>Deduplication</td><td>Drop near-identical chunks (overlapping passages, repeated boilerplate) so you don't pay twice for the same fact.</td></tr>
+              <tr><td><span class="term">Contextual compression</span></td><td>Use an LLM to trim each chunk down to just the sentences relevant to the question before inserting it — keeping the gold, cutting the filler.</td></tr>
+              <tr><td>Summarization</td><td>Replace several long chunks with a shorter LLM-written summary that preserves the key facts, saving tokens.</td></tr>
+              <tr><td>Strategic ordering</td><td>Counter lost-in-the-middle by placing the most important chunks at the <em>start and end</em> of the context, not buried in the middle.</td></tr>
+              <tr><td>Right-sized chunking</td><td>Fix it at the source: tune chunk size/overlap offline so chunks are self-contained but not bloated (ties back to the "bad chunks" failure in Topic 1).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Treat the context window as <strong>precious, paid real estate</strong>. Your job isn't to fill it
+          — it's to fit the <em>highest-signal, lowest-redundancy</em> context that answers the question, in the
+          best order. Quality and density of context beats quantity, every time.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example with the Session 1 cost model</span>
+          <p>Suppose input costs <strong>$5 per 1,000,000 tokens</strong>. A naive pipeline stuffs 40 chunks
+          (~20,000 tokens) into every query:</p>
+          <ul>
+            <li>Naive: 20,000 ÷ 1,000,000 × $5 = <strong>$0.10 per query</strong> on input alone — plus slow
+            prefill, plus lost-in-the-middle hurting accuracy.</li>
+            <li>Optimized: re-rank to the top 5, dedupe and compress to ~2,500 tokens: 2,500 ÷ 1,000,000 × $5 =
+            <strong>$0.0125 per query</strong> — <em>8× cheaper</em>, faster, <em>and</em> more accurate
+            because the model sees only the good stuff.</li>
+          </ul>
+          <p>Across a million queries that's $100,000 vs $12,500. Context optimization isn't a nicety — it's
+          where RAG quality and RAG economics meet.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Compression and summarization are themselves LLM calls — so you're trading generation cost to save
+          input cost. They also risk dropping a fact that turns out to matter. Compress aggressively for cheap,
+          high-volume cases; be gentler when completeness is critical.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The context window is fixed and every token costs money and latency, and over-stuffing triggers
+          lost-in-the-middle. So pack it well: keep only top-K after re-ranking, dedupe, compress/summarize,
+          order the best chunks at the edges, and right-size chunks at the source. Best context beats most
+          context — for both accuracy and cost.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You started this session with a clumsy retrieve-then-generate pipeline and ended with a smart,
+        self-checking one. Here's the one-paragraph story that connects all 8 topics:</p>
+        <div class="bigidea">
+          <p>Basic RAG fails silently — bad chunks, ambiguous queries, lost-in-the-middle, and noise — and
+          every fix trades <strong>speed for accuracy</strong>. So before searching, we <strong>rewrite</strong>
+          the question to clean it up, and <strong>decompose</strong> complex questions into focused sub-queries.
+          When questions don't look like answers, <strong>HyDE</strong> embeds a hypothetical answer as a search
+          probe. After retrieving a wide net cheaply with a <strong>bi-encoder</strong>, we
+          <strong>re-rank</strong> with a sharp <strong>cross-encoder</strong> to keep only the truly best
+          chunks. An <strong>LLM-as-a-judge</strong> scores relevance and faithfulness — both to evaluate the
+          pipeline and to power <strong>Corrective RAG (CRAG)</strong>, which grades retrieved docs and loops
+          back (rewrite, web search, or admit uncertainty) when they're poor. Finally, we
+          <strong>optimize the context window</strong> — top-K, dedupe, compress, order well — so we fit the
+          best context, not the most, respecting the token economics from Session 1. Together these turn RAG
+          from a brittle line into an accurate, self-correcting system.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why is "just retrieve 50 chunks to be safe" usually a bad idea?</summary>
+          <p class="ans">It triggers lost-in-the-middle (the model skims the middle and misses the key chunk),
+          buries the useful signal in irrelevant noise, and burns tokens — costing more money and latency for
+          <em>worse</em> accuracy. Better retrieval beats more retrieval.</p>
+        </details>
+        <details class="quiz">
+          <summary>In HyDE, does it matter if the hypothetical answer is factually wrong?</summary>
+          <p class="ans">No. The fake answer is only a search probe — we embed it to find real chunks that look
+          like answers, then throw it away. The actual facts come from the real chunks we retrieve and generate
+          from, never from the hypothetical answer itself.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between a bi-encoder and a cross-encoder, and why use both?</summary>
+          <p class="ans">A bi-encoder encodes the query and documents separately into vectors (fast but rough,
+          scales to millions). A cross-encoder reads each query–document pair together for a direct relevance
+          score (accurate but slow, only tens of items). You use the bi-encoder to grab ~50 candidates, then the
+          cross-encoder to re-rank them to the top ~5 — accuracy at low cost.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does a "faithfulness" judge check, and which Session 1 problem does it fight?</summary>
+          <p class="ans">It checks that every claim in the answer is supported by the retrieved context. It's an
+          automatic hallucination detector — fighting the "confidently wrong" problem from Session 1 by flagging
+          any statement the chunks don't back up.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does CRAG change the shape of the RAG pipeline?</summary>
+          <p class="ans">It turns the straight line (retrieve → generate) into a feedback loop: grade the
+          retrieved docs and, if they're poor, correct course (rewrite the query, do a web search, or admit "I
+          don't know") before answering. This is the first step toward agentic RAG.</p>
+        </details>
+        <details class="quiz">
+          <summary>Models have huge context windows now — why still bother optimizing context?</summary>
+          <p class="ans">Because every token costs money and latency, and over-stuffing triggers
+          lost-in-the-middle, which lowers accuracy. Keeping only the best top-K chunks (deduped, compressed,
+          well-ordered) is cheaper, faster, and more accurate. Best context beats most context.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-4.html"><div class="dir">← Previous</div><div class="ttl">Session 4: RAG 1 — Intro to RAG</div></a>
+        <a class="next" href="session-6.html"><div class="dir">Next →</div><div class="ttl">Session 6: LangChain &amp; LangGraph</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 5 — RAG 2: Advanced Retrieval Strategies · You leveled up your RAG 🚀</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

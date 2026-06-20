@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 3 — Introduction to AI Agents</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 3</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 03 · Introduction to AI Agents</span>
+      <h1>Giving the AI hands: from chatbot to agent</h1>
+      <p class="lead">
+        In Session 1 you learned that an LLM is just a next-token predictor that lives in a frozen
+        brain with no memory and a knowledge cutoff. In Session 2 you learned to talk to it well.
+        Today we give it <em>hands</em>. We'll build up — gently, from scratch — the idea of an
+        <strong>AI agent</strong>: an LLM that can decide what to do, use tools, look at the results, and
+        keep going until the job is done. Same beginner pace as always: a little story first, then the
+        real mechanics, then a worked example.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#why-agents">Why a plain LLM isn't enough</a></li>
+          <li><a href="#what-is-agent">What is an AI agent?</a></li>
+          <li><a href="#tools">Tools &amp; function calling</a></li>
+          <li><a href="#react">The reasoning loop (ReAct)</a></li>
+          <li><a href="#planning">Planning vs reactive agents</a></li>
+          <li><a href="#determinism">Deterministic vs non-deterministic</a></li>
+          <li><a href="#failures">Failure modes &amp; guardrails</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. WHY AGENTS ===================== -->
+      <section id="why-agents">
+        <h2><span class="sec-num">1</span> Why a plain LLM isn't enough</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the smartest person you know, but they're locked in a windowless room with no
+          phone, no internet, and no clock. They've read a zillion books — but only books printed
+          <em>before</em> they got locked in. Ask them "what's the weather <strong>right now</strong>?" and they
+          honestly can't tell you. Ask them to "turn off my bedroom light" and they can't reach it.
+          They can only <em>talk</em>. That brilliant locked-in person is a plain LLM. An agent is that
+          same person, but now we slide them a phone, a calculator, and a notepad under the door.</p>
+        </div>
+
+        <p>Let's recall exactly <em>why</em> a raw LLM is limited. Every limitation here comes straight from
+        Session 1, and each one is a reason agents exist.</p>
+
+        <h3>The four walls of the locked room</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Limitation</th><th>Where it comes from (Session 1)</th><th>What goes wrong</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Knowledge cutoff</span></td><td>The model learned everything during <strong>training</strong>, which ended on a fixed date.</td><td>It can't know anything that happened after that date — yesterday's news, a price that changed this morning, a sports score from last night.</td></tr>
+              <tr><td>No live / real-time data</td><td>Inference doesn't fetch anything; the model only "reads" the prompt you give it.</td><td>It can't check the weather, a stock price, your calendar, or a live database on its own.</td></tr>
+              <tr><td>Can't take actions</td><td>The model only outputs <strong>text</strong> (predicted tokens). That's its only superpower.</td><td>It can describe how to send an email, but it can't actually send one. It can't book a flight, run code, or edit a file.</td></tr>
+              <tr><td>No memory</td><td>The model is <span class="term">stateless</span> — parameters are frozen and nothing carries between requests.</td><td>It forgets everything the moment a request ends. It can't remember what you told it an hour ago unless the app re-sends it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Quick refresher on "stateless"</span>
+          <p>From Session 1: an LLM doesn't truly remember your conversation. The app fakes memory by
+          re-sending the whole history with every message. The model itself is a frozen, one-shot
+          text-predictor. Hold onto this — it shapes how agents have to be built, because the agent's
+          "memory" of what it has done so far must also be stuffed back into the prompt each step.</p>
+        </div>
+
+        <h3>So what would fix this?</h3>
+        <p>Notice that three of the four problems are really the same wish: <strong>"let the model reach
+        outside its room."</strong> If we could let the LLM look things up, run a calculation, call an API,
+        or write to a file — and then read the result and decide what to do next — almost all of those
+        walls fall down. The model stays a text-predictor, but now its text can <em>trigger real actions</em>,
+        and the actions' results flow back in as new text. That bridge is exactly what an agent is.</p>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example of the gap</span>
+          <p>You ask a plain chatbot: <code class="inl">"What's the current price of 3 units of product
+          SKU-42 including today's sales tax?"</code></p>
+          <ul>
+            <li>It doesn't know the <em>current</em> price (that lives in a live database — no real-time data).</li>
+            <li>It might get the multiplication slightly wrong (LLMs are shaky at exact arithmetic).</li>
+            <li>It can't look up <em>today's</em> tax rate if it changed after the cutoff.</li>
+          </ul>
+          <p>An agent, by contrast, could call a <code class="inl">get_price</code> tool, call a
+          <code class="inl">get_tax_rate</code> tool, use a <code class="inl">calculator</code> tool, and only
+          then answer — with real numbers.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A plain LLM is a brilliant but locked-in text-predictor: knowledge cutoff, no live data, can't
+          act in the world, no memory. Agents exist to break those walls by letting the model's text
+          trigger real actions and then read the results back in.
+        </div>
+      </section>
+
+      <!-- ===================== 2. WHAT IS AN AGENT ===================== -->
+      <section id="what-is-agent">
+        <h2><span class="sec-num">2</span> What is an AI agent?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A chatbot is like a friend on the phone who can only <em>talk</em> to you. An agent is like a
+          friend who can talk to you <strong>and</strong> get up, walk to the kitchen, check the fridge, and
+          come back to tell you what's there. Same friend, same brain — but now they can <em>do</em> things,
+          look at what happened, and keep going until your question is actually answered.</p>
+        </div>
+
+        <p>Here's a clean definition we'll use all session:</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>An <span class="term">AI agent</span> is an <strong>LLM "brain" + tools + a loop</strong>. The LLM
+          decides <em>what to do next</em>, calls a <strong>tool</strong> to actually do it, reads the result, and
+          repeats — looping until the task is finished. The LLM is the decision-maker; the tools are its
+          hands; the loop is what lets it take more than one step.</p>
+        </div>
+
+        <h3>The three ingredients</h3>
+        <ul>
+          <li><strong>The brain (LLM)</strong> — the same next-token predictor from Session 1. Its job in an
+          agent is to <em>reason</em> about the goal and choose actions. It never magically gains new powers;
+          it just decides which tool to use and what to say.</li>
+          <li><strong>The tools</strong> — functions the agent is allowed to call: search the web, run code,
+          query a database, send an email, read a file. Each tool is a real piece of code <em>you</em> write or
+          provide. (Full detail in Topic 3.)</li>
+          <li><strong>The loop</strong> — the controller code that runs the brain, executes whichever tool the
+          brain asked for, feeds the result back to the brain, and runs it again. Without the loop you just
+          have a one-shot answer; with it, the agent can take many steps. (Full detail in Topic 4.)</li>
+        </ul>
+
+        <h3>Chatbot vs agent — the key contrast</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Chatbot (just talks)</th><th>Agent (talks <em>and</em> does)</th></tr></thead>
+            <tbody>
+              <tr><td>What it produces</td><td>Text, and only text.</td><td>Text <em>and</em> actions in the world (via tools).</td></tr>
+              <tr><td>Steps</td><td>One shot: prompt in, answer out.</td><td>Many steps in a loop until the goal is met.</td></tr>
+              <tr><td>Access to fresh info</td><td>None — limited to its training data + your prompt.</td><td>Can fetch live data through tools.</td></tr>
+              <tr><td>Who decides the next move</td><td>You (you ask the next question).</td><td>The agent decides its own next action.</td></tr>
+              <tr><td>Example</td><td>"Here's how you'd check the weather…"</td><td>Actually calls a weather API and tells you it's 22°C.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A subtle but important point</span>
+          <p>The LLM does <strong>not</strong> run the tools itself. It can only output text. When it "uses a
+          tool," it really just <em>writes a request</em> ("please call <code class="inl">get_weather</code> for
+          Paris"), and <em>your surrounding code</em> actually runs the function and hands the result back. The
+          agent is a partnership: the model thinks, your code acts. We'll see exactly how this handshake works
+          in the next topic.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example</span>
+          <p>Goal: <code class="inl">"Email me a summary of today's top AI news."</code></p>
+          <ul>
+            <li>A <strong>chatbot</strong> replies with general AI facts from before its cutoff. It can't see
+            "today," and it can't send email. Dead end.</li>
+            <li>An <strong>agent</strong>: (1) calls a <code class="inl">web_search</code> tool for today's AI
+            news, (2) reads the results, (3) writes a summary, (4) calls a <code class="inl">send_email</code>
+            tool. Done — a real action happened.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          An AI agent = LLM brain + tools + a loop. The brain decides, the tools act, the loop lets it take
+          many steps. A chatbot only talks; an agent talks <em>and</em> does — but remember the model still
+          only outputs text; your code is what actually runs the tools.
+        </div>
+      </section>
+
+      <!-- ===================== 3. TOOLS / FUNCTION CALLING ===================== -->
+      <section id="tools">
+        <h2><span class="sec-num">3</span> Tools &amp; function calling — how an LLM "uses" a tool</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine the locked-in genius can't leave the room, but they can write notes and slip them
+          under the door. On a note they write: <em>"Please look up the weather in Paris."</em> A helper
+          outside reads the note, actually checks the weather, and slides back another note:
+          <em>"It's 18°C and raining."</em> The genius reads that and continues. The genius never left the
+          room — they just asked, and someone outside did the doing. That note-passing <em>is</em> function
+          calling.</p>
+        </div>
+
+        <p>A <span class="term">tool</span> is just a function the agent is allowed to call — for example
+        <code class="inl">get_weather(city)</code> or <code class="inl">calculator(expression)</code>. The
+        mechanism by which the LLM requests one is called <span class="term">function calling</span> (also
+        known as <span class="term">tool use</span>). Let's build it from scratch.</p>
+
+        <h3>Step 1 — You describe the tools to the model</h3>
+        <p>Before the agent runs, you give the model a list of available tools. Each tool has a
+        <strong>name</strong>, a <strong>description</strong> (what it does and when to use it), and a
+        <strong>schema</strong> of its inputs (which arguments it takes, and their types). The description is
+        basically a tiny instruction manual — the model reads it to decide <em>whether</em> and <em>how</em> to
+        use the tool.</p>
+
+        <div class="callout example">
+          <span class="c-title">A tool definition (illustrative)</span>
+          <pre>{
+  "name": "get_weather",
+  "description": "Get the current weather for a given city.",
+  "parameters": {
+    "city":  { "type": "string", "description": "City name, e.g. 'Paris'" },
+    "units": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+  }
+}</pre>
+          <p>You're not giving the model the <em>code</em> — only a description of the tool and what arguments
+          it expects. The real code lives in your program.</p>
+        </div>
+
+        <h3>Step 2 — The model outputs a structured tool request</h3>
+        <p>Here's the crucial bit, and it ties straight back to Session 1: the model still does <em>only one
+        thing</em> — it outputs text/tokens. When it "decides" to use a tool, it produces a structured
+        request (usually JSON) that names the tool and fills in the arguments. It does <strong>not</strong> run
+        anything. It's the note slipped under the door.</p>
+
+        <div class="callout example">
+          <span class="c-title">What the model emits</span>
+          <pre>{
+  "tool_call": {
+    "name": "get_weather",
+    "arguments": { "city": "Paris", "units": "celsius" }
+  }
+}</pre>
+        </div>
+
+        <h3>Step 3 — Your code runs the tool</h3>
+        <p>Your surrounding program (the agent's loop) sees this request, recognises the tool name, and
+        actually calls the real <code class="inl">get_weather("Paris")</code> function — which might hit a
+        weather API over the internet. This is the step that breaks out of the locked room: real code, real
+        network, real fresh data.</p>
+
+        <h3>Step 4 — The result is fed back to the model</h3>
+        <p>The tool returns a result (e.g. <code class="inl">{"temp": 18, "condition": "rain"}</code>). Your
+        code appends that result to the conversation and sends the whole thing back to the model. Now the
+        model can read the live answer and continue — maybe answering you, maybe calling another tool.</p>
+
+        <h3>The full handshake as a flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">1. Model decides</div><div class="s-d">Outputs a tool request (JSON)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔧</div><div class="s-t">2. Code runs tool</div><div class="s-d">Your program calls the real function</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">3. Tool returns</div><div class="s-d">Result comes back (live data)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📨</div><div class="s-t">4. Feed back</div><div class="s-d">Result added to the prompt</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💬</div><div class="s-t">5. Model continues</div><div class="s-d">Answers or calls another tool</div></div>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a calculator tool</span>
+          <p>You ask: <code class="inl">"What is 4,817 × 392?"</code> LLMs are unreliable at exact arithmetic
+          (remember from Session 1, they predict tokens, they don't truly "compute"). With a calculator tool:</p>
+          <ul>
+            <li>Model emits: <code class="inl">{"tool_call":{"name":"calculator","arguments":{"expression":"4817*392"}}}</code></li>
+            <li>Your code runs it → <code class="inl">1888264</code></li>
+            <li>You feed <code class="inl">1888264</code> back to the model</li>
+            <li>Model replies: <code class="inl">"4,817 × 392 = 1,888,264."</code></li>
+          </ul>
+          <p>The model offloaded the part it's bad at to a tool that's perfect at it. That's the whole spirit
+          of tools: let the LLM reason, let reliable code do the exact work.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>The model can only request tools you actually gave it, and it can produce malformed requests
+          (wrong arguments, a tool that doesn't exist, invalid JSON). Your code must <strong>validate</strong>
+          every tool call before running it — never blindly execute what the model asks. More on this in
+          Topic 7.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A tool is a function the agent may call. Function calling is a four-beat handshake: you describe
+          the tools → the model outputs a structured request → your code runs the real function → the result
+          is fed back so the model can continue. The model only ever writes the request; your code does the
+          doing.
+        </div>
+      </section>
+
+      <!-- ===================== 4. REACT LOOP ===================== -->
+      <section id="react">
+        <h2><span class="sec-num">4</span> The reasoning loop — ReAct (Reason → Act → Observe)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think about how you'd find a friend's house in a new town. You <em>think</em> ("I should check the
+          map"), you <em>do</em> ("open the map app"), you <em>look</em> ("oh, it says turn left"), then you think
+          again, do again, look again — until you arrive. You don't plan the entire trip perfectly in your
+          head first; you take a step, see what happened, and adjust. An agent does exactly this little
+          think–do–look cycle, over and over.</p>
+        </div>
+
+        <p>The most common pattern for an agent's loop is called <span class="term">ReAct</span>, short for
+        <strong>Reason + Act</strong>. Each turn of the loop has three beats:</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Beat</th><th>Name</th><th>What the agent does</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td><span class="term">Reason (Thought)</span></td><td>The LLM thinks out loud: what's the goal, what do I know, what should I do next?</td></tr>
+              <tr><td>2</td><td><span class="term">Act (Action)</span></td><td>It picks a tool and outputs a tool call (the function-calling request from Topic 3).</td></tr>
+              <tr><td>3</td><td><span class="term">Observe (Observation)</span></td><td>Your code runs the tool and feeds the result back. The agent reads it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Then it loops: reason again using the new observation, act again, observe again — until the agent
+        decides it has enough to give a final answer (and stops calling tools).</p>
+
+        <div class="bigidea">
+          <span class="c-title">Why the loop is the heart of an agent</span>
+          <p>A single tool call answers single-step questions. The <strong>loop</strong> is what lets an agent
+          chain several steps together and handle questions where you don't know all the steps in advance —
+          because each new observation can change what it does next. Remember the model is stateless
+          (Session 1), so the loop must re-send the growing trail of thoughts, actions, and observations on
+          every turn — that trail <em>is</em> the agent's working memory.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a multi-step question</span>
+          <p>Question: <code class="inl">"Who is the current CEO of the company that makes the iPhone, and
+          how old are they?"</code> This needs live lookups <em>and</em> chaining. Watch the loop:</p>
+          <ul>
+            <li><strong>Thought 1:</strong> "The iPhone is made by Apple. I need Apple's current CEO — that's
+            live info, I should search."</li>
+            <li><strong>Action 1:</strong> <code class="inl">web_search("current CEO of Apple")</code></li>
+            <li><strong>Observation 1:</strong> "Tim Cook is the CEO of Apple."</li>
+            <li><strong>Thought 2:</strong> "Good. Now I need Tim Cook's age. I'll search his birth date."</li>
+            <li><strong>Action 2:</strong> <code class="inl">web_search("Tim Cook date of birth")</code></li>
+            <li><strong>Observation 2:</strong> "Born November 1, 1960."</li>
+            <li><strong>Thought 3:</strong> "Today is June 2026, so he is 65. I'll compute it to be safe."</li>
+            <li><strong>Action 3:</strong> <code class="inl">calculator("2026 - 1960")</code> → 66 (then adjust
+            for birthday) → 65.</li>
+            <li><strong>Thought 4:</strong> "I now have both facts. I can answer."</li>
+            <li><strong>Final answer:</strong> "Apple makes the iPhone. Its CEO is Tim Cook, who is 65."</li>
+          </ul>
+          <p>Notice: the agent never planned all three searches up front. It discovered step 2 only
+          <em>after</em> seeing the answer to step 1. That adaptiveness is the point of ReAct.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">How does it know when to stop?</span>
+          <p>When the model decides no more tools are needed, it simply outputs a normal text answer instead
+          of a tool call. The loop sees "no tool requested" and ends, returning that text to you. (We also add
+          a hard safety limit on the number of loops — see Topic 7 — in case it never decides to stop.)</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ReAct = Reason → Act → Observe, repeated. The agent thinks, calls a tool, reads the result, and
+          loops, adapting each step to what it just learned, until it's ready to answer. The growing
+          thought/action/observation trail is the agent's working memory, re-sent each turn because the model
+          is stateless.
+        </div>
+      </section>
+
+      <!-- ===================== 5. PLANNING VS REACTIVE ===================== -->
+      <section id="planning">
+        <h2><span class="sec-num">5</span> Planning agents vs reactive agents</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Two ways to cook dinner. One cook reads the <em>whole</em> recipe first and writes out every
+          step before touching a pan — that's <strong>planning</strong>. Another cook just starts: tastes, sees
+          what's in the fridge, and figures out the next step as they go — that's <strong>reactive</strong>.
+          Both can make dinner. The planner is great when the recipe is clear; the improviser is great when
+          things keep changing.</p>
+        </div>
+
+        <p>The ReAct loop in Topic 4 is the <em>reactive</em> style: decide one step at a time. But there's
+        another flavour where the agent makes a <em>plan</em> first. Let's compare.</p>
+
+        <h3>Reactive agents (decide step-by-step)</h3>
+        <p>A <span class="term">reactive agent</span> chooses its next action based only on the current
+        situation, one step at a time — exactly the ReAct loop. It has no long-term plan; it just keeps asking
+        "given what I know right now, what's the best next move?"</p>
+
+        <h3>Planning agents (plan, then execute)</h3>
+        <p>A <span class="term">planning agent</span> first asks the LLM to break the goal into an ordered list
+        of sub-steps — a <span class="term">plan</span> — and <em>then</em> executes that plan step by step. This
+        is often called <span class="term">plan-and-execute</span>. Some planning agents also <em>re-plan</em>:
+        if a step fails or surprises them, they go back and revise the remaining plan.</p>
+
+        <div class="callout example">
+          <span class="c-title">Same goal, two styles</span>
+          <p>Goal: <code class="inl">"Plan a weekend trip to a nearby city under $300."</code></p>
+          <ul>
+            <li><strong>Reactive:</strong> searches a city → looks at it → maybe searches hotels → looks → maybe
+            searches trains… deciding each move as results come in.</li>
+            <li><strong>Planning:</strong> first writes a plan — (1) pick a city, (2) find transport cost,
+            (3) find a hotel, (4) sum costs, (5) check under $300 — then executes each step in order.</li>
+          </ul>
+        </div>
+
+        <h3>Pros and cons</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Reactive (step-by-step)</th><th>Planning (plan-then-execute)</th></tr></thead>
+            <tbody>
+              <tr><td>Best for</td><td>Open-ended tasks where you can't know the steps up front; quick, exploratory work.</td><td>Complex, multi-part tasks with a clear structure; tasks where order matters.</td></tr>
+              <tr><td>Adaptability</td><td>High — adjusts instantly to each new observation.</td><td>Lower unless it re-plans; a rigid plan can go stale.</td></tr>
+              <tr><td>Big-picture coherence</td><td>Can "lose the thread" or wander on long tasks.</td><td>Strong — the plan keeps it organised and on-goal.</td></tr>
+              <tr><td>Cost / steps</td><td>Can waste steps backtracking.</td><td>Planning up front can reduce wasted steps — but a bad plan wastes them all.</td></tr>
+              <tr><td>Risk</td><td>May get stuck in short-sighted loops.</td><td>If the initial plan is wrong, it may stubbornly follow a bad path.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">In practice: a blend</span>
+          <p>Real agents often mix both: make a rough plan, then execute each step <em>reactively</em>, and
+          re-plan when reality doesn't match expectations. You don't have to pick one religiously — pick what
+          fits the task, and lean on planning as tasks get longer and more structured.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Reactive agents decide one step at a time (the ReAct loop) — flexible but can wander. Planning
+          agents write a plan first, then execute it — organised for complex tasks but brittle if the plan is
+          wrong. Many real agents blend the two and re-plan when surprised.
+        </div>
+      </section>
+
+      <!-- ===================== 6. DETERMINISM ===================== -->
+      <section id="determinism">
+        <h2><span class="sec-num">6</span> Deterministic vs non-deterministic behavior</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A vending machine is <strong>deterministic</strong>: press B4 and you <em>always</em> get the same
+          chocolate bar. A box of assorted chocolates is <strong>non-deterministic</strong>: reach in and you
+          might get a different one each time. Agents are more like the box of chocolates — ask the same
+          thing twice and they might take slightly different paths to the answer. Sometimes that's fun;
+          sometimes you really want the vending machine.</p>
+        </div>
+
+        <p>Something is <span class="term">deterministic</span> if the same input <em>always</em> produces the
+        same output. It's <span class="term">non-deterministic</span> if the same input can produce different
+        outputs on different runs. Agents are often non-deterministic, and it's important to know why.</p>
+
+        <h3>Why agents wander</h3>
+        <p>Recall <span class="term">temperature</span> from Session 1: it controls how randomly the model
+        samples its next token. At higher temperature the model sometimes picks a less-likely token, so it can
+        word things differently — or, in an agent, <em>decide differently</em>. Because an agent's whole path is
+        a chain of these decisions, a small difference early on can snowball into a completely different route:
+        a different tool chosen, a different search query, a different number of steps.</p>
+
+        <div class="callout example">
+          <span class="c-title">Same question, two different paths</span>
+          <p>Ask an agent twice: <code class="inl">"Find me a good pizza place nearby and its rating."</code></p>
+          <ul>
+            <li><strong>Run 1:</strong> searches "best pizza near me" → picks the top result → looks up its rating.</li>
+            <li><strong>Run 2:</strong> searches "top rated pizza restaurants" → compares three → returns a
+            different one.</li>
+          </ul>
+          <p>Both are reasonable; neither is "wrong." But they're different — that's non-determinism in action.</p>
+        </div>
+
+        <h3>When you <em>want</em> determinism</h3>
+        <ul>
+          <li><strong>Testing &amp; debugging</strong> — if every run differs, you can't tell whether your change
+          helped or you just got a different roll of the dice (this echoes the prompt-testing advice from
+          Session 1).</li>
+          <li><strong>Critical, repeatable tasks</strong> — financial calculations, compliance steps, anything
+          where "the same input must give the same output" is a requirement.</li>
+          <li><strong>Reproducibility</strong> — when a user reports a bug, you want to reproduce the exact run.</li>
+        </ul>
+
+        <h3>How to push an agent toward determinism</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Lever</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td>Set <span class="term">temperature</span> low (≈0)</td><td>The model almost always picks its most-likely token, so decisions become far more repeatable.</td></tr>
+              <tr><td>Set a fixed <span class="term">seed</span> (if supported)</td><td>Pins the random number generator so sampling repeats identically.</td></tr>
+              <tr><td>Constrain the tools &amp; choices</td><td>Fewer valid moves = fewer ways to diverge.</td></tr>
+              <tr><td>Use rigid plans / hard-coded steps for critical parts</td><td>Move the must-be-exact logic out of the LLM and into plain code.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Even at temperature 0, agents are not <em>guaranteed</em> perfectly deterministic. Tools that hit
+          the live world (a web search, a database) return different data over time, and some model
+          infrastructure has tiny unavoidable variations. Low temperature reduces randomness a lot — it
+          doesn't make the outside world freeze.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Non-determinism is a <em>feature</em> for creative, exploratory tasks and a <em>bug</em> for critical,
+          repeatable ones. The main dial is temperature (from Session 1): turn it down when you need the
+          vending machine, leave it up when you want the box of chocolates.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deterministic = same input → same output; non-deterministic = it can vary. Agents wander because
+          temperature makes token (and thus decision) choices random, and small differences snowball. Lower
+          temperature, fixed seeds, fewer choices, and hard-coded steps push toward determinism — but live
+          tools and infrastructure mean it's never 100% guaranteed.
+        </div>
+      </section>
+
+      <!-- ===================== 7. FAILURE MODES & GUARDRAILS ===================== -->
+      <section id="failures">
+        <h2><span class="sec-num">7</span> Failure modes &amp; guardrails</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Giving the AI hands is powerful — but a toddler with scissors is also powerful. Agents can mess
+          up: ask for a tool that doesn't exist, get stuck doing the same thing forever, grab the wrong tool,
+          or run up a giant bill. So we put up little fences — like a "you've tried 10 times, stop now" rule,
+          or "ask a grown-up before doing the risky thing." Those fences are called guardrails.</p>
+        </div>
+
+        <p>Because an agent makes its own decisions and takes real actions, it has more ways to go wrong than a
+        plain chatbot. Knowing the common <span class="term">failure modes</span> — and the
+        <span class="term">guardrails</span> that contain them — is essential before you let one loose.</p>
+
+        <h3>Common failure modes</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Failure mode</th><th>What it looks like</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Hallucinated / invalid tool call</span></td><td>The model invents a tool that doesn't exist, or fills in arguments that are malformed or wrong (recall hallucination from Session 1 — it's predicting, not checking).</td></tr>
+              <tr><td><span class="term">Infinite loop</span></td><td>The agent keeps reasoning and acting but never decides it's done — looping forever (and burning money each turn).</td></tr>
+              <tr><td>Wrong tool choice</td><td>It uses the search tool when it should have used the calculator, or calls a destructive tool when a read-only one would do.</td></tr>
+              <tr><td>Getting stuck</td><td>It repeats the same failed action over and over, or thrashes between two steps without making progress.</td></tr>
+              <tr><td>Runaway cost</td><td>Long loops, large tool outputs, and re-sending the whole growing history every turn (remember: stateless model, Session 1) can quietly rack up huge token bills.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Guardrails — how we contain the damage</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Guardrail</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Max steps</span> (loop limit)</td><td>Cap the number of loop iterations (e.g. "stop after 10 steps"). Kills infinite loops dead.</td></tr>
+              <tr><td><span class="term">Validation</span></td><td>Before running any tool call, check it: does this tool exist? Are the arguments the right type and within allowed ranges? Reject bad calls instead of executing them.</td></tr>
+              <tr><td><span class="term">Human-in-the-loop</span></td><td>For risky or irreversible actions (sending money, deleting files, emailing customers), pause and ask a human to approve before acting.</td></tr>
+              <tr><td>Budget / cost limits</td><td>Cap total tokens or dollars per run; stop when the budget is hit.</td></tr>
+              <tr><td>Tool permissions &amp; sandboxing</td><td>Only expose tools the task actually needs; run risky tools (like code execution) in an isolated sandbox so mistakes can't harm the real system.</td></tr>
+              <tr><td>Loop / repetition detection</td><td>Notice when the agent repeats the same action and break out or change strategy.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: guardrails saving the day</span>
+          <p>An agent is asked to "clean up old files." Without guardrails it might call
+          <code class="inl">delete_file</code> on the wrong folder. With guardrails:</p>
+          <ul>
+            <li><strong>Validation</strong> rejects a delete call whose path is outside the allowed directory.</li>
+            <li><strong>Human-in-the-loop</strong> shows you the list of files and waits for your "yes" before
+            deleting.</li>
+            <li><strong>Max steps</strong> ensures that even if it gets confused, it can't loop forever trying.</li>
+          </ul>
+          <p>The agent still does the useful work — but the fences keep a mistake from becoming a disaster.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Golden rule</span>
+          <p>Never let an agent take an <em>irreversible</em> or <em>expensive</em> action without a guardrail in
+          front of it. The more powerful the tools you hand an agent, the more important the fences become.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Looking ahead: Assignment 02</span>
+          <p>This session's hands-on project is <strong>Assignment 02: build a website-cloning agent</strong> —
+          an agent that's given tools (fetch a page, read its HTML/CSS, write files) and loops until it has
+          reproduced a target website. As you build it, you'll feel every idea from today: choosing tools,
+          the ReAct loop, non-determinism between runs, and why a <em>max-steps</em> guardrail keeps it from
+          spinning forever. Keep this checklist of failure modes nearby while you build.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Agents fail in characteristic ways: hallucinated/invalid tool calls, infinite loops, wrong tool
+          choice, getting stuck, and runaway cost. Guardrails — max steps, validation, human-in-the-loop,
+          budget limits, sandboxing, and loop detection — keep those failures contained. Always fence off
+          irreversible or costly actions.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just turned a locked-in text-predictor into something that can act in the world. Here's the
+        one-paragraph story that connects all 7 topics:</p>
+        <div class="bigidea">
+          <p>A <strong>plain LLM</strong> is brilliant but trapped — knowledge cutoff, no live data, can't act,
+          no memory (all from Session 1). An <strong>AI agent</strong> frees it by adding <strong>tools</strong>
+          and a <strong>loop</strong>: the LLM brain reasons and emits a structured <strong>function call</strong>,
+          your code actually runs the tool and feeds the <strong>result</strong> back, and the
+          <strong>ReAct loop</strong> (Reason → Act → Observe) repeats until the job is done. Agents can work
+          <strong>reactively</strong> (step-by-step) or by <strong>planning</strong> first, and because of
+          <strong>temperature</strong> they're often <strong>non-deterministic</strong> — taking different paths on
+          the same question, which you tame with low temperature when you need repeatability. Finally, because
+          agents take real actions, you must respect their <strong>failure modes</strong> and wrap them in
+          <strong>guardrails</strong> (max steps, validation, human-in-the-loop) — which is exactly what you'll
+          practise in Assignment 02's website-cloning agent.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Why can't a plain LLM tell you the current weather, and what fixes it?</summary>
+          <p class="ans">It has no live/real-time data and can't take actions — it only predicts text from its
+          frozen training data (knowledge cutoff). An agent fixes this by giving it a weather <em>tool</em> it can
+          call to fetch live data.</p>
+        </details>
+        <details class="quiz">
+          <summary>When an agent "uses a tool," what does the LLM actually do?</summary>
+          <p class="ans">It only outputs text — a structured request (usually JSON) naming the tool and its
+          arguments. It does <em>not</em> run anything. Your surrounding code reads that request, runs the real
+          function, and feeds the result back.</p>
+        </details>
+        <details class="quiz">
+          <summary>What are the three beats of the ReAct loop?</summary>
+          <p class="ans">Reason (think about what to do) → Act (call a tool) → Observe (read the result) — then
+          repeat until the agent is ready to give a final answer.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why might an agent give different answers to the exact same question twice?</summary>
+          <p class="ans">Non-determinism: temperature (from Session 1) makes token — and therefore decision —
+          choices partly random, and small early differences snowball into different tool calls and paths.
+          Lower the temperature for more repeatable runs.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name two guardrails that prevent an agent from causing damage, and what each stops.</summary>
+          <p class="ans">Max steps (a loop limit) stops infinite loops and runaway cost; human-in-the-loop
+          pauses for approval before risky/irreversible actions; validation rejects malformed or invalid tool
+          calls before they run. (Any two.)</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-2.html"><div class="dir">← Previous</div><div class="ttl">Session 2: Prompt Engineering</div></a>
+        <a class="next" href="session-4.html"><div class="dir">Next →</div><div class="ttl">Session 4: RAG 1 — Intro to RAG</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 3 — Introduction to AI Agents · You gave the AI hands 🤖</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

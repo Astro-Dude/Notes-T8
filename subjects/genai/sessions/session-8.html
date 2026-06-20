@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 8 — Threads &amp; Tracing in Agent SDK</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 8</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 08 · Threads &amp; Tracing</span>
+      <h1>Threads &amp; Tracing — keeping memory of, and watching, your agent</h1>
+      <p class="lead">
+        In <a href="session-7.html">Session 7</a> you built your first agent with the Agent SDK. Now
+        come the two skills that turn a toy agent into something you can actually trust: giving it a
+        <strong>thread</strong> so it remembers the conversation across turns, and adding
+        <strong>tracing</strong> so you can <em>see</em> exactly what it did and fix it when it goes
+        wrong. As always, every topic starts with a tiny "explain like I'm 5" story, then we go deep
+        with real examples. Take it slow.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#threads">Threads — remembering across turns</a></li>
+          <li><a href="#tracing">What is tracing?</a></li>
+          <li><a href="#debugging">Debugging agent workflows</a></li>
+          <li><a href="#observability">Observability practices</a></li>
+          <li><a href="#investigation">Failure investigation: a case study</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. THREADS ===================== -->
+      <section id="threads">
+        <h2><span class="sec-num">1</span> Threads — remembering across turns</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine you're chatting with a friend who has a <em>terrible</em> memory — every time you
+          say something new, they forget everything that came before. Annoying, right? To fix it, you
+          keep a little notebook of your whole conversation, and before each new sentence you read the
+          <strong>whole notebook</strong> back to them so they're caught up. A <strong>thread</strong> is
+          that notebook. The SDK keeps it for you, so the agent <em>feels</em> like it remembers — even
+          though the model itself forgets the moment it finishes answering.</p>
+        </div>
+
+        <h3>First, recall: the model is stateless</h3>
+        <p>Back in <a href="session-1.html#flow">Session 1</a> we learned the big, surprising truth: an
+        LLM is <span class="term">stateless</span>. It has <strong>no memory between requests</strong>.
+        Each time you call the model, it reads what you send, produces an answer, and then completely
+        forgets the whole exchange. ChatGPT only <em>feels</em> like it remembers because the app
+        secretly re-sends the entire conversation with every new message.</p>
+
+        <p>So if the model has no memory, <em>who keeps the conversation?</em> Something on the outside
+        has to store the history and re-send it each turn. In the Agent SDK, that "something" is a
+        <span class="term">thread</span>.</p>
+
+        <h3>What a thread actually is</h3>
+        <p>A <span class="term">thread</span> (sometimes called a <span class="term">session</span> or
+        <span class="term">conversation</span>) is a persistent object that holds everything about one
+        ongoing conversation across multiple <span class="term">turns</span>. A <span class="term">turn
+        </span> is one round of "user says something → agent responds." A thread accumulates turns.</p>
+
+        <p>Concretely, a thread holds:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>What's in a thread</th><th>Why it's there</th></tr></thead>
+            <tbody>
+              <tr><td>The full message history</td><td>Every user message and every agent reply, in order — the "notebook."</td></tr>
+              <tr><td>Tool calls &amp; their results</td><td>So the agent remembers it already looked something up and what it found (recall the agent loop from <a href="session-3.html">Session 3</a>).</td></tr>
+              <tr><td>Running state / scratch data</td><td>Things the agent is keeping track of mid-task (e.g. a partly-filled form, a running total).</td></tr>
+              <tr><td>An identifier</td><td>A <code class="inl">thread_id</code> so you can save it, reload it later, and keep different users' conversations separate.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>The <strong>model</strong> forgets; the <strong>thread</strong> remembers. Continuity in a
+          chat is an illusion created by replaying the thread's stored history to the stateless model on
+          every single turn. The thread <em>is</em> the memory.</p>
+        </div>
+
+        <h3>How the SDK uses a thread, step by step</h3>
+        <p>When you send a new message on an existing thread, the SDK does roughly this:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📒</div><div class="s-t">1. Load thread</div><div class="s-d">Fetch stored history for this thread_id</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">➕</div><div class="s-t">2. Append</div><div class="s-d">Add the new user message</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧠</div><div class="s-t">3. Send all</div><div class="s-d">Pass the whole history to the model</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💬</div><div class="s-t">4. Get reply</div><div class="s-d">Model answers using full context</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💾</div><div class="s-t">5. Save</div><div class="s-d">Append the reply back to the thread</div></div>
+        </div>
+
+        <p>Notice step 5: the reply is written <em>back</em> into the thread. That's what makes the next
+        turn aware of this one. Without a thread, you'd be back to the forgetful friend.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: multiple turns on one thread</span>
+          <p>Watch how a thread carries context so the agent can resolve "it" and "that one":</p>
+          <ul>
+            <li><strong>Turn 1.</strong> User: <code class="inl">"What's the capital of Japan?"</code><br />
+            Agent: <code class="inl">"Tokyo."</code> &nbsp;→ thread now holds both lines.</li>
+            <li><strong>Turn 2.</strong> User: <code class="inl">"How many people live there?"</code><br />
+            The word "there" means nothing on its own. But because the SDK re-sends the whole thread,
+            the model sees Turn 1 and knows "there" = Tokyo.<br />
+            Agent: <code class="inl">"About 14 million in the city proper."</code></li>
+            <li><strong>Turn 3.</strong> User: <code class="inl">"And compared to Osaka?"</code><br />
+            Again, "compared" only makes sense with the prior turns in view. The thread supplies them, so
+            the agent gives a sensible comparison.</li>
+          </ul>
+          <p>Start a <em>brand-new</em> thread and ask only Turn 3 — the agent has no idea what you're
+          comparing. That gap is exactly what the thread fills.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Threads vs the context window</span>
+          <p>A thread can grow forever, but the model's <span class="term">context window</span>
+          (<a href="session-1.html#flow">Session 1</a>) is a fixed size. Once a thread's history is longer
+          than the window, something has to give — usually the oldest turns get trimmed or summarised
+          before sending. So a thread is the <em>full</em> record; what reaches the model each turn is
+          whatever fits. (Smarter ways to handle this are exactly what <a href="session-9.html">Session 9
+          </a> on memory systems is about.)</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Watch out</span>
+          <p>Because the whole thread is re-sent every turn, <strong>long threads cost more per message</strong>
+          (more input tokens — recall token economics in <a href="session-1.html#tokens">Session 1</a>) and
+          can eventually overflow the context window. Don't keep one giant thread running forever for
+          unrelated topics; start fresh threads when the conversation truly changes subject.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          The model is stateless and forgets after every reply. A <strong>thread</strong> is the persistent
+          object that stores the full conversation — messages, tool calls, and state — and re-sends it to the
+          model each turn so the agent appears to remember. The thread is the memory; the model is just the
+          engine that re-reads it.
+        </div>
+      </section>
+
+      <!-- ===================== 2. TRACING ===================== -->
+      <section id="tracing">
+        <h2><span class="sec-num">2</span> What is tracing?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine your friend goes to the shop to buy you a snack, but comes back with the wrong thing.
+          You ask "what happened?" and they say "...I dunno." Useless! Now imagine they came back with a
+          <strong>receipt and a little diary</strong>: "I went to aisle 3, picked the blue box, paid $2,
+          it took 5 minutes." Now you can see exactly where it went wrong. <strong>Tracing</strong> is
+          giving your agent that diary — a record of every single thing it did on the way to its answer.</p>
+        </div>
+
+        <h3>What tracing captures</h3>
+        <p><span class="term">Tracing</span> means automatically capturing a structured, time-ordered
+        record of everything that happened during one <span class="term">agent run</span> (one full
+        attempt to handle a request, which may involve many model calls and tool calls — the agent loop
+        from <a href="session-3.html">Session 3</a>). A good trace records:</p>
+        <ul>
+          <li><strong>Every model call</strong> — the exact prompt sent, the response, the model used.</li>
+          <li><strong>Every tool call</strong> — which tool, what arguments went in, what came back.</li>
+          <li><strong>Inputs and outputs</strong> at each step, so you can read the data flowing through.</li>
+          <li><strong>Timing</strong> — how long each step took (latency).</li>
+          <li><strong>Token usage &amp; cost</strong> — how many input/output tokens each model call burned.</li>
+          <li><strong>Errors</strong> — anything that failed, with the error message.</li>
+        </ul>
+
+        <h3>Two key words: <span class="term">span</span> and <span class="term">trace</span></h3>
+        <p>These two words are the whole vocabulary of tracing, so let's nail them:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Term</th><th>What it is</th><th>Everyday analogy</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Span</span></td><td>A record of <em>one single operation</em> — one model call, or one tool call. It has a start time, an end time, inputs, outputs, and a status.</td><td>One line item on the receipt.</td></tr>
+              <tr><td><span class="term">Trace</span></td><td>The <em>whole tree of spans</em> for one agent run, from the user's request to the final answer. Spans can nest inside spans (a model call that triggers a tool call that triggers another model call).</td><td>The entire receipt + diary for one shopping trip.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>So a <strong>trace</strong> is made of many <strong>spans</strong>, often nested like a tree.
+        Reading a trace top-to-bottom is like replaying the agent's whole thought process in slow motion.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: what a trace looks like</span>
+          <p>A user asks an agent: <code class="inl">"What's the weather in Paris and should I bring an
+          umbrella?"</code> The trace (simplified) might look like this tree of spans:</p>
+<pre>TRACE: "weather in Paris" run  (total 2.3s, 1,840 tokens)
+├─ SPAN model_call #1            (0.6s)  LLM decides to call a tool
+│    input:  user question + system prompt
+│    output: tool_call get_weather(city="Paris")
+├─ SPAN tool_call get_weather    (0.9s)
+│    input:  {"city": "Paris"}
+│    output: {"temp_c": 14, "rain": true}
+└─ SPAN model_call #2            (0.8s)  LLM writes the final answer
+     input:  history + tool result
+     output: "It's 14°C and raining in Paris — yes, bring an umbrella!"</pre>
+          <p>Every step is visible: what the model decided, what the tool returned, how long each took.
+          If the answer were wrong, you could point at the <em>exact</em> span where it went off.</p>
+        </div>
+
+        <h3>Why you can't debug agents with print statements alone</h3>
+        <p>When you wrote normal programs, sprinkling <code class="inl">print()</code> statements was often
+        enough. Agents break that approach for several reasons:</p>
+        <ul>
+          <li><strong>They're non-deterministic.</strong> The same input can produce different steps each
+          run (recall temperature, <a href="session-1.html#decoding">Session 1</a>). A bug might appear
+          only 1 time in 20 — a print you happened to add won't be there next time it strikes.</li>
+          <li><strong>They loop and branch.</strong> An agent might call a tool, reconsider, call another,
+          loop back (<a href="session-3.html">Session 3</a>'s agent loop). Flat printed lines make it
+          almost impossible to see <em>which</em> step led to which.</li>
+          <li><strong>The data is huge.</strong> Full prompts, tool outputs, and histories are enormous.
+          Dumping them as raw prints turns your console into an unreadable wall of text.</li>
+          <li><strong>You need structure and timing.</strong> "Which step was slow? How many tokens did
+          step 3 cost?" Prints don't measure that; spans do, automatically.</li>
+          <li><strong>It happens in production.</strong> You can't add prints to a bug a user hit yesterday.
+          But if tracing was on, the trace is already saved and waiting for you.</li>
+        </ul>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Tracing is to agents what an X-ray is to a doctor. Without it you're guessing from the outside;
+          with it you can see the skeleton of the whole run. In the Agent SDK, tracing is usually a
+          built-in feature you turn on — you don't have to hand-write all those spans yourself.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Tracing records a structured, timed log of everything an agent run did — every model call and
+          tool call, with inputs, outputs, timing, tokens, and errors. A <strong>span</strong> is one
+          operation; a <strong>trace</strong> is the whole nested tree for one run. Because agents are
+          non-deterministic, looping, and data-heavy, print statements aren't enough — you need traces.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DEBUGGING ===================== -->
+      <section id="debugging">
+        <h2><span class="sec-num">3</span> Debugging agent workflows</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If your toy robot ends up in the wrong room, you don't just shrug — you follow its footprints
+          backwards: "it turned left here, then went straight there... <em>ah, it turned the wrong way at
+          the kitchen!</em>" A trace is the robot's footprints. Debugging an agent is just following those
+          footprints back to the exact step where it took a wrong turn.</p>
+        </div>
+
+        <h3>The common ways agent runs go wrong</h3>
+        <p>From <a href="session-3.html">Session 3</a> you already met agent failure modes. Traces are how
+        you actually <em>spot</em> which one happened. The usual suspects:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Failure</th><th>What it looks like</th><th>How the trace reveals it</th></tr></thead>
+            <tbody>
+              <tr><td>Wrong tool</td><td>Agent used the calculator when it should have searched the web.</td><td>A tool-call span names the wrong tool.</td></tr>
+              <tr><td>Bad arguments</td><td>Right tool, but garbage inputs (e.g. searched "wether" instead of "weather", or passed the wrong city).</td><td>The tool-call span's <em>input</em> field shows the bad args.</td></tr>
+              <tr><td>Looping</td><td>Agent calls the same tool over and over, never finishing.</td><td>The trace shows the same span repeating many times.</td></tr>
+              <tr><td>Bad retrieval</td><td>In a RAG agent, it fetched the wrong documents, so the answer is built on the wrong facts.</td><td>The retrieval span's output shows irrelevant chunks.</td></tr>
+              <tr><td>Tool error swallowed</td><td>A tool failed, but the agent carried on as if it succeeded.</td><td>A span has an error status, yet the next model call ignores it.</td></tr>
+              <tr><td>Model misreads</td><td>Tool returned the right data, but the model summarised it wrong.</td><td>The final model-call span: good input, wrong output.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>A step-by-step debugging walkthrough</h3>
+        <p>Here's the reliable routine for using a trace to find where a run went wrong. Always work from
+        the <em>symptom</em> back toward the <em>cause</em>:</p>
+        <ol>
+          <li><strong>Reproduce or locate the run.</strong> Find the trace for the exact failed request
+          (by thread_id, user, or timestamp). With tracing on, it's already saved.</li>
+          <li><strong>Read the final answer span first.</strong> Confirm what actually went wrong — wrong
+          fact? Cut off? Refused? This tells you what kind of failure to hunt for.</li>
+          <li><strong>Walk backwards through the spans.</strong> Look at the step just before the final
+          answer. Was the input to that step already wrong? If yes, the bug is <em>earlier</em>; keep going
+          back. If the input was good but the output was bad, you've found the broken step.</li>
+          <li><strong>Inspect inputs vs outputs at the suspect span.</strong> This is the heart of it:
+          at each span, ask "given this input, is this output reasonable?" The first span where a good
+          input produced a bad output is your culprit.</li>
+          <li><strong>Check tool calls closely.</strong> Right tool? Right arguments? Did the tool return
+          what you expected, or an error/empty result the agent then misused?</li>
+          <li><strong>Check for loops.</strong> Scan for repeated spans. If the agent kept retrying, look at
+          why each attempt "failed" in its eyes.</li>
+          <li><strong>Form a fix and re-run.</strong> Adjust the prompt, tool description, or logic — then
+          run the same input again and compare the new trace to the old one.</li>
+        </ol>
+
+        <div class="callout example">
+          <span class="c-title">Worked walkthrough</span>
+          <p>An agent that books meetings replied: <code class="inl">"I've scheduled your meeting for
+          3pm."</code> But the user wanted <strong>10am</strong>. You open the trace and walk backwards:</p>
+          <ul>
+            <li><strong>Final span (model_call #2):</strong> output says "3pm". Its input contained
+            <code class="inl">{"time": "15:00"}</code> from the tool result. So the model didn't invent
+            3pm — it faithfully reported what the tool gave back. Bug is <em>earlier</em>.</li>
+            <li><strong>Tool span (book_meeting):</strong> input was
+            <code class="inl">{"time": "15:00"}</code>. But the user said 10am! So the wrong time was sent
+            <em>into</em> the tool. Bug is <em>even earlier</em>.</li>
+            <li><strong>First span (model_call #1):</strong> the model read "10am" and produced the tool
+            call with <code class="inl">"15:00"</code>. <strong>Found it.</strong> The model mis-converted
+            "10am" — likely confused by an ambiguous timezone instruction in the system prompt.</li>
+          </ul>
+          <p><strong>Fix:</strong> clarify the system prompt about timezones / 12-vs-24-hour format, re-run
+          the same request, and confirm the new trace shows <code class="inl">{"time": "10:00"}</code>.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common trap</span>
+          <p>Don't fix the <em>symptom</em>. Here it would be tempting to "fix" the final answer wording —
+          but the real bug was three spans upstream. Always trace back to the <strong>first</strong> step
+          where good input became bad output; fixing anything later just hides the problem.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Debugging an agent = reading its trace to find <em>where</em> the run went off. Start at the
+          symptom (final answer), walk backwards span by span, and find the first step where a good input
+          produced a bad output. Check tools for wrong choice, bad args, errors, or loops. Fix the root
+          cause, re-run, and compare traces — never patch the symptom.
+        </div>
+      </section>
+
+      <!-- ===================== 4. OBSERVABILITY ===================== -->
+      <section id="observability">
+        <h2><span class="sec-num">4</span> Observability practices</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A car has three kinds of "tell me what's happening" gadgets. The <strong>warning light</strong>
+          that blinks when something specific happens ("door open!") — those are <em>logs</em>. The
+          <strong>dashboard dials</strong> showing speed and fuel as numbers — those are <em>metrics</em>.
+          And imagine a magic <strong>flight recorder</strong> that saved your whole journey turn by turn —
+          that's a <em>trace</em>. <strong>Observability</strong> just means having all three so you always
+          know how your agent is doing.</p>
+        </div>
+
+        <h3>The three pillars: logs vs metrics vs traces</h3>
+        <p><span class="term">Observability</span> is the practice of being able to understand what your
+        system is doing from the outside, without guessing. It rests on three kinds of signal — people
+        often confuse them, so here's the clean version:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Signal</th><th>What it is</th><th>Answers the question</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Logs</span></td><td>Individual timestamped event messages.</td><td>"What happened, and when?"</td><td><code class="inl">2026-06-20 10:02 ERROR weather_tool timed out</code></td></tr>
+              <tr><td><span class="term">Metrics</span></td><td>Numbers aggregated over time — counts, averages, rates.</td><td>"How much / how often / how fast, overall?"</td><td>"Average latency = 2.1s; error rate = 3%."</td></tr>
+              <tr><td><span class="term">Traces</span></td><td>The full step-by-step story of one request (Topic 2).</td><td>"What exactly happened in <em>this one</em> run?"</td><td>The Paris-weather span tree above.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>They work together: a <strong>metric</strong> tells you <em>something is wrong</em> ("error rate
+        jumped"), <strong>logs</strong> tell you <em>roughly what</em> ("weather tool timing out"), and a
+        <strong>trace</strong> lets you <em>see one bad run in full detail</em> to confirm the cause.</p>
+
+        <h3>The numbers that matter for agents</h3>
+        <p>For LLM agents specifically, three metrics dominate everything:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Metric</th><th>What it measures</th><th>Why you care</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Latency</span></td><td>How long a run (or a step) takes.</td><td>Slow agents feel broken; users leave. Agents are extra slow because they make <em>multiple</em> model + tool calls per answer.</td></tr>
+              <tr><td><span class="term">Token cost</span></td><td>Input + output tokens per run, in money.</td><td>Every model call in the loop costs tokens (<a href="session-1.html#tokens">Session 1</a>). A chatty agent can be shockingly expensive at scale.</td></tr>
+              <tr><td><span class="term">Error rate</span></td><td>Fraction of runs that fail or give bad answers.</td><td>Your headline quality number. A rising error rate is the first sign something broke.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: a metric catches a regression</span>
+          <p>You ship a new version of your agent's prompt on Tuesday. On Wednesday a dashboard shows
+          <strong>average tokens per run jumped from 1,800 to 4,500</strong> and <strong>latency doubled</strong>.
+          The metrics raised the alarm. You open a few <em>traces</em> from Wednesday and discover the new
+          prompt caused the agent to call the search tool 3× per answer instead of once. Metrics found
+          the problem; traces explained it. You roll the prompt back (<a href="session-1.html#inference">prompt
+          versioning</a>, Session 1) and the numbers recover.</p>
+        </div>
+
+        <h3>Tools you'll hear about</h3>
+        <p>You don't build observability from scratch. There are dedicated platforms — at a high level:</p>
+        <ul>
+          <li><span class="term">SDK tracing dashboards</span> — many agent frameworks (including the Agent
+          SDK) ship a built-in trace viewer. You turn tracing on, run your agent, and view the span trees
+          in a web UI.</li>
+          <li><span class="term">LangSmith</span> and similar LLM-observability tools — specialised
+          dashboards for inspecting traces, comparing prompt versions, tracking token cost and latency, and
+          running evaluations over many runs.</li>
+          <li>General observability stacks (the kind used for any software) can ingest logs and metrics too,
+          but the LLM-specific tools understand prompts, tokens, and tool calls out of the box.</li>
+        </ul>
+        <div class="callout note">
+          <span class="c-title">Don't sweat the brand names</span>
+          <p>The specific tool matters far less than the <em>practice</em>. Whatever you use, you want the
+          same three things: searchable traces of individual runs, dashboards of the key metrics, and alerts
+          when a metric crosses a threshold.</p>
+        </div>
+
+        <h3>What to monitor in production</h3>
+        <p>Once your agent is live and real users depend on it, watch at minimum:</p>
+        <ul>
+          <li><strong>Latency</strong> (and percentiles — the slowest 5% of users, not just the average).</li>
+          <li><strong>Token cost per run</strong> and total daily spend (catch runaway loops before the bill does).</li>
+          <li><strong>Error rate</strong> and tool-failure rate (which tools fail most?).</li>
+          <li><strong>Loop / step-count</strong> — how many model+tool steps an average run takes; sudden
+          jumps mean trouble.</li>
+          <li><strong>User feedback signals</strong> — thumbs up/down, retries, abandonment.</li>
+          <li><strong>A sample of full traces</strong> kept for spot-checking and for debugging reported bugs.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Privacy note</span>
+          <p>Traces contain real user inputs and outputs, which may include personal or sensitive data. In
+          production, be careful what you store, who can view it, and for how long — redact secrets and follow
+          your data-handling rules. Observability is powerful, but it's still <em>real user data</em>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Observability = understanding your agent from the outside via <strong>logs</strong> (events),
+          <strong>metrics</strong> (aggregated numbers), and <strong>traces</strong> (full per-run stories).
+          The key agent metrics are <strong>latency</strong>, <strong>token cost</strong>, and
+          <strong>error rate</strong>. Use SDK dashboards or tools like LangSmith; in production, monitor those
+          metrics, watch for loops and runaway cost, keep sample traces, and respect user-data privacy.
+        </div>
+      </section>
+
+      <!-- ===================== 5. FAILURE INVESTIGATION ===================== -->
+      <section id="investigation">
+        <h2><span class="sec-num">5</span> Failure investigation: a case study</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A detective doesn't guess who did it — they follow the clues from the scene of the crime
+          backwards until they find the real culprit. When an agent gives a wrong answer, you become the
+          detective, and the <strong>trace</strong> is your pile of clues. Let's solve one mystery together,
+          start to finish.</p>
+        </div>
+
+        <h3>The case: a confidently wrong answer</h3>
+        <p>You run a customer-support agent for an online store. It has a tool
+        <code class="inl">lookup_order(order_id)</code> that fetches order details, and it uses
+        <span class="term">RAG</span> retrieval over the store's policy documents. A customer complains:</p>
+        <div class="callout warn">
+          <span class="c-title">The bug report</span>
+          <p>Customer asked: <em>"Can I return order #A-4471? It arrived broken."</em> The agent confidently
+          replied: <em>"Sorry, order #A-4471 is outside the 30-day return window and cannot be returned."</em>
+          But the order arrived <strong>three days ago</strong> — it absolutely should be returnable. The
+          agent gave a <strong>wrong answer</strong>, and an angry customer.</p>
+        </div>
+
+        <h3>The investigation process</h3>
+        <p>Here's the repeatable flow a good investigation follows — the same skeleton every time:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🚩</div><div class="s-t">1. Reproduce</div><div class="s-d">Find the exact trace</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔍</div><div class="s-t">2. Read trace</div><div class="s-d">Walk spans backwards</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🎯</div><div class="s-t">3. Isolate</div><div class="s-d">First bad-output span</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛠️</div><div class="s-t">4. Fix</div><div class="s-d">Patch the root cause</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✅</div><div class="s-t">5. Verify</div><div class="s-d">Re-run, compare traces</div></div>
+        </div>
+
+        <h3>Following the clues</h3>
+        <p>We pull up the trace for that exact run and walk it backwards, applying the debugging routine
+        from Topic 3:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Span (latest → earliest)</th><th>Input</th><th>Output</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td>model_call #2 (final answer)</td><td>order data + retrieved policy text saying "30-day window from <em>order date</em>"</td><td>"outside the 30-day window, cannot return"</td><td>Output matches its input → <strong>not the root cause</strong>. Look earlier.</td></tr>
+              <tr><td>retrieval span (RAG)</td><td>query: "return policy"</td><td>fetched the <em>old 2023</em> policy doc (30 days from <em>order</em> date)</td><td>🚩 Wrong document — the current policy is 30 days from <em>delivery</em> date. Suspicious.</td></tr>
+              <tr><td>tool_call lookup_order</td><td>{"order_id": "A-4471"}</td><td>{"ordered": "2026-04-10", "delivered": "2026-06-17"}</td><td>Tool worked fine. Note: ordered long ago, delivered 3 days ago.</td></tr>
+              <tr><td>model_call #1</td><td>user question</td><td>plans: lookup order, then retrieve policy</td><td>Reasonable plan → fine.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Root cause found</span>
+          <p>Two things combined. First, the agent retrieved an <strong>outdated policy document</strong>
+          (30 days from <em>order</em> date) instead of the current one (30 days from <em>delivery</em> date)
+          — a <strong>bad retrieval</strong> failure. Given that wrong policy, the final model call reasoned
+          <em>correctly</em> from <em>wrong facts</em>: ordered 2026-04-10 is indeed &gt;30 days ago, so it
+          said "no return." The model wasn't broken; it was fed bad source material.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">The fix, and verifying it</span>
+          <p><strong>Fix:</strong> the root problem is in retrieval, so we fix retrieval — remove/replace the
+          stale 2023 policy doc in the knowledge base so only the current "30 days from delivery" policy can
+          be retrieved. (We might also tighten the system prompt to always reason from <em>delivery</em> date.)</p>
+          <p><strong>Verify:</strong> re-run the <em>same</em> question and read the new trace. Now the
+          retrieval span returns the current policy, the final model call sees "30 days from delivery
+          (2026-06-17)", and the answer becomes: <em>"Yes — your order was delivered 3 days ago, well within
+          our 30-day return window. Here's how to start a return."</em> The new trace confirms the fix at the
+          exact span that was broken. Case closed.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Why the trace was essential</span>
+          <p>From the outside, this looked like "the model hallucinated." But the trace proved the model
+          reasoned <em>correctly</em> — the real fault was a stale document in the knowledge base. Without the
+          trace you might have wasted days "fixing" the model with prompt tweaks, while the true bug sat
+          quietly in your data. That's the whole point of this session.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A real failure investigation: reproduce the run, read its trace backwards, isolate the first span
+          where good input produced bad output, fix that root cause, then re-run and compare traces to verify.
+          In our case a "hallucination" was actually <strong>bad retrieval</strong> of a stale policy doc — only
+          the trace revealed it. Fix the data, not the symptom.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>This session gave you the two things that turn an agent from a fragile demo into something you
+        can run for real. Here's the one-paragraph story that ties it together:</p>
+        <div class="bigidea">
+          <p>Because the model is <strong>stateless</strong> (<a href="session-1.html#flow">Session 1</a>), a
+          <strong>thread</strong> stores the full conversation and re-sends it each turn so the agent appears
+          to remember. To <em>see</em> what the agent did, you turn on <strong>tracing</strong>, which records
+          a <strong>trace</strong> made of <strong>spans</strong> — every model call and tool call with its
+          inputs, outputs, timing, and tokens. When something goes wrong, you <strong>debug</strong> by walking
+          the trace backwards to the first step where good input produced bad output (recall the failure modes
+          from <a href="session-3.html">Session 3</a>). Across many runs, <strong>observability</strong> —
+          logs, metrics, and traces, watching latency, token cost, and error rate — tells you the health of the
+          whole system. And when a real user hits a bug, a disciplined <strong>failure investigation</strong>
+          using the saved trace takes you from "it gave a wrong answer" all the way to the true root cause —
+          which, as we saw, is often the <em>data</em>, not the model.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>The model is stateless, so how does an agent "remember" earlier turns?</summary>
+          <p class="ans">It doesn't — the <strong>thread</strong> does. The thread stores the full conversation
+          history and the SDK re-sends it to the model every turn, creating the illusion of memory.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between a span and a trace?</summary>
+          <p class="ans">A <strong>span</strong> is the record of one operation (one model call or one tool
+          call) with its input, output, timing, and status. A <strong>trace</strong> is the whole nested tree
+          of spans for one complete agent run.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why aren't print statements enough to debug an agent?</summary>
+          <p class="ans">Agents are non-deterministic (bugs appear intermittently), they loop and branch, the
+          data is huge, you need timing/token info, and bugs happen in production where you can't add prints
+          after the fact. Tracing handles all of that automatically.</p>
+        </details>
+        <details class="quiz">
+          <summary>When debugging, where in the trace is the real bug usually located?</summary>
+          <p class="ans">At the <strong>first span where a good input produced a bad output</strong>. Walk
+          backwards from the final answer; the symptom is at the end, but the root cause is upstream. Never
+          patch the symptom.</p>
+        </details>
+        <details class="quiz">
+          <summary>An agent gave a wrong answer that looked like a hallucination. The trace showed the final model call reasoned correctly. Where was the bug?</summary>
+          <p class="ans">Earlier in the run — in our case study it was <strong>bad retrieval</strong> (a stale
+          policy document). The model reasoned correctly from wrong facts. The fix was in the data, not the
+          model — which only the trace could reveal.</p>
+        </details>
+        <details class="quiz">
+          <summary>Name the three key metrics to watch for an agent in production.</summary>
+          <p class="ans"><strong>Latency</strong> (how slow), <strong>token cost</strong> (how expensive), and
+          <strong>error rate</strong> (how often it fails). Metrics raise the alarm; traces explain the cause.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-7.html"><div class="dir">← Previous</div><div class="ttl">Session 7: Agent SDK — Fundamentals</div></a>
+        <a class="next" href="session-9.html"><div class="dir">Next →</div><div class="ttl">Session 9: Memory Systems in AI Agents</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 8 — Threads &amp; Tracing in Agent SDK · Now you can see inside your agent 🔍</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>

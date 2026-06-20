@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenAI · Session 10 — Graph Databases &amp; Relational Memory</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css" />
+</head>
+<body data-accent="genai">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">GenAI</a> / Session 10</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Session 10 · Graph Databases &amp; Relational Memory</span>
+      <h1>Teaching AI to remember <em>connections</em>, not just facts</h1>
+      <p class="lead">
+        In Session 9 we gave our agent a memory; in Sessions 4–5 we taught it to search documents
+        with vectors. Today we add a third superpower: storing knowledge as a <em>network</em> of
+        connected things. As always, every topic starts with a tiny "explain like I'm 5" story, then
+        we go deeper with real examples and even a few real database queries. By the end you'll know
+        what a graph database is, why "friends of friends" is so hard for normal databases, and how
+        graphs make an AI agent reason over connected knowledge.
+      </p>
+    </section>
+
+    <div class="article-layout">
+
+      <!-- TABLE OF CONTENTS -->
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#fundamentals">Graph database fundamentals</a></li>
+          <li><a href="#knowledge-graphs">Knowledge graphs &amp; triples</a></li>
+          <li><a href="#sql-vs-graph">Relational (SQL) vs graph</a></li>
+          <li><a href="#neo4j">Neo4j, Cypher &amp; GraphRAG</a></li>
+        </ol>
+      </nav>
+
+      <!-- ARTICLE -->
+      <article class="article">
+
+      <!-- ===================== 1. FUNDAMENTALS ===================== -->
+      <section id="fundamentals">
+        <h2><span class="sec-num">1</span> Graph database fundamentals</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine drawing your family on a big sheet of paper. You draw a circle for <em>you</em>,
+          a circle for <em>Mum</em>, a circle for <em>Grandpa</em> — and then you draw <strong>lines</strong>
+          between them: "Mum is my mum," "Grandpa is Mum's dad." A graph database is exactly that paper:
+          little circles for <strong>things</strong>, and lines for <strong>how they're connected</strong>.
+          Instead of a boring list, you get a map of who-knows-what.</p>
+        </div>
+
+        <p>A <span class="term">graph database</span> stores data as a <strong>network</strong> made of three
+        ingredients. Once you know these three words, you understand the whole idea:</p>
+
+        <h3>The three building blocks</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Word</th><th>What it is</th><th>The circle-and-line picture</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Node</span> (also called a vertex)</td><td>A "thing" or entity — a person, a movie, a city, a product.</td><td>A circle on the page.</td></tr>
+              <tr><td><span class="term">Edge</span> (also called a relationship)</td><td>A connection <em>between</em> two nodes, and it has a direction and a name.</td><td>A labelled arrow joining two circles.</td></tr>
+              <tr><td><span class="term">Property</span></td><td>A piece of information stored <em>on</em> a node or an edge, as a key–value pair.</td><td>A sticky note attached to a circle or an arrow.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The official name for this design is the <span class="term">property graph</span> model, because both
+        the nodes <em>and</em> the relationships can carry properties. A node usually also has one or more
+        <span class="term">labels</span> (a type tag like <code class="inl">Person</code> or
+        <code class="inl">Movie</code>) so the database knows what kind of thing it is.</p>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>In a graph database, <strong>relationships are first-class citizens</strong>. They aren't hidden
+          inside columns or worked out on the fly — they are stored directly, as real objects, sitting right
+          next to the things they connect. Following a connection is therefore as cheap as walking from one
+          circle to the next.</p>
+        </div>
+
+        <h3>A diagram in words: a tiny movie graph</h3>
+        <p>Let's build a real little graph about people and movies. Read each line as "circle — arrow → circle":</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🧑</div><div class="s-t">(Keanu)</div><div class="s-d">Person · name: "Keanu Reeves"</div></div>
+          <div class="arrow">ACTED_IN →</div>
+          <div class="step"><div class="s-ico">🎬</div><div class="s-t">(The Matrix)</div><div class="s-d">Movie · year: 1999</div></div>
+          <div class="arrow">← DIRECTED</div>
+          <div class="step"><div class="s-ico">🎥</div><div class="s-t">(Lana)</div><div class="s-d">Person · name: "Lana Wachowski"</div></div>
+        </div>
+
+        <p>Spelling that out in our three building blocks:</p>
+        <ul>
+          <li><strong>Nodes:</strong> <code class="inl">Keanu</code> and <code class="inl">Lana</code> (both labelled
+          <code class="inl">Person</code>), and <code class="inl">The Matrix</code> (labelled <code class="inl">Movie</code>).</li>
+          <li><strong>Edges:</strong> <code class="inl">Keanu —ACTED_IN→ The Matrix</code> and
+          <code class="inl">Lana —DIRECTED→ The Matrix</code>. Notice the arrows have names and point a direction.</li>
+          <li><strong>Properties:</strong> <code class="inl">name="Keanu Reeves"</code> on the person node;
+          <code class="inl">year=1999</code> on the movie node. We could even put a property
+          <code class="inl">role="Neo"</code> <em>on the ACTED_IN edge itself</em>.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Concrete example: how this beats a table</span>
+          <p>In a spreadsheet you might store actors in one sheet, movies in another, and a third sheet
+          listing which actor was in which movie. To answer <em>"who directed a film Keanu acted in?"</em> you'd
+          have to flip between all three sheets and match IDs by hand. In the graph above, you just
+          <strong>walk the arrows</strong>: start at <code class="inl">Keanu</code>, hop along
+          <code class="inl">ACTED_IN</code> to <code class="inl">The Matrix</code>, then hop backwards along
+          <code class="inl">DIRECTED</code> to land on <code class="inl">Lana</code>. Two hops, no matching needed.</p>
+        </div>
+
+        <h3>Contrast with rows and tables</h3>
+        <p>A traditional database stores data in <strong>tables</strong> — grids of rows and columns, like a
+        spreadsheet. A table is brilliant for "here is a list of customers and their email addresses."
+        But a table has no built-in idea of a connection. To link two tables you must repeat an ID in both
+        (a "foreign key") and then <em>recompute</em> the link every time you ask a question. A graph skips that
+        bookkeeping: the link is simply stored. We'll dig into exactly when each one wins in Topic 3.</p>
+
+        <div class="callout note">
+          <span class="c-title">Where you've already seen graphs</span>
+          <p>"People you may know" on social media, "customers who bought this also bought…", Google Maps
+          finding a route between two places, fraud detection spotting suspicious rings of accounts — these
+          are all graph problems. The data is naturally a network, so a graph database fits like a glove.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A graph database stores data as a network of <strong>nodes</strong> (things), <strong>edges</strong>
+          (named, directed relationships between things) and <strong>properties</strong> (key–value details on
+          either). Relationships are stored directly as first-class objects, so following a connection is just
+          walking from circle to circle — unlike tables, where links must be recomputed by matching IDs.
+        </div>
+      </section>
+
+      <!-- ===================== 2. KNOWLEDGE GRAPHS ===================== -->
+      <section id="knowledge-graphs">
+        <h2><span class="sec-num">2</span> Knowledge graphs &amp; triples</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Think of all the little facts you know, written as tiny three-word sentences:
+          "Dogs are animals," "Bingo is a dog," "Bingo loves bones." If you draw a circle for every
+          thing in those sentences and connect them with arrows, you've drawn a giant web of everything
+          you know. That web is a <strong>knowledge graph</strong> — a map of facts where you can trace a
+          path from one fact to another and figure out new things, like "Bingo is an animal."</p>
+        </div>
+
+        <p>A <span class="term">knowledge graph</span> is a graph (nodes + edges, from Topic 1) used specifically
+        to store <strong>facts about the world</strong> in a structured, connected way. It's how you turn a pile
+        of loose facts into a web a computer — or an AI agent — can navigate and reason over.</p>
+
+        <h3>Facts as triples: subject → relationship → object</h3>
+        <p>The atom of a knowledge graph is the <span class="term">triple</span>: a fact written as exactly three
+        parts — a <strong>subject</strong>, a <strong>relationship</strong> (also called a predicate), and an
+        <strong>object</strong>. In graph terms, the subject and object are nodes, and the relationship is the
+        edge between them.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Subject</th><th>Relationship</th><th>Object</th><th>The fact in English</th></tr></thead>
+            <tbody>
+              <tr><td>Marie Curie</td><td>WON</td><td>Nobel Prize</td><td>Marie Curie won a Nobel Prize.</td></tr>
+              <tr><td>Marie Curie</td><td>BORN_IN</td><td>Warsaw</td><td>Marie Curie was born in Warsaw.</td></tr>
+              <tr><td>Warsaw</td><td>CAPITAL_OF</td><td>Poland</td><td>Warsaw is the capital of Poland.</td></tr>
+              <tr><td>Marie Curie</td><td>STUDIED</td><td>Physics</td><td>Marie Curie studied physics.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bigidea">
+          <span class="c-title">The one big idea</span>
+          <p>Because every fact is a triple, and triples share nodes, the facts <strong>automatically link up into
+          one connected web</strong>. The "Marie Curie" node above is shared by three triples, and "Warsaw" is
+          shared by two — so without any extra effort you can chain facts together:
+          <em>Marie Curie → born in → Warsaw → capital of → Poland</em>, letting you conclude she was born in
+          Poland even though no single triple said so.</p>
+        </div>
+
+        <h3>Why an agent loves this shape</h3>
+        <p>Recall from Session 1 that an LLM stores everything as fuzzy patterns in its parameters, with a
+        knowledge cutoff and a tendency to <span class="term">hallucinate</span>. A knowledge graph is the
+        opposite: facts are <strong>explicit, checkable, and connected</strong>. An agent can:</p>
+        <ul>
+          <li><strong>Look up</strong> a precise fact instead of guessing it ("What did Curie win?" → follow
+          the <code class="inl">WON</code> edge → "Nobel Prize"). No hallucination.</li>
+          <li><strong>Traverse</strong> several edges to answer a question no single fact answers, exactly like
+          the Warsaw → Poland chain above. This is called <span class="term">multi-hop reasoning</span>.</li>
+          <li><strong>Stay current</strong>: add or correct a triple and the agent instantly "knows" the new
+          fact — no expensive retraining (contrast with training in Session 1).</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: answering with a chain of triples</span>
+          <p>Question to the agent: <em>"Which country was the physicist who won the Nobel Prize born in?"</em></p>
+          <p>The agent walks the graph:</p>
+          <ul>
+            <li>Find the node that <code class="inl">WON</code> → <code class="inl">Nobel Prize</code> and
+            <code class="inl">STUDIED</code> → <code class="inl">Physics</code> ⇒ <strong>Marie Curie</strong>.</li>
+            <li>From Marie Curie follow <code class="inl">BORN_IN</code> ⇒ <strong>Warsaw</strong>.</li>
+            <li>From Warsaw follow <code class="inl">CAPITAL_OF</code> ⇒ <strong>Poland</strong>.</li>
+            <li>Answer: <strong>Poland.</strong></li>
+          </ul>
+          <p>Three separate stored facts combined into one new answer — with a clear, auditable trail showing
+          <em>why</em> the answer is right. That traceability is something a raw LLM guess can't give you.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Real knowledge graphs you use daily</span>
+          <p>When you Google "Marie Curie" and a little fact-box appears on the right, that's Google's
+          <strong>Knowledge Graph</strong> serving triples. Wikidata is a giant public knowledge graph anyone can
+          query. The idea scales from a handful of triples to billions.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A knowledge graph stores facts as <strong>triples</strong> (subject → relationship → object). Because
+          triples share nodes, facts link into one navigable web, letting an agent do <strong>multi-hop
+          reasoning</strong> over explicit, checkable, easily-updated facts — the opposite of an LLM's fuzzy,
+          frozen, hallucination-prone memory.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SQL VS GRAPH ===================== -->
+      <section id="sql-vs-graph">
+        <h2><span class="sec-num">3</span> Relational (SQL) vs graph databases</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Imagine two ways to keep your address book. Way one: a neat list in a notebook — great for
+          "what's Sam's phone number?" Way two: a big web of strings connecting all your friends — great for
+          "who are Sam's friends' friends?" Neither way is "better"; they're good at <em>different</em> questions.
+          The notebook is a normal (SQL) database. The web of strings is a graph database.</p>
+        </div>
+
+        <p>The traditional workhorse is the <span class="term">relational database</span> (queried with a
+        language called <span class="term">SQL</span>). It stores data in tables and is the default choice for
+        most software. So when should you reach for a graph instead? The honest answer: <strong>it depends on
+        whether your questions are about rows, or about relationships.</strong></p>
+
+        <h3>Side-by-side comparison</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Relational / SQL</th><th>Graph</th></tr></thead>
+            <tbody>
+              <tr><td>Stores data as</td><td>Tables (rows &amp; columns).</td><td>Nodes &amp; edges (a network).</td></tr>
+              <tr><td>Relationships</td><td>Implied via foreign keys; recomputed at query time with JOINs.</td><td>Stored directly as first-class objects.</td></tr>
+              <tr><td>Great at</td><td>Aggregates over many rows — sums, counts, averages, reports.</td><td>Traversing connections — "who connects to whom," paths, multi-hop.</td></tr>
+              <tr><td>Struggles with</td><td>Deep relationship questions (many JOINs get slow &amp; complex).</td><td>Big tabular aggregates &amp; simple flat lookups (overkill).</td></tr>
+              <tr><td>Query language</td><td>SQL.</td><td>Cypher (Neo4j), Gremlin, etc. — covered in Topic 4.</td></tr>
+              <tr><td>Classic use</td><td>Bank ledgers, inventory, invoices, analytics dashboards.</td><td>Social networks, recommendations, fraud rings, knowledge graphs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The "JOIN explosion" problem — why graphs win at traversal</h3>
+        <p>In SQL, to follow a relationship you perform a <span class="term">JOIN</span>: an operation that matches
+        rows from two tables by a shared ID. One JOIN is fine. But traversal questions need one JOIN <em>per hop</em>,
+        and the cost grows fast. Consider a friendship table where each row is "person A is friends with person B."</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Question</th><th>SQL effort</th><th>Graph effort</th></tr></thead>
+            <tbody>
+              <tr><td>Sam's friends</td><td>1 JOIN — fine.</td><td>1 hop.</td></tr>
+              <tr><td>Friends of friends</td><td>2 JOINs — getting heavier.</td><td>2 hops.</td></tr>
+              <tr><td>Friends of friends of friends</td><td>3 JOINs — slowing down a lot.</td><td>3 hops.</td></tr>
+              <tr><td>Anyone connected within 5 steps</td><td>5 JOINs over a huge table — often painfully slow.</td><td>5 hops — still quick.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>This blow-up is the <span class="term">JOIN explosion</span>: each extra hop forces SQL to re-scan and
+        re-match enormous numbers of row combinations, so query time can climb steeply. A graph database doesn't
+        re-match anything — at each node, the relationships are <em>already sitting there</em> as pointers, so it
+        simply follows them. Graph people call this <span class="term">index-free adjacency</span>: a node knows
+        its neighbours directly, no lookup table required. The result: deep traversals stay fast even as the
+        data grows.</p>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: "friends of friends" recommendation</span>
+          <p>You want to suggest new friends to Sam by finding people who are friends-of-friends but not yet
+          Sam's direct friends.</p>
+          <ul>
+            <li><strong>In SQL:</strong> join the friendship table to itself (Sam → friends), then join again
+            (friends → their friends), then filter out Sam and anyone already a direct friend, then de-duplicate.
+            Several JOINs, easy to get wrong, and slow on millions of rows.</li>
+            <li><strong>In a graph:</strong> start at Sam, hop two relationships out, exclude one-hop neighbours.
+            Two hops, naturally fast — this is the graph's home turf.</li>
+          </ul>
+          <p>That's why every "People you may know" feature is powered by a graph, not a stack of JOINs.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Don't over-correct</span>
+          <p>Graphs are <em>not</em> a universal upgrade. If your real question is "what was our total revenue last
+          quarter?" — a big aggregate over rows — a relational database is faster, cheaper, and simpler. Many real
+          systems use <strong>both</strong>: SQL for transactions and reports, a graph for the connected/relationship
+          parts. Pick the tool that matches the <em>shape of your questions</em>, not the hype.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Relationships and traversal (friends-of-friends, paths, multi-hop) ⇒ <strong>graph wins</strong>,
+          because it stores links directly and dodges the JOIN explosion. Tabular aggregates and simple lookups
+          ⇒ <strong>SQL wins</strong>. Match the database to the kind of question you ask most.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SQL stores tables and computes links with JOINs; graphs store links directly. Each extra hop costs SQL
+          another JOIN, and deep traversals trigger the <strong>JOIN explosion</strong>, while graphs follow
+          ready-made pointers (index-free adjacency) and stay fast. Use graphs for relationship-heavy questions,
+          SQL for aggregates — often both together.
+        </div>
+      </section>
+
+      <!-- ===================== 4. NEO4J ===================== -->
+      <section id="neo4j">
+        <h2><span class="sec-num">4</span> Neo4j, Cypher &amp; GraphRAG</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>If a graph is a web of circles and arrows, you need a program to <em>hold</em> the web and a way to
+          <em>ask it questions</em>. Neo4j is the most popular program for holding graphs, and Cypher is the
+          friendly language for asking — and the lovely thing is that a Cypher question is shaped like a little
+          drawing of the very arrows you're looking for. You literally draw the pattern in text.</p>
+        </div>
+
+        <p><span class="term">Neo4j</span> is the leading <strong>graph database</strong> — the most widely used
+        way to store and query property graphs. It comes with its own query language,
+        <span class="term">Cypher</span>, designed so that querying feels like sketching the pattern you want
+        to find.</p>
+
+        <h3>Cypher: drawing patterns in text</h3>
+        <p>Cypher uses round brackets <code class="inl">()</code> for nodes and arrows
+        <code class="inl">--&gt;</code> for relationships — so the query literally looks like the graph. Square
+        brackets <code class="inl">[]</code> name the relationship type. Here is a small query that finds the
+        directors of films Keanu Reeves acted in (our Topic 1 graph):</p>
+
+        <pre>// Find who directed films that Keanu acted in
+MATCH (keanu:Person {name: "Keanu Reeves"})-[:ACTED_IN]->(movie:Movie)&lt;-[:DIRECTED]-(director:Person)
+RETURN movie.title, director.name</pre>
+
+        <p>Read it like a sentence: <em>"MATCH a Person named Keanu who ACTED_IN a Movie that a director
+        DIRECTED, then RETURN the movie's title and the director's name."</em> The pattern
+        <code class="inl">(keanu)-[:ACTED_IN]-&gt;(movie)&lt;-[:DIRECTED]-(director)</code> is a tiny picture of
+        the two hops we walked by hand back in Topic 1 — Cypher just does the walking for you.</p>
+
+        <p>Creating data is just as visual. To add a fact (a triple from Topic 2):</p>
+        <pre>// Add the fact: Marie Curie BORN_IN Warsaw
+MERGE (mc:Person {name: "Marie Curie"})
+MERGE (w:City {name: "Warsaw"})
+MERGE (mc)-[:BORN_IN]->(w)</pre>
+        <p><code class="inl">MERGE</code> means "create this if it doesn't already exist," so you can safely add
+        facts without making duplicates — handy when an agent is continuously writing new knowledge.</p>
+
+        <h3>Where graphs meet GenAI: graph memory and GraphRAG</h3>
+        <p>Now we connect today's session to two earlier ones.</p>
+
+        <h4>Graphs as agent memory (Session 9)</h4>
+        <p>In <strong>Session 9</strong> we built memory systems so an agent could remember facts across
+        conversations. A graph is a powerful kind of long-term memory: as the agent learns things about a user
+        — <em>"Medha prefers window seats," "Medha works at Scaler," "Scaler is in Bangalore"</em> — it writes
+        them as triples into a graph. Later it can traverse them to reason: <em>"Where does Medha's employer
+        operate?"</em> ⇒ follow <code class="inl">WORKS_AT</code> then <code class="inl">LOCATED_IN</code> ⇒
+        "Bangalore." This is <strong>relational memory</strong>: memory that captures how facts <em>connect</em>,
+        not just isolated notes.</p>
+
+        <h4>GraphRAG vs vector RAG (Sessions 4–5)</h4>
+        <p>Recall <span class="term">RAG</span> (Retrieval-Augmented Generation) from <strong>Sessions 4–5</strong>:
+        you embed documents into vectors, and at query time you fetch the chunks whose embeddings are closest in
+        meaning, then hand them to the LLM. That's excellent for "find me passages that <em>sound like</em> my
+        question." But classic vector RAG retrieves <strong>isolated chunks</strong> — each snippet comes back on
+        its own, with no idea how it relates to the others.</p>
+
+        <p><span class="term">GraphRAG</span> upgrades this by retrieving <strong>connected facts from a knowledge
+        graph</strong> instead of (or alongside) loose text chunks. Here's the contrast:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Aspect</th><th>Vector RAG (Sessions 4–5)</th><th>GraphRAG</th></tr></thead>
+            <tbody>
+              <tr><td>What's retrieved</td><td>Isolated text chunks ranked by semantic similarity.</td><td>Connected nodes &amp; relationships from a graph.</td></tr>
+              <tr><td>Good at</td><td>"Find passages that mean roughly this."</td><td>"Find this fact <em>and everything it connects to</em>."</td></tr>
+              <tr><td>Multi-hop questions</td><td>Weak — answer may be split across chunks that don't link.</td><td>Strong — just traverse the edges.</td></tr>
+              <tr><td>Explainability</td><td>"These chunks looked similar."</td><td>A clear path of facts showing <em>why</em>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: a question that breaks vector RAG but suits GraphRAG</span>
+          <p>Question: <em>"Which of our suppliers are based in the same city as a customer who filed a complaint
+          last month?"</em></p>
+          <ul>
+            <li><strong>Vector RAG:</strong> it might fetch a chunk mentioning complaints and a separate chunk
+            mentioning supplier cities — but it has no way to <em>connect</em> them, so the LLM is left guessing
+            the link. This is the classic "isolated chunks" weakness.</li>
+            <li><strong>GraphRAG:</strong> traverse the graph —
+            <code class="inl">Complaint —FILED_BY→ Customer —LOCATED_IN→ City ←LOCATED_IN— Supplier</code> — and
+            return exactly the matching suppliers, with the path as proof. A multi-hop relationship question, which
+            is precisely what graphs are built for (Topic 3).</li>
+          </ul>
+          <p>Many real systems use a <strong>hybrid</strong>: vectors to find the right starting nodes by meaning,
+          then graph traversal to gather the connected facts around them — the best of both sessions.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">A note on which model reads the results</span>
+          <p>Whether you use vector RAG or GraphRAG, the retrieved facts are stuffed into the prompt and an LLM
+          writes the final answer. If you're building this with Claude (Anthropic's models), the same Session 1
+          rules apply — the facts must fit in the context window, and you still pay per token for everything you
+          retrieve and send. GraphRAG often sends <em>fewer, more relevant</em> facts, which can mean cleaner
+          answers and lower cost than dumping many loosely-related chunks.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Neo4j stores property graphs; Cypher queries them by letting you draw the pattern of nodes and
+          arrows you want. Plugged into GenAI, graphs become <strong>relational memory</strong> (Session 9) and
+          power <strong>GraphRAG</strong> — retrieving connected, explainable facts instead of the isolated chunks
+          of vector RAG (Sessions 4–5).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <strong>Neo4j</strong> is the leading graph database; <strong>Cypher</strong> queries it with patterns
+          that look like the graph (<code class="inl">()-[]-&gt;()</code>). Graphs serve as an agent's
+          <strong>relational memory</strong> and power <strong>GraphRAG</strong>, which retrieves connected,
+          multi-hop, explainable facts — a complement to the isolated-chunk retrieval of vector RAG.
+        </div>
+      </section>
+
+      <!-- ===================== WRAP UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <p>You just learned how to give an AI a memory of <em>connections</em>. Here's the one-paragraph story
+        that ties all four topics together:</p>
+        <div class="bigidea">
+          <p>A <strong>graph database</strong> stores data as a network of <strong>nodes</strong> (things),
+          <strong>edges</strong> (named, directed relationships) and <strong>properties</strong> (details on
+          either), making relationships first-class. Used to hold facts, it becomes a <strong>knowledge
+          graph</strong> built from <strong>triples</strong> (subject → relationship → object) that link into a
+          web an agent can traverse for <strong>multi-hop reasoning</strong>. Compared with a
+          <strong>relational/SQL</strong> database, graphs win on relationship-heavy, traversal questions
+          because they avoid the <strong>JOIN explosion</strong> via index-free adjacency, while SQL still wins
+          on tabular aggregates. <strong>Neo4j</strong> and its <strong>Cypher</strong> language make graphs
+          practical, and when wired into GenAI they act as an agent's <strong>relational memory</strong>
+          (Session 9) and power <strong>GraphRAG</strong> — retrieving connected, explainable facts instead of
+          the isolated chunks of vector RAG (Sessions 4–5).</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What are the three building blocks of a property graph?</summary>
+          <p class="ans">Nodes (things/entities), edges (named, directed relationships between nodes), and
+          properties (key–value details stored on a node or an edge). Nodes also usually carry a label naming
+          their type.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is a "triple" in a knowledge graph, with an example?</summary>
+          <p class="ans">A fact written as subject → relationship → object, e.g. "Marie Curie → BORN_IN →
+          Warsaw." The subject and object are nodes; the relationship is the edge. Triples share nodes, so they
+          link into one navigable web.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does a "friends of friends of friends" query favour a graph over SQL?</summary>
+          <p class="ans">Each hop costs SQL another JOIN, and deep traversals cause the JOIN explosion (re-matching
+          huge numbers of row combinations, getting slow). A graph stores relationships directly (index-free
+          adjacency), so it just follows pointers hop by hop and stays fast.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does GraphRAG differ from the vector RAG you learned in Sessions 4–5?</summary>
+          <p class="ans">Vector RAG retrieves isolated text chunks ranked by semantic similarity. GraphRAG
+          retrieves connected nodes and relationships from a knowledge graph, so it handles multi-hop questions
+          and gives an explainable path of facts. Many systems combine both (vectors to find start nodes, graph
+          traversal to gather connected facts).</p>
+        </details>
+        <details class="quiz">
+          <summary>In Cypher, what do round brackets and arrows represent?</summary>
+          <p class="ans">Round brackets <code class="inl">()</code> represent nodes and arrows
+          <code class="inl">--&gt;</code> (with <code class="inl">[:TYPE]</code> for the relationship name)
+          represent edges — so a Cypher pattern looks like a little drawing of the graph you want to match.</p>
+        </details>
+      </section>
+
+      <!-- PAGER -->
+      <nav class="pager">
+        <a href="session-9.html"><div class="dir">← Previous</div><div class="ttl">Session 9: Memory Systems</div></a>
+        <a class="next" href="session-11.html"><div class="dir">Next →</div><div class="ttl">Session 11: Conversational &amp; Voice-Based AI Agents</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">GenAI · Session 10 — Graph Databases &amp; Relational Memory · You taught the AI to remember connections 🕸️</footer>
+
+  <script src="../../../assets/js/app.js"></script>
+</body>
+</html>
