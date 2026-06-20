@@ -28,7 +28,7 @@
         pseudocode and cost formulas. Take it slow — by the end you'll understand the engines that make
         <code class="inl">ORDER BY</code>, <code class="inl">JOIN</code>, and <code class="inl">GROUP BY</code> fast.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 21 min read</span><span class="badge-rt">📖 4 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 27 min read</span><span class="badge-rt">📖 4 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -156,6 +156,111 @@
             nextRuns.append(merged)
         runs = nextRuns
     <span class="kw">return</span> runs[0]</pre>
+
+        <h3>The heart of Phase 2: a k-way merge with a min-heap</h3>
+        <p>The merge step needs to repeatedly find the <em>smallest</em> unread record across all
+        <code class="inl">k</code> input runs. Scanning every run head each time would cost
+        <code class="inl">O(k)</code> per record; a <span class="term">min-heap</span> (priority queue) keyed on
+        the run heads makes it <code class="inl">O(log k)</code>. Below is the in-memory k-way merge of
+        <em>already-sorted</em> runs — the core inner loop a real engine runs on each group of
+        <code class="inl">B − 1</code> runs. (When data exceeds memory, those input runs are produced by Phase 1,
+        sorting <code class="inl">B</code> pages at a time and spilling each sorted chunk to disk; here we keep
+        them in lists to show the merge itself.)</p>
+
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># k-way merge of already-sorted runs using a min-heap.</span>
+<span class="cm"># Each heap entry is (value, run_index, pos_within_run).</span>
+<span class="kw">import</span> heapq
+
+<span class="kw">def</span> kway_merge(runs):
+    <span class="cm"># Each run is a list sorted ascending. Returns one merged sorted list.</span>
+    heap = []
+    <span class="kw">for</span> i, run <span class="kw">in</span> <span class="nm">enumerate</span>(runs):     <span class="cm"># seed heap with each run's head</span>
+        <span class="kw">if</span> run:
+            heapq.heappush(heap, (run[<span class="nm">0</span>], i, <span class="nm">0</span>))
+    out = []
+    <span class="kw">while</span> heap:
+        val, i, pos = heapq.heappop(heap)   <span class="cm"># smallest head across all runs</span>
+        out.append(val)
+        <span class="kw">if</span> pos + <span class="nm">1</span> &lt; <span class="nm">len</span>(runs[i]):         <span class="cm"># refill from the SAME run</span>
+            heapq.heappush(heap, (runs[i][pos + <span class="nm">1</span>], i, pos + <span class="nm">1</span>))
+    <span class="kw">return</span> out
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    runs = [[<span class="nm">1</span>, <span class="nm">4</span>, <span class="nm">7</span>], [<span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">9</span>], [<span class="nm">5</span>, <span class="nm">6</span>, <span class="nm">8</span>]]   <span class="cm"># 3 sorted runs</span>
+    <span class="nm">print</span>(kway_merge(runs))                  <span class="cm"># [1, 2, 3, 4, 5, 6, 7, 8, 9]</span>
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// k-way merge of already-sorted runs using a min-heap.</span>
+<span class="cm">// Each heap entry is {value, runIndex, posWithinRun}.</span>
+<span class="cm">#include &lt;iostream&gt;</span>
+<span class="cm">#include &lt;vector&gt;</span>
+<span class="cm">#include &lt;queue&gt;</span>
+
+<span class="kw">struct</span> Item {
+    <span class="kw">int</span> value, run, pos;
+    <span class="kw">bool</span> <span class="kw">operator</span>&gt;(<span class="kw">const</span> Item&amp; o) <span class="kw">const</span> { <span class="kw">return</span> value &gt; o.value; } <span class="cm">// min-heap</span>
+};
+
+std::vector&lt;<span class="kw">int</span>&gt; kwayMerge(<span class="kw">const</span> std::vector&lt;std::vector&lt;<span class="kw">int</span>&gt;&gt;&amp; runs) {
+    <span class="cm">// greater&lt;&gt; turns the default max-heap into a min-heap</span>
+    std::priority_queue&lt;Item, std::vector&lt;Item&gt;, std::greater&lt;Item&gt;&gt; heap;
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nm">0</span>; i &lt; (<span class="kw">int</span>)runs.size(); ++i)   <span class="cm">// seed with each run's head</span>
+        <span class="kw">if</span> (!runs[i].empty()) heap.push({runs[i][<span class="nm">0</span>], i, <span class="nm">0</span>});
+
+    std::vector&lt;<span class="kw">int</span>&gt; out;
+    <span class="kw">while</span> (!heap.empty()) {
+        Item t = heap.top(); heap.pop();        <span class="cm">// smallest head across runs</span>
+        out.push_back(t.value);
+        <span class="kw">if</span> (t.pos + <span class="nm">1</span> &lt; (<span class="kw">int</span>)runs[t.run].size())  <span class="cm">// refill from SAME run</span>
+            heap.push({runs[t.run][t.pos + <span class="nm">1</span>], t.run, t.pos + <span class="nm">1</span>});
+    }
+    <span class="kw">return</span> out;
+}
+
+<span class="kw">int</span> main() {
+    std::vector&lt;std::vector&lt;<span class="kw">int</span>&gt;&gt; runs = {{<span class="nm">1</span>,<span class="nm">4</span>,<span class="nm">7</span>},{<span class="nm">2</span>,<span class="nm">3</span>,<span class="nm">9</span>},{<span class="nm">5</span>,<span class="nm">6</span>,<span class="nm">8</span>}};
+    <span class="kw">for</span> (<span class="kw">int</span> v : kwayMerge(runs)) std::cout &lt;&lt; v &lt;&lt; <span class="st">' '</span>;
+    std::cout &lt;&lt; <span class="st">"\n"</span>;                          <span class="cm">// 1 2 3 4 5 6 7 8 9</span>
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// k-way merge of already-sorted runs using a min-heap.</span>
+<span class="cm">// Each heap entry is (value, runIndex, posWithinRun).</span>
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">public class</span> KWayMerge {
+    <span class="kw">record</span> Item(<span class="kw">int</span> value, <span class="kw">int</span> run, <span class="kw">int</span> pos) {}
+
+    <span class="kw">static</span> List&lt;Integer&gt; kwayMerge(List&lt;List&lt;Integer&gt;&gt; runs) {
+        <span class="cm">// PriorityQueue is a min-heap; order by value</span>
+        PriorityQueue&lt;Item&gt; heap = <span class="kw">new</span> PriorityQueue&lt;&gt;(Comparator.comparingInt(Item::value));
+        <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nm">0</span>; i &lt; runs.size(); i++)      <span class="cm">// seed with each run's head</span>
+            <span class="kw">if</span> (!runs.get(i).isEmpty())
+                heap.add(<span class="kw">new</span> Item(runs.get(i).get(<span class="nm">0</span>), i, <span class="nm">0</span>));
+
+        List&lt;Integer&gt; out = <span class="kw">new</span> ArrayList&lt;&gt;();
+        <span class="kw">while</span> (!heap.isEmpty()) {
+            Item t = heap.poll();                  <span class="cm">// smallest head across runs</span>
+            out.add(t.value());
+            <span class="kw">if</span> (t.pos() + <span class="nm">1</span> &lt; runs.get(t.run()).size())  <span class="cm">// refill from SAME run</span>
+                heap.add(<span class="kw">new</span> Item(runs.get(t.run()).get(t.pos() + <span class="nm">1</span>), t.run(), t.pos() + <span class="nm">1</span>));
+        }
+        <span class="kw">return</span> out;
+    }
+
+    <span class="kw">public static void</span> main(String[] args) {
+        List&lt;List&lt;Integer&gt;&gt; runs = List.of(List.of(<span class="nm">1</span>,<span class="nm">4</span>,<span class="nm">7</span>),
+                                          List.of(<span class="nm">2</span>,<span class="nm">3</span>,<span class="nm">9</span>),
+                                          List.of(<span class="nm">5</span>,<span class="nm">6</span>,<span class="nm">8</span>));
+        System.out.println(kwayMerge(runs));       <span class="cm">// [1, 2, 3, 4, 5, 6, 7, 8, 9]</span>
+    }
+}
+</pre>
+        </div>
 
         <div class="callout note">
           <span class="c-title">A common optimisation: replacement selection</span>
@@ -319,17 +424,104 @@ i = 0;  j = 0
         result for every build row in the bucket that actually matches (hashing can put different keys in the
         same bucket — a <span class="term">collision</span> — so we still compare the real keys).</p>
 
-        <pre><span class="cm">// In-memory hash join: build on smaller S, probe with larger R</span>
-<span class="kw">function</span> hashJoin(S, R, key):
-    H = {}                              <span class="cm">// hash table: bucket -&gt; list of rows</span>
-    <span class="cm">// --- Build phase (smaller input) ---</span>
-    <span class="kw">for</span> s <span class="kw">in</span> S:
-        H[ hash(s.key) ].append(s)
-    <span class="cm">// --- Probe phase (larger input) ---</span>
-    <span class="kw">for</span> r <span class="kw">in</span> R:
-        <span class="kw">for</span> s <span class="kw">in</span> H[ hash(r.key) ]:
-            <span class="kw">if</span> s.key == r.key:        <span class="cm">// guard against collisions</span>
-                emit(s, r)</pre>
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># In-memory hash join: build on smaller S, probe with larger R.</span>
+<span class="cm"># Each row is (key, payload). We join on the key.</span>
+<span class="kw">from</span> collections <span class="kw">import</span> defaultdict
+
+<span class="kw">def</span> hash_join(build, probe):
+    <span class="cm"># --- Build phase: hash the SMALLER relation by key ---</span>
+    table = defaultdict(list)          <span class="cm"># key -&gt; list of build rows</span>
+    <span class="kw">for</span> key, payload <span class="kw">in</span> build:
+        table[key].append((key, payload))
+    <span class="cm"># --- Probe phase: scan the LARGER relation ---</span>
+    out = []
+    <span class="kw">for</span> rkey, rpay <span class="kw">in</span> probe:
+        <span class="kw">for</span> srow <span class="kw">in</span> table.get(rkey, ()):   <span class="cm"># dict guards collisions for us</span>
+            out.append((srow, (rkey, rpay)))
+    <span class="kw">return</span> out
+
+<span class="cm"># --- Tiny demo: customers (small) JOIN orders (big) on customer_id ---</span>
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    customers = [(<span class="nm">1</span>, <span class="st">"Alice"</span>), (<span class="nm">2</span>, <span class="st">"Bob"</span>), (<span class="nm">3</span>, <span class="st">"Cara"</span>)]
+    orders    = [(<span class="nm">2</span>, <span class="st">"ord-A"</span>), (<span class="nm">2</span>, <span class="st">"ord-B"</span>), (<span class="nm">3</span>, <span class="st">"ord-C"</span>), (<span class="nm">9</span>, <span class="st">"ord-D"</span>)]
+    <span class="kw">for</span> s, r <span class="kw">in</span> hash_join(customers, orders):
+        <span class="nm">print</span>(s[<span class="nm">1</span>], <span class="st">"&lt;-&gt;"</span>, r[<span class="nm">1</span>])
+    <span class="cm"># Alice never matches; customer 9 has no row =&gt; both dropped.</span>
+    <span class="cm"># Output: Bob &lt;-&gt; ord-A / Bob &lt;-&gt; ord-B / Cara &lt;-&gt; ord-C</span>
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// In-memory hash join: build on smaller S, probe with larger R.</span>
+<span class="cm">// Each row is {key, payload}. We join on the key.</span>
+<span class="cm">#include &lt;iostream&gt;</span>
+<span class="cm">#include &lt;string&gt;</span>
+<span class="cm">#include &lt;vector&gt;</span>
+<span class="cm">#include &lt;unordered_map&gt;</span>
+
+<span class="kw">struct</span> Row { <span class="kw">int</span> key; std::string payload; };
+
+std::vector&lt;std::pair&lt;Row, Row&gt;&gt;
+hashJoin(<span class="kw">const</span> std::vector&lt;Row&gt;&amp; build, <span class="kw">const</span> std::vector&lt;Row&gt;&amp; probe) {
+    <span class="cm">// --- Build phase: hash the SMALLER relation by key ---</span>
+    std::unordered_map&lt;<span class="kw">int</span>, std::vector&lt;Row&gt;&gt; table;   <span class="cm">// key -&gt; build rows</span>
+    <span class="kw">for</span> (<span class="kw">const</span> Row&amp; s : build) table[s.key].push_back(s);
+
+    <span class="cm">// --- Probe phase: scan the LARGER relation ---</span>
+    std::vector&lt;std::pair&lt;Row, Row&gt;&gt; out;
+    <span class="kw">for</span> (<span class="kw">const</span> Row&amp; r : probe) {
+        <span class="kw">auto</span> it = table.find(r.key);          <span class="cm">// map guards collisions</span>
+        <span class="kw">if</span> (it == table.end()) <span class="kw">continue</span>;
+        <span class="kw">for</span> (<span class="kw">const</span> Row&amp; s : it-&gt;second) out.push_back({s, r});
+    }
+    <span class="kw">return</span> out;
+}
+
+<span class="kw">int</span> main() {
+    <span class="cm">// customers (small) JOIN orders (big) on customer_id</span>
+    std::vector&lt;Row&gt; customers = {{<span class="nm">1</span>,<span class="st">"Alice"</span>},{<span class="nm">2</span>,<span class="st">"Bob"</span>},{<span class="nm">3</span>,<span class="st">"Cara"</span>}};
+    std::vector&lt;Row&gt; orders    = {{<span class="nm">2</span>,<span class="st">"ord-A"</span>},{<span class="nm">2</span>,<span class="st">"ord-B"</span>},{<span class="nm">3</span>,<span class="st">"ord-C"</span>},{<span class="nm">9</span>,<span class="st">"ord-D"</span>}};
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [s, r] : hashJoin(customers, orders))
+        std::cout &lt;&lt; s.payload &lt;&lt; <span class="st">" &lt;-&gt; "</span> &lt;&lt; r.payload &lt;&lt; <span class="st">"\n"</span>;
+    <span class="cm">// Output: Bob &lt;-&gt; ord-A / Bob &lt;-&gt; ord-B / Cara &lt;-&gt; ord-C</span>
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// In-memory hash join: build on smaller S, probe with larger R.</span>
+<span class="cm">// Each row is (key, payload). We join on the key.</span>
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">public class</span> HashJoin {
+    <span class="kw">record</span> Row(<span class="kw">int</span> key, String payload) {}
+
+    <span class="kw">static</span> List&lt;Row[]&gt; hashJoin(List&lt;Row&gt; build, List&lt;Row&gt; probe) {
+        <span class="cm">// --- Build phase: hash the SMALLER relation by key ---</span>
+        Map&lt;Integer, List&lt;Row&gt;&gt; table = <span class="kw">new</span> HashMap&lt;&gt;();
+        <span class="kw">for</span> (Row s : build)
+            table.computeIfAbsent(s.key(), k -&gt; <span class="kw">new</span> ArrayList&lt;&gt;()).add(s);
+
+        <span class="cm">// --- Probe phase: scan the LARGER relation ---</span>
+        List&lt;Row[]&gt; out = <span class="kw">new</span> ArrayList&lt;&gt;();
+        <span class="kw">for</span> (Row r : probe)
+            <span class="kw">for</span> (Row s : table.getOrDefault(r.key(), List.of()))  <span class="cm">// guards collisions</span>
+                out.add(<span class="kw">new</span> Row[]{s, r});
+        <span class="kw">return</span> out;
+    }
+
+    <span class="kw">public static void</span> main(String[] args) {
+        <span class="cm">// customers (small) JOIN orders (big) on customer_id</span>
+        List&lt;Row&gt; customers = List.of(<span class="kw">new</span> Row(<span class="nm">1</span>,<span class="st">"Alice"</span>), <span class="kw">new</span> Row(<span class="nm">2</span>,<span class="st">"Bob"</span>), <span class="kw">new</span> Row(<span class="nm">3</span>,<span class="st">"Cara"</span>));
+        List&lt;Row&gt; orders    = List.of(<span class="kw">new</span> Row(<span class="nm">2</span>,<span class="st">"ord-A"</span>), <span class="kw">new</span> Row(<span class="nm">2</span>,<span class="st">"ord-B"</span>),
+                                       <span class="kw">new</span> Row(<span class="nm">3</span>,<span class="st">"ord-C"</span>), <span class="kw">new</span> Row(<span class="nm">9</span>,<span class="st">"ord-D"</span>));
+        <span class="kw">for</span> (Row[] pair : hashJoin(customers, orders))
+            System.out.println(pair[<span class="nm">0</span>].payload() + <span class="st">" &lt;-&gt; "</span> + pair[<span class="nm">1</span>].payload());
+        <span class="cm">// Output: Bob &lt;-&gt; ord-A / Bob &lt;-&gt; ord-B / Cara &lt;-&gt; ord-C</span>
+    }
+}
+</pre>
+        </div>
 
         <div class="callout example">
           <span class="c-title">Worked example</span>

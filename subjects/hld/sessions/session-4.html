@@ -27,7 +27,7 @@
         the cache must be told (invalidation). We'll build all of it up from scratch, with everyday stories,
         real pseudocode, and a full case study at the end. Take it slow — none of this requires prior knowledge.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 4 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 43 min read</span><span class="badge-rt">📖 4 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -129,6 +129,168 @@
         popularity (a viral video everyone keeps watching), but it can keep stale "once-famous" items around too
         long and is slow to let go of yesterday's hits.</p>
 
+        <p>An O(1) LFU keeps a <strong>frequency bucket</strong> for each count: each bucket is itself an ordered
+        list of keys with that exact frequency. We track the <code class="inl">min_freq</code> bucket so the victim
+        is found instantly; on a tie within a bucket we evict the <em>least-recently-used</em> key (insertion order).</p>
+
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># LFU cache: O(1) get/put with frequency buckets; LRU tie-break within a bucket</span>
+<span class="kw">from</span> collections <span class="kw">import</span> defaultdict, OrderedDict
+
+<span class="kw">class</span> LFUCache:
+    <span class="kw">def</span> __init__(self, capacity):
+        self.cap      = capacity
+        self.val      = {}                       <span class="cm"># key -&gt; value</span>
+        self.freq     = {}                       <span class="cm"># key -&gt; use count</span>
+        self.buckets  = defaultdict(OrderedDict)  <span class="cm"># count -&gt; keys (oldest first)</span>
+        self.min_freq = <span class="nm">0</span>
+
+    <span class="kw">def</span> _bump(self, key):                        <span class="cm"># move key to its next-higher bucket</span>
+        f = self.freq[key]
+        <span class="kw">del</span> self.buckets[f][key]
+        <span class="kw">if</span> <span class="kw">not</span> self.buckets[f] <span class="kw">and</span> f == self.min_freq:
+            self.min_freq += <span class="nm">1</span>
+        self.freq[key] = f + <span class="nm">1</span>
+        self.buckets[f + <span class="nm">1</span>][key] = <span class="kw">None</span>
+
+    <span class="kw">def</span> get(self, key):
+        <span class="kw">if</span> key <span class="kw">not in</span> self.val:
+            <span class="kw">return</span> -<span class="nm">1</span>                           <span class="cm"># cache miss</span>
+        self._bump(key)
+        <span class="kw">return</span> self.val[key]
+
+    <span class="kw">def</span> put(self, key, value):
+        <span class="kw">if</span> self.cap == <span class="nm">0</span>:
+            <span class="kw">return</span>
+        <span class="kw">if</span> key <span class="kw">in</span> self.val:                       <span class="cm"># update + bump frequency</span>
+            self.val[key] = value
+            self._bump(key)
+            <span class="kw">return</span>
+        <span class="kw">if</span> len(self.val) &gt;= self.cap:            <span class="cm"># evict least-frequent (oldest within bucket)</span>
+            evict, _ = self.buckets[self.min_freq].popitem(last=<span class="kw">False</span>)
+            <span class="kw">del</span> self.val[evict]; <span class="kw">del</span> self.freq[evict]
+        self.val[key]  = value
+        self.freq[key] = <span class="nm">1</span>
+        self.buckets[<span class="nm">1</span>][key] = <span class="kw">None</span>
+        self.min_freq  = <span class="nm">1</span>
+
+<span class="cm"># --- demo ---</span>
+c = LFUCache(<span class="nm">2</span>)
+c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>)
+print(c.get(<span class="nm">1</span>))   <span class="cm"># 10  (freq of 1 -&gt; 2, freq of 2 stays 1)</span>
+c.put(<span class="nm">3</span>, <span class="nm">30</span>)      <span class="cm"># full -&gt; evicts key 2 (least frequent)</span>
+print(c.get(<span class="nm">2</span>))   <span class="cm"># -1  (evicted)</span>
+print(c.get(<span class="nm">3</span>))   <span class="cm"># 30</span></pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// LFU cache: O(1) get/put with frequency buckets; LRU tie-break within a bucket.</span>
+<span class="kw">#include</span> <span class="st">&lt;iostream&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;list&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unordered_map&gt;</span>
+<span class="kw">using namespace</span> std;
+
+<span class="kw">class</span> LFUCache {
+    <span class="kw">int</span> cap, minFreq = <span class="nm">0</span>;
+    unordered_map&lt;<span class="kw">int</span>, pair&lt;<span class="kw">int</span>, <span class="kw">int</span>&gt;&gt; val;            <span class="cm">// key -&gt; {value, freq}</span>
+    unordered_map&lt;<span class="kw">int</span>, list&lt;<span class="kw">int</span>&gt;&gt; buckets;             <span class="cm">// freq -&gt; keys (front = oldest)</span>
+    unordered_map&lt;<span class="kw">int</span>, list&lt;<span class="kw">int</span>&gt;::iterator&gt; pos;       <span class="cm">// key -&gt; node in its bucket</span>
+
+    <span class="kw">void</span> bump(<span class="kw">int</span> key) {                              <span class="cm">// move key to next-higher bucket</span>
+        <span class="kw">int</span> f = val[key].second;
+        buckets[f].erase(pos[key]);
+        <span class="kw">if</span> (buckets[f].empty() &amp;&amp; f == minFreq) minFreq++;
+        val[key].second = f + <span class="nm">1</span>;
+        buckets[f + <span class="nm">1</span>].push_back(key);
+        pos[key] = prev(buckets[f + <span class="nm">1</span>].end());
+    }
+<span class="kw">public</span>:
+    LFUCache(<span class="kw">int</span> capacity) : cap(capacity) {}
+
+    <span class="kw">int</span> get(<span class="kw">int</span> key) {
+        <span class="kw">if</span> (!val.count(key)) <span class="kw">return</span> -<span class="nm">1</span>;             <span class="cm">// cache miss</span>
+        bump(key);
+        <span class="kw">return</span> val[key].first;
+    }
+
+    <span class="kw">void</span> put(<span class="kw">int</span> key, <span class="kw">int</span> value) {
+        <span class="kw">if</span> (cap == <span class="nm">0</span>) <span class="kw">return</span>;
+        <span class="kw">if</span> (val.count(key)) { val[key].first = value; bump(key); <span class="kw">return</span>; }
+        <span class="kw">if</span> ((<span class="kw">int</span>)val.size() &gt;= cap) {                <span class="cm">// evict least-frequent, oldest first</span>
+            <span class="kw">int</span> evict = buckets[minFreq].front();
+            buckets[minFreq].pop_front();
+            val.erase(evict); pos.erase(evict);
+        }
+        val[key] = {value, <span class="nm">1</span>};
+        buckets[<span class="nm">1</span>].push_back(key);
+        pos[key] = prev(buckets[<span class="nm">1</span>].end());
+        minFreq = <span class="nm">1</span>;
+    }
+};
+
+<span class="kw">int</span> main() {
+    LFUCache c(<span class="nm">2</span>);
+    c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>);
+    cout &lt;&lt; c.get(<span class="nm">1</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// 10</span>
+    c.put(<span class="nm">3</span>, <span class="nm">30</span>);                  <span class="cm">// evicts key 2 (least frequent)</span>
+    cout &lt;&lt; c.get(<span class="nm">2</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// -1</span>
+    cout &lt;&lt; c.get(<span class="nm">3</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// 30</span>
+}</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// LFU cache: O(1) get/put with frequency buckets; LRU tie-break within a bucket.</span>
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">class</span> LFUCache {
+    <span class="kw">private final</span> <span class="kw">int</span> cap;
+    <span class="kw">private</span> <span class="kw">int</span> minFreq = <span class="nm">0</span>;
+    <span class="kw">private final</span> Map&lt;Integer, Integer&gt; val  = <span class="kw">new</span> HashMap&lt;&gt;();   <span class="cm">// key -&gt; value</span>
+    <span class="kw">private final</span> Map&lt;Integer, Integer&gt; freq = <span class="kw">new</span> HashMap&lt;&gt;();   <span class="cm">// key -&gt; count</span>
+    <span class="cm">// freq -&gt; keys, insertion-ordered so the eldest is the LRU tie-break</span>
+    <span class="kw">private final</span> Map&lt;Integer, LinkedHashSet&lt;Integer&gt;&gt; buckets = <span class="kw">new</span> HashMap&lt;&gt;();
+
+    <span class="kw">public</span> LFUCache(<span class="kw">int</span> capacity) { <span class="kw">this</span>.cap = capacity; }
+
+    <span class="kw">private</span> <span class="kw">void</span> bump(<span class="kw">int</span> key) {                        <span class="cm">// move key to next-higher bucket</span>
+        <span class="kw">int</span> f = freq.get(key);
+        buckets.get(f).remove(key);
+        <span class="kw">if</span> (buckets.get(f).isEmpty() &amp;&amp; f == minFreq) minFreq++;
+        freq.put(key, f + <span class="nm">1</span>);
+        buckets.computeIfAbsent(f + <span class="nm">1</span>, k -&gt; <span class="kw">new</span> LinkedHashSet&lt;&gt;()).add(key);
+    }
+
+    <span class="kw">public</span> <span class="kw">int</span> get(<span class="kw">int</span> key) {
+        <span class="kw">if</span> (!val.containsKey(key)) <span class="kw">return</span> -<span class="nm">1</span>;        <span class="cm">// cache miss</span>
+        bump(key);
+        <span class="kw">return</span> val.get(key);
+    }
+
+    <span class="kw">public</span> <span class="kw">void</span> put(<span class="kw">int</span> key, <span class="kw">int</span> value) {
+        <span class="kw">if</span> (cap == <span class="nm">0</span>) <span class="kw">return</span>;
+        <span class="kw">if</span> (val.containsKey(key)) { val.put(key, value); bump(key); <span class="kw">return</span>; }
+        <span class="kw">if</span> (val.size() &gt;= cap) {                       <span class="cm">// evict least-frequent, eldest first</span>
+            LinkedHashSet&lt;Integer&gt; b = buckets.get(minFreq);
+            <span class="kw">int</span> evict = b.iterator().next();
+            b.remove(evict);
+            val.remove(evict); freq.remove(evict);
+        }
+        val.put(key, value);
+        freq.put(key, <span class="nm">1</span>);
+        buckets.computeIfAbsent(<span class="nm">1</span>, k -&gt; <span class="kw">new</span> LinkedHashSet&lt;&gt;()).add(key);
+        minFreq = <span class="nm">1</span>;
+    }
+
+    <span class="kw">public static</span> <span class="kw">void</span> main(String[] args) {
+        LFUCache c = <span class="kw">new</span> LFUCache(<span class="nm">2</span>);
+        c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>);
+        System.out.println(c.get(<span class="nm">1</span>)); <span class="cm">// 10</span>
+        c.put(<span class="nm">3</span>, <span class="nm">30</span>);                 <span class="cm">// evicts key 2 (least frequent)</span>
+        System.out.println(c.get(<span class="nm">2</span>)); <span class="cm">// -1</span>
+        System.out.println(c.get(<span class="nm">3</span>)); <span class="cm">// 30</span>
+    }
+}</pre>
+        </div>
+
         <h4>FIFO — First In, First Out</h4>
         <p><span class="term">FIFO</span> evicts whatever was <em>added first</em>, regardless of how often or how
         recently it's been used — like a queue at a ticket counter. Simple and cheap, but dumb: it might evict a
@@ -202,7 +364,13 @@
           <div class="step"><div class="s-ico">🗑️</div><div class="s-t">Over capacity?</div><div class="s-d">drop tail = LRU victim</div></div>
         </div>
 
-        <pre><span class="cm"># LRU cache: O(1) get and put using hashmap + doubly linked list</span>
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># LRU cache: O(1) get and put using hashmap + doubly linked list</span>
 <span class="kw">class</span> Node:
     <span class="kw">def</span> __init__(self, key, value):
         self.key   = key
@@ -213,7 +381,7 @@
 <span class="kw">class</span> LRUCache:
     <span class="kw">def</span> __init__(self, capacity):
         self.cap  = capacity
-        self.map  = {}                  <span class="cm"># key -> Node, gives O(1) lookup</span>
+        self.map  = {}                  <span class="cm"># key -&gt; Node, gives O(1) lookup</span>
         <span class="cm"># two dummy "sentinel" nodes so we never check for None edges</span>
         self.head = Node(<span class="kw">None</span>, <span class="kw">None</span>)   <span class="cm"># most-recently-used side</span>
         self.tail = Node(<span class="kw">None</span>, <span class="kw">None</span>)   <span class="cm"># least-recently-used side</span>
@@ -244,10 +412,92 @@
         node = Node(key, value)
         self.map[key] = node
         self._add_front(node)
-        <span class="kw">if</span> len(self.map) &gt; self.cap:   <span class="cm"># over capacity -> evict LRU</span>
+        <span class="kw">if</span> len(self.map) &gt; self.cap:   <span class="cm"># over capacity -&gt; evict LRU</span>
             lru = self.tail.prev        <span class="cm"># node just before tail = oldest</span>
             self._remove(lru)
-            <span class="kw">del</span> self.map[lru.key]</pre>
+            <span class="kw">del</span> self.map[lru.key]
+
+<span class="cm"># --- demo ---</span>
+c = LRUCache(<span class="nm">2</span>)
+c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>)
+print(c.get(<span class="nm">1</span>))   <span class="cm"># 10  (1 is now most-recently-used)</span>
+c.put(<span class="nm">3</span>, <span class="nm">30</span>)      <span class="cm"># full -&gt; evicts key 2 (least recent)</span>
+print(c.get(<span class="nm">2</span>))   <span class="cm"># -1  (miss, was evicted)</span>
+print(c.get(<span class="nm">3</span>))   <span class="cm"># 30</span></pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// LRU cache: O(1) get and put using unordered_map + doubly linked list.</span>
+<span class="cm">// std::list is a doubly linked list; we store iterators for O(1) splice.</span>
+<span class="kw">#include</span> <span class="st">&lt;iostream&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;list&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unordered_map&gt;</span>
+<span class="kw">using namespace</span> std;
+
+<span class="kw">class</span> LRUCache {
+    <span class="kw">int</span> cap;
+    list&lt;pair&lt;<span class="kw">int</span>, <span class="kw">int</span>&gt;&gt; dll;                          <span class="cm">// front = most recent, back = least recent</span>
+    unordered_map&lt;<span class="kw">int</span>, list&lt;pair&lt;<span class="kw">int</span>, <span class="kw">int</span>&gt;&gt;::iterator&gt; map;  <span class="cm">// key -&gt; node</span>
+<span class="kw">public</span>:
+    LRUCache(<span class="kw">int</span> capacity) : cap(capacity) {}
+
+    <span class="kw">int</span> get(<span class="kw">int</span> key) {
+        <span class="kw">auto</span> it = map.find(key);
+        <span class="kw">if</span> (it == map.end()) <span class="kw">return</span> -<span class="nm">1</span>;             <span class="cm">// cache miss</span>
+        dll.splice(dll.begin(), dll, it-&gt;second);      <span class="cm">// move node to front, O(1)</span>
+        <span class="kw">return</span> it-&gt;second-&gt;second;
+    }
+
+    <span class="kw">void</span> put(<span class="kw">int</span> key, <span class="kw">int</span> value) {
+        <span class="kw">auto</span> it = map.find(key);
+        <span class="kw">if</span> (it != map.end()) dll.erase(it-&gt;second);     <span class="cm">// drop old node</span>
+        dll.push_front({key, value});                  <span class="cm">// insert at most-recent end</span>
+        map[key] = dll.begin();
+        <span class="kw">if</span> ((<span class="kw">int</span>)map.size() &gt; cap) {                 <span class="cm">// over capacity -&gt; evict LRU</span>
+            map.erase(dll.back().first);
+            dll.pop_back();                            <span class="cm">// back = least recent</span>
+        }
+    }
+};
+
+<span class="kw">int</span> main() {
+    LRUCache c(<span class="nm">2</span>);
+    c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>);
+    cout &lt;&lt; c.get(<span class="nm">1</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// 10</span>
+    c.put(<span class="nm">3</span>, <span class="nm">30</span>);                  <span class="cm">// evicts key 2</span>
+    cout &lt;&lt; c.get(<span class="nm">2</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// -1</span>
+    cout &lt;&lt; c.get(<span class="nm">3</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// 30</span>
+}</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// LRU cache: O(1) get and put by extending LinkedHashMap (map + DLL built in)</span>
+<span class="kw">import</span> java.util.LinkedHashMap;
+<span class="kw">import</span> java.util.Map;
+
+<span class="kw">class</span> LRUCache <span class="kw">extends</span> LinkedHashMap&lt;Integer, Integer&gt; {
+    <span class="kw">private final</span> <span class="kw">int</span> cap;
+
+    <span class="kw">public</span> LRUCache(<span class="kw">int</span> capacity) {
+        <span class="cm">// accessOrder=true: get/put move an entry to the most-recent end</span>
+        <span class="kw">super</span>(capacity, <span class="nm">0.75f</span>, <span class="kw">true</span>);
+        <span class="kw">this</span>.cap = capacity;
+    }
+
+    <span class="cm">// LinkedHashMap calls this after each insert; true -&gt; drop eldest (LRU)</span>
+    <span class="kw">@Override</span>
+    <span class="kw">protected</span> <span class="kw">boolean</span> removeEldestEntry(Map.Entry&lt;Integer, Integer&gt; eldest) {
+        <span class="kw">return</span> size() &gt; cap;
+    }
+
+    <span class="kw">public</span> <span class="kw">int</span> get(<span class="kw">int</span> key) {
+        <span class="kw">return</span> getOrDefault(key, -<span class="nm">1</span>);   <span class="cm">// -1 on a cache miss</span>
+    }
+
+    <span class="kw">public static</span> <span class="kw">void</span> main(String[] args) {
+        LRUCache c = <span class="kw">new</span> LRUCache(<span class="nm">2</span>);
+        c.put(<span class="nm">1</span>, <span class="nm">10</span>); c.put(<span class="nm">2</span>, <span class="nm">20</span>);
+        System.out.println(c.get(<span class="nm">1</span>)); <span class="cm">// 10</span>
+        c.put(<span class="nm">3</span>, <span class="nm">30</span>);                 <span class="cm">// evicts key 2</span>
+        System.out.println(c.get(<span class="nm">2</span>)); <span class="cm">// -1</span>
+        System.out.println(c.get(<span class="nm">3</span>)); <span class="cm">// 30</span>
+    }
+}</pre>
+        </div>
 
         <div class="callout note">
           <span class="c-title">Why two "sentinel" nodes?</span>

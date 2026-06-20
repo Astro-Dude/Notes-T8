@@ -28,7 +28,7 @@
         (the read path, the sparse index, and the bloom filter) that make reads fast again. No prior
         knowledge needed.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 30 min read</span><span class="badge-rt">📖 5 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 5 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -547,22 +547,130 @@
           <div class="step"><div class="s-ico">🔎</div><div class="s-t">Scan block</div><div class="s-d">Find lemon / not present</div></div>
         </div>
 
-        <h3>Sparse index lookup in pseudocode</h3>
-        <pre><span class="kw">function</span> sstable_get(key):
-    <span class="cm"># sparse_index is a sorted list of (indexed_key, offset),</span>
-    <span class="cm"># kept in memory. Find the block that COULD contain key.</span>
-    start_offset = floor_entry(sparse_index, key)   <span class="cm"># largest indexed_key &lt;= key</span>
-    end_offset   = next_entry_offset(sparse_index, key)  <span class="cm"># start of next block</span>
+        <h3>Sparse index lookup in code</h3>
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># Python</span>
+<span class="kw">from</span> bisect <span class="kw">import</span> bisect_right
 
-    <span class="kw">if</span> start_offset <span class="kw">is</span> NONE:
-        <span class="kw">return</span> NONE        <span class="cm"># key sorts before the very first key</span>
+<span class="cm"># The sparse index: sorted (first_key_of_block, byte_offset) pairs, in RAM.</span>
+sparse_index = [(<span class="st">"apple"</span>, <span class="nm">0</span>), (<span class="st">"cherry"</span>, <span class="nm">4096</span>), (<span class="st">"mango"</span>, <span class="nm">8192</span>), (<span class="st">"peach"</span>, <span class="nm">12288</span>)]
 
-    block = disk_read(file, start_offset, end_offset)   <span class="cm"># ONE disk read</span>
+<span class="cm"># Stand-in for a real file: each block is the run of (key, value) it holds.</span>
+blocks = {
+    <span class="nm">0</span>:     [(<span class="st">"apple"</span>, <span class="st">"A"</span>), (<span class="st">"banana"</span>, <span class="st">"B"</span>)],
+    <span class="nm">4096</span>:  [(<span class="st">"cherry"</span>, <span class="st">"C"</span>), (<span class="st">"lemon"</span>, <span class="st">"L"</span>), (<span class="st">"lime"</span>, <span class="st">"Li"</span>)],
+    <span class="nm">8192</span>:  [(<span class="st">"mango"</span>, <span class="st">"M"</span>), (<span class="st">"orange"</span>, <span class="st">"O"</span>)],
+    <span class="nm">12288</span>: [(<span class="st">"peach"</span>, <span class="st">"P"</span>)],
+}
 
-    <span class="kw">for</span> (k, v) <span class="kw">in</span> block:        <span class="cm"># small in-memory scan</span>
+<span class="kw">def</span> disk_read(offset):       <span class="cm"># the ONE disk read</span>
+    <span class="kw">return</span> blocks[offset]
+
+<span class="kw">def</span> sstable_get(key):
+    keys = [k <span class="kw">for</span> (k, _) <span class="kw">in</span> sparse_index]
+    <span class="cm"># binary search: largest indexed key &lt;= key</span>
+    i = bisect_right(keys, key) - <span class="nm">1</span>
+    <span class="kw">if</span> i &lt; <span class="nm">0</span>:
+        <span class="kw">return</span> <span class="kw">None</span>           <span class="cm"># key sorts before the very first block</span>
+
+    _, offset = sparse_index[i]
+    block = disk_read(offset)   <span class="cm"># one disk read of the candidate block</span>
+    <span class="kw">for</span> (k, v) <span class="kw">in</span> block:        <span class="cm"># short in-memory linear scan</span>
         <span class="kw">if</span> k == key:
             <span class="kw">return</span> v
-    <span class="kw">return</span> NONE                  <span class="cm"># not in this SSTable</span></pre>
+    <span class="kw">return</span> <span class="kw">None</span>               <span class="cm"># not in this SSTable</span>
+
+
+<span class="cm"># --- tiny demo ---</span>
+print(sstable_get(<span class="st">"lemon"</span>))   <span class="cm"># "L"   (cherry block @4096, then scan)</span>
+print(sstable_get(<span class="st">"grape"</span>))   <span class="cm"># None  (apple block @0 scanned, absent)</span>
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// C++</span>
+<span class="cm">#include &lt;vector&gt;</span>
+<span class="cm">#include &lt;string&gt;</span>
+<span class="cm">#include &lt;map&gt;</span>
+<span class="cm">#include &lt;algorithm&gt;</span>
+<span class="cm">#include &lt;optional&gt;</span>
+<span class="cm">#include &lt;iostream&gt;</span>
+
+<span class="kw">using</span> Entry = std::pair&lt;std::string, std::string&gt;;   <span class="cm">// (key, value)</span>
+
+<span class="cm">// Sparse index: sorted (first_key_of_block, byte_offset), in RAM.</span>
+std::vector&lt;std::pair&lt;std::string, <span class="kw">long</span>&gt;&gt; sparse_index = {
+    {<span class="st">"apple"</span>, <span class="nm">0</span>}, {<span class="st">"cherry"</span>, <span class="nm">4096</span>}, {<span class="st">"mango"</span>, <span class="nm">8192</span>}, {<span class="st">"peach"</span>, <span class="nm">12288</span>}
+};
+
+<span class="cm">// Stand-in for a file: each block is the run of entries it holds.</span>
+std::map&lt;<span class="kw">long</span>, std::vector&lt;Entry&gt;&gt; blocks = {
+    {<span class="nm">0</span>,     {{<span class="st">"apple"</span>, <span class="st">"A"</span>}, {<span class="st">"banana"</span>, <span class="st">"B"</span>}}},
+    {<span class="nm">4096</span>,  {{<span class="st">"cherry"</span>, <span class="st">"C"</span>}, {<span class="st">"lemon"</span>, <span class="st">"L"</span>}, {<span class="st">"lime"</span>, <span class="st">"Li"</span>}}},
+    {<span class="nm">8192</span>,  {{<span class="st">"mango"</span>, <span class="st">"M"</span>}, {<span class="st">"orange"</span>, <span class="st">"O"</span>}}},
+    {<span class="nm">12288</span>, {{<span class="st">"peach"</span>, <span class="st">"P"</span>}}}
+};
+
+std::optional&lt;std::string&gt; sstable_get(<span class="kw">const</span> std::string&amp; key) {
+    <span class="cm">// binary search: largest indexed key &lt;= key</span>
+    <span class="kw">auto</span> it = std::upper_bound(
+        sparse_index.begin(), sparse_index.end(), key,
+        [](<span class="kw">const</span> std::string&amp; k, <span class="kw">const</span> <span class="kw">auto</span>&amp; e){ <span class="kw">return</span> k &lt; e.first; });
+    <span class="kw">if</span> (it == sparse_index.begin()) <span class="kw">return</span> std::nullopt;  <span class="cm">// before first block</span>
+    --it;
+
+    <span class="kw">const</span> <span class="kw">auto</span>&amp; block = blocks[it-&gt;second];   <span class="cm">// one disk read of candidate block</span>
+    <span class="kw">for</span> (<span class="kw">const</span> <span class="kw">auto</span>&amp; [k, v] : block)        <span class="cm">// short in-memory scan</span>
+        <span class="kw">if</span> (k == key) <span class="kw">return</span> v;
+    <span class="kw">return</span> std::nullopt;                  <span class="cm">// not in this SSTable</span>
+}
+
+<span class="kw">int</span> main() {
+    <span class="kw">auto</span> a = sstable_get(<span class="st">"lemon"</span>);
+    <span class="kw">auto</span> b = sstable_get(<span class="st">"grape"</span>);
+    std::cout &lt;&lt; (a ? *a : <span class="st">"NONE"</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// L</span>
+    std::cout &lt;&lt; (b ? *b : <span class="st">"NONE"</span>) &lt;&lt; <span class="st">"\n"</span>;   <span class="cm">// NONE</span>
+    <span class="kw">return</span> <span class="nm">0</span>;
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// Java</span>
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">class</span> SparseIndexLookup {
+    <span class="kw">record</span> Entry(String key, String value) {}
+
+    <span class="cm">// Sparse index: sorted first-key-of-block -&gt; byte offset, in RAM.</span>
+    <span class="kw">static final</span> String[] indexKeys   = {<span class="st">"apple"</span>, <span class="st">"cherry"</span>, <span class="st">"mango"</span>, <span class="st">"peach"</span>};
+    <span class="kw">static final</span> <span class="kw">long</span>[]   indexOffsets = {<span class="nm">0</span>, <span class="nm">4096</span>, <span class="nm">8192</span>, <span class="nm">12288</span>};
+
+    <span class="cm">// Stand-in for a file: each block is the run of entries it holds.</span>
+    <span class="kw">static final</span> Map&lt;Long, List&lt;Entry&gt;&gt; blocks = Map.of(
+        <span class="nm">0L</span>,     List.of(<span class="kw">new</span> Entry(<span class="st">"apple"</span>, <span class="st">"A"</span>),  <span class="kw">new</span> Entry(<span class="st">"banana"</span>, <span class="st">"B"</span>)),
+        <span class="nm">4096L</span>,  List.of(<span class="kw">new</span> Entry(<span class="st">"cherry"</span>, <span class="st">"C"</span>), <span class="kw">new</span> Entry(<span class="st">"lemon"</span>, <span class="st">"L"</span>), <span class="kw">new</span> Entry(<span class="st">"lime"</span>, <span class="st">"Li"</span>)),
+        <span class="nm">8192L</span>,  List.of(<span class="kw">new</span> Entry(<span class="st">"mango"</span>, <span class="st">"M"</span>),  <span class="kw">new</span> Entry(<span class="st">"orange"</span>, <span class="st">"O"</span>)),
+        <span class="nm">12288L</span>, List.of(<span class="kw">new</span> Entry(<span class="st">"peach"</span>, <span class="st">"P"</span>)));
+
+    <span class="kw">static</span> String sstableGet(String key) {
+        <span class="cm">// binary search: largest indexed key &lt;= key</span>
+        <span class="kw">int</span> i = Arrays.binarySearch(indexKeys, key);
+        <span class="kw">if</span> (i &lt; <span class="nm">0</span>) i = -(i + <span class="nm">1</span>) - <span class="nm">1</span>;   <span class="cm">// insertion point - 1</span>
+        <span class="kw">if</span> (i &lt; <span class="nm">0</span>) <span class="kw">return</span> <span class="kw">null</span>;         <span class="cm">// before first block</span>
+
+        List&lt;Entry&gt; block = blocks.get(indexOffsets[i]);  <span class="cm">// one disk read</span>
+        <span class="kw">for</span> (Entry e : block)              <span class="cm">// short in-memory scan</span>
+            <span class="kw">if</span> (e.key().equals(key)) <span class="kw">return</span> e.value();
+        <span class="kw">return</span> <span class="kw">null</span>;                      <span class="cm">// not in this SSTable</span>
+    }
+
+    <span class="kw">public static</span> <span class="kw">void</span> main(String[] args) {
+        System.out.println(sstableGet(<span class="st">"lemon"</span>));  <span class="cm">// L</span>
+        System.out.println(sstableGet(<span class="st">"grape"</span>));  <span class="cm">// null</span>
+    }
+}
+</pre>
+        </div>
 
         <div class="callout note">
           <span class="c-title">A nice side effect</span>
@@ -689,22 +797,149 @@ bits:   0 0 1 0 1 0 0 1 0 0</pre>
           coincidence of bits set by <em>other</em> keys — that's a false positive.</p>
         </div>
 
-        <h3>Bloom filter in pseudocode</h3>
-        <pre><span class="kw">class</span> BloomFilter:
-    bits = array of m zeros
-    k    = number of hash functions
+        <h3>Bloom filter in code</h3>
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># Python</span>
+<span class="kw">class</span> BloomFilter:
+    <span class="kw">def</span> __init__(self, m, k):
+        self.m = m                  <span class="cm"># number of bits</span>
+        self.k = k                  <span class="cm"># number of hash functions</span>
+        self.bits = [<span class="nm">0</span>] * m       <span class="cm"># bit array, all zero</span>
 
-    <span class="kw">function</span> add(key):
-        <span class="kw">for</span> i <span class="kw">in</span> 0 .. k-1:
-            pos = hash_i(key) % m
-            bits[pos] = 1
+    <span class="kw">def</span> _positions(self, key):
+        <span class="cm"># derive k independent indices from one base hash</span>
+        h = hash(key)
+        h1, h2 = h &amp; <span class="nm">0xFFFFFFFF</span>, (h &gt;&gt; <span class="nm">32</span>) &amp; <span class="nm">0xFFFFFFFF</span>
+        <span class="kw">for</span> i <span class="kw">in</span> range(self.k):
+            <span class="kw">yield</span> (h1 + i * h2) % self.m   <span class="cm"># double hashing</span>
 
-    <span class="kw">function</span> might_contain(key):
-        <span class="kw">for</span> i <span class="kw">in</span> 0 .. k-1:
-            pos = hash_i(key) % m
-            <span class="kw">if</span> bits[pos] == 0:
-                <span class="kw">return</span> FALSE     <span class="cm"># definitely NOT present</span>
-        <span class="kw">return</span> TRUE              <span class="cm"># possibly present (might be a false positive)</span></pre>
+    <span class="kw">def</span> add(self, key):
+        <span class="kw">for</span> pos <span class="kw">in</span> self._positions(key):
+            self.bits[pos] = <span class="nm">1</span>
+
+    <span class="kw">def</span> might_contain(self, key):
+        <span class="kw">for</span> pos <span class="kw">in</span> self._positions(key):
+            <span class="kw">if</span> self.bits[pos] == <span class="nm">0</span>:
+                <span class="kw">return</span> <span class="kw">False</span>      <span class="cm"># a 0 bit =&gt; definitely NOT present</span>
+        <span class="kw">return</span> <span class="kw">True</span>               <span class="cm"># all 1 =&gt; possibly present (maybe false positive)</span>
+
+
+<span class="cm"># --- tiny demo ---</span>
+bf = BloomFilter(m=<span class="nm">100</span>, k=<span class="nm">3</span>)
+<span class="kw">for</span> word <span class="kw">in</span> (<span class="st">"apple"</span>, <span class="st">"mango"</span>, <span class="st">"cherry"</span>):
+    bf.add(word)
+
+print(bf.might_contain(<span class="st">"apple"</span>))   <span class="cm"># True  (was added)</span>
+print(bf.might_contain(<span class="st">"grape"</span>))   <span class="cm"># False or True; if False it is DEFINITELY absent</span>
+<span class="cm"># A "False" is always trustworthy: no false negatives.</span>
+<span class="cm"># A "True" may be a false positive -- confirm with the real lookup.</span>
+
+<span class="cm"># Sizing: for n keys at false-positive rate p,</span>
+<span class="cm">#   m = ceil(-n * ln(p) / (ln 2)^2)   bits</span>
+<span class="cm">#   k = round((m / n) * ln 2)         hashes</span>
+<span class="cm"># e.g. p = 1%  ->  ~10 bits per key, k = 7.</span>
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// C++</span>
+<span class="cm">#include &lt;vector&gt;</span>
+<span class="cm">#include &lt;string&gt;</span>
+<span class="cm">#include &lt;functional&gt;</span>
+<span class="cm">#include &lt;iostream&gt;</span>
+
+<span class="kw">class</span> BloomFilter {
+    <span class="kw">size_t</span> m_, k_;
+    std::vector&lt;<span class="kw">bool</span>&gt; bits_;          <span class="cm">// m bits, all false</span>
+
+    <span class="cm">// derive k indices from one base hash (double hashing)</span>
+    <span class="kw">template</span> &lt;<span class="kw">class</span> F&gt;
+    <span class="kw">void</span> positions(<span class="kw">const</span> std::string&amp; key, F fn) <span class="kw">const</span> {
+        <span class="kw">size_t</span> h  = std::hash&lt;std::string&gt;{}(key);
+        <span class="kw">size_t</span> h1 = h &amp; <span class="nm">0xFFFFFFFFu</span>;
+        <span class="kw">size_t</span> h2 = (h &gt;&gt; <span class="nm">32</span>) &amp; <span class="nm">0xFFFFFFFFu</span>;
+        <span class="kw">if</span> (h2 == <span class="nm">0</span>) h2 = <span class="nm">1</span>;
+        <span class="kw">for</span> (<span class="kw">size_t</span> i = <span class="nm">0</span>; i &lt; k_; ++i) fn((h1 + i * h2) % m_);
+    }
+
+<span class="kw">public</span>:
+    BloomFilter(<span class="kw">size_t</span> m, <span class="kw">size_t</span> k) : m_(m), k_(k), bits_(m, <span class="kw">false</span>) {}
+
+    <span class="kw">void</span> add(<span class="kw">const</span> std::string&amp; key) {
+        positions(key, [&amp;](<span class="kw">size_t</span> pos){ bits_[pos] = <span class="kw">true</span>; });
+    }
+
+    <span class="kw">bool</span> might_contain(<span class="kw">const</span> std::string&amp; key) <span class="kw">const</span> {
+        <span class="kw">bool</span> all_set = <span class="kw">true</span>;
+        positions(key, [&amp;](<span class="kw">size_t</span> pos){ <span class="kw">if</span> (!bits_[pos]) all_set = <span class="kw">false</span>; });
+        <span class="kw">return</span> all_set;    <span class="cm">// false =&gt; definitely absent; true =&gt; maybe present</span>
+    }
+};
+
+<span class="kw">int</span> main() {
+    BloomFilter bf(<span class="nm">100</span>, <span class="nm">3</span>);
+    <span class="kw">for</span> (<span class="kw">const</span> std::string&amp; w : {<span class="st">"apple"</span>, <span class="st">"mango"</span>, <span class="st">"cherry"</span>}) bf.add(w);
+
+    std::cout &lt;&lt; bf.might_contain(<span class="st">"apple"</span>) &lt;&lt; <span class="st">"\n"</span>;  <span class="cm">// 1  (was added)</span>
+    std::cout &lt;&lt; bf.might_contain(<span class="st">"grape"</span>) &lt;&lt; <span class="st">"\n"</span>;  <span class="cm">// 0 or 1; if 0 it is DEFINITELY absent</span>
+    <span class="cm">// No false negatives: a "0" can be trusted. A "1" may be a false positive.</span>
+
+    <span class="cm">// Sizing: for n keys at false-positive rate p,</span>
+    <span class="cm">//   m = ceil(-n * ln(p) / (ln 2)^2)  bits</span>
+    <span class="cm">//   k = round((m / n) * ln 2)        hashes   (p = 1% -&gt; ~10 bits/key, k = 7)</span>
+    <span class="kw">return</span> <span class="nm">0</span>;
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// Java</span>
+<span class="kw">import</span> java.util.BitSet;
+
+<span class="kw">class</span> BloomFilter {
+    <span class="kw">private final</span> <span class="kw">int</span> m, k;
+    <span class="kw">private final</span> BitSet bits;        <span class="cm">// m bits, all clear</span>
+
+    BloomFilter(<span class="kw">int</span> m, <span class="kw">int</span> k) {
+        <span class="kw">this</span>.m = m;
+        <span class="kw">this</span>.k = k;
+        <span class="kw">this</span>.bits = <span class="kw">new</span> BitSet(m);
+    }
+
+    <span class="cm">// derive k indices from one base hash (double hashing)</span>
+    <span class="kw">private</span> <span class="kw">int</span>[] positions(String key) {
+        <span class="kw">long</span> h  = key.hashCode() &amp; <span class="nm">0xFFFFFFFFL</span>;
+        <span class="kw">long</span> h2 = (Long.rotateLeft(h, <span class="nm">17</span>) | <span class="nm">1</span>) &amp; <span class="nm">0xFFFFFFFFL</span>;
+        <span class="kw">int</span>[] pos = <span class="kw">new</span> <span class="kw">int</span>[k];
+        <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nm">0</span>; i &lt; k; i++)
+            pos[i] = (<span class="kw">int</span>) (((h + (<span class="kw">long</span>) i * h2) % m + m) % m);
+        <span class="kw">return</span> pos;
+    }
+
+    <span class="kw">void</span> add(String key) {
+        <span class="kw">for</span> (<span class="kw">int</span> pos : positions(key)) bits.set(pos);
+    }
+
+    <span class="kw">boolean</span> mightContain(String key) {
+        <span class="kw">for</span> (<span class="kw">int</span> pos : positions(key))
+            <span class="kw">if</span> (!bits.get(pos)) <span class="kw">return</span> <span class="kw">false</span>;   <span class="cm">// a clear bit =&gt; definitely absent</span>
+        <span class="kw">return</span> <span class="kw">true</span>;                          <span class="cm">// all set =&gt; maybe present</span>
+    }
+
+    <span class="kw">public static</span> <span class="kw">void</span> main(String[] args) {
+        BloomFilter bf = <span class="kw">new</span> BloomFilter(<span class="nm">100</span>, <span class="nm">3</span>);
+        <span class="kw">for</span> (String w : <span class="kw">new</span> String[]{<span class="st">"apple"</span>, <span class="st">"mango"</span>, <span class="st">"cherry"</span>}) bf.add(w);
+
+        System.out.println(bf.mightContain(<span class="st">"apple"</span>)); <span class="cm">// true  (was added)</span>
+        System.out.println(bf.mightContain(<span class="st">"grape"</span>)); <span class="cm">// false or true; if false, DEFINITELY absent</span>
+        <span class="cm">// No false negatives: "false" is trustworthy. "true" may be a false positive.</span>
+
+        <span class="cm">// Sizing: for n keys at false-positive rate p,</span>
+        <span class="cm">//   m = ceil(-n * ln(p) / (ln 2)^2)  bits</span>
+        <span class="cm">//   k = round((m / n) * ln 2)        hashes   (p = 1% -&gt; ~10 bits/key, k = 7)</span>
+    }
+}
+</pre>
+        </div>
 
         <h3>Plugging it into set() and get()</h3>
         <p>Every write inserts the key into the bloom filter; every read first asks the bloom filter and bails out

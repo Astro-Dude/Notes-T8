@@ -27,6 +27,20 @@
     if (e.target && e.target.id === "theme-btn") toggleTheme();
   });
 
+  /* ---------- Multi-language code tabs ---------- */
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest ? e.target.closest(".codetab") : null;
+    if (!btn) return;
+    var wrap = btn.closest(".codetabs");
+    if (!wrap) return;
+    var lang = btn.getAttribute("data-lang");
+    var i;
+    var tabs = wrap.querySelectorAll(".codetab");
+    for (i = 0; i < tabs.length; i++) tabs[i].classList.toggle("active", tabs[i] === btn);
+    var panes = wrap.querySelectorAll(".codepane");
+    for (i = 0; i < panes.length; i++) panes[i].classList.toggle("active", panes[i].getAttribute("data-lang") === lang);
+  });
+
   /* ---------- Reading progress ---------- */
   var bar = document.getElementById("progress");
   if (bar) {

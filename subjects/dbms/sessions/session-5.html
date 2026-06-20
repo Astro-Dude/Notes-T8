@@ -28,7 +28,7 @@
         <strong>prefetching</strong> tricks that hide disk latency. We assume you've studied <em>none</em> of
         this before — every topic starts with a tiny everyday story before we go deep.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 4 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 28 min read</span><span class="badge-rt">📖 4 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -101,6 +101,156 @@
               <tr><td>Evict</td><td>Remove the page at the back (least-recently-used end)</td><td>O(1)</td></tr>
             </tbody>
           </table>
+        </div>
+
+        <p>Here is a complete <strong>O(1)</strong> LRU frame manager: a hash map from <code class="inl">page_id</code>
+        to a node, plus a doubly-linked list ordering nodes from most- to least-recently-used. Every access splices the
+        node to the front; eviction unlinks the node at the back.</p>
+
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># Classic LRU buffer-pool frame manager: hash map + doubly-linked list, O(1)</span>
+<span class="kw">class</span> Node:
+    <span class="kw">def</span> __init__(self, page_id):
+        self.page_id = page_id
+        self.prev = self.next = <span class="nm">None</span>
+
+<span class="kw">class</span> LRUBufferPool:
+    <span class="kw">def</span> __init__(self, capacity):
+        self.capacity = capacity
+        self.table = {}                 <span class="cm"># page_id -&gt; Node</span>
+        <span class="cm"># sentinel head (MRU side) and tail (LRU side)</span>
+        self.head, self.tail = Node(<span class="nm">None</span>), Node(<span class="nm">None</span>)
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    <span class="kw">def</span> _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    <span class="kw">def</span> _push_front(self, n):       <span class="cm"># insert right after head = MRU</span>
+        n.prev, n.next = self.head, self.head.next
+        self.head.next.prev = n
+        self.head.next = n
+
+    <span class="kw">def</span> access(self, page_id):       <span class="cm"># returns <span class="st">"HIT"</span> or <span class="st">"MISS"</span></span>
+        n = self.table.get(page_id)
+        <span class="kw">if</span> n <span class="kw">is</span> <span class="kw">not</span> <span class="nm">None</span>:
+            self._unlink(n)
+            self._push_front(n)         <span class="cm"># promote to MRU</span>
+            <span class="kw">return</span> <span class="st">"HIT"</span>
+        <span class="kw">if</span> len(self.table) &gt;= self.capacity:
+            self._evict()
+        n = Node(page_id)
+        self.table[page_id] = n
+        self._push_front(n)
+        <span class="kw">return</span> <span class="st">"MISS"</span>
+
+    <span class="kw">def</span> _evict(self):                <span class="cm"># victim = node before tail (LRU)</span>
+        victim = self.tail.prev
+        self._unlink(victim)
+        <span class="kw">del</span> self.table[victim.page_id]
+        <span class="kw">return</span> victim.page_id
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    bp = LRUBufferPool(<span class="nm">3</span>)
+    <span class="kw">for</span> p <span class="kw">in</span> [<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">1</span>, <span class="nm">4</span>, <span class="nm">2</span>]:   <span class="cm"># access 4 evicts LRU page 2 (then 2 misses again)</span>
+        print(p, bp.access(p))
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// Classic LRU buffer-pool frame manager: hash map + doubly-linked list, O(1)</span>
+<span class="kw">#include</span> <span class="st">&lt;iostream&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unordered_map&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;list&gt;</span>
+
+<span class="kw">class</span> LRUBufferPool {
+    <span class="kw">size_t</span> capacity_;
+    std::list&lt;<span class="kw">int</span>&gt; order_;                                  <span class="cm">// front = MRU, back = LRU</span>
+    std::unordered_map&lt;<span class="kw">int</span>, std::list&lt;<span class="kw">int</span>&gt;::iterator&gt; table_;  <span class="cm">// page_id -&gt; node</span>
+<span class="kw">public</span>:
+    <span class="kw">explicit</span> LRUBufferPool(<span class="kw">size_t</span> capacity) : capacity_(capacity) {}
+
+    std::string access(<span class="kw">int</span> page_id) {                       <span class="cm">// returns "HIT" or "MISS"</span>
+        <span class="kw">auto</span> it = table_.find(page_id);
+        <span class="kw">if</span> (it != table_.end()) {
+            order_.splice(order_.begin(), order_, it-&gt;second);  <span class="cm">// promote to MRU</span>
+            <span class="kw">return</span> <span class="st">"HIT"</span>;
+        }
+        <span class="kw">if</span> (table_.size() &gt;= capacity_) evict();
+        order_.push_front(page_id);
+        table_[page_id] = order_.begin();
+        <span class="kw">return</span> <span class="st">"MISS"</span>;
+    }
+
+    <span class="kw">int</span> evict() {                                          <span class="cm">// victim = back of list (LRU)</span>
+        <span class="kw">int</span> victim = order_.back();
+        order_.pop_back();
+        table_.erase(victim);
+        <span class="kw">return</span> victim;
+    }
+};
+
+<span class="kw">int</span> main() {
+    LRUBufferPool bp(<span class="nm">3</span>);
+    <span class="kw">for</span> (<span class="kw">int</span> p : {<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">1</span>, <span class="nm">4</span>, <span class="nm">2</span>})        <span class="cm">// access 4 evicts LRU page 2</span>
+        std::cout &lt;&lt; p &lt;&lt; <span class="st">" "</span> &lt;&lt; bp.access(p) &lt;&lt; <span class="st">"\n"</span>;
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// Classic LRU buffer-pool frame manager: hash map + doubly-linked list, O(1)</span>
+<span class="kw">import</span> java.util.HashMap;
+
+<span class="kw">public</span> <span class="kw">class</span> LRUBufferPool {
+    <span class="kw">static</span> <span class="kw">class</span> Node {
+        <span class="kw">int</span> pageId;
+        Node prev, next;
+        Node(<span class="kw">int</span> pageId) { <span class="kw">this</span>.pageId = pageId; }
+    }
+
+    <span class="kw">private</span> <span class="kw">final</span> <span class="kw">int</span> capacity;
+    <span class="kw">private</span> <span class="kw">final</span> HashMap&lt;Integer, Node&gt; table = <span class="kw">new</span> HashMap&lt;&gt;();
+    <span class="kw">private</span> <span class="kw">final</span> Node head = <span class="kw">new</span> Node(<span class="nm">-1</span>), tail = <span class="kw">new</span> Node(<span class="nm">-1</span>);  <span class="cm">// sentinels</span>
+
+    <span class="kw">public</span> LRUBufferPool(<span class="kw">int</span> capacity) {
+        <span class="kw">this</span>.capacity = capacity;
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    <span class="kw">private</span> <span class="kw">void</span> unlink(Node n) { n.prev.next = n.next; n.next.prev = n.prev; }
+
+    <span class="kw">private</span> <span class="kw">void</span> pushFront(Node n) {              <span class="cm">// insert after head = MRU</span>
+        n.prev = head; n.next = head.next;
+        head.next.prev = n; head.next = n;
+    }
+
+    <span class="kw">public</span> String access(<span class="kw">int</span> pageId) {           <span class="cm">// returns "HIT" or "MISS"</span>
+        Node n = table.get(pageId);
+        <span class="kw">if</span> (n != <span class="nm">null</span>) {
+            unlink(n); pushFront(n);             <span class="cm">// promote to MRU</span>
+            <span class="kw">return</span> <span class="st">"HIT"</span>;
+        }
+        <span class="kw">if</span> (table.size() &gt;= capacity) evict();
+        n = <span class="kw">new</span> Node(pageId);
+        table.put(pageId, n);
+        pushFront(n);
+        <span class="kw">return</span> <span class="st">"MISS"</span>;
+    }
+
+    <span class="kw">public</span> <span class="kw">int</span> evict() {                          <span class="cm">// victim = node before tail (LRU)</span>
+        Node victim = tail.prev;
+        unlink(victim);
+        table.remove(victim.pageId);
+        <span class="kw">return</span> victim.pageId;
+    }
+
+    <span class="kw">public</span> <span class="kw">static</span> <span class="kw">void</span> main(String[] args) {
+        LRUBufferPool bp = <span class="kw">new</span> LRUBufferPool(<span class="nm">3</span>);
+        <span class="kw">for</span> (<span class="kw">int</span> p : <span class="kw">new</span> <span class="kw">int</span>[]{<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">1</span>, <span class="nm">4</span>, <span class="nm">2</span>})  <span class="cm">// access 4 evicts LRU page 2</span>
+            System.out.println(p + <span class="st">" "</span> + bp.access(p));
+    }
+}
+</pre>
         </div>
 
         <h3>So where does LRU break?</h3>
@@ -256,23 +406,155 @@
         <p>Each page keeps a small history of its last K access timestamps. <code class="inl">HIST(p, K)</code> is
         the timestamp of the K-th most recent access to page <code class="inl">p</code>, or
         <code class="inl">0</code> (treated as ∞ distance) if it has fewer than K accesses.</p>
-        <pre><span class="cm"># now = current logical time (a counter that ticks on every access)</span>
-<span class="kw">def</span> access(p):
-    <span class="kw">if</span> p <span class="kw">in</span> buffer_pool:
-        record_reference(p, now)        <span class="cm"># shift its K-history, append `now`</span>
-        <span class="kw">return</span> HIT
-    <span class="kw">if</span> buffer_is_full():
-        victim = <span class="nm">None</span>
-        max_dist = <span class="nm">-1</span>
-        <span class="kw">for</span> q <span class="kw">in</span> buffer_pool:
-            dist = now - HIST(q, K)     <span class="cm"># HIST = 0 ⇒ dist is effectively ∞</span>
-            <span class="kw">if</span> dist &gt; max_dist:
-                max_dist = dist
-                victim = q              <span class="cm"># largest backward K-distance loses</span>
-        evict(victim)
-    load_from_disk(p)
-    record_reference(p, now)
-    <span class="kw">return</span> MISS</pre>
+        <div class="codetabs">
+          <div class="codetab-bar">
+            <button class="codetab active" data-lang="py">Python</button>
+            <button class="codetab" data-lang="cpp">C++</button>
+            <button class="codetab" data-lang="java">Java</button>
+          </div>
+          <pre class="codepane active" data-lang="py"><span class="cm"># LRU-K: keep last K access timestamps per page; evict the page whose</span>
+<span class="cm"># K-th most recent access is OLDEST (largest backward K-distance).</span>
+<span class="kw">from</span> collections <span class="kw">import</span> deque
+
+<span class="kw">class</span> LRUKBufferPool:
+    <span class="kw">def</span> __init__(self, capacity, k):
+        self.capacity = capacity
+        self.k = k
+        self.now = <span class="nm">0</span>                     <span class="cm"># logical clock, ticks per access</span>
+        self.hist = {}                    <span class="cm"># page_id -&gt; deque of last K timestamps</span>
+
+    <span class="kw">def</span> _kth_distance(self, page_id):     <span class="cm"># backward K-distance; inf if &lt; K refs</span>
+        h = self.hist[page_id]
+        <span class="kw">if</span> len(h) &lt; self.k:
+            <span class="kw">return</span> <span class="nm">float</span>(<span class="st">"inf"</span>)        <span class="cm"># too few refs =&gt; evict first</span>
+        <span class="kw">return</span> self.now - h[<span class="nm">0</span>]         <span class="cm"># h[0] = K-th most recent access</span>
+
+    <span class="kw">def</span> _record(self, page_id):
+        self.now += <span class="nm">1</span>
+        h = self.hist.setdefault(page_id, deque(maxlen=self.k))
+        h.append(self.now)                <span class="cm"># oldest auto-dropped past K</span>
+
+    <span class="kw">def</span> access(self, page_id):           <span class="cm"># returns <span class="st">"HIT"</span> or <span class="st">"MISS"</span></span>
+        <span class="kw">if</span> page_id <span class="kw">in</span> self.hist:
+            self._record(page_id)
+            <span class="kw">return</span> <span class="st">"HIT"</span>
+        <span class="kw">if</span> len(self.hist) &gt;= self.capacity:
+            <span class="cm"># victim = largest backward K-distance (ties: oldest most-recent ref)</span>
+            victim = <span class="nm">max</span>(self.hist, key=<span class="kw">lambda</span> q: (self._kth_distance(q), self.now - self.hist[q][<span class="nm">-1</span>]))
+            <span class="kw">del</span> self.hist[victim]
+        self._record(page_id)
+        <span class="kw">return</span> <span class="st">"MISS"</span>
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    bp = LRUKBufferPool(capacity=<span class="nm">3</span>, k=<span class="nm">2</span>)            <span class="cm"># LRU-2</span>
+    <span class="kw">for</span> p <span class="kw">in</span> [<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">4</span>, <span class="nm">1</span>, <span class="nm">2</span>]:        <span class="cm"># hot 1,2 survive scan 3,4</span>
+        print(p, bp.access(p))
+</pre>
+          <pre class="codepane" data-lang="cpp"><span class="cm">// LRU-K: keep last K access timestamps per page; evict the page whose</span>
+<span class="cm">// K-th most recent access is OLDEST (largest backward K-distance).</span>
+<span class="kw">#include</span> <span class="st">&lt;iostream&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unordered_map&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;deque&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;limits&gt;</span>
+
+<span class="kw">class</span> LRUKBufferPool {
+    <span class="kw">size_t</span> capacity_;
+    <span class="kw">size_t</span> k_;
+    <span class="kw">long</span> now_ = <span class="nm">0</span>;                                       <span class="cm">// logical clock</span>
+    std::unordered_map&lt;<span class="kw">int</span>, std::deque&lt;<span class="kw">long</span>&gt;&gt; hist_;       <span class="cm">// page_id -&gt; last K timestamps</span>
+
+    <span class="kw">double</span> kthDistance(<span class="kw">int</span> page_id) {                    <span class="cm">// inf if &lt; K refs</span>
+        <span class="kw">const</span> <span class="kw">auto</span>&amp; h = hist_[page_id];
+        <span class="kw">if</span> (h.size() &lt; k_) <span class="kw">return</span> std::numeric_limits&lt;<span class="kw">double</span>&gt;::infinity();
+        <span class="kw">return</span> <span class="kw">static_cast</span>&lt;<span class="kw">double</span>&gt;(now_ - h.front());     <span class="cm">// front = K-th most recent</span>
+    }
+
+    <span class="kw">void</span> record(<span class="kw">int</span> page_id) {
+        ++now_;
+        <span class="kw">auto</span>&amp; h = hist_[page_id];
+        h.push_back(now_);
+        <span class="kw">if</span> (h.size() &gt; k_) h.pop_front();                  <span class="cm">// keep only last K</span>
+    }
+<span class="kw">public</span>:
+    LRUKBufferPool(<span class="kw">size_t</span> capacity, <span class="kw">size_t</span> k) : capacity_(capacity), k_(k) {}
+
+    std::string access(<span class="kw">int</span> page_id) {                   <span class="cm">// returns "HIT" or "MISS"</span>
+        <span class="kw">if</span> (hist_.count(page_id)) { record(page_id); <span class="kw">return</span> <span class="st">"HIT"</span>; }
+        <span class="kw">if</span> (hist_.size() &gt;= capacity_) {
+            <span class="kw">int</span> victim = <span class="nm">-1</span>;
+            <span class="kw">double</span> best = <span class="nm">-1</span>;
+            <span class="kw">long</span> bestRecent = <span class="nm">0</span>;
+            <span class="kw">for</span> (<span class="kw">auto</span>&amp; [q, h] : hist_) {            <span class="cm">// largest K-distance; tie: oldest recent ref</span>
+                <span class="kw">double</span> d = kthDistance(q);
+                <span class="kw">long</span> recent = now_ - h.back();
+                <span class="kw">if</span> (d &gt; best || (d == best &amp;&amp; recent &gt; bestRecent)) {
+                    best = d; bestRecent = recent; victim = q;
+                }
+            }
+            hist_.erase(victim);
+        }
+        record(page_id);
+        <span class="kw">return</span> <span class="st">"MISS"</span>;
+    }
+};
+
+<span class="kw">int</span> main() {
+    LRUKBufferPool bp(<span class="nm">3</span>, <span class="nm">2</span>);                              <span class="cm">// LRU-2</span>
+    <span class="kw">for</span> (<span class="kw">int</span> p : {<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">4</span>, <span class="nm">1</span>, <span class="nm">2</span>})       <span class="cm">// hot 1,2 survive scan 3,4</span>
+        std::cout &lt;&lt; p &lt;&lt; <span class="st">" "</span> &lt;&lt; bp.access(p) &lt;&lt; <span class="st">"\n"</span>;
+}
+</pre>
+          <pre class="codepane" data-lang="java"><span class="cm">// LRU-K: keep last K access timestamps per page; evict the page whose</span>
+<span class="cm">// K-th most recent access is OLDEST (largest backward K-distance).</span>
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">public</span> <span class="kw">class</span> LRUKBufferPool {
+    <span class="kw">private</span> <span class="kw">final</span> <span class="kw">int</span> capacity, k;
+    <span class="kw">private</span> <span class="kw">long</span> now = <span class="nm">0</span>;                                  <span class="cm">// logical clock</span>
+    <span class="kw">private</span> <span class="kw">final</span> Map&lt;Integer, Deque&lt;Long&gt;&gt; hist = <span class="kw">new</span> HashMap&lt;&gt;();  <span class="cm">// page -&gt; last K timestamps</span>
+
+    <span class="kw">public</span> LRUKBufferPool(<span class="kw">int</span> capacity, <span class="kw">int</span> k) { <span class="kw">this</span>.capacity = capacity; <span class="kw">this</span>.k = k; }
+
+    <span class="kw">private</span> <span class="kw">double</span> kthDistance(<span class="kw">int</span> pageId) {            <span class="cm">// inf if &lt; K refs</span>
+        Deque&lt;Long&gt; h = hist.get(pageId);
+        <span class="kw">if</span> (h.size() &lt; k) <span class="kw">return</span> Double.POSITIVE_INFINITY;
+        <span class="kw">return</span> now - h.peekFirst();                     <span class="cm">// first = K-th most recent</span>
+    }
+
+    <span class="kw">private</span> <span class="kw">void</span> record(<span class="kw">int</span> pageId) {
+        now++;
+        Deque&lt;Long&gt; h = hist.computeIfAbsent(pageId, x -&gt; <span class="kw">new</span> ArrayDeque&lt;&gt;());
+        h.addLast(now);
+        <span class="kw">if</span> (h.size() &gt; k) h.pollFirst();                 <span class="cm">// keep only last K</span>
+    }
+
+    <span class="kw">public</span> String access(<span class="kw">int</span> pageId) {              <span class="cm">// returns "HIT" or "MISS"</span>
+        <span class="kw">if</span> (hist.containsKey(pageId)) { record(pageId); <span class="kw">return</span> <span class="st">"HIT"</span>; }
+        <span class="kw">if</span> (hist.size() &gt;= capacity) {
+            <span class="kw">int</span> victim = <span class="nm">-1</span>;
+            <span class="kw">double</span> best = <span class="nm">-1</span>;
+            <span class="kw">long</span> bestRecent = <span class="nm">0</span>;
+            <span class="kw">for</span> (<span class="kw">int</span> q : hist.keySet()) {           <span class="cm">// largest K-distance; tie: oldest recent ref</span>
+                <span class="kw">double</span> d = kthDistance(q);
+                <span class="kw">long</span> recent = now - hist.get(q).peekLast();
+                <span class="kw">if</span> (d &gt; best || (d == best &amp;&amp; recent &gt; bestRecent)) {
+                    best = d; bestRecent = recent; victim = q;
+                }
+            }
+            hist.remove(victim);
+        }
+        record(pageId);
+        <span class="kw">return</span> <span class="st">"MISS"</span>;
+    }
+
+    <span class="kw">public</span> <span class="kw">static</span> <span class="kw">void</span> main(String[] args) {
+        LRUKBufferPool bp = <span class="kw">new</span> LRUKBufferPool(<span class="nm">3</span>, <span class="nm">2</span>);     <span class="cm">// LRU-2</span>
+        <span class="kw">for</span> (<span class="kw">int</span> p : <span class="kw">new</span> <span class="kw">int</span>[]{<span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">1</span>, <span class="nm">2</span>, <span class="nm">3</span>, <span class="nm">4</span>, <span class="nm">1</span>, <span class="nm">2</span>})  <span class="cm">// hot 1,2 survive scan 3,4</span>
+            System.out.println(p + <span class="st">" "</span> + bp.access(p));
+    }
+}
+</pre>
+        </div>
 
         <div class="callout warn">
           <span class="c-title">Trade-offs &amp; the &quot;Correlated Reference Period&quot;</span>
