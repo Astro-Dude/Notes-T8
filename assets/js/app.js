@@ -74,4 +74,279 @@
 
   document.addEventListener("DOMContentLoaded", syncThemeIcon);
   syncThemeIcon();
+
+  /* ---------- Listen / read-aloud (Web Speech API) ---------- */
+  (function () {
+    var article = document.querySelector(".article");
+    if (!article || !("speechSynthesis" in window)) return;
+    var synth = window.speechSynthesis;
+
+    // Build an ordered queue of {el, text} from readable content,
+    // skipping code, the TOC, pager, quizzes, and the player itself.
+    var SKIP = { PRE: 1, SCRIPT: 1, STYLE: 1, BUTTON: 1, IMG: 1 };
+    var SKIP_CLASS = ["codetabs", "toc", "pager", "hero-meta", "tts-player", "quiz"];
+    var LEAF = { P: 1, LI: 1, H2: 1, H3: 1, H4: 1, FIGCAPTION: 1, TD: 1, TH: 1, SUMMARY: 1 };
+
+    function skipEl(el) {
+      if (SKIP[el.tagName]) return true;
+      for (var i = 0; i < SKIP_CLASS.length; i++) if (el.classList.contains(SKIP_CLASS[i])) return true;
+      if (el.tagName === "DETAILS") return true; // self-check quizzes
+      return false;
+    }
+    var blocks = [];
+    (function walk(node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var c = node.childNodes[i];
+        if (c.nodeType === 3) {
+          var t = c.textContent.replace(/\s+/g, " ").trim();
+          if (t) blocks.push({ el: node, text: t });
+        } else if (c.nodeType === 1) {
+          if (skipEl(c)) continue;
+          if (LEAF[c.tagName]) {
+            var tx = (c.innerText || c.textContent).replace(/\s+/g, " ").trim();
+            if (tx) blocks.push({ el: c, text: tx });
+          } else {
+            walk(c);
+          }
+        }
+      }
+    })(article);
+
+    // Expand blocks into <=220-char sentence chunks (avoids Chrome's long-utterance cutoff)
+    var queue = [];
+    blocks.forEach(function (b) {
+      var parts = b.text.match(/[^.!?]+[.!?]*\s*/g) || [b.text];
+      var buf = "";
+      parts.forEach(function (p) {
+        if ((buf + p).length > 220 && buf) { queue.push({ el: b.el, text: buf.trim() }); buf = ""; }
+        buf += p;
+      });
+      if (buf.trim()) queue.push({ el: b.el, text: buf.trim() });
+    });
+    if (!queue.length) return;
+
+    var idx = 0, playing = false, paused = false, lastEl = null;
+    var rate = parseFloat(localStorage.getItem("notes-tts-rate") || "1");
+
+    // ---- UI ----
+    var launch = document.createElement("button");
+    launch.className = "tts-launch";
+    launch.title = "Listen to this page";
+    launch.setAttribute("aria-label", "Listen to this page");
+    launch.textContent = "🎧";
+
+    var player = document.createElement("div");
+    player.className = "tts-player collapsed";
+    player.innerHTML =
+      '<button class="tts-btn primary" data-act="toggle" title="Play / pause" aria-label="Play or pause">▶︎</button>' +
+      '<button class="tts-btn" data-act="prev" title="Previous" aria-label="Previous">⏮</button>' +
+      '<button class="tts-btn" data-act="next" title="Next" aria-label="Next">⏭</button>' +
+      '<button class="tts-btn" data-act="stop" title="Stop" aria-label="Stop">⏹</button>' +
+      '<select class="tts-voice" title="Choose voice" aria-label="Choose voice"></select>' +
+      '<button class="tts-speed" data-act="speed" title="Playback speed">' + rate + "x</button>" +
+      '<span class="tts-status">0%</span>' +
+      '<button class="tts-btn" data-act="close" title="Hide player" aria-label="Hide">✕</button>';
+
+    document.body.appendChild(launch);
+    document.body.appendChild(player);
+
+    var primaryBtn = player.querySelector('[data-act="toggle"]');
+    var speedBtn = player.querySelector('[data-act="speed"]');
+    var status = player.querySelector(".tts-status");
+    var voiceSel = player.querySelector(".tts-voice");
+    var chosenURI = localStorage.getItem("notes-tts-voice-v2") || "";
+
+    // Score a voice by likely quality (higher = nicer). Neural/Natural/Online win.
+    function score(v) {
+      var n = (v.name + " " + (v.voiceURI || "")).toLowerCase();
+      var s = 0;
+      if (/natural|neural/.test(n)) s += 100;
+      if (/online/.test(n)) s += 60;
+      if (/\bgoogle\b/.test(n)) s += 55;
+      if (/premium|enhanced/.test(n)) s += 50;
+      if (/siri|aria|jenny|guy|libby|sonia|ava|emma|andrew|brian/.test(n)) s += 40;
+      if (/samantha|karen|moira|serena|daniel|tessa|fiona/.test(n)) s += 20;
+      if (/en-us/.test((v.lang || "").toLowerCase())) s += 8;
+      if (/^en/i.test(v.lang || "")) s += 5;
+      if (v.localService) s += 2; // works offline
+      if (/albert|fred|zarvox|bad|bells|cellos|trinoids|whisper|novelty|compact|eloquence/.test(n)) s -= 80;
+      return s;
+    }
+    function enVoices() {
+      return (synth.getVoices() || [])
+        .filter(function (v) { return /^en/i.test(v.lang || ""); })
+        .sort(function (a, b) { return score(b) - score(a); });
+    }
+    // The macOS `say` command uses the system default on-device voice.
+    // The Web Speech API marks it with .default (and it is a localService voice).
+    function defaultVoice() {
+      var all = synth.getVoices() || [];
+      var en = enVoices();
+      return all.find(function (v) { return v.default && v.localService; })   // system voice (= say)
+          || en.find(function (v) { return v.default; })
+          || en.find(function (v) { return v.localService && /samantha|alex/i.test(v.name); })
+          || en.find(function (v) { return v.localService; })
+          || en[0] || all[0] || null;
+    }
+    // Prefer a good MALE English voice (the Web Speech API exposes no gender,
+    // so we use a name heuristic). Quality order: Alex → premium/Siri male → Daniel → others.
+    var MALE = /\b(alex|daniel|rishi|tom|aaron|arthur|oliver|gordon|reed|evan|nathan|ralph|rocko|eddy|jacques|thomas|fred)\b/i;
+    var FEMALE = /\b(samantha|karen|moira|tessa|fiona|victoria|allison|ava|susan|kathy|vicki|nora|serena|zoe|veena|kanya|isha|sandy|grandma)\b/i;
+    var NOVELTY = /bad news|good news|bahh|bells|boing|bubbles|cellos|wobble|zarvox|whisper|trinoids|organ|deranged|hysterical|albert|jester|superstar|grandpa/i;
+    function maleRank(v) {
+      var n = v.name.toLowerCase(), s = score(v);
+      if (/\balex\b/.test(n)) s += 200;
+      if (/natural|neural|premium|enhanced|siri/.test(n)) s += 120;
+      if (/\b(aaron|tom|reed|evan|arthur|oliver|nathan)\b/.test(n)) s += 80;
+      if (/\bdaniel\b/.test(n)) s += 60;
+      if (/\brishi\b/.test(n)) s += 40;
+      return s;
+    }
+    // A short curated shortlist — clear, high-quality voices, mixed male/female.
+    // Tried in this order; only the ones actually installed are shown (max 5).
+    var CURATED = [
+      /\balex\b/i,                              // ♂ US — clear classic
+      /\bsamantha\b/i,                          // ♀ US
+      /\bdaniel\b/i,                            // ♂ UK
+      /\bkaren\b/i,                             // ♀ AU
+      /\b(reed|tom|aaron|evan|nathan)\b/i,      // ♂ premium / Siri
+      /\bmoira\b/i,                             // ♀ IE
+      /\brishi\b/i,                             // ♂ IN
+      /\b(tessa|fiona|victoria|allison|ava)\b/i // ♀
+    ];
+    function genderOf(v) {
+      if (MALE.test(v.name) && !FEMALE.test(v.name)) return " ♂";
+      if (FEMALE.test(v.name)) return " ♀";
+      return "";
+    }
+    function curatedList() {
+      var en = enVoices(), out = [], seen = {};
+      CURATED.forEach(function (re) {
+        if (out.length >= 5) return;
+        var v = en.find(function (x) { return re.test(x.name) && !seen[x.voiceURI]; });
+        if (v) { out.push(v); seen[v.voiceURI] = 1; }
+      });
+      // top up to 5 with the best remaining non-novelty English voices
+      for (var i = 0; i < en.length && out.length < 5; i++) {
+        if (!seen[en[i].voiceURI] && !NOVELTY.test(en[i].name)) { out.push(en[i]); seen[en[i].voiceURI] = 1; }
+      }
+      // always include the user's chosen voice even if outside the shortlist
+      if (chosenURI && !seen[chosenURI]) {
+        var c = en.find(function (x) { return x.voiceURI === chosenURI; });
+        if (c) out.unshift(c);
+      }
+      return out;
+    }
+    function preferredDefault() {
+      var list = curatedList();
+      return list.find(function (v) { return MALE.test(v.name) && !FEMALE.test(v.name); }) || list[0] || defaultVoice();
+    }
+    function pickVoice() {
+      var en = enVoices();
+      if (chosenURI) {
+        var c = en.find(function (v) { return v.voiceURI === chosenURI; });
+        if (c) return c;
+      }
+      return preferredDefault();
+    }
+    function prettyName(v) {
+      return v.name.replace(/\s*\((Natural|Online|United States|United Kingdom|en-US|en-GB)\)/gi, "").trim()
+        + (/natural|neural/i.test(v.name) ? " ✨" : "");
+    }
+    function populateVoices() {
+      var list = curatedList();
+      if (!list.length) return;
+      var active = pickVoice();
+      var activeURI = active ? active.voiceURI : "";
+      voiceSel.innerHTML = list.map(function (v) {
+        return '<option value="' + v.voiceURI + '"' + (v.voiceURI === activeURI ? " selected" : "") +
+               ">" + prettyName(v) + genderOf(v) + "</option>";
+      }).join("");
+    }
+
+    function highlight(el) {
+      if (lastEl) lastEl.classList.remove("tts-reading");
+      if (el) {
+        el.classList.add("tts-reading");
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+      lastEl = el;
+    }
+    function updateStatus() {
+      status.textContent = Math.round((idx / queue.length) * 100) + "%";
+    }
+    function setPlayingIcon() { primaryBtn.textContent = playing && !paused ? "⏸" : "▶︎"; }
+
+    function speakCurrent() {
+      if (idx >= queue.length) { stop(); return; }
+      var item = queue[idx];
+      var u = new SpeechSynthesisUtterance(item.text);
+      u.rate = rate;
+      var v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; }
+      highlight(item.el);
+      updateStatus();
+      u.onend = function () {
+        if (!playing || paused) return;
+        idx++;
+        speakCurrent();
+      };
+      synth.speak(u);
+    }
+
+    function play() {
+      if (paused) { paused = false; synth.resume(); playing = true; setPlayingIcon(); return; }
+      synth.cancel();
+      playing = true; paused = false;
+      setPlayingIcon();
+      speakCurrent();
+    }
+    function pause() {
+      paused = true; playing = true; synth.pause(); setPlayingIcon();
+    }
+    function stop() {
+      synth.cancel(); playing = false; paused = false; idx = 0;
+      highlight(null); setPlayingIcon(); updateStatus();
+    }
+    function jump(delta) {
+      idx = Math.max(0, Math.min(queue.length - 1, idx + delta));
+      synth.cancel();
+      if (playing) speakCurrent(); else { highlight(queue[idx].el); updateStatus(); }
+    }
+
+    launch.addEventListener("click", function () {
+      player.classList.remove("collapsed");
+      launch.style.display = "none";
+      play();
+    });
+
+    player.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act]"); if (!btn) return;
+      var act = btn.getAttribute("data-act");
+      if (act === "toggle") { (playing && !paused) ? pause() : play(); }
+      else if (act === "next") jump(1);
+      else if (act === "prev") jump(-1);
+      else if (act === "stop") stop();
+      else if (act === "close") { stop(); player.classList.add("collapsed"); launch.style.display = "grid"; }
+      else if (act === "speed") {
+        var steps = [0.75, 1, 1.25, 1.5, 1.75, 2];
+        rate = steps[(steps.indexOf(rate) + 1) % steps.length];
+        localStorage.setItem("notes-tts-rate", String(rate));
+        speedBtn.textContent = rate + "x";
+        if (playing && !paused) { synth.cancel(); speakCurrent(); } // apply immediately
+      }
+    });
+
+    voiceSel.addEventListener("change", function () {
+      chosenURI = voiceSel.value;
+      localStorage.setItem("notes-tts-voice-v2", chosenURI);
+      if (playing && !paused) { synth.cancel(); speakCurrent(); } // apply immediately
+    });
+
+    // voices may load late (esp. Chrome/Edge online voices)
+    populateVoices();
+    if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = populateVoices;
+    // stop audio when leaving the page
+    window.addEventListener("pagehide", function () { synth.cancel(); });
+    window.addEventListener("beforeunload", function () { synth.cancel(); });
+  })();
 })();
