@@ -81,11 +81,11 @@
     if (!article || !("speechSynthesis" in window)) return;
     var synth = window.speechSynthesis;
 
-    // Build an ordered queue of {el, text} from readable content,
-    // skipping code, the TOC, pager, quizzes, and the player itself.
-    var SKIP = { PRE: 1, SCRIPT: 1, STYLE: 1, BUTTON: 1, IMG: 1 };
+    // Walk readable content into "units" (a highlight box + its text nodes),
+    // skipping code, the TOC, pager, quizzes, images, and the player itself.
+    var SKIP = { PRE: 1, SCRIPT: 1, STYLE: 1, BUTTON: 1, IMG: 1, SELECT: 1 };
     var SKIP_CLASS = ["codetabs", "toc", "pager", "hero-meta", "tts-player", "quiz"];
-    var LEAF = { P: 1, LI: 1, H2: 1, H3: 1, H4: 1, FIGCAPTION: 1, TD: 1, TH: 1, SUMMARY: 1 };
+    var LEAF = { P: 1, LI: 1, H2: 1, H3: 1, H4: 1, FIGCAPTION: 1, TD: 1, TH: 1, SUMMARY: 1, BLOCKQUOTE: 1 };
 
     function skipEl(el) {
       if (SKIP[el.tagName]) return true;
@@ -93,39 +93,63 @@
       if (el.tagName === "DETAILS") return true; // self-check quizzes
       return false;
     }
-    var blocks = [];
+    function textNodesIn(el, acc) {
+      for (var i = 0; i < el.childNodes.length; i++) {
+        var c = el.childNodes[i];
+        if (c.nodeType === 3) { if (c.textContent.trim()) acc.push(c); }
+        else if (c.nodeType === 1 && !skipEl(c)) textNodesIn(c, acc);
+      }
+      return acc;
+    }
+    var units = [];
     (function walk(node) {
       for (var i = 0; i < node.childNodes.length; i++) {
         var c = node.childNodes[i];
         if (c.nodeType === 3) {
-          var t = c.textContent.replace(/\s+/g, " ").trim();
-          if (t) blocks.push({ el: node, text: t });
+          if (c.textContent.trim()) units.push({ box: node, nodes: [c] });
         } else if (c.nodeType === 1) {
           if (skipEl(c)) continue;
           if (LEAF[c.tagName]) {
-            var tx = (c.innerText || c.textContent).replace(/\s+/g, " ").trim();
-            if (tx) blocks.push({ el: c, text: tx });
-          } else {
-            walk(c);
-          }
+            var ns = textNodesIn(c, []);
+            if (ns.length) units.push({ box: c, nodes: ns });
+          } else walk(c);
         }
       }
     })(article);
+    if (!units.length) return;
 
-    // Expand blocks into <=220-char sentence chunks (avoids Chrome's long-utterance cutoff)
-    var queue = [];
-    blocks.forEach(function (b) {
-      var parts = b.text.match(/[^.!?]+[.!?]*\s*/g) || [b.text];
-      var buf = "";
-      parts.forEach(function (p) {
-        if ((buf + p).length > 220 && buf) { queue.push({ el: b.el, text: buf.trim() }); buf = ""; }
-        buf += p;
+    // Lazily wrap each word in a <span> and build the spoken segment queue.
+    // Each segment: { box, words:[spans], text, offs:[char start of each word] }
+    var queue = [], built = false;
+    function buildQueue() {
+      if (built) return; built = true;
+      units.forEach(function (unit) {
+        var spans = [];
+        unit.nodes.forEach(function (tn) {
+          if (!tn.parentNode) return;
+          var frag = document.createDocumentFragment();
+          tn.textContent.split(/(\s+)/).forEach(function (p) {
+            if (!p) return;
+            if (/^\s+$/.test(p)) { frag.appendChild(document.createTextNode(p)); }
+            else { var s = document.createElement("span"); s.className = "tts-w"; s.textContent = p; frag.appendChild(s); spans.push(s); }
+          });
+          tn.parentNode.replaceChild(frag, tn);
+        });
+        var i = 0;
+        while (i < spans.length) {
+          var words = [], text = "", offs = [];
+          while (i < spans.length && words.length < 32 && text.length < 200) {
+            if (text) text += " ";
+            offs.push(text.length);
+            text += spans[i].textContent;
+            words.push(spans[i]); i++;
+          }
+          queue.push({ box: unit.box, words: words, text: text, offs: offs });
+        }
       });
-      if (buf.trim()) queue.push({ el: b.el, text: buf.trim() });
-    });
-    if (!queue.length) return;
+    }
 
-    var idx = 0, playing = false, paused = false, lastEl = null;
+    var idx = 0, playing = false, paused = false, lastEl = null, lastWord = null;
     var rate = parseFloat(localStorage.getItem("notes-tts-rate") || "1");
 
     // ---- UI ----
@@ -143,7 +167,7 @@
       '<button class="tts-btn" data-act="next" title="Next" aria-label="Next">⏭</button>' +
       '<button class="tts-btn" data-act="stop" title="Stop" aria-label="Stop">⏹</button>' +
       '<select class="tts-voice" title="Choose voice" aria-label="Choose voice"></select>' +
-      '<button class="tts-speed" data-act="speed" title="Playback speed">' + rate + "x</button>" +
+      '<select class="tts-speed" title="Playback speed" aria-label="Playback speed"></select>' +
       '<span class="tts-status">0%</span>' +
       '<button class="tts-btn" data-act="close" title="Hide player" aria-label="Hide">✕</button>';
 
@@ -151,9 +175,22 @@
     document.body.appendChild(player);
 
     var primaryBtn = player.querySelector('[data-act="toggle"]');
-    var speedBtn = player.querySelector('[data-act="speed"]');
     var status = player.querySelector(".tts-status");
     var voiceSel = player.querySelector(".tts-voice");
+    var speedSel = player.querySelector(".tts-speed");
+
+    // populate the speed dropdown
+    [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].forEach(function (s) {
+      var o = document.createElement("option");
+      o.value = s; o.textContent = s + "×";
+      if (s === rate) o.selected = true;
+      speedSel.appendChild(o);
+    });
+    speedSel.addEventListener("change", function () {
+      rate = parseFloat(speedSel.value);
+      localStorage.setItem("notes-tts-rate", String(rate));
+      if (playing && !paused) { synth.cancel(); speakCurrent(); } // apply immediately
+    });
     var chosenURI = localStorage.getItem("notes-tts-voice-v2") || "";
 
     // Score a voice by likely quality (higher = nicer). Neural/Natural/Online win.
@@ -265,26 +302,43 @@
     }
 
     function highlight(el) {
-      if (lastEl) lastEl.classList.remove("tts-reading");
+      if (lastEl && lastEl !== el) lastEl.classList.remove("tts-reading");
       if (el) {
         el.classList.add("tts-reading");
         el.scrollIntoView({ block: "center", behavior: "smooth" });
       }
       lastEl = el;
     }
+    function highlightWord(span) {
+      if (lastWord) lastWord.classList.remove("tts-w-active");
+      lastWord = span || null;
+      if (!span) return;
+      span.classList.add("tts-w-active");
+      var r = span.getBoundingClientRect();
+      if (r.top < 70 || r.bottom > window.innerHeight - 70) {
+        span.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+    }
     function updateStatus() {
-      status.textContent = Math.round((idx / queue.length) * 100) + "%";
+      status.textContent = queue.length ? Math.round((idx / queue.length) * 100) + "%" : "0%";
     }
     function setPlayingIcon() { primaryBtn.textContent = playing && !paused ? "⏸" : "▶︎"; }
 
     function speakCurrent() {
       if (idx >= queue.length) { stop(); return; }
-      var item = queue[idx];
-      var u = new SpeechSynthesisUtterance(item.text);
+      var seg = queue[idx];
+      var u = new SpeechSynthesisUtterance(seg.text);
       u.rate = rate;
       var v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; }
-      highlight(item.el);
+      highlight(seg.box);
+      highlightWord(seg.words[0]);
       updateStatus();
+      u.onboundary = function (e) {
+        if (e.name && e.name !== "word") return;
+        var ci = e.charIndex || 0, k = 0;
+        for (var j = 0; j < seg.offs.length; j++) { if (seg.offs[j] <= ci) k = j; else break; }
+        highlightWord(seg.words[k]);
+      };
       u.onend = function () {
         if (!playing || paused) return;
         idx++;
@@ -295,6 +349,8 @@
 
     function play() {
       if (paused) { paused = false; synth.resume(); playing = true; setPlayingIcon(); return; }
+      buildQueue();
+      if (!queue.length) return;
       synth.cancel();
       playing = true; paused = false;
       setPlayingIcon();
@@ -305,12 +361,14 @@
     }
     function stop() {
       synth.cancel(); playing = false; paused = false; idx = 0;
-      highlight(null); setPlayingIcon(); updateStatus();
+      highlight(null); highlightWord(null); setPlayingIcon(); updateStatus();
     }
     function jump(delta) {
+      buildQueue();
       idx = Math.max(0, Math.min(queue.length - 1, idx + delta));
       synth.cancel();
-      if (playing) speakCurrent(); else { highlight(queue[idx].el); updateStatus(); }
+      if (playing) speakCurrent();
+      else { highlight(queue[idx].box); highlightWord(queue[idx].words[0]); updateStatus(); }
     }
 
     launch.addEventListener("click", function () {
@@ -327,13 +385,6 @@
       else if (act === "prev") jump(-1);
       else if (act === "stop") stop();
       else if (act === "close") { stop(); player.classList.add("collapsed"); launch.style.display = "grid"; }
-      else if (act === "speed") {
-        var steps = [0.75, 1, 1.25, 1.5, 1.75, 2];
-        rate = steps[(steps.indexOf(rate) + 1) % steps.length];
-        localStorage.setItem("notes-tts-rate", String(rate));
-        speedBtn.textContent = rate + "x";
-        if (playing && !paused) { synth.cancel(); speakCurrent(); } // apply immediately
-      }
     });
 
     voiceSel.addEventListener("change", function () {
