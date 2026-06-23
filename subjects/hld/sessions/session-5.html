@@ -26,7 +26,7 @@
         real-ish products with them — a code judge, a leaderboard, and a social newsfeed. We assume you've
         studied <em>none</em> of this before, so every topic starts with a tiny everyday story before we go deep.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 6 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 39 min read</span><span class="badge-rt">📖 6 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -139,9 +139,12 @@
           is great, but it's never free.</p>
         </div>
 
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed.png" alt="Cartoon asking 'Do we always want cash? Yes.'" loading="lazy"><figcaption>The class opener's pun: "Do we always want <em>cash</em>? Yes." — but caching is a different question.</figcaption></figure>
+
         <h3>Do we always want to cache? Not always.</h3>
         <p>A cache is not a free win you sprinkle on everything. It is a deliberate design decision with real
         trade-offs. Let's be honest about both sides.</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%281%29.png" alt="Diagram weighing whether to cache, listing pros and cons" loading="lazy"><figcaption>"Do we always want to cache?" — no. Weigh the pros (read throughput, lower average latency) against the cons (complexity, extra infra, worse worst-case latency and writes).</figcaption></figure>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Pros of caching</th><th>Cons of caching</th></tr></thead>
@@ -262,6 +265,7 @@
         <p>How many problems are solved on a given day? Around <strong>100–200 different problems</strong> — we run
         multiple batches in parallel, each solving the current (or last) class's problems, and the batches overlap in
         timeline.</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%282%29.png" alt="Code judge data sources: SQL/RDS for user and problem info, S3 for test-case files" loading="lazy"><figcaption>The code judge pulls small user/problem info from SQL (RDS) and large test-case files (~3 TB total) from S3 — the heavy data is what we'll cache.</figcaption></figure>
 
         <div class="callout warn">
           <span class="c-title">Interview trap: "Should we store these test cases in a CDN?"</span>
@@ -281,6 +285,7 @@
           of test-case data for each request — just from the cache server instead of S3. We swapped an expensive
           S3→app-server transfer for an equally expensive cache→app-server transfer. No win.</p>
         </div>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%283%29.png" alt="A global cache still forces a 1 GB transfer from the cache server to the app server" loading="lazy"><figcaption>A global cache doesn't help: we still ship 1 GB per request, now from the cache server to the app server instead of from S3.</figcaption></figure>
         <p><strong>Local cache wins.</strong> Each app server caches some test cases on its <em>own local HDD</em>:</p>
         <ul>
           <li>The request comes to the app server.</li>
@@ -289,6 +294,7 @@
           <li>If not cached, download from S3, save locally on the HDD, then use them.</li>
           <li>Any subsequent request for the same problem now reads from the HDD.</li>
         </ul>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%284%29.png" alt="Local cache flow: app server checks its HDD, downloads from S3 on a miss, then reuses" loading="lazy"><figcaption>The local-cache flow: on a miss the app server downloads from S3 once and saves to its HDD; every later request for that problem reads straight from disk, no network.</figcaption></figure>
         <pre>POST /evaluate-submission
 
 fn check_solution(request):
@@ -393,6 +399,7 @@ fn check_solution(request):
         Maintaining atomicity across 2 servers is already insanely hard and slow; across 100s it's impossible — at
         least one will fail and you'd have to roll back the other 99, and you'd be limited by the slowest server
         (brutally slow writes). So we do something smarter:</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%285%29.png" alt="Naive write-through trying to update 1 GB files atomically across hundreds of app servers plus S3 — this will NOT work" loading="lazy"><figcaption>The naive write-through: atomically updating 1 GB files across S3 and hundreds of app servers. At least one server fails, you must roll back the rest, and the slowest server limits everyone — this will NOT work.</figcaption></figure>
         <ul>
           <li><strong>Version the test-case files by putting a timestamp in the filename:</strong>
           <code class="inl">p1_input.txt</code> ⇒ <code class="inl">p1_input_2025-03-16_08:00.txt</code>.</li>
@@ -406,6 +413,7 @@ fn check_solution(request):
           <li>Any request after the SQL entry is updated gets the new filename, the app server sees it lacks those
           files on its HDD, fetches them from S3, and uses them. <strong>Immediate consistency, achieved.</strong></li>
         </ul>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%286%29.png" alt="Versioned-filename design: SQL stores the current test-case filename; app servers cache immutable, timestamped files" loading="lazy"><figcaption>The versioned-filename design: SQL returns the current (timestamped) filename per request; the app server caches that immutable file from S3 — the version id is never cached, so it can never be stale.</figcaption></figure>
         <pre>fn check_solution(request):
     pid = request.solution.problem_id
     uid = request.uid
@@ -429,6 +437,7 @@ fn check_solution(request):
           <em>new version</em> instead), the test-case files are <span class="term">immutable</span>. Immutable data
           never changes, so it never needs invalidation!</p>
         </div>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%286%29.png" alt="Caching immutable, versioned test cases — only the filename in SQL changes on update" loading="lazy"><figcaption>Because we only ever upload a <em>new</em> versioned file (never modify an existing one), the cached test cases are immutable — the app server just caches and evicts, never invalidates.</figcaption></figure>
         <div class="callout note">
           <span class="c-title">Who actually does the invalidation?</span>
           <p>The app server is only doing <strong>eviction</strong>, not invalidation. The <em>problem setter</em> does
@@ -461,6 +470,7 @@ fn check_solution(request):
         <p>Recall the mental model: <em>why do we have more than one server?</em> Here it's because evaluation is heavy
         compute, not because the working set must be sharded — so <strong>round robin</strong> is the answer, with each
         app server acting independently. But let's prove the alternatives are worse.</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%286%29.png" alt="Round-robin load balancing across code-judge app servers, each with its own local cache" loading="lazy"><figcaption>With round robin, any request can hit any app server; each independently caches the ~100 problems being solved today. It looks wasteful but isn't — and it spreads CPU-bound load evenly.</figcaption></figure>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>LB strategy</th><th>What happens</th></tr></thead>
@@ -527,6 +537,7 @@ fn check_solution(request):
         <p>The <span class="term">leaderboard</span> is a paginated rank list. For each rank it shows the user's
         details and, for each contest problem, the problem details plus the user's score and submission details. Users
         ask two things: "show me page 23" and "show me my rank." Let's run the 5-step process.</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%287%29.png" alt="Paginated contest leaderboard showing rank, user details, and per-problem scores" loading="lazy"><figcaption>The leaderboard UI: a paginated rank list where each row shows the user plus their score and submission details for every contest problem.</figcaption></figure>
 
         <h3>The situation &amp; the numbers</h3>
         <p>A <strong>3-hour contest</strong>, <strong>100,000 participants</strong>, <strong>5 problems</strong>.</p>
@@ -550,6 +561,7 @@ Peak load (start & end of contest run hotter)
         <p>Those 100 submissions/sec are evaluated by the code judge (previous case study). For each one, the code
         judge writes the final verdict/score to SQL. From that collective data we must compute and show the
         leaderboard.</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%288%29.png" alt="Submissions flow into the code judge, verdicts land in SQL, and the leaderboard is computed from that data" loading="lazy"><figcaption>Submissions (≈100/s at peak) are graded by the code judge, which writes each verdict/score to SQL — the leaderboard service then aggregates all of it into a ranked list.</figcaption></figure>
 
         <h3>Step 1 — Establish the need</h3>
         <h4>How do we compute the rank list?</h4>
@@ -611,6 +623,7 @@ Peak load (start & end of contest run hotter)
         <p>10 MB fits on a single cache server. 200 queries/sec is nothing — a single Redis server can handle up to
         <strong>100,000 read requests/sec</strong>. The per-request network transfer is just 1 KB (≈ 200 Kbps of
         bandwidth total). So the ideal here is a <strong>single global cache server</strong> (e.g. Redis).</p>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%289%29.png" alt="A single global in-memory cache server (Redis) serving all leaderboard app servers" loading="lazy"><figcaption>A single global in-memory cache (e.g. Redis): 20 MB of data and ~200 reads/s sit comfortably on one server that can handle up to 100,000 reads/s.</figcaption></figure>
         <div class="callout note">
           <span class="c-title">Scale-of-data definitions</span>
           <p><strong>Low scale:</strong> data that fits on 1 server (≤ ~10 GB in RAM, ≤ ~1 TB on disk).
@@ -643,6 +656,7 @@ Peak load (start & end of contest run hotter)
             </tbody>
           </table>
         </div>
+        <figure class="figure"><img src="../HLD-CaseStudy/%5BSST-2028%5D%20Caching%20Case%20Studies_files/unnamed%2810%29.png" alt="A separate CRON app server periodically recomputes the ranklist and writes it into Redis (write-around)" loading="lazy"><figcaption>Write-around for the leaderboard: a separate CRON app server runs every ~10 min, fetches all submission scores, computes the rank list, and stores it in Redis — so no user request ever pays the 5 s compute.</figcaption></figure>
         <div class="callout warn">
           <span class="c-title">Cold start: what about the first requests?</span>
           <p>Before the CRON job has run, the cache has no rank list. Two options: (1) return an error — "rank list not

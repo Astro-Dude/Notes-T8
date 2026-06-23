@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HLD · Session 13 — Case Study — IRCTC Ticket Booking System</title>
+  <title>HLD · Session 13 — Case Study: Typeahead-2 (Building &amp; Scaling Autocomplete)</title>
   <link rel="stylesheet" href="../../../assets/css/styles.css" />
 </head>
 <body data-accent="hld">
@@ -18,18 +18,19 @@
 
   <main class="wrap">
     <section class="page-hero">
-      <span class="kicker">Session 13 · Case Study — IRCTC</span>
-      <h1>Designing IRCTC: booking train tickets without ever selling the same seat twice</h1>
+      <span class="kicker">Session 13 · Case Study — Typeahead-2</span>
+      <h1>Typeahead-2: actually building, storing, and scaling autocomplete</h1>
       <p class="lead">
-        Today we put on our system-design hats and build something real: India's train-ticket
-        booking system, IRCTC — one of the busiest websites on Earth. We assume you've studied
-        <em>none</em> of this before, so every topic opens with a tiny "explain like I'm 5" story,
-        then we go deep with real SQL, diagrams, and trade-offs. The whole session circles one
-        wickedly hard problem: <strong>thousands of people grabbing for the same seat at the same
-        instant</strong>. We'll lean on the ACID, consistency, and locking ideas from earlier
-        sessions to solve it.
+        In the previous session we sketched what a search "type-as-you-go" suggestion box should do.
+        Today we roll up our sleeves and <strong>build it for real</strong>: how to store the data
+        (tries vs. a plain key-value cache), how to make every keystroke feel instant, how the system
+        becomes terrifyingly <em>read- and write-heavy</em>, and the two clever tricks — <strong>batching</strong>
+        and <strong>sampling</strong> — that tame the write storm. We finish with the "make it smarter"
+        extras: recency/freshness, geolocation, personalization, and typo handling. We assume you've
+        studied <em>none</em> of this before, so every topic opens with a tiny "explain like I'm 5" story
+        and ends with a recap.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 39 min read</span><span class="badge-rt">📖 9 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 27 min read</span><span class="badge-rt">📖 8 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -38,15 +39,14 @@
       <nav class="toc" aria-label="Table of contents">
         <h4>On this page</h4>
         <ol>
-          <li><a href="#requirements">Requirements &amp; the core challenge</a></li>
-          <li><a href="#acid">Avoiding double-booking with ACID &amp; locking</a></li>
-          <li><a href="#spikes">Handling load spikes</a></li>
-          <li><a href="#services">Multi-service architecture</a></li>
-          <li><a href="#trie">Typeahead approach 1 — Tries</a></li>
-          <li><a href="#hashmap">Typeahead approach 2 — Hashmap / Key-Value</a></li>
+          <li><a href="#problem">The problem &amp; the prefix rule</a></li>
+          <li><a href="#trie">Approach 1 — Tries</a></li>
+          <li><a href="#trie-sharding">Sharding a trie</a></li>
+          <li><a href="#hashmap">Approach 2 — Hashmap / Key-Value</a></li>
+          <li><a href="#log-search">Logging searches &amp; the write explosion</a></li>
           <li><a href="#optimizing">Optimizing reads &amp; writes</a></li>
           <li><a href="#reduce-writes">Reducing writes — batching &amp; sampling</a></li>
-          <li><a href="#future">Future scope — recency, geo, typos</a></li>
+          <li><a href="#future">Future scope — recency, geo, personalization, typos</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
           <li><a href="#refs">References &amp; further reading</a></li>
         </ol>
@@ -55,532 +55,84 @@
       <!-- ARTICLE -->
       <article class="article">
 
-      <!-- ===================== 1. REQUIREMENTS ===================== -->
-      <section id="requirements">
-        <h2><span class="sec-num">1</span> Requirements &amp; the core challenge</h2>
+      <!-- ===================== 1. THE PROBLEM ===================== -->
+      <section id="problem">
+        <h2><span class="sec-num">1</span> The problem &amp; the prefix rule</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
           <span class="c-title">Explain like I'm 5</span>
-          <p>Imagine one ice-cream truck with exactly 72 cones, and 50,000 kids sprinting toward it
-          the moment it rings its bell. Everyone reaches in for a cone at the <em>same</em> second.
-          The truck's whole job is simple to say but hard to do: <strong>give each cone to exactly one
-          kid, and never hand the same cone to two kids.</strong> IRCTC is that truck — the cones are
-          train seats, and the bell is "tatkal" tickets opening at 10 a.m.</p>
+          <p>You start typing in a search box — just the letters "<code class="inl">What</code>" — and before you
+          even finish, a little list pops up guessing the rest: "what is 2+2", "what is the color of the sky"…
+          It's like a friend who finishes your sentences, and always with the <strong>most popular</strong> endings.
+          Our whole job today is to build that friend: given the few letters typed so far, instantly show the
+          <strong>top 5 most-searched queries that begin with exactly those letters</strong>.</p>
         </div>
 
-        <p>Before we design anything, good engineers write down what the system must do. We split this
-        into two buckets. <span class="term">Functional requirements</span> are the features — what the
-        user can <em>do</em>. <span class="term">Non-functional requirements</span> are the qualities —
-        how <em>well</em> the system must behave (fast? reliable? handles a crowd?).</p>
+        <p>This is the <span class="term">typeahead</span> (autocomplete) feature. The rule is simple to state:
+        if the user types the partial query "<code class="inl">What</code>", we must show the <strong>top 5 search
+        queries that are a strict prefix match</strong> — i.e. queries that literally start with "What".</p>
 
-        <h3>Functional requirements (the features)</h3>
-        <ul>
-          <li><strong>Search trains</strong> between a source and destination on a given date, with class
-          (Sleeper, 3AC, etc.) and seat availability.</li>
-          <li><strong>Check availability</strong> — how many seats are free in each class on each train.</li>
-          <li><strong>Book a ticket</strong> — pick a train, select seats/berths, enter passenger details,
-          and confirm.</li>
-          <li><strong>Pay</strong> for the booking and get a confirmation (a PNR — the booking reference
-          number).</li>
-          <li><strong>Cancel</strong> a ticket and get a refund; the freed seat goes back into the pool.</li>
-          <li><strong>Waitlist &amp; RAC</strong> — when a class is sold out, users can join a waiting list
-          and get promoted if others cancel.</li>
-          <li><strong>Tatkal</strong> — a special last-minute quota that opens at a fixed time and sells out
-          in seconds.</li>
-        </ul>
-
-        <h3>Non-functional requirements (the qualities)</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Quality</th><th>What it means here</th><th>Target (illustrative)</th></tr></thead>
-            <tbody>
-              <tr><td><span class="term">Consistency</span></td><td>The seat count must be exactly right — a seat is never sold twice. This is non-negotiable.</td><td>Strong consistency on the seat inventory.</td></tr>
-              <tr><td>Availability</td><td>The site should stay up, especially during tatkal.</td><td>99.9%+ uptime.</td></tr>
-              <tr><td>Scalability</td><td>Handle a normal day <em>and</em> the tatkal stampede.</td><td>~10–20× spike at 10 a.m.</td></tr>
-              <tr><td>Latency</td><td>Search and availability feel instant; booking confirms in a few seconds.</td><td>Search &lt; 300 ms; booking &lt; few s.</td></tr>
-              <tr><td>Durability</td><td>A confirmed booking is never lost, even if a server crashes.</td><td>Survives crashes (ACID — Topic 2).</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>A back-of-the-envelope on the load</h3>
-        <p>Let's get a feel for the numbers, because the design choices flow from them.</p>
-        <div class="callout example">
-          <span class="c-title">Worked example — sizing the tatkal spike</span>
-          <p>Suppose on a normal day IRCTC handles <strong>~25 million</strong> users and books
-          <strong>~1 million</strong> tickets, spread across the day. That's a modest average of a few
-          hundred bookings per second.</p>
-          <p>But tatkal opens at <strong>10:00 a.m.</strong> sharp. In the first minute, tens of millions
-          of requests can pile in. If 10 million people hit "search" and "book" in 60 seconds, that's
-          roughly:</p>
-          <p><code class="inl">10,000,000 ÷ 60 ≈ 167,000 requests/second</code> — a 100×+ burst over the
-          quiet baseline, all aimed at a <em>tiny</em> pool of tatkal seats.</p>
-          <p>This is the defining shape of the problem: <strong>enormous, bursty read traffic, and a
-          fierce fight over a small, shared, write-heavy resource (the seats).</strong></p>
-        </div>
-
-        <h3>The core challenge: double-booking under contention</h3>
-        <p>Everything in this session orbits one problem. Two users, Asha and Ravi, both see "1 seat
-        left" and both click "book" within the same millisecond. If our system naïvely does
-        <em>"read count → it's 1 → sell → write count = 0"</em> for both of them, we sell the same seat
-        twice. That's called a <span class="term">race condition</span> (two operations racing, and the
-        result depends on who wins). The fancier name for two requests reading-then-writing the same data
-        without coordination is a <span class="term">lost update</span>.</p>
-
-        <div class="bigidea">
-          <span class="c-title">The one big idea</span>
-          <p>A train seat is a <strong>shared, finite resource that must be allocated exactly once</strong>.
-          The entire art of building IRCTC is making thousands of simultaneous grabs for that seat behave
-          as if they happened <em>one at a time, in a clean order</em> — without making everyone wait so
-          long the site feels broken. ACID transactions and locking (Topic 2) are how we win this.</p>
-        </div>
+        <p>That little phrase "<strong>prefix match</strong>" is the heart of everything. It tells us two things:
+        (1) the data structure we pick must be great at "find everything starting with these letters", and
+        (2) among all those matches, we must rank by popularity and keep only the best few. The rest of this
+        session is two different ways to do exactly that — and then how to make it survive real-world scale.</p>
 
         <div class="callout note">
-          <span class="c-title">Why this is harder than a shopping cart</span>
-          <p>Amazon can <em>oversell</em> a phone and apologise later — they'll just ship it next week.
-          IRCTC <strong>cannot</strong> put two strangers on the same berth; there is no "ship more seats."
-          The inventory is hard-capped and the consequence of a mistake is a real human standing in a train
-          with no place to sit. So we choose <strong>strong consistency</strong> for the seat inventory and
-          accept a little extra latency for it.</p>
-        </div>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          IRCTC must let users search, check availability, book, pay, cancel, waitlist, and use tatkal
-          (functional), while being consistent, available, scalable, fast, and durable (non-functional).
-          The killer problem is <strong>preventing double-booking of one seat under a massive, bursty
-          stampede</strong> of concurrent users — a race condition we must tame with transactions and locks.
-        </div>
-      </section>
-
-      <!-- ===================== 2. ACID & LOCKING ===================== -->
-      <section id="acid">
-        <h2><span class="sec-num">2</span> Avoiding double-booking with ACID &amp; locking</h2>
-        <hr class="section-rule" />
-
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Picture one bathroom and a line of people. The trick that stops two people barging in at once
-          is the <strong>lock on the door</strong>. Whoever gets in first turns the lock; everyone else waits
-          their turn. A database "lock" is exactly that: while one booking is touching a seat, it bolts the
-          door so no one else can grab the same seat until it's done. The booking either fully completes
-          (you walk out, job done) or fully un-happens (as if you never went in) — never half-way.</p>
-        </div>
-
-        <h3>First, a refresher: ACID transactions</h3>
-        <p>A <span class="term">transaction</span> is a bundle of database steps that must all succeed or all
-        fail together. Databases guarantee transactions are <span class="term">ACID</span> — four properties
-        we've met in earlier sessions, recapped here because they're the bedrock of our solution:</p>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Letter</th><th>Property</th><th>What it gives the booking</th></tr></thead>
-            <tbody>
-              <tr><td>A</td><td><strong>Atomicity</strong></td><td>Reserve-seat + create-PNR + charge-payment either <em>all</em> happen or <em>none</em> do. No half-bookings.</td></tr>
-              <tr><td>C</td><td><strong>Consistency</strong></td><td>Rules are never violated — e.g. seats-booked can never exceed seats-total.</td></tr>
-              <tr><td>I</td><td><strong>Isolation</strong></td><td>Concurrent bookings don't trample each other; each behaves as if it ran alone. <em>This is the one that beats double-booking.</em></td></tr>
-              <tr><td>D</td><td><strong>Durability</strong></td><td>Once confirmed, the booking survives crashes and power cuts (written to disk/replicated).</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Isolation levels — how strict is "don't trample"?</h3>
-        <p>Isolation isn't all-or-nothing; databases offer <span class="term">isolation levels</span> that
-        trade safety for speed. From weakest to strongest:</p>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Level</th><th>Allows the anomaly?</th><th>Plain English</th></tr></thead>
-            <tbody>
-              <tr><td>Read Uncommitted</td><td>Dirty reads ✅</td><td>You can see another transaction's half-finished work. Dangerous.</td></tr>
-              <tr><td>Read Committed</td><td>Non-repeatable reads ✅</td><td>You only see committed data, but a re-read can change mid-transaction.</td></tr>
-              <tr><td>Repeatable Read</td><td>Phantom rows (sometimes) ✅</td><td>Rows you've read won't change under you.</td></tr>
-              <tr><td><strong>Serializable</strong></td><td>Nothing — fully safe</td><td>Transactions behave as if run one after another. Safest, slowest.</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>The <span class="term">lost update</span> from Topic 1 (Asha and Ravi both reading "1 left")
-        sneaks in at the weaker levels. To stop it cleanly, we either crank isolation up <em>or</em>, more
-        commonly, take an explicit <strong>lock</strong> on the seat row. Locking gives us precise control
-        without forcing the <em>entire</em> system to the slow Serializable level.</p>
-
-        <h3>Pessimistic locking — "assume a fight, lock the door first"</h3>
-        <p><span class="term">Pessimistic locking</span> assumes conflicts are likely (true during tatkal!),
-        so it grabs a lock <em>before</em> touching the seat. In SQL this is <code class="inl">SELECT ... FOR
-        UPDATE</code>: it reads the row <em>and</em> bolts it shut so no other transaction can read-for-update
-        or modify it until you commit.</p>
-        <pre><span class="cm">-- Pessimistic locking: bolt the seat row, then update it.</span>
-<span class="kw">BEGIN</span>;
-
-<span class="cm">-- Lock the row for this seat. Any other booking trying the same</span>
-<span class="cm">-- row now WAITS here until we COMMIT or ROLLBACK.</span>
-<span class="kw">SELECT</span> status
-<span class="kw">FROM</span> seats
-<span class="kw">WHERE</span> train_id = <span class="nm">12951</span>
-  <span class="kw">AND</span> coach = <span class="st">'B1'</span>
-  <span class="kw">AND</span> seat_no = <span class="nm">23</span>
-  <span class="kw">AND</span> journey_date = <span class="st">'2026-07-01'</span>
-<span class="kw">FOR UPDATE</span>;                       <span class="cm">-- &lt;-- the magic words</span>
-
-<span class="cm">-- Now we are the ONLY one who can touch this seat.</span>
-<span class="cm">-- App checks: is status = 'AVAILABLE'? If yes:</span>
-<span class="kw">UPDATE</span> seats
-<span class="kw">SET</span> status = <span class="st">'BOOKED'</span>, pnr = <span class="st">'8204417653'</span>
-<span class="kw">WHERE</span> train_id = <span class="nm">12951</span>
-  <span class="kw">AND</span> coach = <span class="st">'B1'</span>
-  <span class="kw">AND</span> seat_no = <span class="nm">23</span>
-  <span class="kw">AND</span> journey_date = <span class="st">'2026-07-01'</span>;
-
-<span class="kw">COMMIT</span>;                              <span class="cm">-- door unlocks; next person proceeds</span></pre>
-
-        <div class="callout example">
-          <span class="c-title">Worked example — Asha vs Ravi, with FOR UPDATE</span>
+          <span class="c-title">Two operations to support</span>
           <ul>
-            <li><strong>t=0ms</strong> — Asha's transaction runs <code class="inl">SELECT ... FOR UPDATE</code> on seat B1-23. She gets the lock. Status reads <code class="inl">AVAILABLE</code>.</li>
-            <li><strong>t=1ms</strong> — Ravi's transaction runs the <em>same</em> <code class="inl">SELECT ... FOR UPDATE</code>. The database makes him <strong>wait</strong> — the door is bolted.</li>
-            <li><strong>t=8ms</strong> — Asha sets status to <code class="inl">BOOKED</code> and <code class="inl">COMMIT</code>s. The lock releases.</li>
-            <li><strong>t=8ms</strong> — Ravi's <code class="inl">SELECT</code> now returns, and he sees <code class="inl">BOOKED</code>. His app refuses the booking and offers him the waitlist.</li>
+            <li><code class="inl">typeahead(partialQuery)</code> — the <strong>read</strong>: given what's typed so far, return the top suggestions. This must be <em>blazing</em> fast (it fires on every keystroke).</li>
+            <li><code class="inl">log_search(searchQuery)</code> — the <strong>write</strong>: when a user actually runs a full search, record it so popularity counts stay current.</li>
           </ul>
-          <p>The seat was sold <strong>exactly once.</strong> The lock turned a chaotic race into an orderly queue.</p>
-        </div>
-
-        <h3>Optimistic locking — "assume no fight, but check before you commit"</h3>
-        <p><span class="term">Optimistic locking</span> assumes conflicts are <em>rare</em>. It takes no lock
-        up front. Instead each seat row carries a <span class="term">version</span> number; you read the
-        version, do your work, and at write-time say "update only if the version is still what I read." If
-        someone slipped in first, the version changed, your update matches zero rows, and you retry.</p>
-        <pre><span class="cm">-- Optimistic locking: no lock held; detect the clash at write time.</span>
-
-<span class="cm">-- Step 1: read the seat AND its current version.</span>
-<span class="kw">SELECT</span> status, version
-<span class="kw">FROM</span> seats
-<span class="kw">WHERE</span> seat_id = <span class="nm">9912</span>;
-<span class="cm">-- suppose this returns status='AVAILABLE', version=7</span>
-
-<span class="cm">-- Step 2: try to book, but ONLY if version is still 7.</span>
-<span class="kw">UPDATE</span> seats
-<span class="kw">SET</span> status  = <span class="st">'BOOKED'</span>,
-    pnr     = <span class="st">'8204417653'</span>,
-    version = version + <span class="nm">1</span>      <span class="cm">-- bump it to 8</span>
-<span class="kw">WHERE</span> seat_id = <span class="nm">9912</span>
-  <span class="kw">AND</span> version  = <span class="nm">7</span>           <span class="cm">-- &lt;-- the guard</span>
-  <span class="kw">AND</span> status   = <span class="st">'AVAILABLE'</span>;
-
-<span class="cm">-- If 1 row updated  -> success.</span>
-<span class="cm">-- If 0 rows updated -> someone else booked it first; retry or fail.</span></pre>
-
-        <div class="callout note">
-          <span class="c-title">What just happened to Ravi here?</span>
-          <p>Both Asha and Ravi read <code class="inl">version=7</code>. Asha's UPDATE runs first, succeeds,
-          and bumps version to 8. Ravi's UPDATE has <code class="inl">WHERE version = 7</code> — but it's now
-          8, so <strong>0 rows change</strong>. His app sees "0 rows" and knows he lost the race, without
-          ever having locked anything.</p>
-        </div>
-
-        <h3>Pessimistic vs optimistic — the trade-off</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th></th><th>Pessimistic (<code class="inl">FOR UPDATE</code>)</th><th>Optimistic (version check)</th></tr></thead>
-            <tbody>
-              <tr><td>Assumes</td><td>Conflicts are common</td><td>Conflicts are rare</td></tr>
-              <tr><td>When it locks</td><td>Up front, holds it until commit</td><td>Never holds a lock; checks at write</td></tr>
-              <tr><td>Cost of contention</td><td>Others wait in line (can be slow, risks deadlock)</td><td>Losers retry (wasted work if conflicts are frequent)</td></tr>
-              <tr><td>Best for</td><td>Hot rows with heavy contention — <strong>tatkal seats</strong></td><td>Low-contention edits — e.g. updating a passenger's phone number</td></tr>
-              <tr><td>Risk</td><td>Deadlocks &amp; lock waits under load</td><td>Retry storms if everyone clashes</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="callout warn">
-          <span class="c-title">Watch out — the deadlock trap</span>
-          <p>Pessimistic locks can <span class="term">deadlock</span>: transaction A locks seat 1 and waits
-          for seat 2, while B locks seat 2 and waits for seat 1 — both stuck forever. Avoid it by
-          <strong>always locking rows in a consistent order</strong> (e.g. ascending seat_id), keeping
-          transactions short, and setting a lock-wait timeout so the database can abort and retry one of them.</p>
-        </div>
-
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>For the <em>hot, fought-over</em> seat inventory during tatkal, <strong>pessimistic
-          <code class="inl">SELECT ... FOR UPDATE</code></strong> is usually the right call — it serialises the
-          fight cleanly. Use <strong>optimistic locking</strong> for the calmer parts of the system where
-          clashes are rare and you'd rather not pay the cost of holding locks.</p>
         </div>
 
         <div class="recap">
           <span class="c-title">Recap</span>
-          ACID transactions (especially <strong>Isolation</strong>) are the foundation; isolation levels trade
-          safety for speed. To stop double-booking, lock the seat. <strong>Pessimistic</strong> locking
-          (<code class="inl">FOR UPDATE</code>) bolts the row first and is ideal for hot tatkal seats;
-          <strong>optimistic</strong> locking uses a version check and retries on clash, ideal when conflicts
-          are rare. Lock in a consistent order to dodge deadlocks.
+          Typeahead must, on every keystroke, return the <strong>top 5 queries that strictly start with the typed
+          prefix</strong>, ranked by popularity. That means we need a data structure good at prefix lookups plus a
+          way to rank by count. Two operations matter: a very fast read (<code class="inl">typeahead</code>) and a
+          write that keeps counts fresh (<code class="inl">log_search</code>).
         </div>
       </section>
 
-      <!-- ===================== 3. LOAD SPIKES ===================== -->
-      <section id="spikes">
-        <h2><span class="sec-num">3</span> Handling load spikes</h2>
-        <hr class="section-rule" />
-
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Remember the 50,000 kids charging the ice-cream truck? You don't let all of them shove at the
-          window at once — that breaks the truck. Instead you hand out <strong>numbered tickets</strong> and
-          a calm helper calls "kids 1 to 50, please." Everyone else waits in a comfy <strong>waiting room</strong>.
-          And once a kid says "I want the chocolate cone," you <strong>hold it for them for 2 minutes</strong>
-          while they find their money — but if they dawdle, the cone goes back. That's the whole trick:
-          smooth the stampede into a polite line, and hold things briefly so nobody pays twice or grabs twice.</p>
-        </div>
-
-        <p>From Topic 1 we know tatkal can be a 100×+ burst. A database doing <code class="inl">SELECT ...
-        FOR UPDATE</code> can only serialise so fast before requests pile up and time out. The job here is to
-        <strong>protect the precious booking core from the flood</strong>. We have five tools.</p>
-
-        <h3>Tool 1 — A queue / virtual waiting room</h3>
-        <p>Instead of letting every request slam the booking database, we put incoming users into a
-        <span class="term">queue</span> (a line) and admit them in controlled batches. Many big ticketing
-        sites show a literal "you are number 14,233 in line" <span class="term">waiting room</span>. This
-        converts a spiky, unpredictable flood into a steady, survivable trickle the booking core can handle.</p>
-        <div class="flow">
-          <div class="step"><div class="s-ico">🌊</div><div class="s-t">Flood arrives</div><div class="s-d">167k req/s at 10:00</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🪑</div><div class="s-t">Waiting room</div><div class="s-d">Hold users politely</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🎟️</div><div class="s-t">Admit in batches</div><div class="s-d">e.g. 2k/s let through</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🛡️</div><div class="s-t">Booking core</div><div class="s-d">Safe, steady load</div></div>
-        </div>
-
-        <h3>Tool 2 — Rate limiting</h3>
-        <p><span class="term">Rate limiting</span> caps how many requests a single user (or IP) may send in
-        a window. It blocks bots and scripts (a huge problem in tatkal) and stops one greedy client from
-        hogging capacity. A classic implementation is the <span class="term">token-bucket</span> algorithm:
-        each user has a bucket that refills at a steady rate; each request spends a token; empty bucket =
-        request rejected with HTTP <code class="inl">429 Too Many Requests</code>.</p>
-        <div class="callout example">
-          <span class="c-title">Example — token bucket</span>
-          <p>Give each user a bucket of 5 tokens that refills 1 token/second. A human clicking normally
-          never empties it. A bot firing 100 requests/second drains it instantly and gets
-          <code class="inl">429</code>ed after 5 — protecting everyone else.</p>
-        </div>
-
-        <h3>Tool 3 — Seat-hold with a TTL</h3>
-        <p>When a user picks a seat, we don't make them race through payment while holding a database lock —
-        that would freeze the seat for everyone for minutes. Instead we create a short <span class="term">seat
-        hold</span> (a soft reservation) with a <span class="term">TTL</span> (time-to-live, an auto-expiry).
-        The seat is marked <code class="inl">HELD</code> for, say, 8 minutes while they pay. If they don't
-        finish, the hold expires and the seat returns to the pool automatically.</p>
-        <pre><span class="cm">-- Place a 8-minute hold, atomically, only if still available.</span>
-<span class="kw">UPDATE</span> seats
-<span class="kw">SET</span> status      = <span class="st">'HELD'</span>,
-    held_by     = <span class="st">'user_77421'</span>,
-    hold_expiry = NOW() + <span class="kw">INTERVAL</span> <span class="st">'8 minutes'</span>
-<span class="kw">WHERE</span> seat_id = <span class="nm">9912</span>
-  <span class="kw">AND</span> status  = <span class="st">'AVAILABLE'</span>;          <span class="cm">-- only grab a free seat</span>
-
-<span class="cm">-- A background job (or a check on read) frees expired holds:</span>
-<span class="kw">UPDATE</span> seats
-<span class="kw">SET</span> status = <span class="st">'AVAILABLE'</span>, held_by = <span class="kw">NULL</span>, hold_expiry = <span class="kw">NULL</span>
-<span class="kw">WHERE</span> status = <span class="st">'HELD'</span>
-  <span class="kw">AND</span> hold_expiry &lt; NOW();           <span class="cm">-- the TTL has passed</span></pre>
-        <p>Seat holds are often kept in a fast in-memory store like <span class="term">Redis</span> with a
-        native TTL, so expiry is automatic and reads are blazing fast — the database remains the durable
-        source of truth for <em>confirmed</em> bookings.</p>
-
-        <h3>Tool 4 — Idempotent payment</h3>
-        <p>During a spike, networks hiccup and users mash the "Pay" button. Without care, one person could be
-        charged twice, or two bookings created for one payment. The fix is
-        <span class="term">idempotency</span>: an operation you can safely repeat and get the
-        <em>same single result</em>. The client generates a unique <span class="term">idempotency key</span>
-        for the payment; the server records it, and any retry with the same key returns the original result
-        instead of charging again.</p>
-        <pre><span class="cm">-- The idempotency key makes retries safe.</span>
-<span class="cm">-- A UNIQUE constraint guarantees one charge per key, even under a race.</span>
-<span class="kw">INSERT INTO</span> payments (idempotency_key, pnr, amount, status)
-<span class="kw">VALUES</span> (<span class="st">'pay_a1b2c3d4'</span>, <span class="st">'8204417653'</span>, <span class="nm">1245.00</span>, <span class="st">'CHARGED'</span>)
-<span class="kw">ON CONFLICT</span> (idempotency_key) <span class="kw">DO NOTHING</span>;   <span class="cm">-- duplicate = no-op</span>
-
-<span class="cm">-- If the row already existed, we DID NOT charge again;</span>
-<span class="cm">-- we just return the existing payment's result to the user.</span></pre>
-
-        <h3>Tool 5 — Read replicas for browsing</h3>
-        <p>Most traffic is <strong>reads</strong>: people searching trains and checking availability, not
-        booking. Reads don't need the locked, write-heavy primary database. We spin up
-        <span class="term">read replicas</span> — copies of the database that serve read queries — and send
-        all the search/browse traffic there. This frees the <span class="term">primary</span> (the single
-        authoritative write node) to focus purely on the precious booking writes.</p>
-        <div class="callout warn">
-          <span class="c-title">Trade-off — replica lag</span>
-          <p>Replicas update a fraction of a second behind the primary (<span class="term">replication
-          lag</span>), so a search might briefly show "2 seats left" when 1 was just booked. That's fine for
-          <em>browsing</em> — it's only a hint. The <strong>final, authoritative seat check happens against
-          the primary inside the locked booking transaction</strong> (Topic 2), where correctness is
-          guaranteed. <em>Eventually-consistent reads, strongly-consistent writes.</em></p>
-        </div>
-
-        <div class="callout example">
-          <span class="c-title">Worked example — the five tools in one tatkal flow</span>
-          <ol>
-            <li>10:00:00 — 167k req/s arrive. The <strong>waiting room</strong> holds most; admits ~2k/s.</li>
-            <li>A bot tries 500 req/s and is <strong>rate-limited</strong> to a trickle of 429s.</li>
-            <li>Admitted users browse availability on <strong>read replicas</strong> — fast, no load on the primary.</li>
-            <li>A user picks seat B1-23; we place an <strong>8-minute seat hold</strong> in Redis.</li>
-            <li>They pay; the <strong>idempotency key</strong> ensures their double-click charges them once.</li>
-            <li>On success, the booking core confirms the seat against the <strong>primary</strong> inside a locked transaction. Done.</li>
-          </ol>
-        </div>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          To survive spikes: a <strong>queue/waiting room</strong> smooths the flood into a steady trickle;
-          <strong>rate limiting</strong> blocks bots and hogs; <strong>seat holds with a TTL</strong> let
-          users pay without freezing seats forever; <strong>idempotent payment</strong> makes retries safe;
-          and <strong>read replicas</strong> absorb all the browsing so the primary database is reserved for
-          the consistent, locked booking writes.
-        </div>
-      </section>
-
-      <!-- ===================== 4. MULTI-SERVICE ARCHITECTURE ===================== -->
-      <section id="services">
-        <h2><span class="sec-num">4</span> Multi-service architecture</h2>
-        <hr class="section-rule" />
-
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Think of a restaurant. One person doesn't take your order, cook, handle the cash, <em>and</em>
-          phone you when food's ready — there's a waiter, a chef, a cashier, and a host. Each is great at one
-          job, and they hand work to each other. We build IRCTC the same way: separate
-          <strong>services</strong>, each owning one job, talking to each other. If the "phone you" person is
-          out sick, you still get your food — the others keep working. That's why we split things up.</p>
-        </div>
-
-        <p>A single giant program (a <span class="term">monolith</span>) that does everything is hard to scale
-        and fragile — one bug or one overloaded feature can sink the whole site. So we split IRCTC into
-        independent <span class="term">microservices</span>, each owning its own data and scaling on its own.</p>
-
-        <h3>The services</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Service</th><th>Job</th><th>Notes on scaling/consistency</th></tr></thead>
-            <tbody>
-              <tr><td><strong>Search / Availability</strong></td><td>Find trains, show seat counts.</td><td>Read-heavy. Scales wide on <strong>read replicas</strong> + cache. Eventual consistency is fine.</td></tr>
-              <tr><td><strong>Booking</strong></td><td>Hold seats, allocate them, create the PNR.</td><td>The consistency-critical core. ACID + locking (Topic 2). The primary database lives here.</td></tr>
-              <tr><td><strong>Payment</strong></td><td>Charge the card, talk to banks/UPI.</td><td>Must be <strong>idempotent</strong> (Topic 3). Slow &amp; external — never block a lock on it.</td></tr>
-              <tr><td><strong>Notification</strong></td><td>Send SMS/email/app confirmation with the PNR.</td><td>Best-effort, asynchronous. A failure here must <em>not</em> fail the booking.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>The consistency problem between services</h3>
-        <p>Here's the catch. In Topic 2, atomicity was easy: one database, one transaction, all-or-nothing.
-        But now <strong>booking, payment, and notification live in different services with different
-        databases.</strong> There's no single transaction spanning all of them. So what if we reserve the
-        seat, but the payment fails? We'd have a held seat and no money — a mess.</p>
-
-        <div class="bigidea">
-          <span class="c-title">The big idea — sagas &amp; eventual consistency</span>
-          <p>When you can't have one big ACID transaction across services, you use a <span class="term">saga</span>:
-          a <em>sequence of local transactions</em>, one per service, where each step has a matching
-          <span class="term">compensating action</span> that undoes it if a later step fails. The system isn't
-          consistent at every instant, but it becomes correct shortly after — <span class="term">eventual
-          consistency</span>. (Recall replica lag from Topic 3 — same family of idea.)</p>
-        </div>
-
-        <div class="callout example">
-          <span class="c-title">Worked example — a saga that fails and self-heals</span>
-          <ol>
-            <li><strong>Booking service</strong> holds seat B1-23 (local transaction ✅).</li>
-            <li><strong>Payment service</strong> tries to charge ₹1,245 — the bank <strong>declines</strong> ❌.</li>
-            <li>The saga triggers the <strong>compensating action</strong>: Booking service releases the hold, seat returns to <code class="inl">AVAILABLE</code>.</li>
-            <li>Notification service tells the user "payment failed, please retry."</li>
-          </ol>
-          <p>No money taken, no seat stuck, no double-booking. The system briefly held a seat it shouldn't
-          have, then <em>healed</em> itself — eventual consistency in action.</p>
-        </div>
-
-        <h3>How services talk: events &amp; the outbox</h3>
-        <p>Services coordinate by passing <span class="term">events</span> through a
-        <span class="term">message queue</span> (like Kafka or RabbitMQ) rather than calling each other
-        directly and waiting. The Booking service emits a <code class="inl">SeatReserved</code> event; Payment
-        listens and acts; on success it emits <code class="inl">PaymentConfirmed</code>; Notification listens
-        and sends the SMS. This <span class="term">asynchronous</span> style means a slow or down Notification
-        service never blocks a booking.</p>
-        <div class="callout note">
-          <span class="c-title">The outbox pattern (so events aren't lost)</span>
-          <p>A subtle danger: what if Booking commits the seat but crashes before publishing the event? The
-          <span class="term">transactional outbox</span> fixes this: the service writes the event into an
-          <code class="inl">outbox</code> table <em>in the same local transaction</em> as the seat change. A
-          separate process then reliably ships rows from the outbox to the queue. Either both the seat change
-          and the event survive, or neither does — preserving atomicity within the service.</p>
-        </div>
-
-        <h3>End-to-end booking flow</h3>
-        <div class="flow">
-          <div class="step"><div class="s-ico">🔎</div><div class="s-t">1. Search</div><div class="s-d">Find train (read replica)</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🪑</div><div class="s-t">2. Hold seat</div><div class="s-d">Booking svc, TTL hold</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">💳</div><div class="s-t">3. Pay</div><div class="s-d">Payment svc, idempotent</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🔒</div><div class="s-t">4. Confirm</div><div class="s-d">Lock + commit, make PNR</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">📩</div><div class="s-t">5. Notify</div><div class="s-d">Async SMS/email</div></div>
-        </div>
-        <p>Notice how each step maps to a service and to ideas from earlier topics: step 1 uses replicas
-        (Topic 3), step 2 the TTL hold (Topic 3), step 3 idempotency (Topic 3), step 4 the locked ACID
-        transaction (Topic 2), and step 5 is the fire-and-forget asynchronous tail. If any step before the
-        commit fails, the saga's compensations unwind everything cleanly.</p>
-
-        <div class="callout warn">
-          <span class="c-title">Watch out — don't make payment part of the lock</span>
-          <p>A classic beginner mistake is holding the seat's database <code class="inl">FOR UPDATE</code> lock
-          <em>while</em> calling the payment provider. Payment can take seconds and may time out — you'd freeze
-          that hot seat for everyone the whole time. <strong>Always: hold (soft) → pay (no DB lock) → then take
-          the short lock only to flip the seat to BOOKED.</strong></p>
-        </div>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Split IRCTC into <strong>search/availability, booking, payment, and notification</strong> services,
-          each owning its data and scaling independently. Because there's no single transaction across them,
-          use a <strong>saga</strong> of local transactions with <strong>compensating actions</strong> for
-          <strong>eventual consistency</strong>, coordinated by asynchronous <strong>events</strong> (with the
-          <strong>outbox pattern</strong> so events aren't lost). The end-to-end flow is search → hold → pay →
-          confirm (locked) → notify (async).
-        </div>
-      </section>
-
-      <!-- ===================== 5. TYPEAHEAD — TRIES ===================== -->
+      <!-- ===================== 2. TRIES ===================== -->
       <section id="trie">
-        <h2><span class="sec-num">5</span> Typeahead approach 1 — Tries</h2>
+        <h2><span class="sec-num">2</span> Approach 1 — Tries</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
           <span class="c-title">Explain like I'm 5</span>
-          <p>This session's case study has a second half: the <strong>search box that finishes your sentence</strong>.
-          You type "<code class="inl">What</code>" and it instantly suggests the most popular things people search that
-          start with "What". Imagine a giant tree of letters: start at the root, walk down one letter at a time
-          (<code class="inl">W → h → a → t</code>), and everything hanging below the spot you land on is a possible
-          ending. Show the 5 most-searched endings. That tree-of-letters is a <span class="term">trie</span>.</p>
+          <p>Imagine a giant tree made of letters. You start at the top (the root) and walk down one letter at a
+          time: <code class="inl">W → h → a → t</code>. Everything hanging <em>below</em> the spot where you stop is
+          a possible way to finish the word. So to suggest endings for "What", you walk to the "What" spot and look
+          at everything underneath it. That letter-tree is called a <span class="term">trie</span> (say "try").</p>
         </div>
 
-        <p>The feature is called <span class="term">typeahead</span> (or autocomplete). When the user types the partial
-        query "<code class="inl">What</code>", we must show the <strong>top 5 search queries that are a strict prefix
-        match</strong>. The classic data-structures answer is a <span class="term">trie</span> (prefix tree).</p>
+        <p>The classic data-structures answer to "find everything with this prefix" is a <span class="term">trie</span>
+        (a prefix tree). Each path from the root spells out a string, and shared prefixes share the same path — so
+        "what is 2+2" and "what does the fox say" share the "what" branch.</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed.png" alt="A trie of letters with a highlighted path spelling a prefix" loading="lazy">
+          <figcaption>A trie: start at the root and walk one letter per child. Everything in the subtree below the node you land on is a possible suggestion for that prefix.</figcaption>
+        </figure>
 
         <h3>What each trie node stores</h3>
         <ul>
           <li><strong>children</strong> — links to all the subsequent letters.</li>
           <li><strong>isTerminal</strong> — does a complete search query end at this node?</li>
-          <li><strong>count</strong> — only meaningful if <code class="inl">isTerminal</code>: the number of times this
-          exact query has been searched.</li>
+          <li><strong>count</strong> — only meaningful when <code class="inl">isTerminal</code>: the number of times
+          this exact query has been searched.</li>
         </ul>
         <pre><span class="kw">class</span> TrieNode {
     TrieNode children[<span class="nm">63</span>]     <span class="cm">// a-z + A-Z + 0-9 + space</span>
     <span class="kw">long</span> count;               <span class="cm">// how many times has this</span>
                               <span class="cm">// query been searched</span>
 }</pre>
+        <p>Why 63 children? Lowercase letters (26) + uppercase (26) + digits (10) + the space character (1) = 63
+        possible "next characters" at any node.</p>
 
-        <h3>Query: <code class="inl">typeahead(partialQuery)</code></h3>
+        <h3>The read: <code class="inl">typeahead(partialQuery)</code></h3>
         <div class="flow">
           <div class="step"><div class="s-ico">🌱</div><div class="s-t">Start at root</div><div class="s-d">Top of the trie</div></div>
           <div class="arrow">→</div>
@@ -590,95 +142,179 @@
           <div class="arrow">→</div>
           <div class="step"><div class="s-ico">🏆</div><div class="s-t">Scan subtree</div><div class="s-d">Find the top 5 in it</div></div>
         </div>
-        <p>Once we reach the node matching the <code class="inl">partialQuery</code>, all possible suggestions live in
-        the <strong>subtree</strong> of that node. We'd have to walk the entire subtree (every query that matches the
-        prefix) to find the top 5.</p>
+        <p>To serve <code class="inl">typeahead(partialQuery)</code>: start from the root and, for each letter of the
+        partial query, descend into the appropriate child. Once you reach the node that matches the
+        <code class="inl">partialQuery</code>, <strong>all possible suggestions live inside the subtree of that
+        node</strong>. To find the answer you'd have to walk that entire subtree (every query that matches the
+        prefix) and pick out the top 5.</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%281%29.png" alt="A trie node whose entire subtree must be scanned to find top suggestions" loading="lazy">
+          <figcaption>The catch: under a short prefix the subtree can hold billions of entries. Scanning all of them on every keystroke is far too slow.</figcaption>
+        </figure>
 
         <div class="callout warn">
           <span class="c-title">Watch out — the subtree can be enormous</span>
           <p>Walking the whole subtree is <strong>highly time-consuming</strong>. There are potentially
-          <strong>billions</strong> of entries under a short prefix like "wh". Scanning that on every keystroke is a
-          non-starter.</p>
+          <strong>billions</strong> of entries under a short prefix like "wh". Re-scanning that on <em>every</em>
+          keystroke is a non-starter.</p>
         </div>
 
         <h3>The fix: data-augmentation</h3>
-        <p>We can speed this up with <span class="term">data-augmentation</span>: at <em>every</em> node, pre-compute
-        and store the top 5 results. Now <code class="inl">typeahead</code> just reads the answer off the node — no
-        subtree scan. The price is that <strong>updates become (slightly) slower</strong>.</p>
+        <p>We can fix this with <span class="term">data-augmentation</span>: at <strong>every node, pre-compute and
+        store the top 5 results</strong> for that prefix. Now <code class="inl">typeahead</code> just reads the
+        already-computed answer off the node — no subtree scan at all. The price is that <strong>updates become
+        (slightly) slow</strong>, because writing a new count may change the stored top-5 of many ancestor nodes.</p>
 
-        <h3>Query: <code class="inl">log_search(searchQuery)</code> (update the count)</h3>
+        <div class="callout example">
+          <span class="c-title">Worked example — augmented read is instant</span>
+          <p>The node for "<code class="inl">what</code>" stores, right on itself:
+          <code class="inl">["what is 2+2" → 10000, "what is the color of the sky" → 5000, "what does the fox say" → 2000]</code>.
+          When the user types "what", we walk four letters, land on the node, and hand back its stored list. No
+          billion-entry scan — just a four-step walk and a read.</p>
+        </div>
+
+        <h3>The write: <code class="inl">log_search(searchQuery)</code></h3>
+        <p>To update the count for a query:</p>
         <ul>
           <li>Traverse to the node that matches this <code class="inl">searchQuery</code>.</li>
           <li>Increment its <code class="inl">count</code>.</li>
-          <li>If augmented, also update the stored top-5 data for <em>all nodes from here up to the root</em>.</li>
+          <li><strong>If augmented</strong>, also update the stored top-5 data for <em>all nodes from here up to the
+          root</em> (because a bigger count here might now belong in the top-5 of every prefix above it).</li>
         </ul>
 
-        <h3>Sharding a trie</h3>
-        <p><strong>Q: What will be the sharding key?</strong></p>
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          A <strong>trie</strong> answers <code class="inl">typeahead(prefix)</code> by walking the prefix and then
+          scanning the subtree for the top 5 — but that subtree can hold billions of entries. So we
+          <strong>data-augment</strong> every node with its pre-computed top 5: reads become instant, while writes
+          get a little slower because each new count must propagate up to the root.
+        </div>
+      </section>
+
+      <!-- ===================== 3. SHARDING A TRIE ===================== -->
+      <section id="trie-sharding">
+        <h2><span class="sec-num">3</span> Sharding a trie</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One giant tree won't fit on one computer, so we cut it into pieces and put each piece on a different
+          machine. The question is: <em>how do we decide which piece a query belongs to?</em> The rule we choose is
+          the <strong>sharding key</strong>. We want each machine to hold a fair, roughly-equal share of the data —
+          not one machine groaning under all the popular stuff while another sits nearly empty.</p>
+        </div>
+
+        <p><strong>Q: What will be the sharding key?</strong> A <span class="term">sharding key</span> decides which
+        server (shard) a piece of data lives on. For a trie the natural choices are "first letter" or "first few
+        letters" of the query.</p>
+
+        <h3>Option A — shard by the first letter</h3>
+        <p>Every query that starts with the letter <code class="inl">a</code> goes to the same shard. Important: this
+        does <em>not</em> mean the letter <code class="inl">a</code> gets a <em>dedicated</em> shard — a single shard
+        might contain several starting letters. We're only guaranteeing that all queries starting with
+        <code class="inl">a</code> land <strong>together</strong> in one place.</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%282%29.png" alt="Sharding a trie by the first letter of each query" loading="lazy">
+          <figcaption>First-letter sharding: all queries beginning with the same letter go to one shard. Simple, but only 26 buckets and very uneven sizes.</figcaption>
+        </figure>
+
+        <ul>
+          <li><strong>Low cardinality</strong> — only 26 possible children, so at most ~26 groups to spread across machines.</li>
+          <li><strong>Uneven data distribution</strong> — the number of queries starting with <code class="inl">a</code>
+          is much higher than those starting with <code class="inl">z</code>. Some shards get swamped, others idle.</li>
+        </ul>
+
+        <h3>Option B — shard by the first 3 letters</h3>
+        <p>Every query that starts with the letters <code class="inl">abc</code> goes to the same shard. (Same caveat:
+        a single shard may hold several starting triples; we only guarantee that all <code class="inl">abc</code>
+        queries are together.)</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%283%29.png" alt="Sharding a trie by the first three letters of each query" loading="lazy">
+          <figcaption>First-3-letters sharding: far more buckets (≈17,000), giving finer control — but still lopsided, since common triples like "why" dwarf rare ones like "zxz".</figcaption>
+        </figure>
+
+        <ul>
+          <li><strong>High cardinality</strong> — 26³ ≈ <strong>17,000</strong> possible groups, so we have far more buckets to balance across machines.</li>
+          <li><strong>Still uneven</strong> — many more queries start with <code class="inl">why</code> than with <code class="inl">zxz</code>.</li>
+        </ul>
+
+        <h3>Fixing the load imbalance: manual grouping</h3>
+        <p>To balance the load with the 3-letter key, we <strong>manually create groups</strong> of starting triples so
+        that frequent prefixes get their own room and rare prefixes are clubbed together:</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%284%29.png" alt="Manually grouping rare three-letter prefixes onto shared shards" loading="lazy">
+          <figcaption>Manual grouping: hot prefixes (e.g. "why") get a dedicated shard, while many rare prefixes ("zxz", "zyx", "zxy"…) are clubbed onto one shared shard to even out the load.</figcaption>
+        </figure>
+
+        <ul>
+          <li>Queries starting with <code class="inl">why</code> are very frequent ⇒ give them a <strong>dedicated shard</strong>.</li>
+          <li>Queries starting with <code class="inl">zxz</code> are rare ⇒ group them with other rare prefixes
+          (<code class="inl">zyx</code> + <code class="inl">zxy</code> + <code class="inl">zxz</code> + …) onto one shard.</li>
+        </ul>
+
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Sharding key</th><th>Cardinality</th><th>Problem</th></tr></thead>
             <tbody>
-              <tr><td><strong>First letter</strong> — every query starting with <code class="inl">a</code> goes to the same shard</td><td>Low (only 26 possible children)</td><td>Uneven distribution: far more queries start with <code class="inl">a</code> than <code class="inl">z</code>.</td></tr>
-              <tr><td><strong>First 3 letters</strong> — every query starting with <code class="inl">abc</code> goes to the same shard</td><td>High: 26³ ≈ 17,000</td><td>Still uneven: many more queries start with <code class="inl">why</code> than <code class="inl">zxz</code>.</td></tr>
+              <tr><td>First letter (<code class="inl">a</code> → same shard)</td><td>Low — only 26 children</td><td>Very uneven: way more queries start with <code class="inl">a</code> than <code class="inl">z</code>.</td></tr>
+              <tr><td>First 3 letters (<code class="inl">abc</code> → same shard)</td><td>High — 26³ ≈ 17,000</td><td>Still uneven (<code class="inl">why</code> ≫ <code class="inl">zxz</code>); fix by manually grouping rare triples.</td></tr>
             </tbody>
           </table>
         </div>
-        <p>Note: putting all "<code class="inl">a</code>" queries on the same shard does <em>not</em> mean
-        <code class="inl">a</code> gets a dedicated shard — a single shard may hold several starting letters. We only
-        guarantee that all queries with the same prefix land <em>together</em>.</p>
-        <p>To fix the load imbalance with the 3-letter key, we <strong>manually group</strong> the starting triples so
-        rare ones are clubbed together:</p>
-        <ul>
-          <li>Queries starting with <code class="inl">why</code> are very frequent ⇒ give them a <strong>dedicated shard</strong>.</li>
-          <li>Queries starting with <code class="inl">zxz</code> are rare ⇒ group them with other rare prefixes
-          (<code class="inl">zyx</code> + <code class="inl">zxy</code> + <code class="inl">zxz</code> + …).</li>
-        </ul>
 
         <div class="callout note">
           <span class="c-title">Q: Which existing databases support tries?</span>
           <p>There's <strong>no popular database built for storing tries</strong>. Tries exist only as a 3rd-party
           extension in some databases, but none was built specifically for them. So with this approach you'd have to
-          <strong>build your own DB</strong> — which is exactly what pushes us toward approach 2.</p>
+          <strong>build your own DB</strong> — which is exactly the pain that pushes us toward Approach 2.</p>
         </div>
 
         <div class="recap">
           <span class="c-title">Recap</span>
-          A <strong>trie</strong> answers <code class="inl">typeahead(prefix)</code> by walking the prefix and scanning
-          the subtree for the top 5 — but the subtree can hold billions of entries, so we
-          <strong>data-augment</strong> every node with its pre-computed top 5 (fast reads, slightly slower writes that
-          must propagate to the root). Shard by first-N letters, then <strong>manually group</strong> rare prefixes to
-          even out load. No off-the-shelf DB stores tries, so you'd build your own.
+          Shard a trie by the first letter (low cardinality, very uneven) or first 3 letters (≈17,000 buckets, finer
+          but still lopsided). To balance load, <strong>manually group</strong> rare prefixes together while giving
+          hot prefixes dedicated shards. Crucially, <strong>no off-the-shelf database stores tries</strong>, so you'd
+          have to build your own — motivating a simpler approach.
         </div>
       </section>
 
-      <!-- ===================== 6. TYPEAHEAD — HASHMAP ===================== -->
+      <!-- ===================== 4. HASHMAP / KEY-VALUE ===================== -->
       <section id="hashmap">
-        <h2><span class="sec-num">6</span> Typeahead approach 2 — Hashmap / Key-Value</h2>
+        <h2><span class="sec-num">4</span> Approach 2 — Hashmap / Key-Value</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
           <span class="c-title">Explain like I'm 5</span>
-          <p>Forget the fancy tree. What if we just kept a giant cheat-sheet? On the left column, every possible thing
-          someone might have typed so far ("<code class="inl">wha</code>", "<code class="inl">what</code>",
-          "<code class="inl">what d</code>"). On the right column, the 3 best suggestions for that. When you type, we
-          just look up your row and read the answer. That cheat-sheet is a <span class="term">hashmap</span> (key →
-          value), and looking something up is basically instant.</p>
+          <p>Forget the fancy tree. What if we just kept a giant cheat-sheet? On the left, every possible thing someone
+          might have typed so far ("<code class="inl">wha</code>", "<code class="inl">what</code>",
+          "<code class="inl">what d</code>"). On the right, the best few suggestions for that. When you type, we just
+          look up your row and read the answer — basically instant. That cheat-sheet is a
+          <span class="term">hashmap</span> (key → value).</p>
         </div>
 
         <div class="bigidea">
           <span class="c-title">The big idea — augmentation IS a cache</span>
-          <p>As a DSA person, we'd build a trie and augment each node with its top-5. As an <strong>HLD person</strong>,
+          <p>As a DSA person, we'd build a trie and augment each node with its top-5. As an <strong>HLD person</strong>
           we realise we're effectively just <strong>caching the top-5 results for every possible prefix</strong>. So:
           <code class="inl">prefix == TrieNode</code> and <code class="inl">data-augmentation == cache</code>. We can
-          drop the trie entirely and store this as a plain <strong>key-value cache</strong>.</p>
+          drop the trie entirely and store this as a plain <strong>key-value cache</strong>!</p>
         </div>
 
         <h3>Two databases</h3>
+        <p>The design splits into two stores:</p>
         <ul>
-          <li><span class="term">Search Frequency DB</span> — for each actual <code class="inl">searchQuery</code>, stores its <strong>count</strong>.</li>
-          <li><span class="term">Top Suggestions DB (cache)</span> — for each possible <strong>prefix</strong> we'd show suggestions for, stores the <strong>top-k suggestions</strong>.</li>
+          <li><span class="term">Search Frequency DB</span> — for each actual <code class="inl">searchQuery</code>, store its <strong>count</strong> (how many times it's been searched).</li>
+          <li><span class="term">Top Suggestions DB (cache)</span> — for each possible <strong>prefix</strong> we'd show suggestions for, store the <strong>top-k suggestions</strong>.</li>
         </ul>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed.png" alt="Two stores: a Search Frequency DB and a Top Suggestions cache" loading="lazy">
+          <figcaption>Two key-value stores: a <strong>Search Frequency DB</strong> (query → count) and a <strong>Top Suggestions cache</strong> (prefix → top-k suggestions).</figcaption>
+        </figure>
 
         <h4>Search Frequency DB (query → count)</h4>
         <div class="tbl-wrap">
@@ -697,7 +333,8 @@
           </table>
         </div>
 
-        <h4>Top Suggestions DB (prefix → top k=3)</h4>
+        <h4>Top Suggestions DB (prefix → top k = 3)</h4>
+        <p>For each prefix we store the best 3 completions, already sorted by count:</p>
         <pre>wha
 [
   what is 2+2                  =&gt; 10000
@@ -739,13 +376,13 @@ how to k
   how to kill someone          =&gt;  2000
 ]</pre>
 
-        <h3>Query: <code class="inl">typeahead(partial_query)</code></h3>
+        <h3>The read: <code class="inl">typeahead(partial_query)</code></h3>
         <p>If someone types "<code class="inl">what i</code>", we just go to the suggestions DB and look up that key.
         This is <strong>very fast</strong>: hashmaps have <code class="inl">O(1)</code> lookup. (Technically it's
         <code class="inl">O(l)</code> in the key length <code class="inl">l</code> — but keys in a hashmap should
-        <em>never</em> be long; if your hashmap keys are long, you're using hashmaps wrong.) Here the average key length
-        was assumed to be <strong>10 chars</strong> and the max <strong>50 chars</strong>. No computation needed — just
-        fetch the value for the key.</p>
+        <em>never</em> be long; if your hashmap keys are long, you're using hashmaps wrong.) Here the average key
+        length was assumed to be <strong>10 chars</strong> and the max <strong>50 chars</strong>. There's no
+        computation or processing needed — we just fetch the value for the given key.</p>
 
         <div class="callout example">
           <span class="c-title">Worked example — sizing the cache with Redis</span>
@@ -754,20 +391,58 @@ how to k
           <ul>
             <li>A Redis lookup has latency <code class="inl">&le; 1 ms</code>. ✅</li>
             <li>A single Redis server easily handles <strong>100,000+ reads/writes per second</strong>.</li>
-            <li>So we need only <code class="inl">~100 Redis servers</code> (Google had over 10 million servers as of 2020 — trivial).</li>
+            <li>So we need only <code class="inl">~100 Redis servers</code> to absorb 10M reads/s — trivial (Google had over 10 million servers as of 2020).</li>
           </ul>
         </div>
 
-        <h3>Query: <code class="inl">log_search(search_query)</code></h3>
-        <p>When someone searches "<code class="inl">what does the fox say</code>":</p>
-        <ol>
-          <li><strong>Update the count</strong> in the frequency DB — dead simple: <code class="inl">redis.inc(searchQuery)</code>.</li>
-          <li><strong>Update the cache</strong> (top suggestions DB). Which entries? Updating
-          "<code class="inl">what does the fox say</code>" can't change the suggestions for "<code class="inl">how</code>" —
-          only the <strong>prefixes of the search query itself</strong> are affected:
-          <code class="inl">wha</code>, <code class="inl">what</code>, <code class="inl">what d</code>, …,
-          <code class="inl">what does the fox say</code>.</li>
-        </ol>
+        <div class="callout note">
+          <span class="c-title">Sharding &amp; databases for this approach</span>
+          <p>Sharding is now <strong>automatic</strong> — based on <code class="inl">hash(key)</code>. And unlike tries,
+          there's a whole category of databases with first-class hashmap support. <strong>Q: Are there databases that
+          have first-class support for hashmaps?</strong> Yes — not just one, an entire category!
+          <span class="term">Key-value databases</span> are basically hashmaps distributed across servers:
+          <strong>Redis / Memcached / DynamoDB / …</strong></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Augmenting a trie is really just <strong>caching top-k per prefix</strong>, so store it as a key-value
+          system: a <strong>Frequency DB</strong> (query → count) plus a <strong>Top Suggestions cache</strong>
+          (prefix → top-k). Reads are <code class="inl">O(1)</code> and Redis-fast (~100 servers for 10M reads/s).
+          Sharding is automatic via <code class="inl">hash(key)</code>, and many real databases (Redis, Memcached,
+          DynamoDB) support this out of the box.
+        </div>
+      </section>
+
+      <!-- ===================== 5. LOG_SEARCH & WRITE EXPLOSION ===================== -->
+      <section id="log-search">
+        <h2><span class="sec-num">5</span> Logging searches &amp; the write explosion</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Every time someone finishes a search, we have to bump that query's popularity by one — easy. But because
+          we pre-stored answers for every prefix, bumping one query also means re-checking the cheat-sheet rows for
+          <em>every prefix of that query</em>: "wha", "what", "what d", and so on. One search turns into a whole
+          stack of little updates. Multiply by a million searches a second and you get a problem.</p>
+        </div>
+
+        <h3>Step 1 — update the count</h3>
+        <p>Whenever someone searches "<code class="inl">what does the fox say</code>", we update the count in the
+        Search Frequency DB. Super simple: <code class="inl">redis.inc(searchQuery)</code>.</p>
+
+        <h3>Step 2 — update the cache (top suggestions DB)</h3>
+        <p>Which entries need updating? If I'm updating the count for "<code class="inl">what does the fox say</code>",
+        could the suggestions for the prefix "<code class="inl">how</code>" change? <strong>No.</strong> Only the
+        <strong>prefixes of the search query itself</strong> are affected:</p>
+        <pre>wha
+what
+what d
+...
+what does the fox
+what does the fox s
+what does the fox sa
+what does the fox say</pre>
 
         <div class="callout example">
           <span class="c-title">Worked example — a count flip re-orders suggestions</span>
@@ -784,60 +459,59 @@ what do
   what does a fox eat?         =&gt;  2100
   what does the fox say        =&gt;  2000
 ]</pre>
-          <p>The "<code class="inl">wha</code>" / "<code class="inl">what</code>" lists also pick up the new entry.</p>
+          <p>The "<code class="inl">wha</code>" and "<code class="inl">what</code>" lists also pick up the new
+          higher-ranked entry.</p>
         </div>
+
+        <h3>The killer math: how many writes?</h3>
+        <p>The average query is ~10 letters, so on average <strong>~10 prefixes</strong> need updating per
+        <code class="inl">log_search</code>. That means each update is <code class="inl">1 + 10 = 11</code> writes
+        (1 to the frequency DB + 10 to the suggestions DB). Now scale it:</p>
+        <pre>total redis writes
+  = (1 million log_search / sec) * 11 writes / log_search
+  = 11 million writes / second</pre>
 
         <div class="callout warn">
           <span class="c-title">Watch out — this makes the system read AND write heavy</span>
-          <p>The average query is ~10 letters, so ~10 prefixes need updating per log_search. That's
-          <code class="inl">1 + 10 = 11</code> writes per search. At 1 million log_searches/second that's
-          <code class="inl">1,000,000 × 11 = 11 million writes/second</code> — on top of the 10 million reads/second.
-          <strong>No database in the world is optimized for both heavy reads AND heavy writes.</strong> We'll fix this
-          in the next two topics.</p>
-        </div>
-
-        <div class="callout note">
-          <span class="c-title">Sharding &amp; databases for this approach</span>
-          <p>Sharding is now <strong>automatic</strong> — based on <code class="inl">hash(key)</code>. And unlike tries,
-          there's a whole category of databases with first-class hashmap support: <span class="term">key-value
-          databases</span> are basically hashmaps distributed across servers — <strong>Redis / Memcached / DynamoDB /
-          …</strong></p>
+          <p>We already needed <strong>10 million reads/second</strong> for typeahead. Now we also need
+          <strong>11 million writes/second</strong> for logging. <strong>No database in the world is optimized for both
+          heavy reads AND heavy writes at once.</strong> This tension is the central scaling problem — and we fix it in
+          the next two topics.</p>
         </div>
 
         <div class="recap">
           <span class="c-title">Recap</span>
-          Augmenting a trie is really just <strong>caching top-k per prefix</strong>, so store it as a key-value
-          system: a <strong>Frequency DB</strong> (query → count) plus a <strong>Top Suggestions cache</strong>
-          (prefix → top-k). Reads are <code class="inl">O(1)</code> and Redis-fast (~100 servers for 10M reads/s). But
-          each <code class="inl">log_search</code> touches ~11 keys, making the system both read- and write-heavy — a
-          problem no single DB solves, motivating the optimizations next.
+          <code class="inl">log_search</code> does one cheap count bump (<code class="inl">redis.inc</code>) plus an
+          update to <strong>every prefix of the query</strong> (~10 of them), so each search is ~11 writes. At 1M
+          searches/s that's <strong>11M writes/s</strong> on top of 10M reads/s — making the system both read- and
+          write-heavy, which no single database handles well.
         </div>
       </section>
 
-      <!-- ===================== 7. OPTIMIZING READS & WRITES ===================== -->
+      <!-- ===================== 6. OPTIMIZING READS & WRITES ===================== -->
       <section id="optimizing">
-        <h2><span class="sec-num">7</span> Optimizing reads &amp; writes</h2>
+        <h2><span class="sec-num">6</span> Optimizing reads &amp; writes</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
           <span class="c-title">Explain like I'm 5</span>
-          <p>A library that lots of people <em>read</em> from is easy — keep copies everywhere. A library where lots of
-          people are constantly <em>scribbling new notes</em> is harder. A library where people both read tons AND
+          <p>A library that lots of people <em>read</em> from is easy — keep copies everywhere. A library where lots
+          of people are constantly <em>scribbling new notes</em> is harder. A library where people both read tons AND
           scribble tons at the same time is a nightmare. The trick is to figure out which kind you have, and lean on a
           fast scratchpad (a cache) for the easy direction so the slow, careful book (the database) only does what it
           must.</p>
         </div>
 
-        <p>Generalising beyond typeahead: how you optimize depends on whether the system is read-heavy, write-heavy, or
-        both — and on whether you can tolerate eventual consistency.</p>
+        <p>Let's generalise beyond typeahead. How you optimize depends on whether the system is read-heavy,
+        write-heavy, or both — and on whether you can tolerate eventual consistency.</p>
 
         <h3>If the system is read-heavy (not write-heavy)</h3>
         <ul>
           <li><strong>If eventual consistency is OK</strong> ⇒ absorb the reads in the <span class="term">cache</span>, and optimize the DB for writes.</li>
           <li><strong>If immediate consistency is needed</strong> ⇒ either:
             <ul>
-              <li>incur extra write latency with a <span class="term">write-through cache</span> (DB optimized for writes), or</li>
-              <li>optimize the DB for reads — writes get slower (fine, there are few), and both reads &amp; writes go to the DB. Slower than the cached approach.</li>
+              <li>incur extra write latency with a <span class="term">write-through cache</span> (your DB stays optimized for writes), or</li>
+              <li>optimize the DB for reads — writes get slower (fine, there are few of them), and both reads &amp; writes go to the DB. This is slower than the cached approach.</li>
             </ul>
           </li>
         </ul>
@@ -845,58 +519,72 @@ what do
         <h3>If the system is write-heavy (not read-heavy)</h3>
         <ul>
           <li>Regardless of eventual vs immediate consistency ⇒ <strong>optimize the DB for writes</strong>.</li>
-          <li>If reads are significant, absorb them in the cache; if not, let them hit the DB and be slow.</li>
+          <li>If your reads are significant, absorb them in the cache; if not significant, let them hit the DB and be slow.</li>
           <li>Your <strong>cache cannot handle the writes</strong> — a write-back cache would lose data if the cache
           server crashes with unsynced changes.</li>
         </ul>
 
         <h3>If the system is both read AND write heavy</h3>
-        <p>This is <strong>very VERY difficult</strong> (exactly our typeahead situation). Two escape routes:</p>
+        <p>This is <strong>very VERY difficult</strong> — and it's exactly our typeahead situation. Two escape routes:</p>
         <ul>
           <li><strong>Reduce the writes</strong>:
             <ul>
-              <li><span class="term">Batching</span> — forces <em>eventual consistency</em>: wait for a bunch of requests to collect, then process them in one go.</li>
-              <li><span class="term">Sampling</span> — forces <em>data loss</em>: don't process all requests, only some.</li>
+              <li><span class="term">Batching</span> — forces <em>eventual consistency</em>: wait for a bunch of requests to collect, then process them all in one go.</li>
+              <li><span class="term">Sampling</span> — forces <em>data loss</em>: don't process all the requests, process only some of them.</li>
             </ul>
           </li>
-          <li><strong>If you can't reduce writes, shard more</strong>. Sharding improves both reads &amp; writes — but
-          then you can't join across shards efficiently, so any query needing data from multiple shards is slow.</li>
+          <li><strong>If you can't reduce writes, shard more</strong>. Sharding improves <em>both</em> reads &amp;
+          writes — but then you can't join across shards efficiently, so any query needing data from multiple shards
+          is slow.</li>
         </ul>
 
         <div class="callout key">
           <span class="c-title">Key takeaway</span>
-          <p>For typeahead we can afford <strong>eventual consistency and even some data loss</strong> (it's a
-          non-functional requirement — suggestions only need to be <em>relevant</em>, not perfectly ranked). That
-          permission is what unlocks <strong>batching</strong> and <strong>sampling</strong> to crush the write load.</p>
+          <p>For typeahead we can afford <strong>eventual consistency and even some data loss</strong> — these are part
+          of our non-functional requirements (suggestions only need to be <em>relevant</em>, not perfectly ranked or
+          perfectly up-to-date). That permission is exactly what unlocks <strong>batching</strong> and
+          <strong>sampling</strong> to crush the write load.</p>
         </div>
 
         <div class="recap">
           <span class="c-title">Recap</span>
-          Read-heavy ⇒ absorb reads in a cache (or optimize DB for reads if you need immediate consistency).
+          Read-heavy ⇒ absorb reads in a cache (or optimize the DB for reads if you need immediate consistency).
           Write-heavy ⇒ optimize the DB for writes; caches can't safely absorb writes. <strong>Both</strong> ⇒ very
           hard: either <strong>reduce writes</strong> (batching = eventual consistency, sampling = data loss) or
           <strong>shard more</strong> (helps reads &amp; writes, but kills cross-shard joins).
         </div>
       </section>
 
-      <!-- ===================== 8. REDUCING WRITES ===================== -->
+      <!-- ===================== 7. REDUCING WRITES ===================== -->
       <section id="reduce-writes">
-        <h2><span class="sec-num">8</span> Reducing writes — batching &amp; sampling</h2>
+        <h2><span class="sec-num">7</span> Reducing writes — batching &amp; sampling</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
           <span class="c-title">Explain like I'm 5</span>
           <p>If 10 guests want tea, you don't boil one tiny cup, run it over, come back, boil the next — you make one
-          big pot and serve everyone at once. That's <strong>batching</strong>. And if you want to know who a whole
-          country voted for, you don't ask all 10 crore people — you ask a small random handful outside polling booths
-          and trust the trend. That's <strong>sampling</strong>. Both let us do far less work while still getting an
-          answer that's good enough.</p>
+          big pot and serve everyone at once. That's <strong>batching</strong>. And if you want to know how a whole
+          country voted, you don't ask all 1 crore people — you ask a small random handful outside polling booths and
+          trust the trend. That's <strong>sampling</strong>. Both let us do far less work while still getting an answer
+          that's good enough.</p>
         </div>
 
+        <p>Because typeahead tolerates eventual consistency and data loss, we can use both tricks to shrink the
+        11 million writes/second down to something tiny.</p>
+
         <h3>Batching / batch processing</h3>
-        <p>Instead of doing each task one by one, wait for a lot of tasks to pile up, then do them all in one go. For
-        typeahead: on each <code class="inl">log_search</code>, instead of updating the suggestions DB immediately, we
-        wait for the count to increase by a fixed <strong>batch size</strong> (say 1000) before pushing the update.</p>
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%285%29.png" alt="Many small tasks collected and processed together as one batch" loading="lazy">
+          <figcaption>Batching: instead of handling each task the moment it arrives, let many pile up and process them together in one go.</figcaption>
+        </figure>
+
+        <p>Instead of doing each task one by one, you wait for a lot of tasks to pile up, then do all of them in one go
+        as a batch. (Example: 10 guests need tea — make individual cups one-by-one, or brew a whole pot at once and
+        serve together. The pot is batching.)</p>
+
+        <p>For typeahead: whenever we get a <code class="inl">log_search(search_query)</code> request, instead of
+        updating the suggestions DB immediately, we wait for the count to increase by a fixed amount (say
+        <strong>1000</strong>) before pushing the suggestions update.</p>
 
         <h4>Earlier (no batching)</h4>
         <pre><span class="kw">fn</span> log_search(search_query):         <span class="cm">// 1 million qps</span>
@@ -916,20 +604,22 @@ what do
     <span class="cm">// 1 million writes/s</span>
 
     <span class="kw">if</span> updated_count % <span class="nm">1000</span> == <span class="nm">0</span>:
-        <span class="cm">// update prefixes only when the count has</span>
-        <span class="cm">// changed by the batch size</span>
+        <span class="cm">// update the prefixes only if the count</span>
+        <span class="cm">// has changed by the batch size</span>
         update_prefixes(search_query)
 
 <span class="kw">fn</span> update_prefixes(search_query):
     ...   <span class="cm">// (1 million / 1000 qps) * 10 updates</span>
           <span class="cm">// 10,000 writes/sec</span></pre>
 
+        <p>Effectively, we only update the suggestions when the count increases by 1000.</p>
+
         <div class="callout example">
           <span class="c-title">Worked example — the write count collapses</span>
           <p><strong>Earlier:</strong> 1M writes/s (freq DB) + 10M writes/s (suggestions DB) = <strong>11M
           writes/s</strong>.</p>
           <p><strong>After batching:</strong> 1M writes/s (freq DB) + (10M / 1000) = <strong>1.01M writes/s</strong>.</p>
-          <p>We can't go below 1M/s — that's how often we at least update the counts in the frequency DB.</p>
+          <p>We <em>can't</em> go below 1M/s — that's how often we must at least update the counts in the frequency DB.</p>
         </div>
 
         <div class="callout note">
@@ -939,19 +629,34 @@ what do
         </div>
 
         <h3>Sampling</h3>
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%286%29.png" alt="Estimating an overall result from a small random sample, like an election exit poll" loading="lazy">
+          <figcaption>Sampling: ask only a small random slice of the population. An unbiased sample reflects the same trends as the whole.</figcaption>
+        </figure>
+
         <div class="callout example">
           <span class="c-title">Analogy — election exit polls</span>
           <ul>
-            <li>A country-wide election has 1 crore voters; the actual count takes several days.</li>
-            <li>News channels want to predict the winner with high accuracy <em>before</em> results are out.</li>
-            <li>They can't talk to all 1 crore voters. Instead they stand outside a few polling booths and ask a few
-            random exiting voters "who did you vote for?".</li>
-            <li>Using just that small <strong>sample</strong> they estimate the winner. If the channel is unbiased, the
-            exit-poll result almost perfectly matches the real result.</li>
+            <li>A country-wide election has 1 crore voters; the actual counting takes several days.</li>
+            <li>News channels want to predict the winner with high accuracy <em>before</em> the real results are announced.</li>
+            <li>They can't talk to all 1 crore voters. Instead they stand in front of a small fraction of polling
+            booths and, as people exit, ask a few random people "who did you vote for?".</li>
+            <li>Using just that small <strong>subset/sample</strong> they estimate the winner. If the channel is
+            unbiased, the exit-poll result almost perfectly matches the actual election result.</li>
           </ul>
         </div>
-        <p><strong>If you draw an unbiased sample from a population, any trend that holds in the population also holds
-        in the sample.</strong> A good way to get unbiased samples is to sample <strong>uniformly at random</strong>.</p>
+
+        <p><strong>If you draw an unbiased sample from a population, then any trends that hold within the population
+        will also hold within the sample.</strong> Typically a good way to get unbiased samples is to just sample
+        <strong>uniformly at random</strong>.</p>
+
+        <p>Here's the architecture before and after. The search service is what calls the typeahead service's
+        <code class="inl">log_search</code> endpoint.</p>
+
+        <figure class="figure">
+          <img src="../HLD-CaseStudy/%5BSST-2028%5D%20Case%20Study_%20Typeahead%20-2_files/unnamed%287%29.png" alt="Search service calling the typeahead service's log_search endpoint on every search" loading="lazy">
+          <figcaption>Earlier: the search service calls <code class="inl">log_search</code> on <em>every</em> search, so the typeahead service updates counts and suggestions for all of them.</figcaption>
+        </figure>
 
         <h4>Earlier (every search logged)</h4>
         <pre><span class="cm">// search service</span>
@@ -975,21 +680,21 @@ what do
 <span class="kw">fn</span> search(query):
     ...
     <span class="kw">if</span> rand() &lt; <span class="nm">0.001</span>:
-        <span class="cm">// with probability 0.1%, make the following call</span>
+        <span class="cm">// with a probability of 0.1% make the following call</span>
         make an API call to typeahead service's log_search endpoint
 
 <span class="cm">// typeahead service</span>
     ...</pre>
 
-        <p>For 99.9% of searches we don't even update the counts (just ignore them). For a random
-        <strong>0.1%</strong>, we call <code class="inl">log_search</code> and update both counts and suggestions.
-        Instead of <code class="inl">1M + 10M</code> writes/s, we're back to
-        <code class="inl">(1M + 10M) / 1000 = 10,000 writes/second</code>.</p>
+        <p>For 99.9% of the searches, we don't even update the counts (we just ignore them). For a random
+        <strong>0.1%</strong> of searches, we call <code class="inl">log_search</code> and update both the counts and
+        the suggestions. Thanks to sampling, instead of <code class="inl">1M + 10M</code> writes/second, we're back to
+        just <code class="inl">(1M + 10M) / 1000 = 10,000 writes/second</code>.</p>
 
         <details class="quiz">
           <summary>Won't the counts be inaccurate under sampling?</summary>
-          <p class="ans">Yes — each count is effectively divided by ~1000 (not exactly, since it's random). But it
-          doesn't matter: the suggestions shown to users stay highly relevant.</p>
+          <p class="ans">Yes — each count is effectively divided by approximately 1000 (not exactly, since it's
+          random). But it doesn't matter: the suggestions shown to users stay highly relevant.</p>
         </details>
         <details class="quiz">
           <summary>Won't the suggestions be slightly out of order?</summary>
@@ -997,28 +702,29 @@ what do
         </details>
         <details class="quiz">
           <summary>With sampling, won't infrequent queries get tiny counts or be missed entirely?</summary>
-          <p class="ans">Yes, that can happen — and it's a feature, not a bug! A rare query would never be a typeahead
-          suggestion anyway (it isn't popular). Sampling automatically prunes the majority (99.9%) of "bad" queries.</p>
+          <p class="ans">Yes, that can happen — and it's a feature, not a bug! A rare query would never be part of
+          typeahead suggestions anyway (because it isn't popular). Sampling automatically prunes the majority (99.9%)
+          of the "bad" queries.</p>
         </details>
 
         <div class="callout note">
           <span class="c-title">What sampling costs you</span>
           <p>Sampling <strong>can</strong> lose individual data points, but it won't lose the overall <em>trends</em>.
-          Use it only when data loss is acceptable.</p>
+          Use it only when data loss is okay.</p>
         </div>
 
         <div class="recap">
           <span class="c-title">Recap</span>
-          <strong>Batching</strong> updates the suggestions DB only every Nth count (e.g. 1000), cutting 11M writes/s to
-          ~1.01M writes/s — costing stale reads but never data loss. <strong>Sampling</strong> only logs a random 0.1%
-          of searches, cutting writes to ~10k/s — costing data loss of individual points but preserving trends, and
-          conveniently discarding rare queries that would never be suggested anyway.
+          <strong>Batching</strong> updates the suggestions DB only every Nth count (e.g. 1000), cutting 11M writes/s
+          to ~1.01M writes/s — costing stale reads but never data loss. <strong>Sampling</strong> only logs a random
+          0.1% of searches, cutting writes to ~10k/s — costing data loss of individual points but preserving trends,
+          and conveniently discarding rare queries that would never be suggested anyway.
         </div>
       </section>
 
-      <!-- ===================== 9. FUTURE SCOPE ===================== -->
+      <!-- ===================== 8. FUTURE SCOPE ===================== -->
       <section id="future">
-        <h2><span class="sec-num">9</span> Future scope — recency, geo, typos</h2>
+        <h2><span class="sec-num">8</span> Future scope — recency, geo, personalization, typos</h2>
         <hr class="section-rule" />
 
         <div class="callout eli5">
@@ -1029,10 +735,11 @@ what do
         </div>
 
         <h3>Recency factor</h3>
-        <p>When a big event happens (COVID lockdown declared, election results out, a high-profile arrest, Federer wins
-        Wimbledon), the query is <strong>trending</strong>. Even if "<code class="inl">why is the sky blue?</code>" has
-        a higher all-time count, a trending "<code class="inl">what happened in Nepal?</code>" (recent + popular)
-        should rank higher when someone types "<code class="inl">wh</code>".</p>
+        <p><strong>Problem statement:</strong> when a big event happens — COVID lockdown gets declared, election
+        results are out, a high-profile person gets arrested, Federer wins Wimbledon — the query becomes
+        <strong>trending</strong>. Even though "<code class="inl">why is the sky blue?</code>" might have a higher
+        overall count, a trending "<code class="inl">what happened in Nepal?</code>" (recent + popular) should rank
+        higher when someone types "<code class="inl">wh</code>".</p>
 
         <h4>Approach 1 — separate counts per window</h4>
         <p>For each query keep three counts: <strong>Total</strong>, <strong>Last Week</strong>, <strong>Last
@@ -1043,16 +750,18 @@ what do
 total:what happened in Nepal? =&gt;  500
  week:what happened in Nepal? =&gt;  300
   day:what happened in Nepal? =&gt;  100</pre>
-        <p>To find top-k: find top-k from total, from weekly, and from daily, then <strong>merge</strong> using a
-        scoring function. <strong>Goal:</strong> give more weight to the recent counts.</p>
+        <p>To find the top-k: find top-k from total, find top-k from weekly, find top-k from daily, then
+        <strong>merge</strong> the results using a scoring function. <strong>Goal:</strong> give more weightage to the
+        recent counts.</p>
 
         <h4>Better solution — decay the historical counts</h4>
-        <p>Simply <strong>decay</strong> every query's count by a fixed factor each period — e.g. after each day,
-        decrease the total count by 10% (multiply by 0.9) before adding the day's new count.</p>
+        <p>Simply <strong>decay</strong> the historical counts after every fixed period of time. For example, after
+        each day, decrease the total count for each query by 10% (multiply by 0.9) before adding the day's new count.</p>
+
         <div class="callout example">
           <span class="c-title">Worked example — a steady query converges</span>
           <p>"<code class="inl">who has control over nukes?</code>" gets a steady 1000/day:
-          <code class="inl">[1000, 1000, …]</code> (raw total would be 100,000).</p>
+          <code class="inl">[1000, 1000, 1000, …]</code> — the raw total would be 100,000, but with decay:</p>
           <pre>day 1: 1000
 day 2: 90% of 1000 + 1000  =&gt; 1900
 day 3: 90% of 1900 + 1000  =&gt; 2710
@@ -1061,60 +770,65 @@ day 4: 90% of 2710 + 1000  =&gt; 3439
 day 100: 1000 * (1 + 0.9 + 0.9^2 + 0.9^3 + ...)
        = 1000 * 1/(1 - 0.9)
        = 10,000</pre>
+          <p>So a forever-steady query converges to a decayed score of <strong>10,000</strong> (not 100,000).</p>
         </div>
         <div class="callout example">
           <span class="c-title">Worked example — a fresh burst overtakes it</span>
-          <p>"<code class="inl">who won the wimbledon</code>" is silent then bursts:
-          <code class="inl">[0, 0, …, 5000, 5000, 5000]</code> (raw total just 15,000).</p>
+          <p>"<code class="inl">who won the wimbledon</code>" is silent, then bursts:
+          <code class="inl">[0, 0, …, 5000, 5000, 5000]</code> — raw total just 15,000.</p>
           <pre>day 97: 0
 day 98: 5000
-day 99: 5000 * 0.9 + 5000  =&gt;  9,500
-day 100: 9500 * 0.9 + 5000 =&gt; 13,550</pre>
-          <p>Its decayed score (13,550) now beats the steady query's (10,000) — recency wins. If a decayed count drops
-          below a threshold (say 0), remove the entry.</p>
+day 99: 5000 * 0.9 + 5000   =&gt;  9,500
+day 100: 9500 * 0.9 + 5000  =&gt; 13,550</pre>
+          <p>Its decayed score (13,550) now beats the steady query's (10,000) — <strong>recency wins</strong>. If a
+          count after decay reduces below a threshold (say 0), we can remove that entry.</p>
         </div>
 
         <h3>Geolocation-based personalization</h3>
         <ul>
-          <li>From the user's request, find their location via IP address.</li>
-          <li>Build a separate database per location ⇒ <strong>shard the DB by <code class="inl">country_id</code></strong>. An Indian user's request only hits the Indian shard.</li>
+          <li>Given the user's request, find out their location based on IP address.</li>
+          <li>Build a separate database for each location ⇒ <strong>shard the DB by <code class="inl">country_id</code></strong>. Now an Indian user's request only goes to the Indian shard.</li>
         </ul>
         <pre>"global: what does the fox say" =&gt; 1000
 "India:  what does the fox say" =&gt;   10
 "USA:    what does the fox say" =&gt;   10</pre>
-        <p>When an Indian user types "<code class="inl">wha</code>", find suggestions for the "<code class="inl">wha</code>"
-        prefix <em>and</em> the "<code class="inl">India:wha</code>" prefix, merge them, and return the final set.</p>
+        <p>When an Indian user types "<code class="inl">wha</code>", we find the suggestions for the
+        "<code class="inl">wha</code>" prefix <em>and</em> for the "<code class="inl">India:wha</code>" prefix, merge
+        the results, and return the final set.</p>
 
         <h3>User-based personalization</h3>
         <ul>
           <li>Do this purely on the <strong>client side</strong>: the browser stores the user's search/browsing history.</li>
-          <li>The browser builds typeahead suggestions from the user's local data, <em>and</em> fires a backend request for the global suggestions, then <strong>merges</strong> the two lists.</li>
+          <li>The browser creates typeahead suggestions from the user's local data.</li>
+          <li>The browser also initiates a backend request to get the global typeahead suggestions.</li>
+          <li>The browser <strong>merges</strong> these two lists.</li>
           <li>Google actually pulls this from the backend too — because it maintains your search &amp; browsing history in its backend DB.</li>
         </ul>
 
         <h3>Handling typos</h3>
         <ul>
-          <li>On each search, besides updating the count of <code class="inl">search_query</code>, also update the count of <code class="inl">spell_corrected(search_query)</code>.</li>
-          <li>When a user types something, find suggestions for <code class="inl">partial_query</code> <em>and</em> include the suggestions for <code class="inl">spell_corrected(partial_query)</code>.</li>
+          <li>Whenever a search is made, apart from updating the count of <code class="inl">search_query</code>, also update the count of <code class="inl">spell_corrected(search_query)</code>.</li>
+          <li>Whenever a user types something, find the suggestions for <code class="inl">partial_query</code>, but also include the suggestions for <code class="inl">spell_corrected(partial_query)</code>.</li>
         </ul>
         <pre><span class="kw">def</span> spell_corrected(input: str) -&gt; str:
-    """Corrects the spellings of the words within the
-       input string, and returns the corrected string.
+    """Corrects the spellings of the words within
+       the input string, and returns the corrected
+       string.
        Note:
            - each word in the input is spell corrected
            - gracefully handles partial words
     """</pre>
-        <p>You can keep a dictionary and compute the <span class="term">edit-distance</span> between the user's words
-        and the dictionary words. Peter Norvig's classic essay "<em>How to Write a Spelling Corrector</em>" is the
-        canonical reference.</p>
+        <p>You can simply have a dictionary and calculate the <span class="term">edit-distance</span> between the
+        user's words and the words in the dictionary. Peter Norvig's classic essay "<em>How to Write a Spelling
+        Corrector</em>" is the canonical reference for this.</p>
 
         <div class="recap">
           <span class="c-title">Recap</span>
           Make typeahead smarter with: <strong>recency</strong> (decay counts ~10%/day so trending queries overtake
-          stale popular ones), <strong>geolocation</strong> (shard by country, merge global + local prefixes),
-          <strong>user personalization</strong> (merge client-side history with backend suggestions), and <strong>typo
-          handling</strong> (also track/serve <code class="inl">spell_corrected()</code> via edit-distance against a
-          dictionary).
+          stale popular ones — or keep separate total/week/day counts and merge), <strong>geolocation</strong> (shard
+          by country, merge global + local prefixes), <strong>user personalization</strong> (merge client-side history
+          with backend suggestions), and <strong>typo handling</strong> (also track/serve
+          <code class="inl">spell_corrected()</code> via edit-distance against a dictionary).
         </div>
       </section>
 
@@ -1122,58 +836,55 @@ day 100: 9500 * 0.9 + 5000 =&gt; 13,550</pre>
       <section id="wrapup">
         <h2><span class="sec-num">★</span> Putting it all together</h2>
         <hr class="section-rule" />
-        <p>You just designed one of the hardest consistency problems in the real world. Here's the
-        one-paragraph story that connects all four topics:</p>
+        <p>You just designed a real, planet-scale autocomplete. Here's the one-paragraph story that connects every
+        topic:</p>
         <div class="bigidea">
-          <p>IRCTC must let millions <strong>search, book, pay, and cancel</strong> train tickets while never
-          selling the same seat twice — a brutal <strong>race condition</strong> that explodes during the
-          <strong>tatkal</strong> spike. We beat the double-booking with <strong>ACID transactions</strong> and
-          <strong>locking</strong>: pessimistic <code class="inl">SELECT ... FOR UPDATE</code> for the hot
-          seats, optimistic version checks for the calm parts. We survive the <strong>spike</strong> with a
-          <strong>waiting-room queue</strong>, <strong>rate limiting</strong>, short-lived <strong>seat holds
-          with a TTL</strong>, <strong>idempotent payment</strong>, and <strong>read replicas</strong> for all
-          the browsing. And we keep it maintainable by splitting into <strong>microservices</strong> —
-          search, booking, payment, notification — coordinated by a <strong>saga</strong> with
-          <strong>compensating actions</strong> and asynchronous <strong>events</strong>, giving
-          <strong>strong consistency where it matters (the seat) and eventual consistency everywhere else.</strong></p>
+          <p>Typeahead must, on every keystroke, return the <strong>top queries that strictly start with the typed
+          prefix</strong>. A <strong>trie</strong> can do this if we <strong>augment</strong> each node with its
+          pre-computed top-5 — but no database stores tries, and sharding it evenly is painful. So we realise the
+          augmentation is just a <strong>cache</strong> and store everything as <strong>key-value</strong>: a
+          <strong>Frequency DB</strong> (query → count) and a <strong>Top Suggestions cache</strong> (prefix → top-k),
+          served from ~100 <strong>Redis</strong> servers at &lt; 1 ms. The trouble is that every
+          <code class="inl">log_search</code> touches ~11 keys, making the system both read- <em>and</em> write-heavy
+          (10M reads/s + 11M writes/s) — which no DB handles. Because typeahead tolerates eventual consistency and data
+          loss, we crush the writes with <strong>batching</strong> (update only every 1000th count → ~1.01M writes/s,
+          stale but lossless) and <strong>sampling</strong> (log a random 0.1% → ~10k writes/s, lossy but
+          trend-preserving). Finally we make it smart with <strong>recency decay</strong>, <strong>geo-sharding</strong>,
+          <strong>client-side personalization</strong>, and <strong>typo correction</strong> via edit-distance.</p>
         </div>
 
         <h3>Quick self-check</h3>
         <details class="quiz">
-          <summary>What is the single hardest problem in designing IRCTC, and why?</summary>
-          <p class="ans">Preventing double-booking of the same seat under massive concurrent demand. The seat
-          is a hard-capped resource that must be allocated exactly once — unlike a shop, you can't oversell and
-          apologise. The tatkal burst makes thousands of users fight for the same seat in the same instant.</p>
+          <summary>Why is scanning a trie subtree on every keystroke a bad idea, and what fixes it?</summary>
+          <p class="ans">A short prefix can have billions of entries in its subtree, so scanning it per keystroke is
+          far too slow. The fix is <strong>data-augmentation</strong>: pre-compute and store the top-5 at every node,
+          so a read just reads the node. The cost is that writes must propagate the new count up to the root.</p>
         </details>
         <details class="quiz">
-          <summary>You're booking the last tatkal seat — heavy contention. Pessimistic or optimistic locking?</summary>
-          <p class="ans">Pessimistic (<code class="inl">SELECT ... FOR UPDATE</code>). When conflicts are common,
-          locking the row up front serialises the fight cleanly. Optimistic locking would cause a storm of failed
-          retries when everyone clashes on the same hot row.</p>
+          <summary>Why move from a trie to a key-value store?</summary>
+          <p class="ans">Augmenting a trie is really just caching top-k per prefix, so <code class="inl">prefix ==
+          TrieNode</code> and <code class="inl">augmentation == cache</code>. Unlike tries (no off-the-shelf DB
+          supports them, sharding is uneven), key-value stores like Redis/Memcached/DynamoDB give O(1) lookups,
+          automatic <code class="inl">hash(key)</code> sharding, and first-class support.</p>
         </details>
         <details class="quiz">
-          <summary>Why use read replicas for the search/availability screens?</summary>
-          <p class="ans">Most traffic is reads, and reads don't need the locked write path. Replicas absorb the
-          browsing load so the primary is free for consistent booking writes. The small replica lag is acceptable
-          because the authoritative seat check happens against the primary inside the locked transaction.</p>
+          <summary>Why does <code class="inl">log_search</code> create such a heavy write load?</summary>
+          <p class="ans">Each search bumps the count (1 write) and must update the cached top-k for every prefix of the
+          query (~10 writes), so ~11 writes per search. At 1M searches/s that's ~11M writes/s — combined with 10M
+          reads/s, the system is both read- and write-heavy, which no single DB optimizes for.</p>
         </details>
         <details class="quiz">
-          <summary>What is a seat-hold TTL and what problem does it solve?</summary>
-          <p class="ans">A short soft reservation (e.g. 8 minutes) that auto-expires. It lets a user pay without
-          holding a database lock the whole time, and if they abandon checkout, the seat returns to the pool
-          automatically instead of being stuck forever.</p>
+          <summary>Batching vs sampling — what does each cost you?</summary>
+          <p class="ans">Batching only updates suggestions every Nth count (e.g. 1000), giving ~1.01M writes/s; it
+          causes stale reads but <strong>no data loss</strong> (counts stay exact). Sampling logs only a random 0.1%
+          of searches, giving ~10k writes/s; it causes <strong>data loss</strong> of individual points but preserves
+          overall trends (and usefully discards rare queries).</p>
         </details>
         <details class="quiz">
-          <summary>Why can't we use one ACID transaction across booking, payment, and notification?</summary>
-          <p class="ans">They are separate services with separate databases, so no single transaction spans them.
-          Instead we use a saga: a sequence of local transactions, each with a compensating action to undo it if a
-          later step fails — giving eventual consistency.</p>
-        </details>
-        <details class="quiz">
-          <summary>Why must payment never run while holding the seat's FOR UPDATE lock?</summary>
-          <p class="ans">Payment is slow and external (seconds, may time out). Holding the row lock during it would
-          freeze that hot seat for every other user. Correct order: soft-hold the seat, pay with no DB lock, then
-          take a brief lock only to flip the seat to BOOKED.</p>
+          <summary>How do we make a trending query outrank a stale all-time-popular one?</summary>
+          <p class="ans">Apply <strong>recency decay</strong>: each day multiply existing counts by 0.9 before adding
+          the new day's count. A steady 1000/day query converges to 10,000, while a fresh burst (e.g. Wimbledon) can
+          shoot past it (13,550) — so recent popularity wins. Entries that decay below a threshold are removed.</p>
         </details>
       </section>
 
@@ -1183,15 +894,14 @@ day 100: 9500 * 0.9 + 5000 =&gt; 13,550</pre>
         <h4>Class material</h4>
         <ul>
           <li>📄 <a href="https://docs.google.com/document/d/1AjOS8itQOsg6VSjrUbKuiVg_6hsgeSStQKc_39DjTcw/edit" target="_blank" rel="noopener">Original class notes / handout (Google Doc)</a> — open the shared class material for this session.</li>
-          <li>Class handout: "<em>[SST-2028] Case Study: Typeahead -2 / IRCTC</em>".</li>
+          <li>Class handout: "<em>[SST-2028] Case Study: Typeahead -2</em>".</li>
         </ul>
         <h4>Papers, docs &amp; deep dives</h4>
         <ul>
-          <li>📄 <a href="https://www.postgresql.org/docs/current/explicit-locking.html" target="_blank" rel="noopener">PostgreSQL — Explicit Locking (<code class="inl">SELECT ... FOR UPDATE</code>)</a> — the canonical reference for row-level locks behind pessimistic booking.</li>
-          <li>📄 <a href="https://stripe.com/docs/api/idempotent_requests" target="_blank" rel="noopener">Stripe API — Idempotent Requests</a> — how idempotency keys make payment retries safe.</li>
-          <li>📄 <a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">The System Design Primer</a> — broad reference on consistency, locking, and scaling patterns (see "optimistic vs pessimistic locking").</li>
-          <li>📄 <a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">Microservices.io — The Saga Pattern</a> — coordinating booking, payment, and notification across services.</li>
           <li>📄 <a href="https://norvig.com/spell-correct.html" target="_blank" rel="noopener">Peter Norvig — How to Write a Spelling Corrector</a> — the edit-distance approach behind typeahead typo handling.</li>
+          <li>📄 <a href="https://redis.io/docs/latest/" target="_blank" rel="noopener">Redis documentation</a> — the in-memory key-value store powering the suggestions cache (&lt; 1 ms lookups, 100k+ ops/s per server).</li>
+          <li>📄 <a href="https://aws.amazon.com/dynamodb/" target="_blank" rel="noopener">Amazon DynamoDB</a> — a managed distributed key-value database, automatic <code class="inl">hash(key)</code> sharding.</li>
+          <li>📄 <a href="https://github.com/donnemartin/system-design-primer" target="_blank" rel="noopener">The System Design Primer</a> — broad reference on caching, sharding, and read/write-heavy optimization patterns.</li>
         </ul>
       </section>
 
@@ -1205,7 +915,7 @@ day 100: 9500 * 0.9 + 5000 =&gt; 13,550</pre>
     </div>
   </main>
 
-  <footer class="foot wrap">HLD · Session 13 — Case Study — IRCTC Ticket Booking System · You designed a system that never sells a seat twice 🎉</footer>
+  <footer class="foot wrap">HLD · Session 13 — Case Study: Typeahead-2 · You built planet-scale autocomplete that stays fast under 10M reads &amp; 11M writes per second 🎉</footer>
 
   <script src="../../../assets/js/app.js"></script>
 </body>
