@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>NN Exam · Transfer Learning &amp; CNN Applications</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20260624h" />
+</head>
+<body data-accent="nn">
+<div id="progress"></div>
+
+<header class="topbar">
+  <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+  <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / <a href="index.html">Exam Notes</a> / Transfer Learning</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+</header>
+
+<main class="wrap">
+  <div class="page-hero">
+    <span class="kicker">Exam Notes · W5S1</span>
+    <h1>Transfer Learning &amp; CNN Applications</h1>
+    <p class="lead">Reuse a CNN trained on ImageNet instead of training from scratch. Feature extraction vs fine-tuning, when to use which, then detection (Faster R-CNN, YOLO) and segmentation (FCN, U-Net) — all built on pre-trained backbones.</p>
+    <div class="hero-meta">
+      
+        <span class="badge-rt">⏱ 5 min read</span>
+        <a class="badge-rt" href="index.html">← All exam notes</a>
+      <a class="badge-rt" href="../slides/week-5/session-1/w5s1_slides_transfer_learning.pdf" target="_blank" rel="noopener">📑 Original slides (PDF)</a>
+    </div>
+  </div>
+
+  <div class="article-layout">
+    <nav class="toc">
+      <strong>On this page</strong>
+      <ol>
+        <li><a href="#why">Why transfer learning</a></li>
+        <li><a href="#layers">What CNN layers learn</a></li>
+        <li><a href="#feat">Feature extraction</a></li>
+        <li><a href="#fine">Fine-tuning</a></li>
+        <li><a href="#which">When to use which (2×2)</a></li>
+        <li><a href="#domain">Domain shift</a></li>
+        <li><a href="#detect">Object detection</a></li>
+        <li><a href="#seg">Segmentation</a></li>
+        <li><a href="#exam-qs">Likely exam questions</a></li>
+      </ol>
+    </nav>
+
+    <article class="article">
+
+      <section id="why">
+        <h2><span class="sec-num">1</span> Why transfer learning</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Training from scratch (e.g. ResNet-152 on ImageNet) needs <strong>~1.2M labeled images, 8 GPUs, weeks</strong>. Reality: a few hundred images, one laptop/Colab GPU, a deadline.</li>
+          <li><span class="term">Transfer learning</span>: use knowledge learned on a <strong>large dataset</strong> (ImageNet) to solve a <strong>different task</strong> with limited data.</li>
+          <li>Two approaches: <strong>(1) Feature extraction</strong> — freeze the pre-trained net, train a new head. <strong>(2) Fine-tuning</strong> — unfreeze some layers, adapt with a small LR.</li>
+          <li>In practice you <strong>almost never train from scratch</strong> — transfer learning is the default.</li>
+        </ul>
+      </section>
+
+      <section id="layers">
+        <h2><span class="sec-num">2</span> What CNN layers learn</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li><strong>Early layers = generic</strong>: edges, colors, textures → transfer everywhere.</li>
+          <li><strong>Later layers = task-specific</strong>: patterns → object parts → specialized for the original task.</li>
+          <li>Hierarchy: Layer 1 (edges/colors) → L2 (textures) → L3 (patterns) → L4–5 (object parts).</li>
+          <li>This is <em>why</em> you keep early layers and only retrain the end for a new task.</li>
+        </ul>
+      </section>
+
+      <section id="feat">
+        <h2><span class="sec-num">3</span> Feature extraction</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Use the frozen pre-trained CNN as a fixed feature extractor; it outputs a feature vector (e.g. 512-dim) that you feed to a new trainable classifier.</li>
+          <li>Steps: load pre-trained model → <strong>freeze all layers</strong> (<code class="inl">requires_grad=False</code>) → replace final FC head → train <strong>only the new head</strong>.</li>
+          <li>Fast, needs little data, trains only ~0.1% of parameters yet hits high accuracy.</li>
+        </ul>
+        <pre>model = resnet50(weights='IMAGENET1K_V1')
+for param in model.parameters():
+    param.requires_grad = False        # freeze backbone
+model.fc = nn.Linear(2048, num_classes) # new head (trainable)
+optimizer = Adam(model.fc.parameters(), lr=0.001)</pre>
+        <p><strong>Note:</strong> a frozen layer still runs in the forward pass to produce features; its weights just never update in backprop.</p>
+      </section>
+
+      <section id="fine">
+        <h2><span class="sec-num">4</span> Fine-tuning</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li><span class="term">Fine-tuning</span>: unfreeze some pre-trained layers and train end-to-end with a <strong>small learning rate</strong>.</li>
+          <li><strong>Differential LR</strong>: new head LR ≈ 1e-3; unfrozen pre-trained layers get <strong>10–100× smaller</strong> LR (≈ 1e-4); deeper-frozen layers LR = 0.</li>
+          <li><strong>Critical:</strong> a large LR on pre-trained layers destroys useful features in the first epoch (<span class="term">catastrophic forgetting</span>). Small LR adapts gently without erasing ImageNet knowledge.</li>
+        </ul>
+        <p><strong>Three strategies:</strong></p>
+        <ul>
+          <li><strong>Conservative</strong> — unfreeze only last 1–2 blocks. Safe for small data, minimal forgetting.</li>
+          <li><strong>Aggressive</strong> — unfreeze all layers, very small LR. Best for large data / very different domains.</li>
+          <li><strong>Gradual unfreezing</strong> — start head-only, unfreeze more each epoch. Safest for beginners.</li>
+        </ul>
+        <p><strong>Practical tips:</strong> always train the head first for 1–2 epochs before unfreezing; keep <strong>batch norm in eval mode</strong> while fine-tuning; monitor val loss (overfits fast on small data); use early stopping.</p>
+        <div class="callout key"><span class="c-title">Must-know for exam</span> Feature extraction = freeze backbone, train new head (small/similar data). Fine-tuning = unfreeze + small LR (more data / different domain). <strong>Use a 10–100× smaller LR for pre-trained layers</strong> to avoid catastrophic forgetting. Rule of thumb: <em>start frozen, unfreeze only if accuracy plateaus.</em></div>
+      </section>
+
+      <section id="which">
+        <h2><span class="sec-num">5</span> When to use which — the 2×2</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap"><table>
+          <thead><tr><th></th><th>Small dataset</th><th>Large dataset</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Similar domain</strong></td><td>Feature extraction</td><td>Fine-tune all layers</td></tr>
+            <tr><td><strong>Different domain</strong></td><td>Fine-tune last layers</td><td>Fine-tune all (or scratch)</td></tr>
+          </tbody>
+        </table></div>
+        <ul>
+          <li><strong>Rule of thumb:</strong> start with feature extraction; unfreeze more if needed.</li>
+          <li>Early layers (edges, textures) are the most likely to transfer across <em>different</em> image domains.</li>
+        </ul>
+      </section>
+
+      <section id="domain">
+        <h2><span class="sec-num">6</span> Domain shift</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li><span class="term">Domain shift</span>: model trained on domain A, deployed on domain B → performance drops. E.g. studio→phone photos, US→rural clinic X-rays, synthetic→real-world.</li>
+          <li><strong>Simplest fix:</strong> fine-tune on a small labeled set from the target domain — even <strong>100–500 target samples</strong> can significantly close the gap.</li>
+        </ul>
+      </section>
+
+      <section id="detect">
+        <h2><span class="sec-num">7</span> Object detection</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Detection = <strong>WHAT + WHERE</strong>: class labels <em>and</em> bounding boxes (x1,y1,x2,y2). Uses: self-driving, security, medical, retail.</li>
+          <li><strong>Naive sliding window</strong>: classify a window at every position &amp; scale → millions of forward passes → too slow.</li>
+          <li><strong>Faster R-CNN (two-stage)</strong>: <em>Stage 1</em> Region Proposal Network (RPN) proposes ~2000 regions from shared backbone features; <em>Stage 2</em> classifies each region + refines the box. Backbone computed once, reused.</li>
+          <li><strong>YOLO (single-shot)</strong>: divide image into an S×S grid; each cell predicts B boxes + confidence and C class probabilities. <strong>One forward pass</strong>, real-time (30+ FPS); slightly weaker on small objects.</li>
+          <li><strong>IoU</strong> = area of overlap / area of union between predicted &amp; ground-truth box. IoU &gt; 0.5 ≈ a "correct" detection.</li>
+        </ul>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th></th><th>Two-stage (R-CNN)</th><th>Single-shot (YOLO)</th></tr></thead>
+          <tbody>
+            <tr><td>Speed</td><td>Slower</td><td><strong>Real-time</strong></td></tr>
+            <tr><td>Accuracy</td><td><strong>Higher</strong></td><td>Slightly lower</td></tr>
+            <tr><td>Small objects</td><td><strong>Better</strong></td><td>Weaker</td></tr>
+            <tr><td>Use case</td><td>Medical, high-stakes</td><td>Video, robotics</td></tr>
+          </tbody>
+        </table></div>
+        <p>Both use <strong>pre-trained CNN backbones</strong> — transfer learning is the foundation. YOLO dominates industry (speed beats the last 1% accuracy); R-CNN family for high-stakes accuracy.</p>
+      </section>
+
+      <section id="seg">
+        <h2><span class="sec-num">8</span> Segmentation</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Progression: Classification ("cat") → Detection (box) → <strong>Segmentation (pixel mask)</strong>.</li>
+          <li><strong>Semantic</strong>: classify every pixel (all cats one color). <strong>Instance</strong>: distinguish individuals (cat 1 vs cat 2).</li>
+          <li><strong>Encoder–decoder</strong> architectures (FCN, U-Net): encoder downsamples to build semantic features; decoder <strong>upsamples</strong> back to full resolution (transposed conv or bilinear interp + conv).</li>
+          <li><strong>Skip connections</strong> (U-Net) pass high-res spatial detail from encoder to decoder. Without them the decoder only has the compressed bottleneck → <strong>blurry boundaries</strong>.</li>
+          <li>Why: medical imaging / autonomous driving need <strong>exact boundaries</strong>, not rectangles.</li>
+        </ul>
+      </section>
+
+      <section id="exam-qs">
+        <h2><span class="sec-num">★</span> Likely exam questions</h2>
+        <hr class="section-rule" />
+        <details class="quiz"><summary>Q1. 300 labeled flower photos, 5 species — feature extraction or fine-tuning?</summary><p class="ans">Feature extraction. 300 images is very small and flowers are similar to ImageNet, so freeze ResNet and train only a new FC head. Fine-tuning would overfit with so little data.</p></details>
+        <details class="quiz"><summary>Q2. Why a much smaller LR for pre-trained layers than the new head?</summary><p class="ans">A large LR destroys pre-trained features in the first few updates (catastrophic forgetting). A small LR (10–100× smaller) adapts them gently without erasing useful ImageNet knowledge.</p></details>
+        <details class="quiz"><summary>Q3. What problem does the RPN in Faster R-CNN solve vs sliding window?</summary><p class="ans">Sliding window tests millions of positions/scales, each a forward pass. The RPN shares backbone features and proposes only ~2000 regions — orders of magnitude faster.</p></details>
+        <details class="quiz"><summary>Q4. Purpose of U-Net skip connections — and what happens without them?</summary><p class="ans">They pass high-resolution spatial detail (edges, boundaries) straight from encoder to decoder. Without them the decoder only has the compressed bottleneck and produces blurry boundaries.</p></details>
+        <details class="quiz"><summary>Q5. ImageNet model does poorly on X-rays despite fine-tuning — name it and the fix.</summary><p class="ans">Domain shift. Simplest fix: fine-tune on a small labeled set from the target domain (even 100–500 X-ray samples helps significantly).</p></details>
+        <details class="quiz"><summary>Q6. Which CNN layers transfer best across different domains, and why?</summary><p class="ans">Early layers — they learn generic edges/colors/textures that are universal. Later layers are task-specific and transfer less.</p></details>
+        <details class="quiz"><summary>Q7. Compare YOLO vs Faster R-CNN.</summary><p class="ans">YOLO: single-shot, one forward pass, real-time, slightly weaker on small objects → video/robotics. Faster R-CNN: two-stage (RPN + classify), slower but higher accuracy and better on small objects → medical/high-stakes. Both use pre-trained backbones.</p></details>
+      </section>
+
+      <nav class="pager">
+        <a class="prev" href="cnn-architectures.html">← CNN Architectures</a>
+        <a class="next" href="rnns.html">RNNs →</a>
+      </nav>
+
+    </article>
+  </div>
+</main>
+
+<footer class="foot wrap">
+  Exam Notes · Neural Networks · W5S1 — Transfer Learning &amp; CNN Applications. Built from the lecture slides by Priyansh Saxena.
+</footer>
+
+<script src="../../../assets/js/app.js?v=20260624h"></script>
+</body>
+</html>

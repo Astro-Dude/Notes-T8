@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>NN Exam · Initialization, Normalization &amp; Debugging</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20260624h" />
+</head>
+<body data-accent="nn">
+<div id="progress"></div>
+
+<header class="topbar">
+  <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+  <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / <a href="index.html">Exam Notes</a> / Init &amp; Norm</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+</header>
+
+<main class="wrap">
+  <div class="page-hero">
+    <span class="kicker">Exam Notes · W3S2</span>
+    <h1>Initialization, Normalization &amp; Debugging</h1>
+    <p class="lead">Three questions for a trainable net: how to initialize weights (Xavier/He), how to stabilize activations (BatchNorm/LayerNorm), and how to diagnose a broken network systematically.</p>
+    <div class="hero-meta">
+      
+        <span class="badge-rt">⏱ 7 min read</span>
+        <a class="badge-rt" href="index.html">← All exam notes</a>
+      <a class="badge-rt" href="../slides/week-3/session-2/w3s2_slides_initialization_normalization.pdf" target="_blank" rel="noopener">📑 Original slides (PDF)</a>
+    </div>
+  </div>
+
+  <div class="article-layout">
+    <nav class="toc">
+      <strong>On this page</strong>
+      <ol>
+        <li><a href="#core">The core problem: gradient products</a></li>
+        <li><a href="#vanish">Vanishing vs exploding gradients</a></li>
+        <li><a href="#variance">Preserve variance: the goal</a></li>
+        <li><a href="#init">Xavier &amp; He initialization</a></li>
+        <li><a href="#bn">Batch Normalization</a></li>
+        <li><a href="#ln">Layer Normalization &amp; BN vs LN</a></li>
+        <li><a href="#gradcheck">Gradient checking</a></li>
+        <li><a href="#debug">Debugging checklist &amp; failure modes</a></li>
+        <li><a href="#exam-qs">Likely exam questions</a></li>
+      </ol>
+    </nav>
+
+    <article class="article">
+
+      <section id="core">
+        <h2><span class="sec-num">1</span> The core problem: gradient products</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>By the chain rule, a gradient through the whole net is a <strong>product</strong> of many per-layer factors.</li>
+          <li>Same architecture, data, and optimizer can either die (loss → NaN) or converge — the difference is purely <strong>how weights were initialized</strong>.</li>
+        </ul>
+<pre>∂L/∂w₁ = (∂L/∂aₙ) · (∂aₙ/∂aₙ₋₁) · (∂aₙ₋₁/∂aₙ₋₂) · … · (∂a₂/∂w₁)</pre>
+        <ul>
+          <li>Each factor <strong>&lt; 1</strong> → product → 0 (<span class="term">gradients vanish</span>).</li>
+          <li>Each factor <strong>&gt; 1</strong> → product → ∞ (<span class="term">gradients explode</span>).</li>
+          <li>The telephone game: even slightly off 1.0, repeated multiplication is exponential.</li>
+        </ul>
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Factor</th><th>After 10 layers</th><th>After 50 layers</th></tr></thead>
+          <tbody>
+            <tr><td>0.5</td><td>0.001</td><td>≈ 10⁻¹⁵</td></tr>
+            <tr><td>0.9</td><td>0.35</td><td>0.005</td></tr>
+            <tr><td>1.0</td><td>1.0</td><td>1.0</td></tr>
+            <tr><td>1.1</td><td>2.6</td><td>117</td></tr>
+            <tr><td>1.5</td><td>57.7</td><td>≈ 637,621</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p>This is why 1990s networks couldn't go beyond 3–5 layers.</p>
+      </section>
+
+      <section id="vanish">
+        <h2><span class="sec-num">2</span> Vanishing vs exploding gradients</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Vanishing</th><th>Exploding</th></tr></thead>
+          <tbody>
+            <tr><td>Early layers have near-zero gradients</td><td>Loss jumps to NaN</td></tr>
+            <tr><td>Loss plateaus (doesn't NaN)</td><td>Weights oscillate wildly</td></tr>
+            <tr><td>Only last few layers learn</td><td>Happens in first few epochs</td></tr>
+            <tr><td><strong>Sneaky</strong> — no crash, just no learning</td><td><strong>Dramatic</strong> — easy to detect</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <ul>
+          <li><strong>Vanishing is worse</strong> — you might not notice it. At least NaN tells you something is wrong.</li>
+          <li><strong>ReLU</strong> helps vanishing: its derivative is exactly 1 for positive inputs (no squashing, unlike sigmoid/tanh).</li>
+        </ul>
+      </section>
+
+      <section id="variance">
+        <h2><span class="sec-num">3</span> Preserve variance: the goal</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Too-small init (σ=0.01): activations shrink → vanish. Too-large (σ=1.0): activations grow → explode.</li>
+          <li><strong>Goal:</strong> keep activation variance <em>constant</em> across layers: Var(aₗ) ≈ Var(aₗ₋₁).</li>
+        </ul>
+<pre>Linear layer y = Wx:
+  Var(y) = nᵢₙ · Var(w) · Var(x)
+  To keep Var(y) = Var(x)  →  Var(w) = 1 / nᵢₙ</pre>
+        <div class="callout key"><span class="c-title">Must-know for exam</span> The Goldilocks rule: weights should keep signals from neither vanishing nor exploding. Solving Var(y)=Var(x) for a linear layer gives Var(w)=1/nᵢₙ — the basis for all smart init schemes.</div>
+      </section>
+
+      <section id="init">
+        <h2><span class="sec-num">4</span> Xavier &amp; He initialization</h2>
+        <hr class="section-rule" />
+        <p><strong>Xavier / Glorot (2010)</strong> — accounts for both forward (activation variance) and backward (gradient variance) passes:</p>
+<pre>Var(w) = 2 / (nᵢₙ + nₒᵤₜ)
+
+w ~ N(0, 2/(nᵢₙ+nₒᵤₜ))   or   w ~ U[ −√(6/(nᵢₙ+nₒᵤₜ)), √(6/(nᵢₙ+nₒᵤₜ)) ]</pre>
+        <ul>
+          <li>Designed for <strong>symmetric activations</strong>: sigmoid, tanh (derivative ≈ 1 around 0).</li>
+          <li>Breakthrough: enabled reliably training 5+ layer nets.</li>
+        </ul>
+        <p><strong>He / Kaiming (2015)</strong> — fixes Xavier+ReLU. ReLU zeros all negatives → kills <strong>half</strong> the activations → variance halves each layer. Double the variance to compensate:</p>
+<pre>Var(w) = 2 / nᵢₙ</pre>
+        <ul>
+          <li>Activations stay stable across 20+ ReLU layers. <strong>Modern default</strong> for almost all deep nets.</li>
+        </ul>
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Activation</th><th>Init</th><th>Var(w)</th></tr></thead>
+          <tbody>
+            <tr><td>Sigmoid / Tanh</td><td>Xavier (Glorot)</td><td>2 / (nᵢₙ + nₒᵤₜ)</td></tr>
+            <tr><td>ReLU / LeakyReLU / ELU</td><td>He (Kaiming)</td><td>2 / nᵢₙ</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <ul>
+          <li>99% of nets use ReLU variants → <strong>He init</strong>. Good init ≠ guaranteed convergence, but <strong>bad init guarantees failure</strong>.</li>
+          <li>PyTorch defaults: <code class="inl">nn.Linear</code> and <code class="inl">nn.Conv2d</code> use Kaiming (He) uniform — rarely need to change.</li>
+        </ul>
+<pre>nn.init.kaiming_normal_(layer.weight, mode='fan_in')
+nn.init.xavier_normal_(layer.weight)
+nn.init.zeros_(layer.bias)</pre>
+        <div class="callout key"><span class="c-title">Must-know for exam</span> Xavier = 2/(nᵢₙ+nₒᵤₜ) for tanh/sigmoid; He = 2/nᵢₙ for ReLU. He doubles the variance specifically to offset ReLU's "halving effect."</div>
+      </section>
+
+      <section id="bn">
+        <h2><span class="sec-num">5</span> Batch Normalization (Ioffe &amp; Szegedy, 2015)</h2>
+        <hr class="section-rule" />
+        <p>For each mini-batch, normalize activations to zero mean / unit variance, then apply learned scale γ and shift β:</p>
+<pre>BN(x) = γ · (x − μ_B) / √(σ²_B + ε) + β</pre>
+        <ul>
+          <li><strong>Why?</strong> As earlier layers change, later layers see shifting input distributions ("internal covariate shift"). BN re-standardizes inputs before each layer.</li>
+          <li>Computed <strong>independently per feature</strong> (column-wise across the batch).</li>
+          <li><strong>γ, β are learned:</strong> γ = learned std, β = learned mean. If γ=σ_B and β=μ_B, BN becomes a no-op → <strong>BN can never hurt</strong> (at worst learns to undo itself).</li>
+        </ul>
+        <p><strong>Worked example</strong> — 4 samples, 1 feature [2,4,6,8]:</p>
+<pre>μ_B = 5,  σ²_B = 5
+x̂ = (x−5)/√5 = [−1.34, −0.45, 0.45, 1.34]
+y = 2x̂ + 1   (with γ=2, β=1)</pre>
+        <div class="callout key"><span class="c-title">Must-know for exam</span> Train vs eval (Common Bug #1): training uses the <strong>current batch</strong> μ,σ² (noisy, updates running averages); inference uses the <strong>running averages</strong> from training. Forgetting <code class="inl">model.eval()</code> makes BN use test-batch stats → batch-dependent, unreliable predictions.</div>
+        <ul>
+          <li><strong>Placement:</strong> Linear → BatchNorm → ReLU. Normalize <em>before</em> activation so ReLU gets well-distributed inputs.</li>
+          <li><strong>Tip:</strong> use <code class="inl">bias=False</code> in the Linear before BN — BN's β replaces the bias.</li>
+        </ul>
+<pre>nn.Sequential(nn.Linear(256,128,bias=False), nn.BatchNorm1d(128), nn.ReLU())</pre>
+        <p><strong>BN limitations:</strong> batch size = 1 (no meaningful stats), small batches (noisy → unstable), variable-length sequences (each timestep needs different stats), and it couples samples (output of A depends on its batch neighbors). These motivated LayerNorm.</p>
+      </section>
+
+      <section id="ln">
+        <h2><span class="sec-num">6</span> Layer Normalization &amp; BN vs LN (Ba et al., 2016)</h2>
+        <hr class="section-rule" />
+        <p>For each sample, normalize across <strong>all features</strong> independently:</p>
+<pre>LN(x) = γ · (x − μ_features) / √(σ²_features + ε) + β</pre>
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th></th><th>BatchNorm</th><th>LayerNorm</th></tr></thead>
+          <tbody>
+            <tr><td>Normalizes</td><td>each feature <strong>across the batch</strong></td><td>each sample <strong>across features</strong></td></tr>
+            <tr><td>Needs</td><td>multiple samples</td><td>self-contained (1 sample OK)</td></tr>
+            <tr><td>Train vs test</td><td>different (running avgs)</td><td>same behavior</td></tr>
+            <tr><td>Best for</td><td>CNNs / vision, big batches</td><td>Transformers, sequences</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <ul>
+          <li>LN works with batch size = 1, variable-length sequences, no sample coupling, identical train/test behavior.</li>
+          <li>Used in <strong>virtually all Transformers</strong> (BERT, GPT, …) because they have variable-length seqs and often batch size 1 at inference — BN would break.</li>
+        </ul>
+      </section>
+
+      <section id="gradcheck">
+        <h2><span class="sec-num">7</span> Gradient checking</h2>
+        <hr class="section-rule" />
+        <p>Verify your analytical (backprop) gradient against a numerical estimate (central difference):</p>
+<pre>∂f/∂x ≈ (f(x+ε) − f(x−ε)) / (2ε)        (ε ≈ 10⁻⁵)
+
+relative error = |g_analytical − g_numerical| / max(|g_analytical|, |g_numerical|)</pre>
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Relative error</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr><td>&lt; 10⁻⁷</td><td>Excellent</td></tr>
+            <tr><td>&lt; 10⁻⁵</td><td>Acceptable</td></tr>
+            <tr><td>&gt; 10⁻³</td><td>Something is wrong</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <ul>
+          <li>Slow (2 forward passes per parameter) → use only for <strong>debugging</strong> custom backward passes, never in training. (PyTorch: <code class="inl">torch.autograd.gradcheck</code>.)</li>
+        </ul>
+      </section>
+
+      <section id="debug">
+        <h2><span class="sec-num">8</span> Debugging checklist &amp; failure modes</h2>
+        <hr class="section-rule" />
+        <p><strong>The checklist — follow in order, never skip ahead:</strong></p>
+        <ul>
+          <li><strong>1. Overfit ONE batch</strong> (8 samples → zero loss). If this fails, stop.</li>
+          <li><strong>2. Check tensor shapes</strong> at every layer — silent mismatches cause mysterious bugs.</li>
+          <li><strong>3. Verify loss at init</strong>: for k classes, L₀ ≈ ln(k). Wrong value ⇒ bad init or loss.</li>
+          <li><strong>4. Gradient check</strong> — numerical vs analytical, catches custom backward bugs.</li>
+          <li><strong>5. Train on a small subset</strong> (~100 samples) — should overfit quickly, confirms pipeline.</li>
+          <li><strong>6. Scale up</strong> — full data, regularization, tuning. Only after steps 1–5 pass.</li>
+        </ul>
+        <div class="callout key"><span class="c-title">Must-know for exam</span> Sanity check: for a k-class classifier with random init, loss should be ≈ ln(k) (e.g. 10 classes → ≈ 2.3). Much higher (e.g. 4.5) ⇒ wrong loss fn, mislabeled data, or applying softmax twice — something broke before training started.</div>
+        <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td>Loss stuck at ln(classes)</td><td>Not learning at all</td><td>Check data pipeline, loss fn, LR</td></tr>
+            <tr><td>Loss → NaN</td><td>Exploding gradients</td><td>Lower LR, gradient clip, check init</td></tr>
+            <tr><td>Loss plateaus early</td><td>Vanishing gradients</td><td>Check activations, add skip connections</td></tr>
+            <tr><td>Train ↓, val ↑</td><td>Overfitting</td><td>Regularize</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </section>
+
+      <section id="exam-qs">
+        <h2><span class="sec-num">★</span> Likely exam questions</h2>
+        <hr class="section-rule" />
+        <details class="quiz"><summary>Q1. Why does Xavier init fail with ReLU, and what does He do differently?</summary><p class="ans">Xavier assumes a symmetric activation with derivative ≈ 1 around 0. ReLU zeros all negatives → halves the variance each layer → activations still vanish. He init uses Var(w)=2/nᵢₙ (double Xavier's 1/nᵢₙ) to compensate for the halving.</p></details>
+        <details class="quiz"><summary>Q2. All weights set to 0.01 in a 50-layer net — what happens to early-layer gradients?</summary><p class="ans">They vanish. Each layer multiplies by a small factor, so the product shrinks exponentially toward 0 — early layers stop learning.</p></details>
+        <details class="quiz"><summary>Q3. During inference, where does BatchNorm get μ and σ²? What if you forget model.eval()?</summary><p class="ans">From running averages accumulated during training (NOT the current batch). Forgetting model.eval() makes BN use the test batch's stats → predictions become batch-dependent and noisy.</p></details>
+        <details class="quiz"><summary>Q4. What do BN and LN normalize over, and why does it matter for Transformers?</summary><p class="ans">BN normalizes each feature across the batch (needs multiple samples); LN normalizes each sample across its features (self-contained). Transformers use variable-length sequences and often batch size 1 at inference, where BN breaks — LN has no batch dependency.</p></details>
+        <details class="quiz"><summary>Q5. Initial loss of a 10-class classifier is 4.5 instead of ≈ 2.3 — what's wrong?</summary><p class="ans">Expected L₀ = ln(10) ≈ 2.3 for uniform random predictions. 4.5 suggests a wrong loss function, mislabeled data, or an architecture bug like applying softmax twice.</p></details>
+        <details class="quiz"><summary>Q6. Loss goes to NaN after 3 epochs — give 3 causes and fixes.</summary><p class="ans">(1) Exploding gradients → lower LR or gradient clipping. (2) Bad initialization → use He init. (3) Numerical overflow in loss e.g. log(0) → add epsilon / use a numerically stable implementation.</p></details>
+        <details class="quiz"><summary>Q7. 30-layer ReLU net has dead gradients in early layers — first fix? And the first debugging step when a model won't learn at all?</summary><p class="ans">Dead-gradient fix: switch to He initialization. Won't-learn-at-all first step: overfit one batch (checklist step 1).</p></details>
+      </section>
+
+      <nav class="pager">
+        <a class="prev" href="regularization.html">← Regularization</a>
+        <a class="next" href="convolutions.html">Convolutions →</a>
+      </nav>
+
+    </article>
+  </div>
+</main>
+
+<footer class="foot wrap">
+  Exam Notes · Neural Networks · W3S2 — Initialization, Normalization &amp; Debugging. Built from the lecture slides by Priyansh Saxena.
+</footer>
+
+<script src="../../../assets/js/app.js?v=20260624h"></script>
+</body>
+</html>

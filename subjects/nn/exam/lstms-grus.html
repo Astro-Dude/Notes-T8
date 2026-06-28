@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>NN Exam · LSTMs, GRUs &amp; Gating</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20260624h" />
+</head>
+<body data-accent="nn">
+<div id="progress"></div>
+
+<header class="topbar">
+  <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+  <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">Neural Nets</a> / <a href="index.html">Exam Notes</a> / LSTMs &amp; GRUs</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+</header>
+
+<main class="wrap">
+  <div class="page-hero">
+    <span class="kicker">Exam Notes · W6S1</span>
+    <h1>LSTMs, GRUs &amp; Gating</h1>
+    <p class="lead">Vanilla RNNs vanish past ~20 steps. The fix: a gated <em>cell-state conveyor belt</em> with additive updates so gradients flow. LSTM (3 gates), GRU (2 gates), bidirectional &amp; deep RNNs.</p>
+    <div class="hero-meta">
+      
+        <span class="badge-rt">⏱ 5 min read</span>
+        <a class="badge-rt" href="index.html">← All exam notes</a>
+      <a class="badge-rt" href="../slides/week-6/session-1/w6s1_slides_lstms_grus.pdf" target="_blank" rel="noopener">📑 Original slides (PDF)</a>
+    </div>
+  </div>
+
+  <div class="article-layout">
+    <nav class="toc">
+      <strong>On this page</strong>
+      <ol>
+        <li><a href="#problem">The problem &amp; the fix</a></li>
+        <li><a href="#cell">Cell state: the conveyor belt</a></li>
+        <li><a href="#gates">The three LSTM gates</a></li>
+        <li><a href="#update">Cell-state update equation</a></li>
+        <li><a href="#vanish">Why LSTMs fix vanishing gradients</a></li>
+        <li><a href="#gru">GRU: fewer gates</a></li>
+        <li><a href="#compare">LSTM vs GRU</a></li>
+        <li><a href="#bidir">Bidirectional RNNs</a></li>
+        <li><a href="#deep">Deep / stacked RNNs</a></li>
+        <li><a href="#exam-qs">Likely exam questions</a></li>
+      </ol>
+    </nav>
+
+    <article class="article">
+
+      <section id="problem">
+        <h2><span class="sec-num">1</span> The problem &amp; the fix</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Vanilla RNNs suffer <strong>vanishing gradients</strong> — can't learn dependencies beyond <strong>~20 steps</strong>.</li>
+          <li>Cause: backprop multiplies by <code class="inl">W<sub>hh</sub></code> repeatedly → gradient decays to ~0.</li>
+          <li><strong>Need:</strong> an architecture where gradients flow <strong>without repeated multiplication by W<sub>hh</sub></strong>.</li>
+          <li>Roadmap: Vanilla RNN (broken) → LSTM (3 gates) → GRU (2 gates) → Bidirectional → Deep/Stacked.</li>
+        </ul>
+      </section>
+
+      <section id="cell">
+        <h2><span class="sec-num">2</span> Cell state: the conveyor belt</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li><span class="term">Cell state C<sub>t</sub></span>: a "conveyor belt" carrying memory across time. Info rides it <strong>unchanged</strong> unless a gate intervenes.</li>
+          <li><span class="term">Gates</span> are <strong>sigmoid</strong> networks: output 0 (closed) to 1 (open).</li>
+          <li>Only <strong>element-wise</strong> operations on the belt — <strong>no matrix multiplication</strong> (this is the key to gradient flow).</li>
+          <li>LSTM keeps <strong>two</strong> states: hidden <code class="inl">h</code> and cell <code class="inl">C</code> (vs RNN's single <code class="inl">h</code>).</li>
+        </ul>
+      </section>
+
+      <section id="gates">
+        <h2><span class="sec-num">3</span> The three LSTM gates</h2>
+        <hr class="section-rule" />
+        <p><strong>Forget gate</strong> — what to erase from old memory:</p>
+        <pre>f_t = σ( W_f · [h_{t-1}, x_t] + b_f )</pre>
+        <ul>
+          <li>0 = completely forget, 1 = completely keep; applied element-wise to <code class="inl">C<sub>t-1</sub></code>.</li>
+          <li>Detail: <code class="inl">b<sub>f</sub></code> initialized to 1 → biased toward remembering by default.</li>
+        </ul>
+        <p><strong>Input gate</strong> — what new info to write (two parts):</p>
+        <pre>i_t = σ( W_i · [h_{t-1}, x_t] + b_i )      (which dims to update)
+C~_t = tanh( W_C · [h_{t-1}, x_t] + b_C )   (candidate values, in [-1,1])</pre>
+        <ul>
+          <li><code class="inl">i<sub>t</sub></code> (sigmoid) picks which dimensions to write; <code class="inl">C~<sub>t</sub></code> (tanh) is the candidate. Together <code class="inl">i<sub>t</sub> ⊙ C~<sub>t</sub></code> = new info to add.</li>
+        </ul>
+        <p><strong>Output gate</strong> — what to reveal as this step's hidden state:</p>
+        <pre>o_t = σ( W_o · [h_{t-1}, x_t] + b_o )
+h_t = o_t ⊙ tanh( C_t )</pre>
+        <ul>
+          <li><code class="inl">h<sub>t</sub></code> is a <strong>filtered view</strong> of the cell state — used for predictions AND passed to next timestep.</li>
+          <li>3 sigmoid activations per cell (forget, input, output); tanh used for candidate and on <code class="inl">C<sub>t</sub></code>.</li>
+        </ul>
+      </section>
+
+      <section id="update">
+        <h2><span class="sec-num">4</span> Cell-state update equation</h2>
+        <hr class="section-rule" />
+        <pre>C_t = f_t ⊙ C_{t-1} + i_t ⊙ C~_t</pre>
+        <ul>
+          <li>Left term: old memory × forget gate (some stuff erased).</li>
+          <li>Right term: new candidate × input gate (some stuff written).</li>
+          <li>The combine is <strong>ADDITION, not multiplication</strong> → gradients flow freely.</li>
+        </ul>
+        <div class="callout key"><span class="c-title">Must-know for exam</span>
+          The core LSTM equation <code class="inl">C_t = f_t ⊙ C_{t-1} + i_t ⊙ C~_t</code>. If <code class="inl">f_t</code> = all 1s → memory preserved perfectly (<code class="inl">C_t = C_{t-1} + new</code>). If <code class="inl">f_t</code> = all 0s → cell wiped clean, total amnesia (<code class="inl">C_t = i_t ⊙ C~_t</code>).
+        </div>
+      </section>
+
+      <section id="vanish">
+        <h2><span class="sec-num">5</span> Why LSTMs fix vanishing gradients</h2>
+        <hr class="section-rule" />
+        <pre>∂C_t / ∂C_{t-1} = f_t       (just the forget gate!)</pre>
+        <ul>
+          <li>If <code class="inl">f<sub>t</sub> ≈ 1</code>: gradient flows <strong>perfectly</strong> — no decay.</li>
+          <li><strong>No W<sub>hh</sub> multiplication</strong> in the cell-state path; the forget gate <em>learns</em> when to let gradients through.</li>
+          <li>Same principle as <strong>ResNet skip connections</strong> (invented 18 years earlier).</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Gradient through time</th><th>Timestep-1 gradient</th></tr></thead>
+            <tbody>
+              <tr><td><strong>RNN</strong></td><td><code class="inl">∂h_t/∂h_{t-1} = W<sub>hh</sub><sup>T</sup>·diag(tanh′)</code> — repeated matmul → vanishes</td><td>≈ 0.001× loss gradient</td></tr>
+              <tr><td><strong>LSTM</strong></td><td><code class="inl">∂C_t/∂C_{t-1} = f_t</code> — element-wise, can stay near 1 → survives</td><td>≈ 0.6× loss gradient</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Result: handles sequences <strong>10–100× longer</strong> than vanilla RNN, at ~4× the parameters (4 weight matrices vs 1).</p>
+      </section>
+
+      <section id="gru">
+        <h2><span class="sec-num">6</span> GRU: fewer gates</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Two simplifications: (1) merge cell &amp; hidden state into <strong>one state</strong> <code class="inl">h</code>; (2) use <strong>2 gates</strong> instead of 3 — the update gate does both forget + input.</li>
+        </ul>
+        <pre>z_t  = σ( W_z · [h_{t-1}, x_t] )          (update gate)
+r_t  = σ( W_r · [h_{t-1}, x_t] )          (reset gate)
+h~_t = tanh( W · [r_t ⊙ h_{t-1}, x_t] )   (candidate)
+h_t  = (1 - z_t) ⊙ h_{t-1} + z_t ⊙ h~_t   (final state)</pre>
+        <ul>
+          <li>Update gate <code class="inl">z<sub>t</sub></code> does both in one shot: <code class="inl">(1-z<sub>t</sub>)</code> keeps from old state (like forget), <code class="inl">z<sub>t</sub></code> takes from candidate (like input).</li>
+          <li>Reset gate <code class="inl">r<sub>t</sub></code> controls how much past state feeds the candidate.</li>
+          <li>When <code class="inl">z<sub>t</sub> = 0</code> → <code class="inl">h_t = h_{t-1}</code>: perfect memory, gradient flows unchanged (identity mapping).</li>
+        </ul>
+      </section>
+
+      <section id="compare">
+        <h2><span class="sec-num">7</span> LSTM vs GRU</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>LSTM</th><th>GRU</th></tr></thead>
+            <tbody>
+              <tr><td>Gates</td><td>3</td><td>2</td></tr>
+              <tr><td>Separate cell state</td><td>Yes (h + C)</td><td>No (one state h)</td></tr>
+              <tr><td>Parameters</td><td>4× RNN</td><td>3× RNN (~75% of LSTM)</td></tr>
+              <tr><td>Training speed</td><td>Slower</td><td>~20% faster</td></tr>
+              <tr><td>Performance</td><td colspan="2">≈ similar on most tasks</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>Rule of thumb:</strong> start with GRU (simpler, faster). Switch to LSTM for very long dependencies, when GRU underperforms, or with lots of data/compute. In practice the difference is often negligible.</li>
+        </ul>
+      </section>
+
+      <section id="bidir">
+        <h2><span class="sec-num">8</span> Bidirectional RNNs</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li><strong>Problem:</strong> standard RNN/LSTM sees only <strong>past</strong> context at each position. Sometimes future context helps ("Apple released a phone" — fruit or company?).</li>
+          <li>Run two RNNs: one <strong>forward</strong> →, one <strong>backward</strong> ←. Output at each position = <strong>concatenation</strong> of both hidden states → output dim = <strong>2 × hidden_size</strong>.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>USE when</th><th>DON'T use when</th></tr></thead>
+            <tbody>
+              <tr><td>Full sequence available upfront</td><td>Real-time / streaming</td></tr>
+              <tr><td>Text classification, NER, POS tagging</td><td>Autoregressive generation</td></tr>
+              <tr><td>Encoder in seq2seq</td><td>Language modeling / can't see future tokens</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Mnemonic: <em>bidirectional = you already have the whole input; unidirectional = generating one token at a time.</em></p>
+      </section>
+
+      <section id="deep">
+        <h2><span class="sec-num">9</span> Deep / stacked RNNs</h2>
+        <hr class="section-rule" />
+        <ul>
+          <li>Stack layers: layer-1 output → layer-2 input → ... Each layer learns a different <strong>level of abstraction</strong> (syntax → semantics → discourse).</li>
+          <li>PyTorch: <code class="inl">nn.LSTM(input_size, hidden_size, num_layers=3)</code>.</li>
+          <li>2015–2017 NLP standard: 2-layer bidirectional LSTM with dropout.</li>
+        </ul>
+      </section>
+
+      <section id="exam-qs">
+        <h2><span class="sec-num">★</span> Likely exam questions</h2>
+        <hr class="section-rule" />
+        <details class="quiz"><summary>Q1. Write the cell-state update; why does the additive form matter?</summary><p class="ans"><code class="inl">C_t = f_t ⊙ C_{t-1} + i_t ⊙ C~_t</code>. Addition gives <code class="inl">∂C_t/∂C_{t-1} = f_t</code> (element-wise), avoiding the repeated matrix multiplication by W<sub>hh</sub> that causes vanishing gradients in RNNs.</p></details>
+        <details class="quiz"><summary>Q2. What if the forget gate outputs all 1s? All 0s?</summary><p class="ans">All 1s: cell state preserved perfectly (<code class="inl">C_t = C_{t-1} + new</code>), never forgets. All 0s: cell wiped clean (<code class="inl">C_t = i_t ⊙ C~_t</code>), total amnesia — memoryless.</p></details>
+        <details class="quiz"><summary>Q3. A GRU has z_t = 0 at some step. What is h_t and what does it mean for gradient flow?</summary><p class="ans"><code class="inl">h_t = (1-0)⊙h_{t-1} + 0⊙h~_t = h_{t-1}</code>. State passes through unchanged → perfect memory, gradient flows as identity.</p></details>
+        <details class="quiz"><summary>Q4. Real-time speech-to-text: use a bidirectional LSTM?</summary><p class="ans">No — streaming means you don't have the full audio upfront. Bidirectional needs the complete sequence; use unidirectional.</p></details>
+        <details class="quiz"><summary>Q5. How many sigmoid activations are in one LSTM cell? Name them.</summary><p class="ans">3 — forget gate, input gate, output gate (each uses sigmoid). The candidate and the cell-to-hidden step use tanh.</p></details>
+        <details class="quiz"><summary>Q6. Short reviews (10–20 words): vanilla RNN, GRU, or LSTM?</summary><p class="ans">A GRU is likely sufficient — sequences are short, GRU gives a safety margin with minimal overhead; LSTM's extra complexity is unlikely to help.</p></details>
+        <details class="quiz"><summary>Q7. What's the output dimension of a bidirectional layer, and why?</summary><p class="ans">2 × hidden_size — the forward and backward hidden states at each position are concatenated.</p></details>
+      </section>
+
+      <nav class="pager">
+        <a class="prev" href="rnns.html">← RNNs</a>
+        <a class="next" href="seq2seq-attention.html">Seq2Seq &amp; Attention →</a>
+      </nav>
+
+    </article>
+  </div>
+</main>
+
+<footer class="foot wrap">
+  Exam Notes · Neural Networks · W6S1 — LSTMs, GRUs &amp; Gating. Built from the lecture slides by Priyansh Saxena.
+</footer>
+
+<script src="../../../assets/js/app.js?v=20260624h"></script>
+</body>
+</html>
