@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 15 — Namespaces, Resource Limits &amp; Workload Types</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 15</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 15</span>
+      <h1>Namespaces, Resource Limits &amp; Workload Types</h1>
+      <p class="lead">
+        Isolate TaskFlow in its own namespace with a CPU/memory budget, size pods correctly with requests and limits,
+        and pick the right controller: Postgres as a StatefulSet, node agents as DaemonSets, migrations and backups as Jobs and CronJobs.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 27 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#namespaces">Namespaces</a></li>
+          <li><a href="#resources">Requests, limits &amp; QoS classes</a></li>
+          <li><a href="#quota-limitrange">ResourceQuota &amp; LimitRange</a></li>
+          <li><a href="#statefulsets">StatefulSets</a></li>
+          <li><a href="#daemonsets">DaemonSets</a></li>
+          <li><a href="#jobs">Jobs &amp; CronJobs</a></li>
+          <li><a href="#workloads">Choosing a workload type</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <div class="callout note">
+        <span class="c-title">Syllabus note</span>
+        <p>The syllabus doesn't list topics for this session yet. These are the standard next Kubernetes topics (and they're needed for the final project). Update after class if different.</p>
+      </div>
+
+      <!-- ===================== 1. NAMESPACES ===================== -->
+      <section id="namespaces">
+        <h2><span class="sec-num">1</span> Namespaces</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A namespace is a folder inside the cluster: the same file name can exist in two folders, and each folder can get its own size limit and access rules.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">namespace</span> partitions one cluster: object names must be unique <em>within</em> a namespace (<code class="inl">taskflow-api</code> can exist in both <code class="inl">taskflow-dev</code> and <code class="inl">taskflow-prod</code>).</li>
+          <li>It's the scope for RBAC (S16), ResourceQuota / LimitRange (§3) and NetworkPolicy (S16).</li>
+          <li>Not a security wall by itself: pods in different namespaces can still talk to each other until a NetworkPolicy says otherwise.</li>
+        </ul>
+
+<pre><span class="pr">$</span> kubectl get namespaces
+<span class="out">NAME              STATUS   AGE
+default           Active   3d
+kube-node-lease   Active   3d
+kube-public       Active   3d
+kube-system       Active   3d
+taskflow          Active   2d</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Namespace</th><th>Contains</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">default</code></td><td>Anything created without <code class="inl">-n</code> / <code class="inl">metadata.namespace</code>. Don't run real apps here.</td></tr>
+              <tr><td><code class="inl">kube-system</code></td><td>Control plane &amp; add-ons: kube-apiserver, etcd, scheduler, controller-manager, CoreDNS, kube-proxy, metrics-server.</td></tr>
+              <tr><td><code class="inl">kube-public</code></td><td>Readable by everyone, even unauthenticated. Holds the <code class="inl">cluster-info</code> ConfigMap.</td></tr>
+              <tr><td><code class="inl">kube-node-lease</code></td><td>One <code class="inl">Lease</code> object per node — the kubelet's heartbeat; how the control plane notices a dead node.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">k8s/namespace.yaml</div>
+<pre>apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow                      <span class="cm"># lowercase DNS label, ≤ 63 chars</span>
+  labels:
+    app.kubernetes.io/part-of: taskflow
+    env: dev                          <span class="cm"># labels let NetworkPolicies / Pod Security select namespaces</span></pre>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/namespace.yaml           <span class="cm"># or: kubectl create namespace taskflow</span>
+<span class="out">namespace/taskflow created</span>
+<span class="pr">$</span> kubectl get pods -n taskflow                  <span class="cm"># one namespace</span>
+<span class="pr">$</span> kubectl get pods -A                           <span class="cm"># all namespaces (adds a NAMESPACE column)</span>
+
+<span class="cm"># stop typing -n taskflow: change the current context's default namespace</span>
+<span class="pr">$</span> kubectl config set-context --current --namespace=taskflow
+<span class="out">Context "minikube" modified.</span>
+<span class="pr">$</span> kubectl config view --minify -o jsonpath='{..namespace}{"\n"}'
+<span class="out">taskflow</span>
+
+<span class="cm"># manifest says one namespace, flag says another → refused</span>
+<span class="pr">$</span> kubectl apply -f k8s/deployment.yaml -n default
+<span class="out">error: the namespace from the provided object "taskflow" does not match the namespace "default". You must pass '--namespace=taskflow' to perform this operation.</span></pre>
+
+        <h3>Namespaced vs cluster-scoped</h3>
+<pre><span class="pr">$</span> kubectl api-resources --namespaced=false
+<span class="out">NAME                SHORTNAMES   APIVERSION                     NAMESPACED   KIND
+namespaces          ns           v1                             false        Namespace
+nodes               no           v1                             false        Node
+persistentvolumes   pv           v1                             false        PersistentVolume
+ingressclasses                   networking.k8s.io/v1           false        IngressClass
+clusterroles                     rbac.authorization.k8s.io/v1   false        ClusterRole
+storageclasses      sc           storage.k8s.io/v1              false        StorageClass</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Namespaced (live inside one)</th><th>Cluster-scoped (no namespace)</th></tr></thead>
+            <tbody>
+              <tr><td>Pod, Deployment, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, ConfigMap, Secret, PVC, ServiceAccount, Role, RoleBinding, HPA, ResourceQuota, LimitRange, NetworkPolicy</td><td>Node, Namespace, PersistentVolume, StorageClass, ClusterRole, ClusterRoleBinding, IngressClass, CustomResourceDefinition, PriorityClass</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Cross-namespace DNS</h3>
+        <p>Short names resolve only in the caller's own namespace. From anywhere else use <code class="inl">&lt;service&gt;.&lt;namespace&gt;</code> or the FQDN <code class="inl">&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>:</p>
+<pre><span class="cm"># Prometheus lives in "monitoring" (created in §5) and scrapes the API in "taskflow"</span>
+<span class="pr">$</span> kubectl run tmp -n monitoring --rm -it --image=busybox:1.36 --restart=Never -- \
+    wget -qO- -T 3 http://taskflow-api.taskflow.svc.cluster.local/health
+<span class="out">{"status":"ok"}
+pod "tmp" deleted</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">kubectl delete namespace taskflow</code> deletes <strong>everything</strong> in it — Deployments, Secrets, PVCs (and with reclaim <code class="inl">Delete</code>, the disks). There is no undo.</li>
+            <li>Namespace stuck in <code class="inl">Terminating</code>: some object inside has a finalizer that can't complete. <code class="inl">kubectl get ns taskflow -o yaml</code> → <code class="inl">status.conditions</code> names it.</li>
+            <li>Creating the Secret without <code class="inl">-n taskflow</code> → it lands in <code class="inl">default</code> and the pod fails with <code class="inl">CreateContainerConfigError</code> (Session 14).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Namespaces scope names, RBAC and quotas. Use <code class="inl">-n</code> / <code class="inl">-A</code> / <code class="inl">set-context --current --namespace</code>. Nodes, PVs, StorageClasses are cluster-scoped. Cross-namespace DNS = <code class="inl">svc.ns</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 2. REQUESTS & LIMITS ===================== -->
+      <section id="resources">
+        <h2><span class="sec-num">2</span> Requests, limits &amp; QoS classes</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A request is the seat you reserve on the bus; the limit is the most seats you may spread over. The driver (scheduler) only counts reservations.</p>
+        </div>
+
+        <div class="fname">k8s/deployment.yaml — container resources (excerpt)</div>
+<pre>          resources:
+            requests:            <span class="cm"># guaranteed minimum; what the SCHEDULER uses to pick a node</span>
+              cpu: 100m          <span class="cm"># 0.1 core</span>
+              memory: 128Mi      <span class="cm"># 128 × 2^20 bytes</span>
+            limits:              <span class="cm"># hard ceiling, enforced by the kubelet / Linux cgroups</span>
+              cpu: 500m          <span class="cm"># above this → throttled</span>
+              memory: 256Mi      <span class="cm"># above this → OOMKilled (exit 137)</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Unit</th><th>Means</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td>CPU <code class="inl">1</code></td><td>1 vCPU / core / hyperthread</td><td><code class="inl">cpu: "2"</code> = two cores</td></tr>
+              <tr><td>CPU <code class="inl">m</code> (millicores)</td><td>1/1000 of a core</td><td><code class="inl">250m</code> = 0.25 = a quarter core; <code class="inl">0.1</code> = <code class="inl">100m</code></td></tr>
+              <tr><td>Memory <code class="inl">Ki Mi Gi</code></td><td>Powers of 2 (1Mi = 1,048,576 B)</td><td><code class="inl">256Mi</code> = 268,435,456 bytes</td></tr>
+              <tr><td>Memory <code class="inl">k M G</code></td><td>Powers of 10 (1M = 1,000,000 B)</td><td><code class="inl">256M</code> ≈ 244Mi</td></tr>
+              <tr><td>Memory <code class="inl">m</code></td><td><strong>milli-bytes</strong> (!)</td><td><code class="inl">256m</code> = 0.256 bytes — a typo that breaks the pod</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>requests</th><th>limits</th></tr></thead>
+            <tbody>
+              <tr><td>Used by</td><td>Scheduler (fits if node allocatable − sum of requests ≥ this), HPA %, eviction ranking</td><td>Kubelet + kernel cgroups at runtime</td></tr>
+              <tr><td>CPU above it</td><td>Allowed if the node has idle CPU</td><td><strong>Throttled</strong> (CFS quota: 500m = 50 ms per 100 ms) — slower, not killed</td></tr>
+              <tr><td>Memory above it</td><td>Allowed, but first in line for eviction under node memory pressure</td><td><strong>OOMKilled</strong>, container restarted</td></tr>
+              <tr><td>If omitted</td><td>Defaults to the limit if a limit is set; otherwise 0</td><td>Unlimited (up to the node)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: how many API pods fit?</span>
+          <p>minikube node: allocatable <code class="inl">cpu: 2</code>. System pods already request <code class="inl">1050m</code> (see <code class="inl">kubectl describe node</code> → Allocated resources). Free = 950m. Each <code class="inl">taskflow-api</code> pod requests 100m → <strong>9 pods</strong> fit; the 10th is <code class="inl">Pending: Insufficient cpu</code> — even if real usage is 2% — because scheduling counts <em>requests</em>, not usage.</p>
+        </div>
+
+        <h3>QoS classes (exam favourite)</h3>
+        <p>Kubernetes derives a <span class="term">QoS class</span> from requests/limits. Under node memory pressure the kubelet evicts <strong>BestEffort first, then Burstable (most over its request first), Guaranteed last</strong>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Class</th><th>Rule</th><th>TaskFlow example</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Guaranteed</strong></td><td><em>Every</em> container sets cpu <strong>and</strong> memory, with requests == limits</td><td>Postgres: <code class="inl">requests: {cpu: 500m, memory: 512Mi}</code>, <code class="inl">limits: {cpu: 500m, memory: 512Mi}</code></td></tr>
+              <tr><td><strong>Burstable</strong></td><td>At least one request or limit set, but not Guaranteed</td><td>API: requests 100m/128Mi, limits 500m/256Mi</td></tr>
+              <tr><td><strong>BestEffort</strong></td><td>No requests or limits on any container</td><td><code class="inl">kubectl run debug --image=busybox:1.36</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Setting only <code class="inl">limits</code> (cpu + memory) also gives Guaranteed — requests default to the limits.</p>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass'
+<span class="out">NAME                            QOS
+debug                           BestEffort
+taskflow-api-7c9d8f6b5d-4kq2x   Burstable
+taskflow-db-6b8d9f7c5-k7m2p     Guaranteed</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>No requests at all</strong>: scheduler packs pods blindly, HPA shows <code class="inl">&lt;unknown&gt;</code>, pods are BestEffort and die first.</li>
+            <li><strong>Requests = peak usage "to be safe"</strong>: nodes look full while CPU sits at 5% → Pending pods and wasted money. Request ≈ typical usage, limit ≈ peak.</li>
+            <li><strong>Tight CPU limit on a latency-sensitive API</strong>: throttling shows up as slow p95 responses, not errors. Check <code class="inl">kubectl top</code> pinned at exactly the limit.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Requests reserve (scheduling, HPA); limits cap (CPU throttled, memory OOMKilled). <code class="inl">m</code> = milli, <code class="inl">Mi</code> = mebibytes. QoS: Guaranteed (req = lim) &gt; Burstable &gt; BestEffort for eviction survival.
+        </div>
+      </section>
+
+      <!-- ===================== 3. QUOTA & LIMITRANGE ===================== -->
+      <section id="quota-limitrange">
+        <h2><span class="sec-num">3</span> ResourceQuota &amp; LimitRange</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>ResourceQuota is the namespace's total pocket money. LimitRange is the per-item rule: "nothing over ₹500, and if you don't say a price, assume ₹100."</p>
+        </div>
+
+        <div class="fname">k8s/quota.yaml</div>
+<pre>apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: taskflow-quota
+  namespace: taskflow                 <span class="cm"># applies to this namespace only</span>
+spec:
+  hard:
+    requests.cpu: "2"                 <span class="cm"># sum of all pods' CPU requests ≤ 2 cores</span>
+    requests.memory: 4Gi
+    limits.cpu: "4"                   <span class="cm"># sum of all CPU limits ≤ 4 cores</span>
+    limits.memory: 8Gi
+    pods: "20"                        <span class="cm"># object counts</span>
+    persistentvolumeclaims: "5"
+    requests.storage: 50Gi            <span class="cm"># total PVC size</span>
+    services.loadbalancers: "0"       <span class="cm"># no cloud LBs from this namespace (use the Ingress)</span>
+    count/deployments.apps: "10"      <span class="cm"># count/&lt;resource&gt;.&lt;group&gt; works for any type</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Limits</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">requests.cpu</code> / <code class="inl">requests.memory</code></td><td>Sum of requests of all non-terminal pods in the namespace.</td></tr>
+              <tr><td><code class="inl">limits.cpu</code> / <code class="inl">limits.memory</code></td><td>Sum of limits.</td></tr>
+              <tr><td><code class="inl">pods</code>, <code class="inl">services</code>, <code class="inl">secrets</code>, <code class="inl">configmaps</code>, <code class="inl">persistentvolumeclaims</code></td><td>Number of objects.</td></tr>
+              <tr><td><code class="inl">requests.storage</code></td><td>Total requested PVC storage (per class: <code class="inl">gp3.storageclass.storage.k8s.io/requests.storage</code>).</td></tr>
+              <tr><td><code class="inl">count/deployments.apps</code></td><td>Generic object count for any resource.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/quota.yaml
+<span class="out">resourcequota/taskflow-quota created</span>
+<span class="pr">$</span> kubectl describe quota taskflow-quota -n taskflow
+<span class="out">Name:                   taskflow-quota
+Namespace:              taskflow
+Resource                Used   Hard
+--------                ----   ----
+count/deployments.apps  2      10
+limits.cpu              1500m  4
+limits.memory           1Gi    8Gi
+persistentvolumeclaims  1      5
+pods                    3      20
+requests.cpu            700m   2
+requests.memory         768Mi  4Gi
+requests.storage        5Gi    50Gi
+services.loadbalancers  0      0</span>
+<span class="cm"># Used = 2 API pods (100m/128Mi req, 500m/256Mi lim) + Postgres (500m/512Mi req = lim)</span>
+
+<span class="cm"># once a quota covers cpu/memory, every new pod MUST declare them</span>
+<span class="pr">$</span> kubectl run tmp -n taskflow --image=busybox:1.36 --restart=Never -- sleep 3600
+<span class="out">Error from server (Forbidden): pods "tmp" is forbidden: failed quota: taskflow-quota: must specify limits.cpu for: tmp; limits.memory for: tmp; requests.cpu for: tmp; requests.memory for: tmp</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: the HPA hits the quota</span>
+          <p>Load spikes and the HPA (Session 13) asks for 10 API pods. Each adds 500m to <code class="inl">limits.cpu</code>: 1500m + 5 × 500m = 4000m = the hard limit, so only <strong>7</strong> run. <code class="inl">kubectl apply</code> never errored — the rejection is on the ReplicaSet:</p>
+<pre><span class="pr">$</span> kubectl get deploy taskflow-api -n taskflow
+<span class="out">NAME           READY   UP-TO-DATE   AVAILABLE   AGE
+taskflow-api   7/10    7            7           2d</span>
+<span class="pr">$</span> kubectl get events -n taskflow --field-selector reason=FailedCreate
+<span class="out">LAST SEEN   TYPE      REASON         OBJECT                              MESSAGE
+12s         Warning   FailedCreate   replicaset/taskflow-api-7c9d8f6b5d  Error creating: pods "taskflow-api-7c9d8f6b5d-q9w2x" is forbidden: exceeded quota: taskflow-quota, requested: limits.cpu=500m, used: limits.cpu=4, limited: limits.cpu=4</span></pre>
+        </div>
+
+        <div class="fname">k8s/limitrange.yaml</div>
+<pre>apiVersion: v1
+kind: LimitRange
+metadata:
+  name: taskflow-limits
+  namespace: taskflow
+spec:
+  limits:
+    - type: Container
+      defaultRequest:                 <span class="cm"># injected when a container sets no request</span>
+        cpu: 100m
+        memory: 128Mi
+      default:                        <span class="cm"># injected when a container sets no LIMIT</span>
+        cpu: 500m
+        memory: 256Mi
+      min:                            <span class="cm"># reject anything smaller</span>
+        cpu: 50m
+        memory: 64Mi
+      max:                            <span class="cm"># reject anything bigger</span>
+        cpu: "2"
+        memory: 2Gi
+    - type: PersistentVolumeClaim
+      min:
+        storage: 1Gi
+      max:
+        storage: 20Gi                 <span class="cm"># no single PVC above 20Gi</span></pre>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/limitrange.yaml
+<span class="out">limitrange/taskflow-limits created</span>
+<span class="pr">$</span> kubectl describe limitrange taskflow-limits -n taskflow
+<span class="out">Name:                  taskflow-limits
+Namespace:             taskflow
+Type                   Resource  Min   Max   Default Request  Default Limit  Max Limit/Request Ratio
+----                   --------  ---   ---   ---------------  -------------  -----------------------
+Container              cpu       50m   2     100m             500m           -
+Container              memory    64Mi  2Gi   128Mi            256Mi          -
+PersistentVolumeClaim  storage   1Gi   20Gi  -                -              -</span>
+
+<span class="cm"># the same pod is now accepted — defaults were injected at admission</span>
+<span class="pr">$</span> kubectl run tmp -n taskflow --image=busybox:1.36 --restart=Never -- sleep 3600
+<span class="out">pod/tmp created</span>
+<span class="pr">$</span> kubectl get pod tmp -n taskflow -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+<span class="out">{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}</span>
+
+<span class="cm"># a container asking for limits.cpu: 4</span>
+<span class="pr">$</span> kubectl apply -f big-pod.yaml
+<span class="out">Error from server (Forbidden): error when creating "big-pod.yaml": pods "big" is forbidden: maximum cpu usage per Container is 2, but limit is 4</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>ResourceQuota</th><th>LimitRange</th></tr></thead>
+            <tbody>
+              <tr><td>Scope</td><td>Whole namespace (sum)</td><td>Each container / pod / PVC</td></tr>
+              <tr><td>Answers</td><td>"How much can this team use in total?"</td><td>"How big can one thing be, and what are the defaults?"</td></tr>
+              <tr><td>Sets defaults?</td><td>No</td><td>Yes (<code class="inl">default</code>, <code class="inl">defaultRequest</code>)</td></tr>
+              <tr><td>Counts objects?</td><td>Yes (pods, PVCs, Services…)</td><td>No</td></tr>
+              <tr><td>When enforced</td><td>Admission of new objects (existing pods are never killed)</td><td>Admission of new pods/PVCs only</td></tr>
+              <tr><td>Error looks like</td><td><code class="inl">exceeded quota: …</code> / <code class="inl">must specify …</code></td><td><code class="inl">maximum cpu usage per Container is 2…</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Deploy them as a pair: the quota caps the namespace, the LimitRange gives every pod sane defaults so the quota's "must specify" rule never bites.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ResourceQuota = namespace total (cpu/memory/storage/object counts). LimitRange = per-container min/max + defaults. Both act at admission; quota failures for Deployments show up as ReplicaSet <code class="inl">FailedCreate</code> events.
+        </div>
+      </section>
+
+      <!-- ===================== 4. STATEFULSETS ===================== -->
+      <section id="statefulsets">
+        <h2><span class="sec-num">4</span> StatefulSets</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Deployment pods are identical and nameless; StatefulSet pods have name tags — <code class="inl">postgres-0</code> always comes back as <code class="inl">postgres-0</code>, with its own disk.</p>
+        </div>
+
+        <ul>
+          <li><strong>Stable names</strong>: <code class="inl">&lt;statefulset&gt;-0</code>, <code class="inl">-1</code>, <code class="inl">-2</code> — not random hashes.</li>
+          <li><strong>Stable DNS</strong> via a <span class="term">headless Service</span> (<code class="inl">clusterIP: None</code>): <code class="inl">postgres-0.taskflow-db.taskflow.svc.cluster.local</code>.</li>
+          <li><strong>Stable storage</strong>: <code class="inl">volumeClaimTemplates</code> creates one PVC per pod (<code class="inl">data-postgres-0</code>); a rescheduled pod re-attaches to <em>its</em> PVC. PVCs are kept on scale-down/delete (by default).</li>
+          <li><strong>Ordered</strong>: created 0 → 1 → 2 (each Running + Ready first), removed 2 → 1 → 0, rolling updates go from the highest ordinal down.</li>
+        </ul>
+
+        <div class="fname">k8s/postgres.yaml (replaces the Session 13 Deployment version)</div>
+<pre><span class="cm"># --- headless Service: DNS returns pod IPs directly, gives each pod a name ---</span>
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-db                   <span class="cm"># the API still connects to "taskflow-db:5432"</span>
+  namespace: taskflow
+spec:
+  clusterIP: None                     <span class="cm"># headless: no virtual IP, no kube-proxy load balancing</span>
+  selector:
+    app: taskflow-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres                      <span class="cm"># pods: postgres-0, postgres-1, …</span>
+  namespace: taskflow
+  labels:
+    app: taskflow-db
+spec:
+  serviceName: taskflow-db            <span class="cm"># MUST name the headless Service → per-pod DNS</span>
+  replicas: 1
+  podManagementPolicy: OrderedReady   <span class="cm"># default; "Parallel" starts all at once</span>
+  updateStrategy:
+    type: RollingUpdate               <span class="cm"># or OnDelete (update only when you delete a pod)</span>
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain               <span class="cm"># keep PVCs if the StatefulSet is deleted (default)</span>
+    whenScaled: Retain                <span class="cm"># keep PVCs of scaled-down pods (default)</span>
+  selector:
+    matchLabels:
+      app: taskflow-db
+  template:
+    metadata:
+      labels:
+        app: taskflow-db
+    spec:
+      terminationGracePeriodSeconds: 30   <span class="cm"># time for Postgres to shut down cleanly</span>
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: taskflow
+            - name: POSTGRES_USER
+              value: taskflow
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-db-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:                  <span class="cm"># requests == limits → Guaranteed QoS</span>
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "taskflow", "-d", "taskflow"]
+            periodSeconds: 5
+          volumeMounts:
+            - name: data              <span class="cm"># matches volumeClaimTemplates[].metadata.name</span>
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:               <span class="cm"># one PVC per pod: &lt;template&gt;-&lt;sts&gt;-&lt;ordinal&gt;</span>
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard    <span class="cm"># gp3 on EKS</span>
+        resources:
+          requests:
+            storage: 5Gi</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">serviceName</code></td><td>Headless Service that governs the pods' DNS. Without it there are no per-pod names.</td></tr>
+              <tr><td><code class="inl">clusterIP: None</code></td><td>DNS for <code class="inl">taskflow-db</code> returns the ready pod IPs (A records), plus <code class="inl">postgres-N.taskflow-db</code> per pod.</td></tr>
+              <tr><td><code class="inl">podManagementPolicy</code></td><td><code class="inl">OrderedReady</code> (one at a time, in order) or <code class="inl">Parallel</code>.</td></tr>
+              <tr><td><code class="inl">updateStrategy</code></td><td><code class="inl">RollingUpdate</code> (highest ordinal first; <code class="inl">partition: N</code> updates only ordinals ≥ N — canary) or <code class="inl">OnDelete</code>.</td></tr>
+              <tr><td><code class="inl">persistentVolumeClaimRetentionPolicy</code></td><td><code class="inl">Retain</code> (default) or <code class="inl">Delete</code> PVCs when the StatefulSet is deleted / scaled down.</td></tr>
+              <tr><td><code class="inl">volumeClaimTemplates</code></td><td>A PVC <em>template</em>; the controller stamps out <code class="inl">data-postgres-0</code>, <code class="inl">data-postgres-1</code>…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/postgres.yaml
+<span class="out">service/taskflow-db created
+statefulset.apps/postgres created</span>
+<span class="pr">$</span> kubectl get sts,pods -n taskflow -l app=taskflow-db
+<span class="out">NAME                        READY   AGE
+statefulset.apps/postgres   1/1     2m
+
+NAME             READY   STATUS    RESTARTS   AGE
+pod/postgres-0   1/1     Running   0          2m</span>
+<span class="pr">$</span> kubectl get svc taskflow-db -n taskflow
+<span class="out">NAME          TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)    AGE
+taskflow-db   ClusterIP   None         &lt;none&gt;        5432/TCP   2m</span>
+<span class="pr">$</span> kubectl get pvc -n taskflow
+<span class="out">NAME              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+data-postgres-0   Bound    pvc-2b9e7c41-6d3a-4f8e-a1c5-9e0d7b3f6a28   5Gi        RWO            standard       &lt;unset&gt;                 2m</span>
+
+<span class="cm"># per-pod DNS (from a tmp busybox pod in taskflow)</span>
+<span class="pr">/ #</span> nslookup postgres-0.taskflow-db.taskflow.svc.cluster.local
+<span class="out">Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+Name:	postgres-0.taskflow-db.taskflow.svc.cluster.local
+Address: 10.244.0.41</span>
+
+<span class="cm"># identity survives deletion: same name, same PVC, same data</span>
+<span class="pr">$</span> kubectl delete pod postgres-0 -n taskflow
+<span class="out">pod "postgres-0" deleted</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-db -w
+<span class="out">NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   0/1     ContainerCreating   0          1s
+postgres-0   0/1     Running             0          3s
+postgres-0   1/1     Running             0          9s</span>
+
+<span class="cm"># ordered scale-up (demo only — see the warning below)</span>
+<span class="pr">$</span> kubectl scale statefulset postgres -n taskflow --replicas=3
+<span class="out">statefulset.apps/postgres scaled</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-db -w
+<span class="out">NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   1/1     Running             0          10m
+postgres-1   0/1     Pending             0          0s
+postgres-1   0/1     ContainerCreating   0          1s
+postgres-1   1/1     Running             0          9s     <span class="cm">← only now does postgres-2 start</span>
+postgres-2   0/1     Pending             0          0s
+postgres-2   0/1     ContainerCreating   0          1s
+postgres-2   1/1     Running             0          8s</span>
+<span class="pr">$</span> kubectl scale statefulset postgres -n taskflow --replicas=1   <span class="cm"># removes postgres-2, then postgres-1</span>
+<span class="pr">$</span> kubectl get pvc -n taskflow -o name | grep postgres             <span class="cm"># their PVCs are kept</span>
+<span class="out">persistentvolumeclaim/data-postgres-0
+persistentvolumeclaim/data-postgres-1
+persistentvolumeclaim/data-postgres-2</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>"replicas: 3 = HA Postgres"</strong> — no. You get 3 independent, empty databases; the headless Service would spread queries across them. Replication needs Postgres config or an operator (CloudNativePG, a <code class="inl">postgresql-ha</code> Helm chart) or a managed DB (RDS).</li>
+            <li><strong>Switching from the Session 13 Deployment</strong>: the new pod gets a <em>new</em> PVC (<code class="inl">data-postgres-0</code>) → empty DB. Dump first: <code class="inl">kubectl exec deploy/taskflow-db -n taskflow -- pg_dump -U taskflow taskflow &gt; backup.sql</code>, then restore with <code class="inl">kubectl exec -i postgres-0 -n taskflow -- psql -U taskflow -d taskflow &lt; backup.sql</code>.</li>
+            <li><strong>Re-applying over the old ClusterIP Service</strong>: <code class="inl">spec.clusterIPs[0]: Invalid value: []string{"None"}: may not change once set</code>. Delete the old Service, then apply.</li>
+          </ul>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Deployment</th><th>StatefulSet</th></tr></thead>
+            <tbody>
+              <tr><td>Pod names</td><td>Random: <code class="inl">taskflow-api-7c9d8f6b5d-4kq2x</code></td><td>Ordinal: <code class="inl">postgres-0</code></td></tr>
+              <tr><td>Storage</td><td>All replicas share one PVC (or none)</td><td>One PVC per pod via <code class="inl">volumeClaimTemplates</code></td></tr>
+              <tr><td>Network identity</td><td>Only the Service name</td><td>Per-pod DNS via headless Service</td></tr>
+              <tr><td>Start / stop order</td><td>Any order, in parallel</td><td>0 → N−1 up, N−1 → 0 down</td></tr>
+              <tr><td>Replacement pod</td><td>New name, any node</td><td>Same name, same PVC</td></tr>
+              <tr><td>Use for</td><td>Stateless API, web, workers</td><td>Databases, Kafka, ZooKeeper, Elasticsearch, Redis cluster</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          StatefulSet = stable name + stable DNS (headless Service via <code class="inl">serviceName</code>) + stable per-pod PVC (<code class="inl">volumeClaimTemplates</code>) + ordered rollout. It does not replicate data for you.
+        </div>
+      </section>
+
+      <!-- ===================== 5. DAEMONSETS ===================== -->
+      <section id="daemonsets">
+        <h2><span class="sec-num">5</span> DaemonSets</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One security guard per building: add a node and a guard appears; remove the node and the guard leaves.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">DaemonSet</span> runs <strong>exactly one pod on every eligible node</strong>. No <code class="inl">replicas</code> field — the node count decides.</li>
+          <li>Used for node-level agents: log shippers (Fluent Bit), metrics (node-exporter), CNI (Calico, Cilium, kindnet), kube-proxy, CSI node plugins.</li>
+          <li>Restrict to some nodes with <code class="inl">nodeSelector</code>/affinity; include tainted nodes (control plane) with <code class="inl">tolerations</code>.</li>
+        </ul>
+
+        <p>Lab cluster with 3 nodes (kind taints its control-plane node, which makes tolerations visible):</p>
+        <div class="fname">kind-3nodes.yaml</div>
+<pre>kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane              <span class="cm"># tainted node-role.kubernetes.io/control-plane:NoSchedule</span>
+  - role: worker
+  - role: worker</pre>
+<pre><span class="pr">$</span> kind create cluster --name lab --config kind-3nodes.yaml
+<span class="pr">$</span> kubectl get ds -A                      <span class="cm"># the cluster already runs DaemonSets</span>
+<span class="out">NAMESPACE     NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+kube-system   kindnet      3         3         3       3            3           &lt;none&gt;                   5m
+kube-system   kube-proxy   3         3         3       3            3           kubernetes.io/os=linux   5m</span></pre>
+
+        <div class="fname">k8s/node-exporter.yaml</div>
+<pre>apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring               <span class="cm"># kubectl create namespace monitoring</span>
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1               <span class="cm"># replace one node's pod at a time</span>
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux       <span class="cm"># only Linux nodes</span>
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule          <span class="cm"># also run on the control-plane node</span>
+      hostNetwork: true               <span class="cm"># listen on the NODE's IP:9100</span>
+      hostPID: true                   <span class="cm"># see the node's processes</span>
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.8.2
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+          ports:
+            - name: metrics
+              containerPort: 9100
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer
+      volumes:                        <span class="cm"># hostPath: the legit use case from Session 13</span>
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>no <code class="inl">replicas</code></td><td>One pod per matching node, automatically.</td></tr>
+              <tr><td><code class="inl">tolerations</code></td><td>Without it DESIRED = 2 (workers only) — the control-plane taint repels the pod.</td></tr>
+              <tr><td><code class="inl">hostNetwork</code> / <code class="inl">hostPID</code></td><td>Agent needs the node's real network stack and process table.</td></tr>
+              <tr><td><code class="inl">hostPath</code> <code class="inl">/proc</code>, <code class="inl">/sys</code>, <code class="inl">/</code></td><td>Read the node's CPU, memory, disk and filesystem stats (read-only).</td></tr>
+              <tr><td><code class="inl">updateStrategy</code></td><td><code class="inl">RollingUpdate</code> (default, <code class="inl">maxUnavailable: 1</code>) or <code class="inl">OnDelete</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl create namespace monitoring &amp;&amp; kubectl apply -f k8s/node-exporter.yaml
+<span class="out">namespace/monitoring created
+daemonset.apps/node-exporter created</span>
+<span class="pr">$</span> kubectl get ds node-exporter -n monitoring
+<span class="out">NAME            DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+node-exporter   3         3         3       3            3           kubernetes.io/os=linux   40s</span>
+<span class="pr">$</span> kubectl get pods -n monitoring -o wide
+<span class="out">NAME                  READY   STATUS    RESTARTS   AGE   IP           NODE                NOMINATED NODE   READINESS GATES
+node-exporter-4jx8m   1/1     Running   0          40s   172.18.0.2   lab-control-plane   &lt;none&gt;           &lt;none&gt;
+node-exporter-9tq2w   1/1     Running   0          40s   172.18.0.3   lab-worker          &lt;none&gt;           &lt;none&gt;
+node-exporter-zk7fd   1/1     Running   0          40s   172.18.0.4   lab-worker2         &lt;none&gt;           &lt;none&gt;</span>
+<span class="cm"># pod IP == node IP because of hostNetwork. Scrape a node:</span>
+<span class="pr">$</span> docker exec lab-worker curl -s localhost:9100/metrics | grep '^node_load1'
+<span class="out">node_load1 0.42</span></pre>
+        <p>In Session 22 the <code class="inl">kube-prometheus-stack</code> Helm chart installs this same DaemonSet for you.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          DaemonSet = one pod per node, auto-added to new nodes. Pair with tolerations (control plane), nodeSelector (subset), hostPath/hostNetwork (node access). Examples: kube-proxy, CNI, node-exporter, Fluent Bit.
+        </div>
+      </section>
+
+      <!-- ===================== 6. JOBS & CRONJOBS ===================== -->
+      <section id="jobs">
+        <h2><span class="sec-num">6</span> Jobs &amp; CronJobs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A Deployment is a shop that's always open. A Job is a delivery — done once it arrives. A CronJob is that delivery booked for every night.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">Job</span> runs pods until a given number <strong>succeed</strong> (exit 0), retrying failures up to <code class="inl">backoffLimit</code> (default 6) with back-off 10 s, 20 s, 40 s… (cap 6 min).</li>
+          <li><code class="inl">restartPolicy</code> must be <code class="inl">Never</code> or <code class="inl">OnFailure</code> (<code class="inl">Always</code> is rejected).</li>
+          <li>Finished pods are kept (status <code class="inl">Completed</code>) so you can read logs — until <code class="inl">ttlSecondsAfterFinished</code> cleans them up.</li>
+        </ul>
+
+        <h3>A database migration Job</h3>
+        <div class="fname">k8s/migrate-job.yaml</div>
+<pre>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taskflow-migrations
+  namespace: taskflow
+data:
+  001_create_tasks.sql: |             <span class="cm"># idempotent: safe if the Job retries</span>
+    CREATE TABLE IF NOT EXISTS tasks (
+      id         SERIAL PRIMARY KEY,
+      title      TEXT        NOT NULL,
+      done       BOOLEAN     NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taskflow-migrate
+  namespace: taskflow
+spec:
+  completions: 1                      <span class="cm"># successful pods needed (default 1)</span>
+  parallelism: 1                      <span class="cm"># pods running at once (default 1)</span>
+  backoffLimit: 3                     <span class="cm"># after 3 retries (4 pods total) → Job Failed</span>
+  activeDeadlineSeconds: 300          <span class="cm"># hard stop after 5 min, retries or not</span>
+  ttlSecondsAfterFinished: 3600       <span class="cm"># auto-delete Job + pods 1 h after finishing</span>
+  template:
+    spec:
+      restartPolicy: Never            <span class="cm"># failed pod is kept for logs; Job creates a new one</span>
+      containers:
+        - name: migrate
+          image: postgres:16          <span class="cm"># used only for its psql client</span>
+          command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/001_create_tasks.sql"]
+          env:                        <span class="cm"># libpq reads PG* variables</span>
+            - name: PGHOST
+              value: taskflow-db
+            - name: PGUSER
+              value: taskflow
+            - name: PGDATABASE
+              value: taskflow
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-db-secret
+                  key: POSTGRES_PASSWORD
+          resources:                  <span class="cm"># required by the quota in §3</span>
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+      volumes:
+        - name: migrations
+          configMap:
+            name: taskflow-migrations   <span class="cm"># each key becomes a file</span></pre>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/migrate-job.yaml
+<span class="out">configmap/taskflow-migrations created
+job.batch/taskflow-migrate created</span>
+<span class="pr">$</span> kubectl wait --for=condition=complete job/taskflow-migrate -n taskflow --timeout=120s
+<span class="out">job.batch/taskflow-migrate condition met</span>
+<span class="pr">$</span> kubectl get jobs -n taskflow
+<span class="out">NAME               STATUS     COMPLETIONS   DURATION   AGE
+taskflow-migrate   Complete   1/1           6s         20s</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l job-name=taskflow-migrate
+<span class="out">NAME                     READY   STATUS      RESTARTS   AGE
+taskflow-migrate-x7k2p   0/1     Completed   0          20s</span>
+<span class="pr">$</span> kubectl logs job/taskflow-migrate -n taskflow
+<span class="out">CREATE TABLE</span>
+
+<span class="cm"># the Job's pod template is immutable → to re-run: delete and re-apply</span>
+<span class="pr">$</span> kubectl delete job taskflow-migrate -n taskflow &amp;&amp; kubectl apply -f k8s/migrate-job.yaml
+<span class="pr">$</span> kubectl logs job/taskflow-migrate -n taskflow
+<span class="out">psql:/migrations/001_create_tasks.sql:6: NOTICE:  relation "tasks" already exists, skipping
+CREATE TABLE</span></pre>
+
+        <p>When it fails (wrong password in the Secret):</p>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l job-name=taskflow-migrate
+<span class="out">NAME                     READY   STATUS   RESTARTS   AGE
+taskflow-migrate-8vq4n   0/1     Error    0          95s
+taskflow-migrate-j2m7c   0/1     Error    0          84s
+taskflow-migrate-p5x9d   0/1     Error    0          63s
+taskflow-migrate-t6w3k   0/1     Error    0          22s</span>     <span class="cm">← 1 try + 3 retries, growing gaps</span>
+<span class="pr">$</span> kubectl logs taskflow-migrate-t6w3k -n taskflow
+<span class="out">psql: error: connection to server at "taskflow-db" (10.244.0.41), port 5432 failed: FATAL:  password authentication failed for user "taskflow"</span>
+<span class="pr">$</span> kubectl describe job taskflow-migrate -n taskflow | tail -1
+<span class="out">  Warning  BackoffLimitExceeded  10s   job-controller  Job has reached the specified backoff limit</span>
+<span class="pr">$</span> kubectl get job taskflow-migrate -n taskflow
+<span class="out">NAME               STATUS   COMPLETIONS   DURATION   AGE
+taskflow-migrate   Failed   0/1           95s        95s</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th><code class="inl">restartPolicy</code></th><th>On failure</th><th>Pick when</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Never</code></td><td>Pod stays <code class="inl">Error</code>; Job creates a <strong>new pod</strong></td><td>You want each failed attempt's logs</td></tr>
+              <tr><td><code class="inl">OnFailure</code></td><td>Same pod, container restarted in place (RESTARTS goes up)</td><td>Fewer pods; logs of old attempts only via <code class="inl">--previous</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pattern</th><th>Settings</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td>Single run</td><td><code class="inl">completions: 1</code>, <code class="inl">parallelism: 1</code></td><td>DB migration</td></tr>
+              <tr><td>Fixed count, in parallel</td><td><code class="inl">completions: 6</code>, <code class="inl">parallelism: 2</code></td><td>6 report chunks, 2 at a time (COMPLETIONS 0/6 → 6/6)</td></tr>
+              <tr><td>Indexed</td><td>+ <code class="inl">completionMode: Indexed</code></td><td>Each pod gets <code class="inl">JOB_COMPLETION_INDEX</code> 0–5 to pick its shard</td></tr>
+              <tr><td>Work queue</td><td><code class="inl">parallelism: N</code>, no <code class="inl">completions</code></td><td>Workers pull from a queue until it's empty</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>A nightly backup CronJob</h3>
+        <div class="fname">k8s/backup-cronjob.yaml</div>
+<pre>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taskflow-backups
+  namespace: taskflow
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi                   <span class="cm"># default StorageClass</span>
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: taskflow-db-backup
+  namespace: taskflow
+spec:
+  schedule: "0 2 * * *"               <span class="cm"># min hour day-of-month month day-of-week → 02:00 daily</span>
+  timeZone: "Asia/Kolkata"            <span class="cm"># without it: controller-manager's zone, usually UTC</span>
+  concurrencyPolicy: Forbid           <span class="cm"># don't start if last night's run is still going</span>
+  startingDeadlineSeconds: 600        <span class="cm"># missed by &gt; 10 min (controller down)? skip this run</span>
+  successfulJobsHistoryLimit: 3       <span class="cm"># keep 3 finished Jobs (default 3)</span>
+  failedJobsHistoryLimit: 1           <span class="cm"># keep 1 failed Job (default 1)</span>
+  suspend: false                      <span class="cm"># true = pause the schedule</span>
+  jobTemplate:                        <span class="cm"># a normal Job spec, stamped out on each tick</span>
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pg-dump
+              image: postgres:16
+              command: ["/bin/sh", "-c"]
+              args:
+                - &gt;-
+                  pg_dump -h taskflow-db -U taskflow -d taskflow -Fc
+                  -f /backups/taskflow-$(date +%Y%m%d-%H%M).dump &amp;&amp;
+                  find /backups -name '*.dump' -mtime +7 -delete &amp;&amp;
+                  ls -lh /backups
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: taskflow-db-secret
+                      key: POSTGRES_PASSWORD
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: taskflow-backups</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">schedule</code></td><td>Standard 5-field cron (same as <code class="inl">crontab</code>, Session 3). Macros <code class="inl">@hourly</code>, <code class="inl">@daily</code>, <code class="inl">@weekly</code> work too.</td></tr>
+              <tr><td><code class="inl">timeZone</code></td><td>IANA zone name (stable since 1.27). Skip it and "0 2 * * *" runs at 02:00 UTC = 07:30 IST.</td></tr>
+              <tr><td><code class="inl">concurrencyPolicy</code></td><td><code class="inl">Allow</code> (default: overlapping runs OK) · <code class="inl">Forbid</code> (skip the new run) · <code class="inl">Replace</code> (kill the old run, start the new one).</td></tr>
+              <tr><td><code class="inl">startingDeadlineSeconds</code></td><td>How late a missed run may still start. Without it, a controller that missed &gt; 100 schedules stops scheduling the CronJob.</td></tr>
+              <tr><td><code class="inl">jobTemplate</code></td><td>Exactly a Job's <code class="inl">spec</code> (backoffLimit, template, …).</td></tr>
+              <tr><td><code class="inl">args: - &gt;-</code></td><td>YAML folded block: the lines join into one shell command. K8s only expands <code class="inl">$(VAR)</code> for defined env vars, so <code class="inl">$(date …)</code> reaches the shell untouched.</td></tr>
+              <tr><td><code class="inl">find … -mtime +7 -delete</code></td><td>Retention: drop dumps older than 7 days.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Schedule</th><th>Runs</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">*/15 * * * *</code></td><td>Every 15 minutes</td></tr>
+              <tr><td><code class="inl">0 2 * * *</code></td><td>02:00 every day</td></tr>
+              <tr><td><code class="inl">0 9 * * 1-5</code></td><td>09:00 Monday–Friday</td></tr>
+              <tr><td><code class="inl">30 23 * * 0</code></td><td>23:30 every Sunday</td></tr>
+              <tr><td><code class="inl">0 0 1 * *</code></td><td>Midnight on the 1st of each month</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/backup-cronjob.yaml
+<span class="out">persistentvolumeclaim/taskflow-backups created
+cronjob.batch/taskflow-db-backup created</span>
+<span class="pr">$</span> kubectl get cronjob -n taskflow
+<span class="out">NAME                 SCHEDULE    TIMEZONE       SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+taskflow-db-backup   0 2 * * *   Asia/Kolkata   False     0        &lt;none&gt;          10s</span>
+
+<span class="cm"># don't wait till 2 AM — run the template once, right now</span>
+<span class="pr">$</span> kubectl create job --from=cronjob/taskflow-db-backup backup-manual-1 -n taskflow
+<span class="out">job.batch/backup-manual-1 created</span>
+<span class="pr">$</span> kubectl logs job/backup-manual-1 -n taskflow
+<span class="out">total 4.0K
+-rw-r--r-- 1 root root 3.4K Oct  9 06:10 taskflow-20261009-0610.dump</span>
+
+<span class="cm"># next morning: CronJob → Job (suffix = scheduled time in minutes since epoch) → Pod</span>
+<span class="pr">$</span> kubectl get jobs -n taskflow
+<span class="out">NAME                          STATUS     COMPLETIONS   DURATION   AGE
+backup-manual-1               Complete   1/1           5s         19h
+taskflow-db-backup-29859630   Complete   1/1           6s         4h</span>
+
+<span class="pr">$</span> kubectl patch cronjob taskflow-db-backup -n taskflow -p '{"spec":{"suspend":true}}'   <span class="cm"># pause</span>
+<span class="out">cronjob.batch/taskflow-db-backup patched</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">restartPolicy: Always</code> in a Job → <code class="inl">spec.template.spec.restartPolicy: Unsupported value: "Always": supported values: "OnFailure", "Never"</code>.</li>
+            <li>Non-idempotent Jobs (e.g. <code class="inl">INSERT</code> seed data) + retries = duplicated rows. Make every step safe to run twice.</li>
+            <li>No <code class="inl">ttlSecondsAfterFinished</code> / history limits → hundreds of <code class="inl">Completed</code> pods clutter <code class="inl">kubectl get pods</code>.</li>
+            <li>Backups on a PVC in the same cluster aren't real backups — copy them off-cluster (e.g. <code class="inl">aws s3 cp</code> to S3) too.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Job = run to completion (completions, parallelism, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished; restartPolicy Never/OnFailure). CronJob = Job on a cron schedule (timeZone, concurrencyPolicy, history limits). Test with <code class="inl">kubectl create job --from=cronjob/…</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 7. WORKLOAD TYPES ===================== -->
+      <section id="workloads">
+        <h2><span class="sec-num">7</span> Choosing a workload type</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Pick the controller by asking: does it ever finish, does it need one copy per machine, and does each copy need its own name and disk?</p>
+        </div>
+
+<pre>Does the work finish?
+ ├─ yes → on a schedule?  ── yes → CronJob
+ │                        └─ no  → Job
+ └─ no (long-running)
+      ├─ one copy per node? ───────────────────────── yes → DaemonSet
+      ├─ each replica needs a stable name / own disk? yes → StatefulSet
+      └─ otherwise ────────────────────────────────────── → Deployment (+ HPA)</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Workload</th><th>Pods</th><th>Names / identity</th><th>Storage</th><th>Use for</th><th>TaskFlow</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Deployment</strong> (→ ReplicaSet)</td><td>N interchangeable, rolling updates</td><td>Random hash</td><td>None / shared PVC</td><td>Stateless APIs, web, workers</td><td><code class="inl">taskflow-api</code>, <code class="inl">taskflow-web</code></td></tr>
+              <tr><td><strong>StatefulSet</strong></td><td>N ordered</td><td><code class="inl">name-0…N-1</code> + per-pod DNS</td><td>PVC per pod</td><td>Databases, queues, clustered stores</td><td><code class="inl">postgres</code></td></tr>
+              <tr><td><strong>DaemonSet</strong></td><td>1 per node</td><td>Tied to node</td><td>Usually hostPath</td><td>Node agents (logs, metrics, CNI)</td><td><code class="inl">node-exporter</code></td></tr>
+              <tr><td><strong>Job</strong></td><td>Run until N succeed</td><td><code class="inl">job-xxxxx</code></td><td>Optional</td><td>Migrations, batch, one-off scripts</td><td><code class="inl">taskflow-migrate</code></td></tr>
+              <tr><td><strong>CronJob</strong></td><td>A Job per schedule tick</td><td><code class="inl">cron-&lt;minutes&gt;-xxxxx</code></td><td>Optional</td><td>Backups, reports, cleanups</td><td><code class="inl">taskflow-db-backup</code></td></tr>
+              <tr><td>ReplicaSet / bare Pod</td><td>—</td><td>—</td><td>—</td><td>Don't use directly (no rollouts / no self-healing)</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl get deploy,sts,ds,job,cronjob -A        <span class="cm"># every workload type at once</span></pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deployment for stateless, StatefulSet for identity + per-pod storage, DaemonSet for per-node agents, Job for run-to-completion, CronJob for scheduled Jobs.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">kubectl get ns</code> / <code class="inl">kubectl create namespace taskflow</code></td><td>List / create namespaces.</td></tr>
+              <tr><td><code class="inl">kubectl config set-context --current --namespace=taskflow</code></td><td>Make <code class="inl">taskflow</code> the default namespace.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -A</code></td><td>All namespaces.</td></tr>
+              <tr><td><code class="inl">kubectl api-resources --namespaced=false</code></td><td>Which kinds are cluster-scoped.</td></tr>
+              <tr><td><code class="inl">kubectl describe node minikube</code></td><td>Allocatable + Allocated resources (requests/limits sums).</td></tr>
+              <tr><td><code class="inl">kubectl get pods -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass'</code></td><td>QoS class per pod.</td></tr>
+              <tr><td><code class="inl">kubectl describe quota -n taskflow</code></td><td>Used vs hard for each quota.</td></tr>
+              <tr><td><code class="inl">kubectl describe limitrange -n taskflow</code></td><td>Min/max/defaults per container.</td></tr>
+              <tr><td><code class="inl">kubectl get sts,pvc -n taskflow</code></td><td>StatefulSets and their per-pod PVCs.</td></tr>
+              <tr><td><code class="inl">kubectl scale statefulset postgres --replicas=N</code></td><td>Ordered scale up/down.</td></tr>
+              <tr><td><code class="inl">kubectl rollout status sts/postgres</code></td><td>Works for StatefulSets and DaemonSets too.</td></tr>
+              <tr><td><code class="inl">kubectl get ds -A</code></td><td>DaemonSets: DESIRED = number of eligible nodes.</td></tr>
+              <tr><td><code class="inl">kubectl wait --for=condition=complete job/NAME --timeout=120s</code></td><td>Block until a Job succeeds (great in CI).</td></tr>
+              <tr><td><code class="inl">kubectl logs job/NAME</code></td><td>Logs of a Job's pod.</td></tr>
+              <tr><td><code class="inl">kubectl create job --from=cronjob/NAME manual-1</code></td><td>Trigger a CronJob now.</td></tr>
+              <tr><td><code class="inl">kubectl patch cronjob NAME -p '{"spec":{"suspend":true}}'</code></td><td>Pause a CronJob.</td></tr>
+              <tr><td><code class="inl">kubectl get deploy,sts,ds,job,cronjob -A</code></td><td>Every workload in the cluster.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>TaskFlow now lives in the <code class="inl">taskflow</code> namespace with a ResourceQuota (total budget) and a LimitRange (per-pod defaults), so every pod declares requests the scheduler and HPA can use. Each component runs under the controller that fits it: the stateless API as a Deployment, Postgres as a StatefulSet with a stable name, DNS and its own PVC, node-exporter as a DaemonSet on every node, the schema migration as a Job and the nightly <code class="inl">pg_dump</code> as a CronJob. Requests and limits decide where pods land, what happens when they overuse resources, and which pods get evicted first.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>A pod has <code class="inl">requests: {cpu: 250m, memory: 256Mi}</code> and <code class="inl">limits: {cpu: 500m, memory: 256Mi}</code>. What's its QoS class, and what happens at 300Mi and at 700m CPU?</summary>
+          <p class="ans"><strong>Burstable</strong> (CPU request ≠ limit). At 300Mi it exceeds the memory limit → OOMKilled (exit 137). At 700m it's throttled to 500m — slower, not killed.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between <code class="inl">memory: 512Mi</code>, <code class="inl">512M</code> and <code class="inl">512m</code>?</summary>
+          <p class="ans">512Mi = 512 × 2²⁰ = 536,870,912 bytes; 512M = 512,000,000 bytes (~488Mi); 512m = 0.512 <em>bytes</em> (milli) — a typo that makes the container unusable.</p>
+        </details>
+        <details class="quiz">
+          <summary>After adding a ResourceQuota on <code class="inl">requests.cpu</code>, <code class="inl">kubectl run tmp --image=busybox</code> is rejected. Why, and what's the clean fix?</summary>
+          <p class="ans">With a compute quota, every pod must declare those resources ("must specify requests.cpu…"). Add a LimitRange with <code class="inl">defaultRequest</code>/<code class="inl">default</code> so pods without resources get defaults injected.</p>
+        </details>
+        <details class="quiz">
+          <summary>Give three things a StatefulSet guarantees that a Deployment doesn't.</summary>
+          <p class="ans">Stable ordinal pod names (<code class="inl">postgres-0</code>), stable per-pod DNS via the headless Service in <code class="inl">serviceName</code>, and a dedicated PVC per pod from <code class="inl">volumeClaimTemplates</code> — plus ordered start/stop/update.</p>
+        </details>
+        <details class="quiz">
+          <summary>You scale <code class="inl">postgres</code> from 3 to 1 replicas. Which pods go first and what happens to their PVCs?</summary>
+          <p class="ans"><code class="inl">postgres-2</code>, then <code class="inl">postgres-1</code> (reverse ordinal). Their PVCs <code class="inl">data-postgres-1/2</code> are retained (default <code class="inl">whenScaled: Retain</code>) and reused if you scale up again.</p>
+        </details>
+        <details class="quiz">
+          <summary>A 3-node kind cluster shows node-exporter DESIRED = 2. Why?</summary>
+          <p class="ans">The control-plane node has the taint <code class="inl">node-role.kubernetes.io/control-plane:NoSchedule</code> and the DaemonSet has no matching toleration, so only the 2 workers are eligible.</p>
+        </details>
+        <details class="quiz">
+          <summary>A CronJob with <code class="inl">schedule: "0 2 * * *"</code> and no <code class="inl">timeZone</code> runs at 07:30 IST. Why? And what does <code class="inl">concurrencyPolicy: Forbid</code> do?</summary>
+          <p class="ans">Without <code class="inl">timeZone</code> the schedule uses the controller-manager's zone (UTC); 02:00 UTC = 07:30 IST. Forbid skips a new run while the previous Job is still active.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 15: Kubernetes 7 (topics not yet published).</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/" target="_blank" rel="noopener">Namespaces</a> — initial namespaces, DNS, namespaced vs not.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers</a> — requests, limits, units.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/policy/resource-quotas/" target="_blank" rel="noopener">Resource Quotas</a> and <a href="https://kubernetes.io/docs/concepts/policy/limit-range/" target="_blank" rel="noopener">Limit Ranges</a>.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/" target="_blank" rel="noopener">StatefulSets</a> and <a href="https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/" target="_blank" rel="noopener">DaemonSet</a>.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/" target="_blank" rel="noopener">Jobs</a> and <a href="https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/" target="_blank" rel="noopener">CronJob</a>.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-14.html"><div class="dir">← Previous</div><div class="ttl">Session 14: K8s Troubleshooting</div></a>
+        <a class="next" href="session-16.html"><div class="dir">Next →</div><div class="ttl">Session 16: K8s Security &amp; Scheduling</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 15 — Namespaces, Resources &amp; Workloads</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

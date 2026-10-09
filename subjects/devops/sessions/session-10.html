@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 10 — Kubernetes Pods, ReplicaSets &amp; Deployments</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 10</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 10</span>
+      <h1>Kubernetes Pods, ReplicaSets &amp; Deployments</h1>
+      <p class="lead">
+        Run TaskFlow as a Pod, keep 3 copies alive with a ReplicaSet, then manage it with a Deployment:
+        scale it, roll out a new image with zero downtime, and roll back a bad release in one command.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#pods">Pods</a></li>
+          <li><a href="#lifecycle">Pod lifecycle</a></li>
+          <li><a href="#labels">Labels &amp; selectors</a></li>
+          <li><a href="#replicasets">ReplicaSets</a></li>
+          <li><a href="#deployments">Deployments &amp; scaling</a></li>
+          <li><a href="#rollouts">Rolling updates &amp; rollbacks</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. PODS ===================== -->
+      <section id="pods">
+        <h2><span class="sec-num">1</span> Pods</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A container is a person; a Pod is a small flat. People in the same flat share the address (IP) and the fridge (volumes).</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">Pod</span> is the smallest thing Kubernetes schedules: one or more containers that always run <strong>together on the same node</strong>.</li>
+          <li>Containers in a Pod share one <strong>network namespace</strong> (same IP, talk over <code class="inl">localhost</code>) and can share <strong>volumes</strong>.</li>
+          <li>Pods are <strong>disposable</strong>: if one dies it is not "repaired" — a controller (ReplicaSet/Deployment) makes a <em>new</em> Pod with a new name and IP.</li>
+          <li>Rule of thumb: <strong>one app container per Pod</strong>. Add a second container only if it must live and die with the first (sidecar).</li>
+        </ul>
+
+        <p>One-time setup used on every K8s page (namespaces are covered in Session 15):</p>
+<pre><span class="pr">$</span> minikube start
+<span class="pr">$</span> kubectl create namespace taskflow
+<span class="out">namespace/taskflow created</span>
+<span class="pr">$</span> kubectl config set-context --current --namespace=taskflow   <span class="cm"># so you can skip -n taskflow</span>
+<span class="out">Context "minikube" modified.</span></pre>
+
+        <h3>A single-container Pod</h3>
+        <div class="fname">pod.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1                       <span class="cm"># Pods live in the core API group → just "v1"</span>
+<span class="kw">kind:</span> Pod
+<span class="kw">metadata:</span>
+  name: taskflow-api                  <span class="cm"># unique per namespace, lowercase + digits + '-'</span>
+  namespace: taskflow
+  labels:                             <span class="cm"># tags that selectors match on (§3)</span>
+    app: taskflow
+    tier: api
+<span class="kw">spec:</span>
+  containers:
+    - name: api                       <span class="cm"># container name, used with -c</span>
+      image: shauryav/taskflow-api:1.0.0
+      imagePullPolicy: IfNotPresent   <span class="cm"># pull only if the node doesn't have it</span>
+      ports:
+        - containerPort: <span class="nm">3000</span>           <span class="cm"># documentation + lets Services refer to it</span>
+      env:
+        - name: PORT
+          value: <span class="st">"3000"</span>                 <span class="cm"># env values are always strings → quote numbers</span>
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }   <span class="cm"># reserved by the scheduler</span>
+        limits:   { cpu: 500m, memory: 256Mi }   <span class="cm"># hard cap (memory over → OOMKilled)</span>
+  restartPolicy: Always               <span class="cm"># default; kubelet restarts crashed containers</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">apiVersion: v1</code></td><td>API group/version. Core objects (Pod, Service, ConfigMap) are <code class="inl">v1</code>; Deployment/ReplicaSet are <code class="inl">apps/v1</code>.</td><td>Wrong version → <code class="inl">no matches for kind "Pod" in version ...</code></td></tr>
+              <tr><td><code class="inl">metadata.labels</code></td><td>Key/value tags. Services and controllers find Pods by labels, never by name.</td><td>Keys/values ≤ 63 chars, no spaces.</td></tr>
+              <tr><td><code class="inl">spec.containers[]</code></td><td>List of containers (at least one). Each needs <code class="inl">name</code> + <code class="inl">image</code>.</td><td>It's a list → every item starts with <code class="inl">-</code>.</td></tr>
+              <tr><td><code class="inl">image</code></td><td><code class="inl">registry/user/repo:tag</code>; no registry = Docker Hub.</td><td>No tag = <code class="inl">:latest</code>, which also flips <code class="inl">imagePullPolicy</code> to <code class="inl">Always</code>.</td></tr>
+              <tr><td><code class="inl">imagePullPolicy</code></td><td><code class="inl">IfNotPresent</code> (default for pinned tags) · <code class="inl">Always</code> · <code class="inl">Never</code>.</td><td>Re-pushed the same tag? Nodes with <code class="inl">IfNotPresent</code> keep the old image.</td></tr>
+              <tr><td><code class="inl">containerPort</code></td><td>Port the app listens on. Informational — it does not open or publish anything.</td><td>Unlike Docker <code class="inl">-p</code>, you reach it via a Service (Session 11).</td></tr>
+              <tr><td><code class="inl">resources</code></td><td><code class="inl">requests</code> = guaranteed share used for scheduling; <code class="inl">limits</code> = ceiling. <code class="inl">100m</code> = 0.1 CPU.</td><td>Details + QoS classes in Session 15.</td></tr>
+              <tr><td><code class="inl">restartPolicy</code></td><td>Pod-wide: <code class="inl">Always</code> / <code class="inl">OnFailure</code> / <code class="inl">Never</code> (see §2).</td><td>Deployments only allow <code class="inl">Always</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Create, inspect, debug, delete</h3>
+<pre><span class="pr">$</span> kubectl apply -f pod.yaml
+<span class="out">pod/taskflow-api created</span>
+
+<span class="pr">$</span> kubectl get pods -o wide
+<span class="out">NAME           READY   STATUS    RESTARTS   AGE   IP           NODE       NOMINATED NODE   READINESS GATES
+taskflow-api   1/1     Running   0          25s   10.244.0.5   minikube   &lt;none&gt;           &lt;none&gt;</span>
+
+<span class="pr">$</span> kubectl describe pod taskflow-api        <span class="cm"># trimmed — read the Events at the bottom first</span>
+<span class="out">Name:             taskflow-api
+Namespace:        taskflow
+Node:             minikube/192.168.49.2
+Labels:           app=taskflow
+                  tier=api
+Status:           Running
+IP:               10.244.0.5
+Containers:
+  api:
+    Image:          shauryav/taskflow-api:1.0.0
+    Port:           3000/TCP
+    State:          Running
+      Started:      Fri, 09 Oct 2026 10:15:09 +0530
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:     500m
+      memory:  256Mi
+    Requests:
+      cpu:        100m
+      memory:     128Mi
+QoS Class:        Burstable
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  30s   default-scheduler  Successfully assigned taskflow/taskflow-api to minikube
+  Normal  Pulling    29s   kubelet            Pulling image "shauryav/taskflow-api:1.0.0"
+  Normal  Pulled     23s   kubelet            Successfully pulled image "shauryav/taskflow-api:1.0.0" in 6.1s
+  Normal  Created    23s   kubelet            Created container: api
+  Normal  Started    23s   kubelet            Started container api</span>
+
+<span class="pr">$</span> kubectl logs taskflow-api                <span class="cm"># add -f to follow, --tail=50, --previous after a crash</span>
+<span class="out">TaskFlow API listening on port 3000</span>
+
+<span class="pr">$</span> kubectl exec -it taskflow-api -- sh      <span class="cm"># shell inside the container</span>
+<span class="out">/app $</span> wget -qO- localhost:3000/health
+<span class="out">{"status":"ok"}</span>
+
+<span class="pr">$</span> kubectl port-forward pod/taskflow-api 3000:3000   <span class="cm"># laptop:3000 → pod:3000 (debug only)</span>
+<span class="out">Forwarding from 127.0.0.1:3000 -&gt; 3000</span>
+
+<span class="pr">$</span> kubectl delete pod taskflow-api          <span class="cm"># or: kubectl delete -f pod.yaml</span>
+<span class="out">pod "taskflow-api" deleted</span></pre>
+
+        <h3>Multi-container Pod (sidecar)</h3>
+        <p>The API writes its log file to a shared <code class="inl">emptyDir</code> volume; a <span class="term">sidecar</span> streams it. Both containers also share <code class="inl">localhost</code>.</p>
+        <div class="fname">sidecar-pod.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Pod
+<span class="kw">metadata:</span>
+  name: taskflow-api-logs
+  labels:
+    app: taskflow-demo                <span class="cm"># deliberately NOT app=taskflow (see §4 adoption gotcha)</span>
+<span class="kw">spec:</span>
+  volumes:
+    - name: logs
+      emptyDir: {}                    <span class="cm"># scratch dir, lives as long as the Pod</span>
+  containers:
+    - name: api                       <span class="cm"># main container</span>
+      image: shauryav/taskflow-api:1.0.0
+      env:
+        - name: LOG_FILE              <span class="cm"># TaskFlow also writes logs here when set</span>
+          value: /var/log/taskflow/app.log
+      ports:
+        - containerPort: <span class="nm">3000</span>
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/taskflow
+    - name: log-agent                 <span class="cm"># sidecar: stands in for fluent-bit / a log shipper</span>
+      image: busybox:1.36
+      command: [<span class="st">"sh"</span>, <span class="st">"-c"</span>, <span class="st">"tail -n+1 -F /var/log/taskflow/app.log"</span>]
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/taskflow
+          readOnly: true</pre>
+<pre><span class="pr">$</span> kubectl apply -f sidecar-pod.yaml
+<span class="out">pod/taskflow-api-logs created</span>
+<span class="pr">$</span> kubectl get pod taskflow-api-logs
+<span class="out">NAME                READY   STATUS    RESTARTS   AGE
+taskflow-api-logs   2/2     Running   0          12s</span>          <span class="cm"># 2/2 = both containers ready</span>
+<span class="pr">$</span> kubectl logs taskflow-api-logs
+<span class="out">Defaulted container "api" out of: api, log-agent</span>      <span class="cm"># always pass -c with multi-container pods</span>
+<span class="out">TaskFlow API listening on port 3000</span>
+<span class="pr">$</span> kubectl logs taskflow-api-logs -c log-agent             <span class="cm"># the sidecar is reading the shared file</span>
+<span class="out">TaskFlow API listening on port 3000</span>
+<span class="pr">$</span> kubectl exec taskflow-api-logs -c log-agent -- wget -qO- localhost:3000/health
+<span class="out">{"status":"ok"}</span>                                 <span class="cm"># busybox reached the api via localhost</span></pre>
+
+        <div class="callout note">
+          <span class="c-title">Native sidecars (K8s 1.33+, GA)</span>
+          <p>You can declare a sidecar under <code class="inl">initContainers</code> with <code class="inl">restartPolicy: Always</code>. It then starts <em>before</em> and stops <em>after</em> the main container — useful for log shippers and proxies.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Putting the API and Postgres in one Pod. You can't scale them separately and a DB restart kills the API. Use two Pods + a Service.</li>
+            <li>Two containers in one Pod both listening on port 3000 → second one fails with <code class="inl">EADDRINUSE</code> (shared network namespace).</li>
+            <li>Creating bare Pods for real workloads. Nothing recreates them if the node dies — use a Deployment (§5).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Pod = 1+ containers sharing IP, localhost and volumes, scheduled together. Pods are cattle: replaced, never repaired.
+          Core loop: <code class="inl">apply → get -o wide → describe → logs → exec → delete</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 2. LIFECYCLE ===================== -->
+      <section id="lifecycle">
+        <h2><span class="sec-num">2</span> Pod lifecycle</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The Pod has a big status on its door (phase); each container inside has its own small mood (state).</p>
+        </div>
+
+        <h3>Pod phases (<code class="inl">.status.phase</code>)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Phase</th><th>Meaning</th><th>Typical cause</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Pending</strong></td><td>Accepted by the API server, but not all containers are running yet.</td><td>Waiting for a node (scheduling), pulling images, running init containers.</td></tr>
+              <tr><td><strong>Running</strong></td><td>Bound to a node, all containers created, at least one running (or restarting).</td><td>Normal state for servers like TaskFlow.</td></tr>
+              <tr><td><strong>Succeeded</strong></td><td>All containers exited with code 0 and won't restart.</td><td>A finished Job (Session 15).</td></tr>
+              <tr><td><strong>Failed</strong></td><td>All containers stopped, at least one with non-zero exit / killed, no restart.</td><td><code class="inl">restartPolicy: Never</code> + app error.</td></tr>
+              <tr><td><strong>Unknown</strong></td><td>Control plane can't get the Pod's state.</td><td>Node lost contact (kubelet down, network split).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Container states</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>State</th><th>Reasons you'll see in STATUS</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Waiting</strong></td><td><code class="inl">ContainerCreating</code>, <code class="inl">PodInitializing</code>, <code class="inl">ErrImagePull</code>, <code class="inl">ImagePullBackOff</code>, <code class="inl">CrashLoopBackOff</code>, <code class="inl">CreateContainerConfigError</code></td><td>Not running yet (or waiting between restarts).</td></tr>
+              <tr><td><strong>Running</strong></td><td><code class="inl">Running</code></td><td>Process is up; <code class="inl">describe</code> shows <code class="inl">Started:</code> time.</td></tr>
+              <tr><td><strong>Terminated</strong></td><td><code class="inl">Completed</code> (exit 0), <code class="inl">Error</code> (non-zero), <code class="inl">OOMKilled</code> (137)</td><td>Process ended; exit code + reason recorded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: STATUS column ≠ phase</span>
+<pre><span class="pr">$</span> kubectl get pod taskflow-api
+<span class="out">NAME           READY   STATUS             RESTARTS      AGE
+taskflow-api   0/1     CrashLoopBackOff   4 (30s ago)   3m</span>
+<span class="pr">$</span> kubectl get pod taskflow-api -o jsonpath='{.status.phase}'
+<span class="out">Running</span></pre>
+          <p>STATUS shows the most interesting <em>container</em> reason. The phase is still <code class="inl">Running</code> because the kubelet keeps restarting it. <code class="inl">Terminating</code> is also not a phase.</p>
+        </div>
+
+        <h3>restartPolicy and back-off</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>restartPolicy</th><th>Restarts container when…</th><th>Used by</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Always</code> (default)</td><td>it exits for any reason</td><td>Deployments, ReplicaSets, DaemonSets (only value allowed)</td></tr>
+              <tr><td><code class="inl">OnFailure</code></td><td>it exits non-zero</td><td>Jobs that should retry</td></tr>
+              <tr><td><code class="inl">Never</code></td><td>never</td><td>Jobs, one-off debug Pods</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li>Restarts happen <strong>in the same Pod</strong> on the same node (RESTARTS goes up, name/IP stay).</li>
+          <li>Delay between restarts doubles: 10s, 20s, 40s … capped at 5 min = <code class="inl">CrashLoopBackOff</code>. Reset after 10 min of running fine.</li>
+        </ul>
+
+        <h3>Init containers</h3>
+        <p>Run <strong>to completion, in order, before</strong> app containers start. Classic use: wait for the database.</p>
+        <div class="fname">pod-with-init.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Pod
+<span class="kw">metadata:</span>
+  name: taskflow-api-init
+  labels:
+    app: taskflow-demo
+<span class="kw">spec:</span>
+  initContainers:                     <span class="cm"># all must exit 0 before "containers" start</span>
+    - name: wait-for-db
+      image: postgres:16-alpine       <span class="cm"># only for its pg_isready binary</span>
+      command: [<span class="st">"sh"</span>, <span class="st">"-c"</span>,
+        <span class="st">"until pg_isready -h taskflow-db -p 5432; do echo waiting for db; sleep 2; done"</span>]
+  containers:
+    - name: api
+      image: shauryav/taskflow-api:1.0.0
+      ports:
+        - containerPort: <span class="nm">3000</span></pre>
+<pre><span class="pr">$</span> kubectl get pod taskflow-api-init -w
+<span class="out">NAME                READY   STATUS            RESTARTS   AGE
+taskflow-api-init   0/1     Init:0/1          0          5s     </span><span class="cm"># 0 of 1 init containers done</span><span class="out">
+taskflow-api-init   0/1     PodInitializing   0          41s
+taskflow-api-init   1/1     Running           0          43s</span>
+<span class="pr">$</span> kubectl logs taskflow-api-init -c wait-for-db
+<span class="out">taskflow-db:5432 - no response
+waiting for db
+taskflow-db:5432 - accepting connections</span></pre>
+        <p><code class="inl">taskflow-db</code> is a Service name — it resolves once the DB Service exists (Session 11).</p>
+
+        <h3>Graceful termination</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">🗑️</div><div class="s-t">1. delete</div><div class="s-d">Pod → Terminating, removed from Service endpoints</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🪝</div><div class="s-t">2. preStop hook</div><div class="s-d">optional, e.g. <code class="inl">sleep 5</code></div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✋</div><div class="s-t">3. SIGTERM</div><div class="s-d">sent to PID 1 of each container</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⏳</div><div class="s-t">4. grace period</div><div class="s-d"><code class="inl">terminationGracePeriodSeconds</code> (default 30)</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">💀</div><div class="s-t">5. SIGKILL</div><div class="s-d">if still alive; exit 137</div></div>
+        </div>
+        <p>TaskFlow should finish in-flight requests on SIGTERM:</p>
+        <div class="fname">server.js (excerpt)</div>
+<pre>process.on(<span class="st">'SIGTERM'</span>, () =&gt; {
+  console.log(<span class="st">'SIGTERM received, closing server'</span>);
+  server.close(() =&gt; process.exit(<span class="nm">0</span>));   <span class="cm">// stop accepting, finish open requests, exit 0</span>
+});</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">CMD npm start</code> (shell form) → <code class="inl">sh</code> is PID 1, Node never sees SIGTERM, every delete waits the full 30 s then SIGKILLs. Use exec form <code class="inl">CMD ["node","server.js"]</code> (Session 7).</li>
+            <li><code class="inl">kubectl delete pod x --grace-period=0 --force</code> skips all of this. Only for stuck Pods on dead nodes.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Phases: Pending → Running → Succeeded/Failed (+ Unknown). Container states: Waiting / Running / Terminated with reasons.
+          Init containers gate startup. Termination = SIGTERM → 30 s grace → SIGKILL.
+        </div>
+      </section>
+
+      <!-- ===================== 3. LABELS ===================== -->
+      <section id="labels">
+        <h2><span class="sec-num">3</span> Labels &amp; selectors</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Labels are name stickers; a selector is "everyone wearing a red sticker, step forward".</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">label</span> is a key/value pair on any object: <code class="inl">app=taskflow</code>, <code class="inl">tier=api</code>, <code class="inl">env=dev</code>.</li>
+          <li>A <span class="term">selector</span> is a query over labels. ReplicaSets, Deployments, Services and NetworkPolicies all find their Pods this way — that's the glue of Kubernetes.</li>
+          <li><span class="term">Annotations</span> are also key/values but are <em>not</em> selectable — for notes like <code class="inl">kubernetes.io/change-cause</code> (§6).</li>
+        </ul>
+
+<pre><span class="pr">$</span> kubectl apply -f pod.yaml
+<span class="pr">$</span> kubectl run taskflow-web --image=nginx:1.27-alpine --labels="app=taskflow,tier=web"
+<span class="out">pod/taskflow-web created</span>
+
+<span class="pr">$</span> kubectl get pods --show-labels
+<span class="out">NAME           READY   STATUS    RESTARTS   AGE   LABELS
+taskflow-api   1/1     Running   0          2m    app=taskflow,tier=api
+taskflow-web   1/1     Running   0          10s   app=taskflow,tier=web</span>
+
+<span class="pr">$</span> kubectl label pod taskflow-api env=dev                <span class="cm"># add</span>
+<span class="out">pod/taskflow-api labeled</span>
+<span class="pr">$</span> kubectl label pod taskflow-api env=prod --overwrite    <span class="cm"># change (needs --overwrite)</span>
+<span class="out">pod/taskflow-api labeled</span>
+<span class="pr">$</span> kubectl label pod taskflow-api env-                   <span class="cm"># remove: key followed by '-'</span>
+<span class="out">pod/taskflow-api unlabeled</span>
+
+<span class="pr">$</span> kubectl get pods -l app=taskflow,tier=api             <span class="cm"># comma = AND</span>
+<span class="out">NAME           READY   STATUS    RESTARTS   AGE
+taskflow-api   1/1     Running   0          3m</span>
+<span class="pr">$</span> kubectl get pods -l 'tier in (api,web)'               <span class="cm"># set-based; quote it for the shell</span>
+<span class="pr">$</span> kubectl get pods -l 'tier!=web'
+<span class="pr">$</span> kubectl get pods -l '!env'                            <span class="cm"># pods WITHOUT an env label</span>
+<span class="pr">$</span> kubectl get pods -L tier                              <span class="cm"># show label as a column</span>
+<span class="out">NAME           READY   STATUS    RESTARTS   AGE   TIER
+taskflow-api   1/1     Running   0          3m    api
+taskflow-web   1/1     Running   0          1m    web</span>
+<span class="pr">$</span> kubectl delete pods -l app=taskflow                   <span class="cm"># bulk delete by label</span>
+<span class="out">pod "taskflow-api" deleted
+pod "taskflow-web" deleted</span></pre>
+
+        <h3>matchLabels vs matchExpressions (in YAML)</h3>
+<pre>selector:
+  matchLabels:                 <span class="cm"># equality: app == taskflow AND tier == api</span>
+    app: taskflow
+    tier: api
+  matchExpressions:            <span class="cm"># set-based; ANDed with matchLabels</span>
+    - { key: env,    operator: In,     values: [dev, staging] }
+    - { key: track,  operator: NotIn,  values: [canary] }
+    - { key: team,   operator: Exists }          <span class="cm"># no values for Exists / DoesNotExist</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Form</th><th>Operators</th><th>kubectl equivalent</th><th>Supported by</th></tr></thead>
+            <tbody>
+              <tr><td>Equality-based (<code class="inl">matchLabels</code>)</td><td><code class="inl">=</code>, <code class="inl">==</code>, <code class="inl">!=</code></td><td><code class="inl">-l app=taskflow,tier!=web</code></td><td>Everything, incl. <strong>Services</strong> (plain map only)</td></tr>
+              <tr><td>Set-based (<code class="inl">matchExpressions</code>)</td><td><code class="inl">In</code>, <code class="inl">NotIn</code>, <code class="inl">Exists</code>, <code class="inl">DoesNotExist</code></td><td><code class="inl">-l 'env in (dev,staging)'</code>, <code class="inl">-l '!env'</code></td><td>ReplicaSet, Deployment, Job, DaemonSet, NetworkPolicy — <em>not</em> Service</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Use the same small label set everywhere (<code class="inl">app</code>, <code class="inl">tier</code>, optionally <code class="inl">env</code>/<code class="inl">version</code>). The official recommended keys are <code class="inl">app.kubernetes.io/name</code>, <code class="inl">app.kubernetes.io/component</code>, etc. — Helm charts use them (Session 17).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Labels tag objects; selectors query them (<code class="inl">-l</code> on the CLI, <code class="inl">matchLabels</code>/<code class="inl">matchExpressions</code> in YAML).
+          Controllers and Services own Pods purely through label matches.
+        </div>
+      </section>
+
+      <!-- ===================== 4. REPLICASETS ===================== -->
+      <section id="replicasets">
+        <h2><span class="sec-num">4</span> ReplicaSets</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A ReplicaSet is a teacher counting heads: "I need 3 kids wearing the taskflow sticker". One leaves, she fetches another.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">ReplicaSet</span> (RS) keeps exactly <code class="inl">replicas</code> Pods matching its <code class="inl">selector</code> running, creating Pods from its <code class="inl">template</code>.</li>
+          <li>It runs a reconciliation loop: <em>count matching Pods → compare with desired → create or delete</em>. That's self-healing.</li>
+        </ul>
+
+        <div class="fname">replicaset.yaml</div>
+<pre><span class="kw">apiVersion:</span> apps/v1                  <span class="cm"># workload controllers live in the "apps" group</span>
+<span class="kw">kind:</span> ReplicaSet
+<span class="kw">metadata:</span>
+  name: taskflow-api-rs
+<span class="kw">spec:</span>
+  replicas: <span class="nm">3</span>                         <span class="cm"># desired number of Pods</span>
+  selector:                           <span class="cm"># which Pods this RS counts as "mine"</span>
+    matchLabels:
+      app: taskflow
+      tier: api
+  template:                           <span class="cm"># Pod blueprint used when it must create one</span>
+    metadata:
+      labels:                         <span class="cm"># MUST satisfy the selector above</span>
+        app: taskflow
+        tier: api
+    spec:
+      containers:
+        - name: api
+          image: shauryav/taskflow-api:1.0.0
+          ports:
+            - containerPort: <span class="nm">3000</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">spec.replicas</code></td><td>Desired count (default 1).</td></tr>
+              <tr><td><code class="inl">spec.selector</code></td><td>Label query defining ownership. Required in <code class="inl">apps/v1</code>.</td></tr>
+              <tr><td><code class="inl">spec.template</code></td><td>A full Pod spec minus <code class="inl">apiVersion</code>/<code class="inl">kind</code>; its Pods get names <code class="inl">&lt;rs-name&gt;-&lt;5 random chars&gt;</code>.</td></tr>
+              <tr><td><code class="inl">template.metadata.labels</code></td><td>Must match the selector, otherwise the API rejects the object (below).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Self-healing demo</h3>
+<pre><span class="pr">$</span> kubectl apply -f replicaset.yaml
+<span class="out">replicaset.apps/taskflow-api-rs created</span>
+<span class="pr">$</span> kubectl get rs,pods
+<span class="out">NAME                              DESIRED   CURRENT   READY   AGE
+replicaset.apps/taskflow-api-rs   3         3         3       20s
+
+NAME                        READY   STATUS    RESTARTS   AGE
+pod/taskflow-api-rs-7xkq2   1/1     Running   0          20s
+pod/taskflow-api-rs-d4f9w   1/1     Running   0          20s
+pod/taskflow-api-rs-m8hzt   1/1     Running   0          20s</span>
+
+<span class="pr">$</span> kubectl delete pod taskflow-api-rs-7xkq2     <span class="cm"># simulate a crash / lost node</span>
+<span class="out">pod "taskflow-api-rs-7xkq2" deleted</span>
+<span class="pr">$</span> kubectl get pods
+<span class="out">NAME                    READY   STATUS    RESTARTS   AGE
+taskflow-api-rs-d4f9w   1/1     Running   0          2m
+taskflow-api-rs-m8hzt   1/1     Running   0          2m
+taskflow-api-rs-q2vbn   1/1     Running   0          4s</span>      <span class="cm"># brand-new Pod, new name, new IP</span>
+
+<span class="pr">$</span> kubectl describe rs taskflow-api-rs | tail -3
+<span class="out">  Normal  SuccessfulCreate  2m    replicaset-controller  Created pod: taskflow-api-rs-m8hzt
+  Normal  SuccessfulCreate  4s    replicaset-controller  Created pod: taskflow-api-rs-q2vbn</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: why you don't create ReplicaSets directly</span>
+<pre><span class="pr">$</span> kubectl set image rs/taskflow-api-rs api=shauryav/taskflow-api:1.1.0
+<span class="out">replicaset.apps/taskflow-api-rs image updated</span>
+<span class="pr">$</span> kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.containers[0].image}{"\n"}{end}'
+<span class="out">taskflow-api-rs-d4f9w  shauryav/taskflow-api:1.0.0
+taskflow-api-rs-m8hzt  shauryav/taskflow-api:1.0.0
+taskflow-api-rs-q2vbn  shauryav/taskflow-api:1.0.0</span></pre>
+          <p>Nothing changed: an RS only uses the template for <em>new</em> Pods. No rolling update, no history, no rollback.
+          A <strong>Deployment</strong> adds all of that by managing ReplicaSets for you. Clean up: <code class="inl">kubectl delete rs taskflow-api-rs</code> (deletes its Pods too; <code class="inl">--cascade=orphan</code> keeps them).</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Template labels don't match the selector:<br /><code class="inl">The ReplicaSet "taskflow-api-rs" is invalid: spec.template.metadata.labels: Invalid value: ...: `selector` does not match template `labels`</code></li>
+            <li><strong>Adoption:</strong> a leftover bare Pod with <code class="inl">app=taskflow,tier=api</code> (from §1) is adopted by the RS, so you see it plus only 2 new Pods. Selectors match <em>any</em> Pod with those labels, not just ones the RS created.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          RS = selector + replicas + template; it replaces deleted Pods. It can't roll out a new version, so you always use it <em>through</em> a Deployment.
+        </div>
+      </section>
+
+      <!-- ===================== 5. DEPLOYMENTS ===================== -->
+      <section id="deployments">
+        <h2><span class="sec-num">5</span> Deployments &amp; scaling</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The Deployment is the principal: she tells a teacher (ReplicaSet) how many kids to keep, and swaps in a new teacher when the rules change.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">Deployment</span> manages ReplicaSets, which manage Pods. You only ever edit the Deployment.</li>
+          <li>Every change to <code class="inl">spec.template</code> (image, env, resources, template labels) creates a <strong>new ReplicaSet</strong> = a new <span class="term">revision</span>. Changing <code class="inl">replicas</code> does not.</li>
+        </ul>
+
+        <div class="fname">k8s/deployment.yaml</div>
+<pre><span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app: taskflow
+    tier: api
+  annotations:
+    kubernetes.io/change-cause: <span class="st">"deploy 1.0.0"</span>   <span class="cm"># shown in rollout history (§6)</span>
+<span class="kw">spec:</span>
+  replicas: <span class="nm">3</span>
+  revisionHistoryLimit: <span class="nm">10</span>             <span class="cm"># old ReplicaSets kept for rollback (default 10)</span>
+  selector:                           <span class="cm"># immutable after creation</span>
+    matchLabels:
+      app: taskflow
+      tier: api
+  strategy:
+    type: RollingUpdate               <span class="cm"># default; alternative: Recreate</span>
+    rollingUpdate:
+      maxSurge: <span class="nm">1</span>                     <span class="cm"># at most 1 Pod ABOVE replicas during an update</span>
+      maxUnavailable: <span class="nm">0</span>               <span class="cm"># never go BELOW replicas ready → zero downtime</span>
+  minReadySeconds: <span class="nm">5</span>                  <span class="cm"># Pod must be Ready 5s before it counts as Available</span>
+  progressDeadlineSeconds: <span class="nm">600</span>        <span class="cm"># mark rollout failed after 10 min without progress</span>
+  template:
+    metadata:
+      labels:
+        app: taskflow
+        tier: api
+    spec:
+      terminationGracePeriodSeconds: <span class="nm">30</span>
+      containers:
+        - name: api
+          image: shauryav/taskflow-api:1.0.0
+          ports:
+            - name: http                    <span class="cm"># named port, used by the Service (Session 11)</span>
+              containerPort: <span class="nm">3000</span>
+          env:
+            - name: PORT
+              value: <span class="st">"3000"</span>
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          readinessProbe:                   <span class="cm"># Pod gets traffic only after /health answers (details: Session 13)</span>
+            httpGet: { path: /health, port: http }
+            periodSeconds: <span class="nm">5</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>What it does</th><th>Why it matters</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">replicas</code></td><td>Desired Pod count.</td><td>Leave it out if an HPA controls scaling (Session 13).</td></tr>
+              <tr><td><code class="inl">revisionHistoryLimit</code></td><td>How many old (scaled-to-0) ReplicaSets to keep.</td><td>Each kept RS is a rollback target. 0 = no rollback.</td></tr>
+              <tr><td><code class="inl">selector</code></td><td>Which Pods belong to this Deployment.</td><td>Immutable in <code class="inl">apps/v1</code>; changing it = delete + recreate.</td></tr>
+              <tr><td><code class="inl">strategy</code></td><td>How old Pods are replaced (§6).</td><td><code class="inl">maxSurge</code>/<code class="inl">maxUnavailable</code> default to 25% each.</td></tr>
+              <tr><td><code class="inl">minReadySeconds</code></td><td>Extra wait before a ready Pod is "available".</td><td>Catches Pods that pass readiness then crash a second later.</td></tr>
+              <tr><td><code class="inl">progressDeadlineSeconds</code></td><td>Rollout timeout.</td><td>After it, <code class="inl">rollout status</code> exits non-zero → CI can fail the deploy.</td></tr>
+              <tr><td><code class="inl">template</code></td><td>The Pod spec. Any change here = new revision.</td><td>Same fields as <code class="inl">pod.yaml</code>.</td></tr>
+              <tr><td><code class="inl">readinessProbe</code></td><td>Health check deciding "ready for traffic".</td><td>Without it, a rolling update treats "container started" as ready.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl delete pods,rs --all                  <span class="cm"># clear demo objects from §1–4 first</span>
+<span class="pr">$</span> kubectl apply -f k8s/deployment.yaml
+<span class="out">deployment.apps/taskflow-api created</span>
+<span class="pr">$</span> kubectl get deploy,rs,pods
+<span class="out">NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/taskflow-api   3/3     3            3           40s
+
+NAME                                      DESIRED   CURRENT   READY   AGE
+replicaset.apps/taskflow-api-6d8f7c9b5d   3         3         3       40s
+
+NAME                                READY   STATUS    RESTARTS   AGE
+pod/taskflow-api-6d8f7c9b5d-2xkqp   1/1     Running   0          40s
+pod/taskflow-api-6d8f7c9b5d-9hj4w   1/1     Running   0          40s
+pod/taskflow-api-6d8f7c9b5d-tz8mn   1/1     Running   0          40s</span></pre>
+
+        <p>Reading the names: <code class="inl">taskflow-api</code> (Deployment) → <code class="inl">-6d8f7c9b5d</code> (<code class="inl">pod-template-hash</code> of the template = the RS) → <code class="inl">-2xkqp</code> (random Pod suffix).</p>
+<pre>Deployment  taskflow-api                       <span class="cm"># you edit this: replicas, strategy, template</span>
+   └── ReplicaSet  taskflow-api-6d8f7c9b5d     <span class="cm"># one per template version (revision)</span>
+          ├── Pod  taskflow-api-6d8f7c9b5d-2xkqp
+          ├── Pod  taskflow-api-6d8f7c9b5d-9hj4w
+          └── Pod  taskflow-api-6d8f7c9b5d-tz8mn</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Column (<code class="inl">get deploy</code>)</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>READY</td><td>ready Pods / desired replicas</td></tr>
+              <tr><td>UP-TO-DATE</td><td>Pods running the <em>latest</em> template</td></tr>
+              <tr><td>AVAILABLE</td><td>Pods ready for at least <code class="inl">minReadySeconds</code> — what users can actually hit</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> kubectl get pod taskflow-api-6d8f7c9b5d-2xkqp -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}'
+<span class="out">ReplicaSet/taskflow-api-6d8f7c9b5d</span></pre>
+
+        <h3>Scaling</h3>
+<pre><span class="pr">$</span> kubectl scale deployment taskflow-api --replicas=5     <span class="cm"># imperative</span>
+<span class="out">deployment.apps/taskflow-api scaled</span>
+<span class="pr">$</span> kubectl get deploy,rs
+<span class="out">NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/taskflow-api   5/5     5            5           6m
+
+NAME                                      DESIRED   CURRENT   READY   AGE
+replicaset.apps/taskflow-api-6d8f7c9b5d   5         5         5       6m</span>   <span class="cm"># same RS → scaling is not a rollout</span>
+
+<span class="cm"># declarative: the file still says "replicas: 3" — apply it (or edit the number first)</span>
+<span class="pr">$</span> kubectl apply -f k8s/deployment.yaml
+<span class="out">deployment.apps/taskflow-api configured</span>
+<span class="pr">$</span> kubectl get pods -l app=taskflow
+<span class="out">NAME                            READY   STATUS        RESTARTS   AGE
+taskflow-api-6d8f7c9b5d-2xkqp   1/1     Running       0          7m
+taskflow-api-6d8f7c9b5d-9hj4w   1/1     Running       0          7m
+taskflow-api-6d8f7c9b5d-tz8mn   1/1     Running       0          7m
+taskflow-api-6d8f7c9b5d-r5wpl   1/1     Terminating   0          1m
+taskflow-api-6d8f7c9b5d-hv6kd   1/1     Terminating   0          1m</span>     <span class="cm"># back to 3: newest Pods removed first</span></pre>
+        <p><code class="inl">kubectl scale deployment taskflow-api --replicas=0</code> stops every Pod but keeps the Deployment (handy to "switch off" an app).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>That's exactly what just happened: <code class="inl">kubectl scale</code> to 5, then <code class="inl">kubectl apply -f</code> with <code class="inl">replicas: 3</code> → silently back to 3. Make the YAML in Git the source of truth (edit the number, then apply); with an HPA, remove <code class="inl">replicas</code> from the YAML entirely.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deployment → ReplicaSet (one per template version) → Pods. Scale with <code class="inl">kubectl scale</code> or by editing <code class="inl">replicas</code> + <code class="inl">apply</code>; scaling reuses the same RS.
+        </div>
+      </section>
+
+      <!-- ===================== 6. ROLLOUTS ===================== -->
+      <section id="rollouts">
+        <h2><span class="sec-num">6</span> Rolling updates &amp; rollbacks</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Changing the team one player at a time so there are always enough on the field — and calling the old players back if the new one trips.</p>
+        </div>
+
+        <h3>maxSurge and maxUnavailable, with numbers</h3>
+        <ul>
+          <li><strong>maxSurge</strong>: how many Pods may exist <em>above</em> <code class="inl">replicas</code> during the update (percent rounds <strong>up</strong>).</li>
+          <li><strong>maxUnavailable</strong>: how many may be <em>missing</em> below <code class="inl">replicas</code> (percent rounds <strong>down</strong>). Both can't be 0.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>replicas</th><th>maxSurge</th><th>maxUnavailable</th><th>Max Pods at once</th><th>Min available</th><th>Character</th></tr></thead>
+            <tbody>
+              <tr><td>3</td><td>1</td><td>0</td><td>4</td><td>3</td><td>TaskFlow: zero downtime, one at a time</td></tr>
+              <tr><td>4</td><td>25% → 1</td><td>25% → 1</td><td>5</td><td>3</td><td>Defaults</td></tr>
+              <tr><td>10</td><td>25% → 3 (2.5 up)</td><td>25% → 2 (2.5 down)</td><td>13</td><td>8</td><td>Defaults, bigger app</td></tr>
+              <tr><td>3</td><td>0</td><td>1</td><td>3</td><td>2</td><td>No spare cluster capacity needed</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Roll out 1.1.0</h3>
+<pre><span class="pr">$</span> kubectl set image deployment/taskflow-api api=shauryav/taskflow-api:1.1.0   <span class="cm"># container=image</span>
+<span class="out">deployment.apps/taskflow-api image updated</span>
+<span class="pr">$</span> kubectl annotate deployment/taskflow-api kubernetes.io/change-cause="upgrade to 1.1.0" --overwrite
+<span class="out">deployment.apps/taskflow-api annotated</span>
+
+<span class="pr">$</span> kubectl rollout status deployment/taskflow-api     <span class="cm"># blocks until done; exit code 0/1 — use it in CI</span>
+<span class="out">Waiting for deployment "taskflow-api" rollout to finish: 1 out of 3 new replicas have been updated...
+Waiting for deployment "taskflow-api" rollout to finish: 2 out of 3 new replicas have been updated...
+Waiting for deployment "taskflow-api" rollout to finish: 1 old replicas are pending termination...
+deployment "taskflow-api" successfully rolled out</span></pre>
+        <p>Meanwhile in another terminal (maxSurge 1, maxUnavailable 0 → new Pod must be Ready before an old one goes):</p>
+<pre><span class="pr">$</span> kubectl get pods -l app=taskflow -w
+<span class="out">NAME                            READY   STATUS              RESTARTS   AGE
+taskflow-api-6d8f7c9b5d-2xkqp   1/1     Running             0          12m
+taskflow-api-6d8f7c9b5d-9hj4w   1/1     Running             0          12m
+taskflow-api-6d8f7c9b5d-tz8mn   1/1     Running             0          12m
+taskflow-api-5b9c4f7d8b-w7hzk   0/1     ContainerCreating   0          1s
+taskflow-api-5b9c4f7d8b-w7hzk   0/1     Running             0          3s
+taskflow-api-5b9c4f7d8b-w7hzk   1/1     Running             0          8s
+taskflow-api-6d8f7c9b5d-2xkqp   1/1     Terminating         0          12m
+taskflow-api-5b9c4f7d8b-fq5rl   0/1     ContainerCreating   0          0s
+...</span>
+<span class="pr">$</span> kubectl get rs
+<span class="out">NAME                      DESIRED   CURRENT   READY   AGE
+taskflow-api-5b9c4f7d8b   3         3         3       70s     </span><span class="cm"># new RS = revision 2</span><span class="out">
+taskflow-api-6d8f7c9b5d   0         0         0       13m     </span><span class="cm"># old RS kept at 0 for rollback</span></pre>
+
+        <h3>A bad release and the rollback</h3>
+<pre><span class="pr">$</span> kubectl set image deployment/taskflow-api api=shauryav/taskflow-api:1.2.0    <span class="cm"># tag never pushed</span>
+<span class="pr">$</span> kubectl annotate deployment/taskflow-api kubernetes.io/change-cause="upgrade to 1.2.0" --overwrite
+<span class="pr">$</span> kubectl get pods
+<span class="out">NAME                            READY   STATUS             RESTARTS   AGE
+taskflow-api-5b9c4f7d8b-fq5rl   1/1     Running            0          20m
+taskflow-api-5b9c4f7d8b-k8mzt   1/1     Running            0          20m
+taskflow-api-5b9c4f7d8b-w7hzk   1/1     Running            0          20m
+taskflow-api-79c6d4b8f5-zx9qm   0/1     ImagePullBackOff   0          90s</span>   <span class="cm"># users unaffected: maxUnavailable 0</span>
+<span class="pr">$</span> kubectl rollout status deployment/taskflow-api
+<span class="out">Waiting for deployment "taskflow-api" rollout to finish: 1 out of 3 new replicas have been updated...
+error: deployment "taskflow-api" exceeded its progress deadline</span>
+
+<span class="pr">$</span> kubectl rollout history deployment/taskflow-api
+<span class="out">deployment.apps/taskflow-api
+REVISION  CHANGE-CAUSE
+1         deploy 1.0.0
+2         upgrade to 1.1.0
+3         upgrade to 1.2.0</span>
+<span class="pr">$</span> kubectl rollout history deployment/taskflow-api --revision=2     <span class="cm"># inspect a revision's template</span>
+<span class="out">deployment.apps/taskflow-api with revision #2
+Pod Template:
+  Labels:       app=taskflow
+                pod-template-hash=5b9c4f7d8b
+                tier=api
+  Containers:
+   api:
+    Image:      shauryav/taskflow-api:1.1.0</span>
+
+<span class="pr">$</span> kubectl rollout undo deployment/taskflow-api                    <span class="cm"># back to the previous revision</span>
+<span class="out">deployment.apps/taskflow-api rolled back</span>
+<span class="pr">$</span> kubectl rollout history deployment/taskflow-api
+<span class="out">deployment.apps/taskflow-api
+REVISION  CHANGE-CAUSE
+1         deploy 1.0.0
+3         upgrade to 1.2.0
+4         upgrade to 1.1.0</span>       <span class="cm"># rev 2 was re-used and renumbered as 4</span>
+<span class="pr">$</span> kubectl rollout undo deployment/taskflow-api --to-revision=1     <span class="cm"># jump to a specific one</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: pause, batch changes, resume, restart</span>
+<pre><span class="pr">$</span> kubectl rollout pause deployment/taskflow-api
+<span class="out">deployment.apps/taskflow-api paused</span>
+<span class="pr">$</span> kubectl set image deployment/taskflow-api api=shauryav/taskflow-api:1.1.1
+<span class="pr">$</span> kubectl set resources deployment/taskflow-api -c api --limits=memory=512Mi
+<span class="pr">$</span> kubectl rollout resume deployment/taskflow-api      <span class="cm"># ONE rollout for both changes</span>
+<span class="out">deployment.apps/taskflow-api resumed</span>
+<span class="pr">$</span> kubectl rollout restart deployment/taskflow-api     <span class="cm"># same image, fresh Pods (e.g. after a ConfigMap change)</span>
+<span class="out">deployment.apps/taskflow-api restarted</span></pre>
+          <p><code class="inl">restart</code> works by stamping a <code class="inl">kubectl.kubernetes.io/restartedAt</code> annotation on the template → new revision, normal rolling update.</p>
+        </div>
+
+        <h3>RollingUpdate vs Recreate</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>RollingUpdate (default)</th><th>Recreate</th></tr></thead>
+            <tbody>
+              <tr><td>How</td><td>New Pods up gradually, old ones down gradually</td><td>Kill <strong>all</strong> old Pods, then start new ones</td></tr>
+              <tr><td>Downtime</td><td>None (with readiness probes)</td><td>Yes, between old down and new ready</td></tr>
+              <tr><td>Two versions live at once?</td><td>Yes, briefly — app/API/DB schema must be backward compatible</td><td>Never</td></tr>
+              <tr><td>Extra capacity</td><td>Up to <code class="inl">maxSurge</code> Pods</td><td>None</td></tr>
+              <tr><td>Use for</td><td>Stateless web/API services (TaskFlow API)</td><td>Apps that can't run two versions together, single-writer volumes</td></tr>
+              <tr><td>YAML</td><td><code class="inl">type: RollingUpdate</code> + <code class="inl">rollingUpdate:</code> block</td><td><code class="inl">strategy: { type: Recreate }</code> (no rollingUpdate block)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">--record</code> is deprecated — use the <code class="inl">kubernetes.io/change-cause</code> annotation (best: set it in the YAML next to the image).</li>
+            <li><code class="inl">kubectl annotate</code> without <code class="inl">--overwrite</code> fails when the annotation already exists.</li>
+            <li><code class="inl">rollout undo</code> changes the cluster, not your YAML. Fix the file too, or the next <code class="inl">apply</code> re-deploys the bad image.</li>
+            <li>Re-using a tag (<code class="inl">:latest</code>) means <code class="inl">set image</code> to the "same" value does nothing. Use unique tags (git SHA / semver).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Template change → new RS → rolling replace limited by maxSurge/maxUnavailable. Watch with <code class="inl">rollout status</code>,
+          inspect with <code class="inl">rollout history</code>, revert with <code class="inl">rollout undo [--to-revision=N]</code>.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">kubectl apply -f file.yaml</code></td><td>Create/update objects declaratively.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -o wide</code></td><td>Pods with IP and node.</td></tr>
+              <tr><td><code class="inl">kubectl get deploy,rs,pods</code></td><td>See the whole Deployment → RS → Pod chain.</td></tr>
+              <tr><td><code class="inl">kubectl describe pod NAME</code></td><td>Details + Events (first stop when debugging).</td></tr>
+              <tr><td><code class="inl">kubectl logs NAME [-c ctr] [-f] [--previous]</code></td><td>Container logs; <code class="inl">--previous</code> = the crashed instance.</td></tr>
+              <tr><td><code class="inl">kubectl exec -it NAME [-c ctr] -- sh</code></td><td>Shell inside a container.</td></tr>
+              <tr><td><code class="inl">kubectl port-forward pod/NAME 3000:3000</code></td><td>Reach a Pod from your laptop (debug).</td></tr>
+              <tr><td><code class="inl">kubectl delete pod NAME</code> / <code class="inl">-f file</code> / <code class="inl">-l key=val</code></td><td>Delete by name, file or label.</td></tr>
+              <tr><td><code class="inl">kubectl get pods --show-labels</code> / <code class="inl">-L key</code></td><td>Show labels (all / as a column).</td></tr>
+              <tr><td><code class="inl">kubectl get pods -l 'app=taskflow,tier in (api,web)'</code></td><td>Filter by label selector.</td></tr>
+              <tr><td><code class="inl">kubectl label pod NAME key=val [--overwrite]</code> / <code class="inl">key-</code></td><td>Add/change/remove a label.</td></tr>
+              <tr><td><code class="inl">kubectl scale deploy NAME --replicas=5</code></td><td>Change replica count.</td></tr>
+              <tr><td><code class="inl">kubectl set image deploy/NAME ctr=img:tag</code></td><td>Trigger a rolling update.</td></tr>
+              <tr><td><code class="inl">kubectl annotate deploy/NAME kubernetes.io/change-cause="..." --overwrite</code></td><td>Record why (shows in history).</td></tr>
+              <tr><td><code class="inl">kubectl rollout status deploy/NAME</code></td><td>Wait for rollout; non-zero exit on failure.</td></tr>
+              <tr><td><code class="inl">kubectl rollout history deploy/NAME [--revision=N]</code></td><td>List revisions / inspect one.</td></tr>
+              <tr><td><code class="inl">kubectl rollout undo deploy/NAME [--to-revision=N]</code></td><td>Roll back.</td></tr>
+              <tr><td><code class="inl">kubectl rollout pause|resume|restart deploy/NAME</code></td><td>Batch changes / fresh Pods with same spec.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>A Pod runs the TaskFlow container but can't survive on its own. Labels let a ReplicaSet count "its" Pods and replace any that die.
+          A Deployment sits on top: each new template (e.g. image <code class="inl">1.1.0</code>) gets a new ReplicaSet, and the Deployment shifts Pods from old to new
+          within <code class="inl">maxSurge</code>/<code class="inl">maxUnavailable</code>, keeping old ReplicaSets so <code class="inl">rollout undo</code> is instant.
+          In practice you write one <code class="inl">k8s/deployment.yaml</code> and never touch ReplicaSets or Pods directly.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>replicas: 10, maxSurge: 25%, maxUnavailable: 25%. What is the max Pod count and the min available Pods during a rollout?</summary>
+          <p class="ans">maxSurge = ceil(2.5) = 3 → at most 13 Pods. maxUnavailable = floor(2.5) = 2 → at least 8 available.</p>
+        </details>
+        <details class="quiz">
+          <summary>Which of these create a new ReplicaSet: (a) replicas 3 → 5, (b) new image tag, (c) new env var, (d) changing maxSurge?</summary>
+          <p class="ans">(b) and (c) — they change <code class="inl">spec.template</code>. Scaling and strategy changes don't create a revision.</p>
+        </details>
+        <details class="quiz">
+          <summary>A container crashes and RESTARTS goes 0 → 1, but the Pod name is the same. Who restarted it? How is that different from deleting the Pod?</summary>
+          <p class="ans">The kubelet restarted the container in place (restartPolicy Always). Deleting the Pod makes the ReplicaSet create a <em>new</em> Pod with a new name and IP.</p>
+        </details>
+        <details class="quiz">
+          <summary>A Pod shows <code class="inl">Init:0/1</code> for 3 minutes. What does it mean and what do you run?</summary>
+          <p class="ans">The first init container hasn't finished, so app containers haven't started. Run <code class="inl">kubectl logs POD -c wait-for-db</code> (and <code class="inl">describe</code>) — usually the DB Service isn't up yet.</p>
+        </details>
+        <details class="quiz">
+          <summary>History shows revisions 1, 2, 3. You run <code class="inl">kubectl rollout undo</code>. What does history show now?</summary>
+          <p class="ans">1, 3, 4 — revision 2's template is re-used and becomes revision 4.</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the Pod phase of a Pod whose STATUS is <code class="inl">CrashLoopBackOff</code>?</summary>
+          <p class="ans">Usually <code class="inl">Running</code>. CrashLoopBackOff is a container <em>Waiting</em> reason, not a phase.</p>
+        </details>
+        <details class="quiz">
+          <summary>When would you pick <code class="inl">Recreate</code> over <code class="inl">RollingUpdate</code>?</summary>
+          <p class="ans">When two versions must never run together (incompatible DB schema change) or the Pod uses a single-writer volume. You accept brief downtime.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 10: Kubernetes Pods, ReplicaSets &amp; Deployments.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/" target="_blank" rel="noopener">Pods</a> — multi-container Pods, init and sidecar containers.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener">Pod Lifecycle</a> — phases, container states, restart policy, termination.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/" target="_blank" rel="noopener">Labels and Selectors</a> — equality vs set-based selectors.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/" target="_blank" rel="noopener">ReplicaSet</a> — and why to use Deployments instead.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/" target="_blank" rel="noopener">Deployments</a> — rolling updates, rollbacks, pause/resume, strategy fields.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-9.html"><div class="dir">← Previous</div><div class="ttl">Session 9: Kubernetes Fundamentals</div></a>
+        <a class="next" href="session-11.html"><div class="dir">Next →</div><div class="ttl">Session 11: K8s Networking &amp; Services</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 10 — Kubernetes Pods, ReplicaSets &amp; Deployments</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

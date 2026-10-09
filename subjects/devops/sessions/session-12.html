@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 12 — Kubernetes Ingress, ConfigMaps &amp; Secrets</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 12</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 12</span>
+      <h1>Kubernetes Ingress, ConfigMaps &amp; Secrets</h1>
+      <p class="lead">
+        Put TaskFlow behind one HTTPS entry point at <code class="inl">taskflow.local</code> with host- and path-based routing,
+        and move all its configuration and the database password out of the image into ConfigMaps, Secrets and env vars.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 23 min read</span><span class="badge-rt">📖 6 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#ingress">Ingress &amp; Ingress Controllers</a></li>
+          <li><a href="#routing">Host &amp; path-based routing</a></li>
+          <li><a href="#tls">TLS for Ingress</a></li>
+          <li><a href="#configmaps">ConfigMaps</a></li>
+          <li><a href="#secrets">Secrets</a></li>
+          <li><a href="#env">Environment variables</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. INGRESS ===================== -->
+      <section id="ingress">
+        <h2><span class="sec-num">1</span> Ingress &amp; Ingress Controllers</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One front door with a receptionist who reads the address on each letter and walks it to the right room — instead of building a separate door for every room.</p>
+        </div>
+
+        <h3>Why Ingress</h3>
+        <ul>
+          <li>With only Services, exposing <code class="inl">taskflow-web</code> and <code class="inl">taskflow-api</code> means two <code class="inl">LoadBalancer</code> Services → two cloud load balancers, two IPs, two bills, TLS set up twice.</li>
+          <li>An <span class="term">Ingress</span> is an L7 (HTTP/HTTPS) routing table: <em>"Host <code class="inl">api.taskflow.local</code> → Service taskflow-api; path <code class="inl">/</code> → taskflow-web"</em>. One load balancer in front, TLS terminated once.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>LoadBalancer Service</th><th>Ingress</th></tr></thead>
+            <tbody>
+              <tr><td>OSI layer</td><td>L4 (TCP/UDP)</td><td>L7 (HTTP/HTTPS)</td></tr>
+              <tr><td>Routing by</td><td>Port only</td><td>Host name + URL path</td></tr>
+              <tr><td>Cloud LBs</td><td>One per Service</td><td>One for the whole cluster (the controller's)</td></tr>
+              <tr><td>TLS</td><td>App or LB does it, per Service</td><td>Terminated at the Ingress, one Secret per host</td></tr>
+              <tr><td>Protocols</td><td>Anything (Postgres, gRPC, raw TCP)</td><td>HTTP(S) only</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Ingress resource vs Ingress Controller</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Ingress resource</th><th>Ingress Controller</th></tr></thead>
+            <tbody>
+              <tr><td>What</td><td>A YAML object with routing rules (just data in etcd)</td><td>Pods running a reverse proxy (nginx, Traefik, Envoy…) or a cloud LB integration</td></tr>
+              <tr><td>Who creates it</td><td>You (<code class="inl">k8s/ingress.yaml</code>)</td><td>Cluster admin / addon / Helm chart</td></tr>
+              <tr><td>Job</td><td>Declare "what should go where"</td><td>Watch Ingress objects and configure the proxy to do it</td></tr>
+              <tr><td>Without the other</td><td>Rules exist, nothing happens (ADDRESS empty)</td><td>Proxy runs, returns 404 for everything</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Controller</th><th>ingressClassName</th><th>Where you meet it</th></tr></thead>
+            <tbody>
+              <tr><td>ingress-nginx (Kubernetes project)</td><td><code class="inl">nginx</code></td><td>minikube addon, countless tutorials</td></tr>
+              <tr><td>Traefik</td><td><code class="inl">traefik</code></td><td>k3s default</td></tr>
+              <tr><td>AWS Load Balancer Controller</td><td><code class="inl">alb</code></td><td>EKS — each Ingress becomes an AWS ALB</td></tr>
+              <tr><td>GKE Ingress / Azure AGIC</td><td><code class="inl">gce</code> / <code class="inl">azure-application-gateway</code></td><td>GCP / Azure managed LBs</td></tr>
+              <tr><td>HAProxy, NGINX Inc. (F5), Kong, Contour</td><td>per controller</td><td>Production alternatives</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="c-title">Status in 2026</span>
+          <p>The Ingress API (<code class="inl">networking.k8s.io/v1</code>) is stable and not going away, but it is <strong>feature-frozen</strong>; Kubernetes recommends <strong>Gateway API</strong> (Gateway + HTTPRoute) for new designs.
+          The community <strong>ingress-nginx</strong> controller was retired (no fixes after March 2026). It still works and is fine for learning on minikube; for production pick a maintained controller.</p>
+        </div>
+
+        <h3>Install a controller on minikube</h3>
+<pre><span class="pr">$</span> minikube addons enable ingress
+<span class="out">💡  ingress is an addon maintained by Kubernetes. For any concerns contact minikube on GitHub.
+🔎  Verifying ingress addon...
+🌟  The 'ingress' addon is enabled</span>
+
+<span class="pr">$</span> kubectl get pods -n ingress-nginx
+<span class="out">NAME                                        READY   STATUS      RESTARTS   AGE
+ingress-nginx-admission-create-8x7kq        0/1     Completed   0          60s
+ingress-nginx-admission-patch-q2vbn         0/1     Completed   0          60s
+ingress-nginx-controller-7c8f9d6b5d-vt9xz   1/1     Running     0          60s</span>   <span class="cm"># the actual proxy</span>
+
+<span class="pr">$</span> kubectl get ingressclass
+<span class="out">NAME    CONTROLLER             PARAMETERS   AGE
+nginx   k8s.io/ingress-nginx   &lt;none&gt;       60s</span></pre>
+        <ul>
+          <li><code class="inl">spec.ingressClassName: nginx</code> in your Ingress says <em>which</em> controller should handle it (a cluster can run several).</li>
+          <li>If you omit it, only an IngressClass annotated <code class="inl">ingressclass.kubernetes.io/is-default-class: "true"</code> picks it up. Always set it explicitly.</li>
+          <li>The old annotation <code class="inl">kubernetes.io/ingress.class: nginx</code> is deprecated — use the field.</li>
+        </ul>
+
+<pre>  browser: https://taskflow.local/api/tasks
+        │   /etc/hosts: taskflow.local → 192.168.49.2  (127.0.0.1 with minikube tunnel)
+        ▼
+  ┌──────────── ingress-nginx controller Pod (L7, TLS termination) ────────────┐
+  │  Host taskflow.local       path /api/*  ──►  Service taskflow-api:80       │
+  │  Host taskflow.local       path /       ──►  Service taskflow-web:80       │
+  │  Host api.taskflow.local   path /       ──►  Service taskflow-api:80       │
+  └─────────────────────────────────────────────────────────────────────────────┘
+        ▼   (nginx sends straight to the Pod IPs from the Service's EndpointSlices)
+  taskflow-api Pods :3000          taskflow-web Pods :80</pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Ingress = HTTP routing rules; Ingress Controller = the proxy that enforces them (required!). One entry point replaces many LoadBalancers.
+          On minikube: <code class="inl">minikube addons enable ingress</code> + <code class="inl">ingressClassName: nginx</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 2. ROUTING ===================== -->
+      <section id="routing">
+        <h2><span class="sec-num">2</span> Host &amp; path-based routing</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Host-based = which building the letter is addressed to. Path-based = which floor inside the building.</p>
+        </div>
+
+        <p>We need a second backend. Stand-in for <code class="inl">taskflow-web</code> (nginx serving the static frontend):</p>
+<pre><span class="pr">$</span> kubectl create deployment taskflow-web --image=nginx:1.27-alpine
+<span class="out">deployment.apps/taskflow-web created</span>
+<span class="pr">$</span> kubectl expose deployment taskflow-web --port=80
+<span class="out">service/taskflow-web exposed</span>                 <span class="cm"># ClusterIP Service, port 80</span></pre>
+
+        <p>TaskFlow's API serves <code class="inl">/health</code> and <code class="inl">/tasks</code> (no <code class="inl">/api</code> prefix). So the file has two Ingress objects: one plain (host-based), one that strips <code class="inl">/api</code> (path-based with rewrite).</p>
+        <div class="fname">k8s/ingress.yaml</div>
+<pre><span class="kw">apiVersion:</span> networking.k8s.io/v1      <span class="cm"># the only Ingress API since K8s 1.22</span>
+<span class="kw">kind:</span> Ingress
+<span class="kw">metadata:</span>
+  name: taskflow
+  namespace: taskflow                 <span class="cm"># backends must be Services in THIS namespace</span>
+<span class="kw">spec:</span>
+  ingressClassName: nginx             <span class="cm"># handled by ingress-nginx</span>
+  rules:
+    - host: taskflow.local            <span class="cm"># HOST-based rule 1: the website</span>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix          <span class="cm"># "/" + Prefix = everything on this host</span>
+            backend:
+              service:
+                name: taskflow-web
+                port:
+                  number: <span class="nm">80</span>          <span class="cm"># the Service's port (not the Pod's)</span>
+    - host: api.taskflow.local        <span class="cm"># HOST-based rule 2: API on its own subdomain</span>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taskflow-api
+                port:
+                  name: http          <span class="cm"># or number: 80 — refers to the Service port name</span>
+---
+<span class="kw">apiVersion:</span> networking.k8s.io/v1
+<span class="kw">kind:</span> Ingress
+<span class="kw">metadata:</span>
+  name: taskflow-api-path
+  namespace: taskflow
+  annotations:                        <span class="cm"># controller-specific options live in annotations</span>
+    nginx.ingress.kubernetes.io/use-regex: <span class="st">"true"</span>
+    nginx.ingress.kubernetes.io/rewrite-target: /$2   <span class="cm"># send only capture group 2 upstream</span>
+<span class="kw">spec:</span>
+  ingressClassName: nginx
+  rules:
+    - host: taskflow.local            <span class="cm"># PATH-based: same host, /api/... → API</span>
+      http:
+        paths:
+          - path: /api(/|$)(.*)       <span class="cm"># group1 = "/" or end, group2 = the rest</span>
+            pathType: ImplementationSpecific   <span class="cm"># regex needs this, not Prefix</span>
+            backend:
+              service:
+                name: taskflow-api
+                port:
+                  number: <span class="nm">80</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">ingressClassName</code></td><td>Which controller owns this Ingress.</td><td>Missing/wrong → ignored, ADDRESS stays empty.</td></tr>
+              <tr><td><code class="inl">rules[].host</code></td><td>Match the HTTP <code class="inl">Host</code> header. Omit = any host. Wildcards like <code class="inl">*.taskflow.local</code> allowed.</td><td>No IPs, no ports — just a DNS name.</td></tr>
+              <tr><td><code class="inl">http.paths[].path</code></td><td>URL path to match.</td><td>Must start with <code class="inl">/</code> (except regex with ImplementationSpecific).</td></tr>
+              <tr><td><code class="inl">pathType</code></td><td><code class="inl">Prefix</code> / <code class="inl">Exact</code> / <code class="inl">ImplementationSpecific</code> (table below).</td><td>Required field in v1.</td></tr>
+              <tr><td><code class="inl">backend.service.name</code></td><td>Target Service (same namespace).</td><td>Old <code class="inl">serviceName</code>/<code class="inl">servicePort</code> syntax was removed with v1beta1.</td></tr>
+              <tr><td><code class="inl">backend.service.port</code></td><td><code class="inl">number:</code> or <code class="inl">name:</code> of the <strong>Service</strong> port.</td><td>Use 80 (Service port), not 3000 (targetPort).</td></tr>
+              <tr><td><code class="inl">rewrite-target: /$2</code></td><td>ingress-nginx rewrites the upstream path to capture group 2.</td><td>Applies to <em>every</em> path in that Ingress — hence the separate object.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/ingress.yaml
+<span class="out">ingress.networking.k8s.io/taskflow created
+ingress.networking.k8s.io/taskflow-api-path created</span>
+<span class="pr">$</span> kubectl get ingress
+<span class="out">NAME                CLASS   HOSTS                               ADDRESS        PORTS   AGE
+taskflow            nginx   taskflow.local,api.taskflow.local   192.168.49.2   80      45s
+taskflow-api-path   nginx   taskflow.local                      192.168.49.2   80      45s</span>
+<span class="pr">$</span> kubectl describe ingress taskflow
+<span class="out">Name:             taskflow
+Namespace:        taskflow
+Address:          192.168.49.2
+Ingress Class:    nginx
+Default backend:  &lt;default&gt;
+Rules:
+  Host                Path  Backends
+  ----                ----  --------
+  taskflow.local
+                      /   taskflow-web:80 (10.244.0.21:80)
+  api.taskflow.local
+                      /   taskflow-api:http (10.244.0.13:3000,10.244.0.14:3000,10.244.0.15:3000)</span>   <span class="cm"># Pod IPs = it found the endpoints</span></pre>
+
+        <h3>Point the host names at the cluster</h3>
+<pre><span class="cm"># Linux / VM drivers: use the node IP</span>
+<span class="pr">$</span> echo "$(minikube ip) taskflow.local api.taskflow.local" | sudo tee -a /etc/hosts
+<span class="out">192.168.49.2 taskflow.local api.taskflow.local</span>
+
+<span class="cm"># macOS / Windows with the Docker driver: run the tunnel and use 127.0.0.1</span>
+<span class="pr">$</span> minikube tunnel                       <span class="cm"># keep this terminal open (asks for sudo to bind 80/443)</span>
+<span class="pr">$</span> echo "127.0.0.1 taskflow.local api.taskflow.local" | sudo tee -a /etc/hosts</pre>
+<pre><span class="pr">$</span> curl http://taskflow.local/                       <span class="cm"># host rule 1 → web</span>
+<span class="out">&lt;title&gt;Welcome to nginx!&lt;/title&gt; ...</span>
+<span class="pr">$</span> curl http://api.taskflow.local/health             <span class="cm"># host rule 2 → api</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl http://taskflow.local/api/health             <span class="cm"># path rule → api receives "/health"</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -H "Host: api.taskflow.local" http://$(minikube ip)/health   <span class="cm"># test without editing /etc/hosts</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -i http://$(minikube ip)/                    <span class="cm"># no rule for a bare IP → controller's default 404</span>
+<span class="out">HTTP/1.1 404 Not Found
+...
+&lt;center&gt;&lt;h1&gt;404 Not Found&lt;/h1&gt;&lt;/center&gt;
+&lt;hr&gt;&lt;center&gt;nginx&lt;/center&gt;</span></pre>
+
+        <h3>pathType</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>pathType / path</th><th><code class="inl">/api</code></th><th><code class="inl">/api/</code></th><th><code class="inl">/api/tasks</code></th><th><code class="inl">/apis</code></th><th><code class="inl">/API</code></th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Exact</code> <code class="inl">/api</code></td><td>✔</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td></tr>
+              <tr><td><code class="inl">Prefix</code> <code class="inl">/api</code></td><td>✔</td><td>✔</td><td>✔</td><td>✘ (not a path element)</td><td>✘ (case-sensitive)</td></tr>
+              <tr><td><code class="inl">ImplementationSpecific</code></td><td colspan="5">Controller decides. ingress-nginx: treated as a regex when <code class="inl">use-regex</code>/<code class="inl">rewrite-target</code> is set.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>When several paths match, the <strong>longest</strong> wins (<code class="inl">Exact</code> beats <code class="inl">Prefix</code> on a tie). So <code class="inl">/api/...</code> goes to the API even though <code class="inl">/</code> also matches.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: how rewrite-target maps paths</span>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>Browser requests</th><th>Group 1 / Group 2</th><th>API receives</th></tr></thead>
+              <tbody>
+                <tr><td><code class="inl">/api</code></td><td>"" / ""</td><td><code class="inl">/</code></td></tr>
+                <tr><td><code class="inl">/api/tasks</code></td><td>"/" / "tasks"</td><td><code class="inl">/tasks</code></td></tr>
+                <tr><td><code class="inl">/api/tasks/7?done=true</code></td><td>"/" / "tasks/7"</td><td><code class="inl">/tasks/7?done=true</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Without the rewrite, the API would get <code class="inl">/api/tasks</code> and answer 404 — the single most common Ingress bug.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">kubectl get ingress</code> shows no ADDRESS → no controller running or wrong <code class="inl">ingressClassName</code>.</li>
+            <li><code class="inl">503 Service Temporarily Unavailable</code> → backend Service has no ready endpoints (Session 11 selector bug).</li>
+            <li>Old tutorials use <code class="inl">apiVersion: extensions/v1beta1</code> and <code class="inl">serviceName:</code> — rejected since 1.22 (<code class="inl">no matches for kind "Ingress" in version ...</code>).</li>
+            <li>Regex in a <code class="inl">Prefix</code> path → newer ingress-nginx rejects it; use <code class="inl">ImplementationSpecific</code>.</li>
+            <li>Pointing a backend at a Service in another namespace — not allowed; create the Ingress in that namespace.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">rules[].host</code> = host-based, <code class="inl">paths[].path</code> + <code class="inl">pathType</code> = path-based, longest match wins.
+          Backends point at Service <em>ports</em>. Use <code class="inl">rewrite-target</code> when the app doesn't know the URL prefix.
+        </div>
+      </section>
+
+      <!-- ===================== 3. TLS ===================== -->
+      <section id="tls">
+        <h2><span class="sec-num">3</span> TLS for Ingress</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The receptionist checks your ID card (certificate) at the door and opens the sealed envelope; inside the building, letters move normally.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">TLS termination</span> at the Ingress: the browser speaks HTTPS to the controller, which decrypts and forwards plain HTTP to the Pods. Apps don't touch certificates.</li>
+          <li>The certificate + private key live in a Secret of type <code class="inl">kubernetes.io/tls</code> (keys <code class="inl">tls.crt</code>, <code class="inl">tls.key</code>), in the <strong>same namespace</strong> as the Ingress.</li>
+        </ul>
+
+        <h3>1. Make a self-signed certificate (local only)</h3>
+<pre><span class="pr">$</span> openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout taskflow.key -out taskflow.crt \
+    -subj "/CN=taskflow.local" \
+    -addext "subjectAltName=DNS:taskflow.local,DNS:api.taskflow.local"
+<span class="out">.....+.........+++++++
+writing new private key to 'taskflow.key'
+-----</span>
+<span class="pr">$</span> openssl x509 -in taskflow.crt -noout -ext subjectAltName      <span class="cm"># verify the host names</span>
+<span class="out">X509v3 Subject Alternative Name:
+    DNS:taskflow.local, DNS:api.taskflow.local</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">req -x509</code></td><td>Output a self-signed certificate instead of a signing request.</td></tr>
+              <tr><td><code class="inl">-nodes</code></td><td>Don't encrypt the private key ("no DES"; OpenSSL 3 also accepts <code class="inl">-noenc</code>). The controller must read it without a passphrase.</td></tr>
+              <tr><td><code class="inl">-days 365 -newkey rsa:2048</code></td><td>Valid one year; create a new 2048-bit RSA key.</td></tr>
+              <tr><td><code class="inl">-subj "/CN=..."</code></td><td>Subject without interactive prompts.</td></tr>
+              <tr><td><code class="inl">-addext subjectAltName=...</code></td><td>Host names the cert is valid for. Browsers/curl check SAN, not CN. Needs OpenSSL 1.1.1+ (or LibreSSL 3.x).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2. Store it as a TLS Secret</h3>
+<pre><span class="pr">$</span> kubectl create secret tls taskflow-tls --cert=taskflow.crt --key=taskflow.key
+<span class="out">secret/taskflow-tls created</span>
+<span class="pr">$</span> kubectl get secret taskflow-tls
+<span class="out">NAME           TYPE                DATA   AGE
+taskflow-tls   kubernetes.io/tls   2      5s</span>          <span class="cm"># DATA 2 = tls.crt + tls.key</span></pre>
+
+        <h3>3. Add a <code class="inl">tls</code> block to the Ingress</h3>
+        <div class="fname">k8s/ingress.yaml (spec of Ingress "taskflow")</div>
+<pre><span class="kw">spec:</span>
+  ingressClassName: nginx
+  tls:                                <span class="cm"># NEW: which hosts get HTTPS, with which cert</span>
+    - hosts:
+        - taskflow.local              <span class="cm"># must match rules[].host AND the cert's SAN</span>
+        - api.taskflow.local
+      secretName: taskflow-tls        <span class="cm"># kubernetes.io/tls Secret, same namespace</span>
+  rules:
+    <span class="cm"># ... unchanged ...</span></pre>
+        <p>Add the same block (hosts: <code class="inl">taskflow.local</code>) to <code class="inl">taskflow-api-path</code>, then apply.</p>
+<pre><span class="pr">$</span> kubectl apply -f k8s/ingress.yaml
+<span class="pr">$</span> kubectl get ingress taskflow
+<span class="out">NAME       CLASS   HOSTS                               ADDRESS        PORTS     AGE
+taskflow   nginx   taskflow.local,api.taskflow.local   192.168.49.2   80, 443   20m</span>
+
+<span class="pr">$</span> curl -I http://taskflow.local/                    <span class="cm"># ingress-nginx redirects HTTP → HTTPS once TLS is set</span>
+<span class="out">HTTP/1.1 308 Permanent Redirect
+Location: https://taskflow.local/</span>
+<span class="pr">$</span> curl https://api.taskflow.local/health
+<span class="out">curl: (60) SSL certificate problem: self-signed certificate</span>      <span class="cm"># expected: nobody trusts our CA</span>
+<span class="pr">$</span> curl --cacert taskflow.crt https://api.taskflow.local/health      <span class="cm"># trust it explicitly</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -k https://taskflow.local/api/health          <span class="cm"># -k = skip verification (testing only)</span>
+<span class="out">{"status":"ok"}</span></pre>
+
+        <h3>Real certificates: cert-manager</h3>
+        <p><span class="term">cert-manager</span> is a controller that obtains and renews certificates (e.g. free Let's Encrypt) and writes them into the TLS Secret for you. Install it once, create a <code class="inl">ClusterIssuer</code>, then just annotate the Ingress:</p>
+<pre><span class="kw">metadata:</span>
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod   <span class="cm"># which issuer to ask</span>
+<span class="kw">spec:</span>
+  tls:
+    - hosts: [taskflow.example.com]                   <span class="cm"># must be a real public domain for Let's Encrypt</span>
+      secretName: taskflow-tls                        <span class="cm"># cert-manager creates + renews this Secret</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Browser shows <strong>"Kubernetes Ingress Controller Fake Certificate"</strong> → the controller couldn't use your Secret: wrong <code class="inl">secretName</code>, Secret in another namespace, or the host isn't in the cert's SAN.</li>
+            <li><code class="inl">tls.hosts</code> lists a host that has no matching <code class="inl">rules[].host</code> → no route for it.</li>
+            <li>Committing <code class="inl">taskflow.key</code> to Git. Add <code class="inl">*.key</code> and <code class="inl">*.crt</code> to <code class="inl">.gitignore</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">openssl req -x509</code> → <code class="inl">kubectl create secret tls</code> → <code class="inl">spec.tls[].hosts + secretName</code>. HTTP gets a 308 to HTTPS.
+          In production let cert-manager issue and renew certs.
+        </div>
+      </section>
+
+      <!-- ===================== 4. CONFIGMAPS ===================== -->
+      <section id="configmaps">
+        <h2><span class="sec-num">4</span> ConfigMaps</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The same toy (image) with a different instruction card (ConfigMap) for each playroom: dev, staging, prod.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">ConfigMap</span> stores <strong>non-secret</strong> config as key/value strings (max 1 MiB). Same image, different ConfigMap per environment — the 12-factor "config in the environment" rule.</li>
+          <li>Pods consume it as <strong>env vars</strong> (one key or all keys) or as <strong>files</strong> in a volume.</li>
+        </ul>
+
+        <h3>Three ways to create one</h3>
+<pre><span class="pr">$</span> kubectl create configmap demo-literal --from-literal=LOG_LEVEL=info --from-literal=NODE_ENV=production
+<span class="out">configmap/demo-literal created</span>
+
+<span class="pr">$</span> cat features.json
+<span class="out">{
+  "enableSignup": true,
+  "maxTasksPerUser": 100
+}</span>
+<span class="pr">$</span> kubectl create configmap taskflow-features --from-file=features.json    <span class="cm"># key = file name</span>
+<span class="out">configmap/taskflow-features created</span>
+
+<span class="pr">$</span> kubectl create configmap demo-env --from-env-file=app.env       <span class="cm"># each KEY=value line → one key; add --dry-run=client -o yaml to just print YAML</span></pre>
+
+        <p>The declarative version that goes in the repo:</p>
+        <div class="fname">k8s/configmap.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> ConfigMap
+<span class="kw">metadata:</span>
+  name: taskflow-config
+  namespace: taskflow
+  labels:
+    app: taskflow
+<span class="kw">data:</span>                                 <span class="cm"># all values are STRINGS</span>
+  NODE_ENV: production
+  LOG_LEVEL: info
+  PORT: <span class="st">"3000"</span>                         <span class="cm"># quote numbers/booleans</span>
+  DB_HOST: taskflow-db                <span class="cm"># the Service from Session 11</span>
+  DB_PORT: <span class="st">"5432"</span>
+  DB_NAME: taskflow
+<span class="cm"># immutable: true                     # optional: can't be edited, must be replaced (safer, less API load)</span></pre>
+        <ul>
+          <li><code class="inl">data</code>: string keys (letters, digits, <code class="inl">-</code> <code class="inl">_</code> <code class="inl">.</code>) → <strong>string</strong> values. <code class="inl">PORT: 3000</code> unquoted fails with <code class="inl">cannot unmarshal number into Go struct field ConfigMap.data of type string</code>.</li>
+          <li>Embed a whole file with <code class="inl">key: |</code> + an indented block; <code class="inl">binaryData</code> takes base64 for non-UTF-8 content.</li>
+          <li><code class="inl">immutable: true</code>: data can't change — create <code class="inl">taskflow-config-v2</code> and point the Deployment at it instead.</li>
+        </ul>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/configmap.yaml
+<span class="out">configmap/taskflow-config created</span>
+<span class="pr">$</span> kubectl get configmaps
+<span class="out">NAME                DATA   AGE
+kube-root-ca.crt    1      2d         </span><span class="cm"># auto-created in every namespace</span><span class="out">
+taskflow-config     6      5s
+taskflow-features   1      40s</span></pre>
+
+        <h3>Three ways to consume it</h3>
+<pre><span class="cm"># (a) one key → one env var (you choose the variable name)</span>
+          env:
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: taskflow-config
+                  key: LOG_LEVEL
+                  optional: true            <span class="cm"># start even if the key/ConfigMap is missing</span>
+
+<span class="cm"># (b) every key → env var of the same name</span>
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+
+<span class="cm"># (c) every key → a file in a directory</span>
+          volumeMounts:
+            - name: features
+              mountPath: /etc/taskflow      <span class="cm"># /etc/taskflow/features.json</span>
+              readOnly: true
+      volumes:                              <span class="cm"># at Pod spec level, next to containers:</span>
+        - name: features
+          configMap:
+            name: taskflow-features</pre>
+<pre><span class="pr">$</span> kubectl exec deploy/taskflow-api -- ls -la /etc/taskflow
+<span class="out">drwxr-xr-x    2 root  root  4096 Oct  9 05:10 ..2026_10_09_05_10_31.2847561093
+lrwxrwxrwx    1 root  root    32 Oct  9 05:10 ..data -&gt; ..2026_10_09_05_10_31.2847561093
+lrwxrwxrwx    1 root  root    20 Oct  9 05:10 features.json -&gt; ..data/features.json</span>
+<span class="pr">$</span> kubectl exec deploy/taskflow-api -- cat /etc/taskflow/features.json
+<span class="out">{
+  "enableSignup": true,
+  "maxTasksPerUser": 100
+}</span></pre>
+        <p>The symlinks are how the kubelet swaps in new content atomically: it writes a new timestamped directory and flips <code class="inl">..data</code>.</p>
+
+        <h3>What happens when you change a ConfigMap</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Consumed as</th><th>Picks up changes?</th><th>What you do</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">env</code> / <code class="inl">envFrom</code></td><td><strong>No</strong> — env is fixed when the container starts</td><td><code class="inl">kubectl rollout restart deployment/taskflow-api</code></td></tr>
+              <tr><td>Volume</td><td><strong>Yes, eventually</strong> (kubelet sync, typically within ~1 min)</td><td>App must re-read the file (watch it or read per request)</td></tr>
+              <tr><td>Volume with <code class="inl">subPath</code></td><td><strong>No</strong></td><td>Restart the Pods</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout example">
+          <span class="c-title">Example: change LOG_LEVEL to debug</span>
+<pre><span class="pr">$</span> kubectl patch configmap taskflow-config -p '{"data":{"LOG_LEVEL":"debug"}}'
+<span class="out">configmap/taskflow-config patched</span>
+<span class="pr">$</span> kubectl exec deploy/taskflow-api -- printenv LOG_LEVEL
+<span class="out">info</span>                                         <span class="cm"># still old — env was read at start</span>
+<span class="pr">$</span> kubectl rollout restart deployment/taskflow-api &amp;&amp; kubectl rollout status deployment/taskflow-api
+<span class="out">deployment.apps/taskflow-api restarted
+deployment "taskflow-api" successfully rolled out</span>
+<span class="pr">$</span> kubectl exec deploy/taskflow-api -- printenv LOG_LEVEL
+<span class="out">debug</span>
+
+<span class="cm"># re-generate a file-based ConfigMap after editing features.json (create-or-update idiom):</span>
+<span class="pr">$</span> kubectl create configmap taskflow-features --from-file=features.json --dry-run=client -o yaml | kubectl apply -f -
+<span class="out">configmap/taskflow-features configured</span></pre>
+          <p>Better long-term: change <code class="inl">k8s/configmap.yaml</code> in Git and apply it. Helm automates the restart with a checksum annotation (Session 17).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ConfigMap = non-secret strings. Create with <code class="inl">--from-literal</code> / <code class="inl">--from-file</code> / YAML. Consume via <code class="inl">configMapKeyRef</code>, <code class="inl">envFrom</code> or a volume.
+          Env needs a restart to update; mounted files update on their own.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SECRETS ===================== -->
+      <section id="secrets">
+        <h2><span class="sec-num">5</span> Secrets</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A Secret is a ConfigMap in a sealed envelope — but the envelope is see-through unless you lock the drawer (RBAC + encryption).</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">Secret</span> holds sensitive values: passwords, tokens, TLS keys, registry credentials (max 1 MiB).</li>
+          <li>Values are stored <strong>base64-encoded</strong>. Kubernetes treats Secrets more carefully than ConfigMaps (kept in tmpfs on nodes, only sent to nodes that run Pods using them, hidden in <code class="inl">describe</code>), but <strong>base64 is not encryption</strong>.</li>
+        </ul>
+
+        <h3>Create one imperatively (the safe default — no file to leak)</h3>
+<pre><span class="pr">$</span> kubectl create secret generic taskflow-db-secret \
+    --from-literal=POSTGRES_USER=taskflow \
+    --from-literal=POSTGRES_PASSWORD='s3cr3t-Tf9x'     <span class="cm"># single quotes: shell won't touch special chars</span>
+<span class="out">secret/taskflow-db-secret created</span>
+<span class="pr">$</span> kubectl get secret taskflow-db-secret
+<span class="out">NAME                 TYPE     DATA   AGE
+taskflow-db-secret   Opaque   2      5s</span>          <span class="cm"># describe shows only byte sizes, not values</span></pre>
+
+        <h3>base64, and why <code class="inl">echo -n</code></h3>
+<pre><span class="pr">$</span> echo -n 'taskflow' | base64
+<span class="out">dGFza2Zsb3c=</span>
+<span class="pr">$</span> echo 'taskflow' | base64                <span class="cm"># without -n the trailing newline is encoded too</span>
+<span class="out">dGFza2Zsb3cK</span>                            <span class="cm"># = "taskflow\n" → Postgres login fails, very hard to spot</span>
+<span class="pr">$</span> echo -n 's3cr3t-Tf9x' | base64
+<span class="out">czNjcjN0LVRmOXg=</span>
+<span class="pr">$</span> kubectl get secret taskflow-db-secret -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d
+<span class="out">s3cr3t-Tf9x</span>                             <span class="cm"># anyone who can "get secrets" can read it</span></pre>
+
+        <h3>The YAML form</h3>
+        <div class="fname">k8s/secret.yaml (local/dev only — git-ignored; commit a secret.example.yaml with placeholders)</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Secret
+<span class="kw">metadata:</span>
+  name: taskflow-db-secret
+  namespace: taskflow
+<span class="kw">type:</span> Opaque                          <span class="cm"># generic key/value secret</span>
+<span class="kw">data:</span>                                 <span class="cm"># values MUST be base64</span>
+  POSTGRES_USER: dGFza2Zsb3c=         <span class="cm"># "taskflow"</span>
+  POSTGRES_PASSWORD: czNjcjN0LVRmOXg= <span class="cm"># "s3cr3t-Tf9x"</span></pre>
+        <p>Or write plain text under <code class="inl">stringData</code> — the API server base64-encodes it into <code class="inl">data</code> (write-only; <code class="inl">get -o yaml</code> shows <code class="inl">data</code>; wins if a key is in both):</p>
+<pre><span class="kw">stringData:</span>                           <span class="cm"># replaces the data: block above</span>
+  POSTGRES_USER: taskflow
+  POSTGRES_PASSWORD: s3cr3t-Tf9x</pre>
+        <p>Plain text under <code class="inl">data:</code> is rejected: <code class="inl">illegal base64 data at input byte ...</code>. <code class="inl">type</code> tells K8s which keys to expect (table below).</p>
+
+        <h3>Secret types</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>type</th><th>Required keys</th><th>Create with</th><th>Used for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Opaque</code></td><td>any</td><td><code class="inl">kubectl create secret generic</code></td><td>Passwords, API keys</td></tr>
+              <tr><td><code class="inl">kubernetes.io/tls</code></td><td><code class="inl">tls.crt</code>, <code class="inl">tls.key</code></td><td><code class="inl">kubectl create secret tls</code></td><td>Ingress TLS (§3)</td></tr>
+              <tr><td><code class="inl">kubernetes.io/dockerconfigjson</code></td><td><code class="inl">.dockerconfigjson</code></td><td><code class="inl">kubectl create secret docker-registry</code></td><td><code class="inl">imagePullSecrets</code> for private registries</td></tr>
+              <tr><td><code class="inl">kubernetes.io/basic-auth</code> / <code class="inl">ssh-auth</code></td><td><code class="inl">username</code>+<code class="inl">password</code> / <code class="inl">ssh-privatekey</code></td><td>YAML</td><td>Tools that expect those keys</td></tr>
+              <tr><td><code class="inl">kubernetes.io/service-account-token</code></td><td><code class="inl">token</code>, <code class="inl">ca.crt</code></td><td>auto / YAML</td><td>Long-lived SA tokens (legacy; Session 16)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Pulling a private image: imagePullSecrets</h3>
+<pre><span class="pr">$</span> kubectl create secret docker-registry ghcr-cred \
+    --docker-server=ghcr.io \
+    --docker-username=shauryav \
+    --docker-password="$GHCR_TOKEN"          <span class="cm"># a GitHub PAT with read:packages</span>
+<span class="out">secret/ghcr-cred created</span>
+
+<span class="cm"># Pod template spec</span>
+    spec:
+      imagePullSecrets:
+        - name: ghcr-cred                    <span class="cm"># kubelet uses it to log in before pulling</span>
+      containers:
+        - name: api
+          image: ghcr.io/shauryav/taskflow-api:1.1.0</pre>
+        <p>Without it: <code class="inl">ErrImagePull</code> → <code class="inl">ImagePullBackOff</code> with <code class="inl">401 Unauthorized</code> in <code class="inl">describe</code> (Session 14).</p>
+
+        <h3>Postgres reads its password from the Secret</h3>
+        <div class="fname">k8s/postgres.yaml (container excerpt — replaces the plain-text env from Session 11)</div>
+<pre>        - name: postgres
+          image: postgres:16
+          envFrom:
+            - secretRef:
+                name: taskflow-db-secret     <span class="cm"># POSTGRES_USER + POSTGRES_PASSWORD</span>
+          env:
+            - name: POSTGRES_DB
+              value: taskflow</pre>
+
+        <h3>Best practices</h3>
+        <ul>
+          <li><strong>Never commit real Secrets to Git</strong> — history is forever. Use <code class="inl">kubectl create secret</code>, CI secrets, or the tools below.</li>
+          <li><strong>RBAC</strong>: only the app's ServiceAccount and admins may <code class="inl">get</code>/<code class="inl">list</code> Secrets. Anyone who can create Pods in the namespace can mount any Secret there (Session 16).</li>
+          <li><strong>Encryption at rest</strong>: by default etcd holds them as base64. Enable an API-server <code class="inl">EncryptionConfiguration</code> (KMS provider on EKS/GKE/AKS).</li>
+          <li><strong>External Secrets Operator</strong>: the real value lives in AWS Secrets Manager / Vault and is synced into a K8s Secret. <strong>Sealed Secrets</strong>: <code class="inl">kubeseal</code> encrypts it into a <code class="inl">SealedSecret</code> that is safe to commit (GitOps, Session 22).</li>
+          <li><strong>Prefer volume mounts</strong> for very sensitive values — env vars leak into crash dumps, child processes and <code class="inl">kubectl exec -- env</code>.</li>
+          <li><strong>Rotate</strong>: update the Secret, <code class="inl">rollout restart</code>, and change the password in the DB itself.</li>
+        </ul>
+
+        <h3>ConfigMap vs Secret (exam favourite)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>ConfigMap</th><th>Secret</th></tr></thead>
+            <tbody>
+              <tr><td>For</td><td>Non-sensitive config (log level, hosts, feature flags)</td><td>Passwords, tokens, keys, certs</td></tr>
+              <tr><td>Storage format</td><td>Plain text in <code class="inl">data</code></td><td>base64 in <code class="inl">data</code> (or <code class="inl">stringData</code> on input)</td></tr>
+              <tr><td>Encrypted?</td><td>No</td><td>No by default — only if encryption at rest is enabled</td></tr>
+              <tr><td>On the node</td><td>Written to disk</td><td>tmpfs (RAM) when mounted</td></tr>
+              <tr><td><code class="inl">kubectl describe</code></td><td>Shows values</td><td>Shows only byte counts</td></tr>
+              <tr><td>Types</td><td>One</td><td>Opaque, tls, dockerconfigjson, …</td></tr>
+              <tr><td>Consume via</td><td><code class="inl">configMapKeyRef</code>, <code class="inl">envFrom.configMapRef</code>, volume</td><td><code class="inl">secretKeyRef</code>, <code class="inl">envFrom.secretRef</code>, volume, <code class="inl">imagePullSecrets</code></td></tr>
+              <tr><td>Size limit</td><td>1 MiB</td><td>1 MiB</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Thinking base64 = encrypted and pasting <code class="inl">secret.yaml</code> into a public repo. Rotate the password immediately if you did.</li>
+            <li><code class="inl">echo</code> without <code class="inl">-n</code> → hidden <code class="inl">\n</code> in the password.</li>
+            <li>Secret created in <code class="inl">default</code> while the Pod runs in <code class="inl">taskflow</code> → <code class="inl">CreateContainerConfigError: secret "taskflow-db-secret" not found</code>. Secrets are namespaced.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Secret = base64 key/values with types (Opaque, tls, dockerconfigjson). base64 ≠ encryption: protect with RBAC, encryption at rest, and keep real values out of Git (External/Sealed Secrets).
+        </div>
+      </section>
+
+      <!-- ===================== 6. ENV VARS ===================== -->
+      <section id="env">
+        <h2><span class="sec-num">6</span> Environment variables</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Before the app wakes up, Kubernetes fills its lunchbox with notes: some written by you, some copied from ConfigMaps and Secrets, some about the Pod itself.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Source</th><th>YAML</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td>Literal</td><td><code class="inl">env: - name, value</code></td><td><code class="inl">NODE_OPTIONS=--max-old-space-size=200</code></td></tr>
+              <tr><td>One ConfigMap key</td><td><code class="inl">valueFrom.configMapKeyRef</code></td><td><code class="inl">LOG_LEVEL</code></td></tr>
+              <tr><td>One Secret key</td><td><code class="inl">valueFrom.secretKeyRef</code></td><td><code class="inl">DB_PASSWORD</code></td></tr>
+              <tr><td>Pod info (<span class="term">downward API</span>)</td><td><code class="inl">valueFrom.fieldRef.fieldPath</code></td><td><code class="inl">metadata.name</code>, <code class="inl">metadata.namespace</code>, <code class="inl">status.podIP</code>, <code class="inl">spec.nodeName</code></td></tr>
+              <tr><td>Container resources</td><td><code class="inl">valueFrom.resourceFieldRef</code></td><td><code class="inl">limits.memory</code></td></tr>
+              <tr><td>All keys of a CM/Secret</td><td><code class="inl">envFrom: configMapRef / secretRef</code> (+ optional <code class="inl">prefix</code>)</td><td>everything in <code class="inl">taskflow-config</code></td></tr>
+              <tr><td>Built from other vars</td><td><code class="inl">value: "$(VAR)"</code></td><td><code class="inl">DATABASE_URL</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>TaskFlow API, fully wired</h3>
+        <div class="fname">k8s/deployment.yaml</div>
+<pre><span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
+  name: taskflow-api
+  namespace: taskflow
+  labels: { app: taskflow, tier: api }
+<span class="kw">spec:</span>
+  replicas: <span class="nm">3</span>
+  selector:
+    matchLabels: { app: taskflow, tier: api }
+  template:
+    metadata:
+      labels: { app: taskflow, tier: api }
+    spec:
+      containers:
+        - name: api
+          image: shauryav/taskflow-api:1.1.0
+          ports:
+            - name: http
+              containerPort: <span class="nm">3000</span>
+          envFrom:                              <span class="cm"># 1) NODE_ENV, LOG_LEVEL, PORT, DB_HOST, DB_PORT, DB_NAME</span>
+            - configMapRef:
+                name: taskflow-config
+          env:                                  <span class="cm"># processed after envFrom; same name here wins</span>
+            - name: DB_USER                     <span class="cm"># 2) from the Secret, renamed</span>
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-db-secret
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-db-secret
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL                <span class="cm"># 3) composed from vars defined ABOVE</span>
+              value: <span class="st">"postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"</span>
+            - name: POD_NAME                    <span class="cm"># 4) downward API: who am I?</span>
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MEMORY_LIMIT_MB             <span class="cm"># 5) my own memory limit, in MiB</span>
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+                  divisor: 1Mi
+          volumeMounts:
+            - name: features                    <span class="cm"># 6) ConfigMap as a file</span>
+              mountPath: /etc/taskflow
+              readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: <span class="nm">5</span>
+      volumes:
+        - name: features
+          configMap:
+            name: taskflow-features</pre>
+        <p>The real file also keeps Session 10's <code class="inl">strategy</code>, <code class="inl">minReadySeconds</code> and change-cause annotation — left out here so the env wiring stands out.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line(s)</th><th>What it does</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">envFrom.configMapRef</code></td><td>Imports all 6 keys as env vars with the same names.</td><td>Keys that aren't valid env names may be skipped (an event is recorded) — keep keys <code class="inl">UPPER_SNAKE</code>.</td></tr>
+              <tr><td><code class="inl">secretKeyRef</code></td><td>Copies one Secret key into a variable of <em>your</em> chosen name.</td><td>Missing key → Pod stuck in <code class="inl">CreateContainerConfigError</code> (unless <code class="inl">optional: true</code>).</td></tr>
+              <tr><td><code class="inl">$(DB_USER)</code> etc.</td><td>Dependent variables: K8s substitutes values of vars defined <em>earlier</em> (incl. from <code class="inl">envFrom</code>).</td><td>Undefined → left as literal text <code class="inl">$(DB_USER)</code>. Escape with <code class="inl">$$</code>. Password must be URL-safe.</td></tr>
+              <tr><td><code class="inl">fieldRef</code></td><td>Downward API: Pod's own name/IP/node/namespace.</td><td>Great for logs: which replica handled this request?</td></tr>
+              <tr><td><code class="inl">resourceFieldRef</code></td><td>Exposes requests/limits; <code class="inl">divisor: 1Mi</code> → <code class="inl">256</code>.</td><td>Lets Node size its heap to the limit.</td></tr>
+              <tr><td><code class="inl">volumes[].configMap</code></td><td>Mounts <code class="inl">taskflow-features</code> as files.</td><td>Mount hides whatever the image had in <code class="inl">/etc/taskflow</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/configmap.yaml -f k8s/deployment.yaml &amp;&amp; kubectl rollout status deployment/taskflow-api
+<span class="out">configmap/taskflow-config configured      </span><span class="cm"># the file says LOG_LEVEL=info → undoes §4's patch</span><span class="out">
+deployment.apps/taskflow-api configured
+deployment "taskflow-api" successfully rolled out</span>
+
+<span class="pr">$</span> kubectl exec deploy/taskflow-api -- env | sort | grep -E '^(DB_|DATABASE_URL|LOG_|NODE_|POD_|MEMORY_)'
+<span class="out">DATABASE_URL=postgres://taskflow:s3cr3t-Tf9x@taskflow-db:5432/taskflow
+DB_HOST=taskflow-db
+DB_NAME=taskflow
+DB_PASSWORD=s3cr3t-Tf9x
+DB_PORT=5432
+DB_USER=taskflow
+LOG_LEVEL=info
+MEMORY_LIMIT_MB=256
+NODE_ENV=production
+NODE_NAME=minikube
+POD_IP=10.244.0.31
+POD_NAME=taskflow-api-7d9c5b8f4c-k2xvp</span>          <span class="cm"># secrets are plain text inside the container</span>
+
+<span class="pr">$</span> kubectl describe pod taskflow-api-7d9c5b8f4c-k2xvp | sed -n '/Environment Variables from/,/Mounts/p'
+<span class="out">    Environment Variables from:
+      taskflow-config  ConfigMap  Optional: false
+    Environment:
+      DB_USER:          &lt;set to the key 'POSTGRES_USER' in secret 'taskflow-db-secret'&gt;      Optional: false
+      DB_PASSWORD:      &lt;set to the key 'POSTGRES_PASSWORD' in secret 'taskflow-db-secret'&gt;  Optional: false
+      DATABASE_URL:     postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)
+      POD_NAME:         taskflow-api-7d9c5b8f4c-k2xvp (v1:metadata.name)
+      POD_IP:            (v1:status.podIP)
+      NODE_NAME:         (v1:spec.nodeName)
+      MEMORY_LIMIT_MB:  256 (limits.memory)
+    Mounts:</span>
+
+<span class="pr">$</span> curl -k https://taskflow.local/api/tasks             <span class="cm"># end to end: Ingress → Service → Pod → Postgres</span>
+<span class="out">[]</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: the CreateContainerConfigError you will hit</span>
+<pre><span class="pr">$</span> kubectl get pods
+<span class="out">NAME                            READY   STATUS                       RESTARTS   AGE
+taskflow-api-6f7b9c8d4d-m2xwq   0/1     CreateContainerConfigError   0          20s</span>
+<span class="pr">$</span> kubectl describe pod taskflow-api-6f7b9c8d4d-m2xwq | grep -A1 Warning
+<span class="out">  Warning  Failed     5s (x3 over 20s)  kubelet  Error: couldn't find key POSTGRES_PASS in Secret taskflow/taskflow-db-secret</span></pre>
+          <p>Typo in <code class="inl">key:</code>. Fix the key (or the Secret) and the kubelet retries automatically — no restart needed.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Precedence: <code class="inl">env</code> beats <code class="inl">envFrom</code>; among several <code class="inl">envFrom</code> sources the last one wins. Order inside <code class="inl">env</code> matters only for <code class="inl">$(VAR)</code> references.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Env vars come from literals, ConfigMaps, Secrets, the downward API and resource fields. Compose with <code class="inl">$(VAR)</code>.
+          Verify with <code class="inl">kubectl exec ... -- env</code> and <code class="inl">kubectl describe pod</code>.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">minikube addons enable ingress</code></td><td>Install the ingress-nginx controller.</td></tr>
+              <tr><td><code class="inl">kubectl get ingressclass</code></td><td>Which controllers/classes exist.</td></tr>
+              <tr><td><code class="inl">kubectl get ingress</code> / <code class="inl">describe ingress NAME</code></td><td>Hosts, address, ports; rules → backends → Pod IPs.</td></tr>
+              <tr><td><code class="inl">curl -H "Host: api.taskflow.local" http://$(minikube ip)/health</code></td><td>Test a host rule without editing /etc/hosts.</td></tr>
+              <tr><td><code class="inl">openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout k -out c -subj ... -addext ...</code></td><td>Self-signed cert for local TLS.</td></tr>
+              <tr><td><code class="inl">kubectl create secret tls NAME --cert=c --key=k</code></td><td>TLS Secret for an Ingress.</td></tr>
+              <tr><td><code class="inl">kubectl create configmap NAME --from-literal=K=V | --from-file=f | --from-env-file=f</code></td><td>Create a ConfigMap.</td></tr>
+              <tr><td><code class="inl">kubectl create secret generic NAME --from-literal=K=V</code></td><td>Create an Opaque Secret.</td></tr>
+              <tr><td><code class="inl">kubectl create secret docker-registry NAME --docker-server=... --docker-username=... --docker-password=...</code></td><td>Registry credentials for imagePullSecrets.</td></tr>
+              <tr><td><code class="inl">kubectl create ... --dry-run=client -o yaml | kubectl apply -f -</code></td><td>Create-or-update from files/literals.</td></tr>
+              <tr><td><code class="inl">kubectl get secret NAME -o jsonpath='{.data.KEY}' | base64 -d</code></td><td>Decode a Secret value.</td></tr>
+              <tr><td><code class="inl">echo -n 'value' | base64</code></td><td>Encode for a Secret's <code class="inl">data:</code>.</td></tr>
+              <tr><td><code class="inl">kubectl exec deploy/NAME -- env</code> / <code class="inl">printenv VAR</code></td><td>Check env vars inside a running container.</td></tr>
+              <tr><td><code class="inl">kubectl rollout restart deployment/NAME</code></td><td>Reload env-based config after a ConfigMap/Secret change.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The ingress-nginx controller is TaskFlow's single front door: it terminates TLS with the <code class="inl">taskflow-tls</code> Secret, routes
+          <code class="inl">taskflow.local</code> to the web Service, <code class="inl">/api/*</code> and <code class="inl">api.taskflow.local</code> to the API Service, and those
+          Services pick the Pods. The image stays the same in every environment — <code class="inl">taskflow-config</code> supplies settings, <code class="inl">taskflow-db-secret</code>
+          supplies credentials, and the Deployment turns both (plus downward-API facts) into env vars and files, composing <code class="inl">DATABASE_URL</code> on the way.
+          Change config → restart for env, wait for files.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>You applied an Ingress but <code class="inl">kubectl get ingress</code> shows no ADDRESS and curl gets "connection refused". Most likely cause?</summary>
+          <p class="ans">No Ingress Controller is running (or <code class="inl">ingressClassName</code> doesn't match one). The Ingress object alone does nothing — <code class="inl">minikube addons enable ingress</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Path <code class="inl">/api(/|$)(.*)</code> with <code class="inl">rewrite-target: /$2</code>. What path does the API receive for <code class="inl">/api/tasks/7</code>?</summary>
+          <p class="ans"><code class="inl">/tasks/7</code> — group 2 is <code class="inl">tasks/7</code>, prefixed by <code class="inl">/</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Does <code class="inl">pathType: Prefix</code>, <code class="inl">path: /api</code> match <code class="inl">/apis</code>? And <code class="inl">/api/</code>?</summary>
+          <p class="ans"><code class="inl">/apis</code>: no (prefix matching is per path element). <code class="inl">/api/</code>: yes.</p>
+        </details>
+        <details class="quiz">
+          <summary>Is a Kubernetes Secret encrypted? What does <code class="inl">data.POSTGRES_PASSWORD: czNjcjN0LVRmOXg=</code> protect against?</summary>
+          <p class="ans">Only base64-encoded by default (encrypted in etcd only if encryption at rest is configured). base64 protects against nothing — <code class="inl">base64 -d</code> reveals <code class="inl">s3cr3t-Tf9x</code>. Protection comes from RBAC + encryption at rest.</p>
+        </details>
+        <details class="quiz">
+          <summary>You changed <code class="inl">LOG_LEVEL</code> in the ConfigMap. The mounted <code class="inl">features.json</code> updated by itself but the env var didn't. Why, and what do you run?</summary>
+          <p class="ans">Env vars are set once at container start; projected volume files are refreshed by the kubelet. Run <code class="inl">kubectl rollout restart deployment/taskflow-api</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>A Pod is stuck in <code class="inl">CreateContainerConfigError</code>. Name two likely causes.</summary>
+          <p class="ans">A referenced ConfigMap/Secret doesn't exist in the Pod's namespace, or a referenced <code class="inl">key</code> is missing (and <code class="inl">optional</code> isn't set).</p>
+        </details>
+        <details class="quiz">
+          <summary>Why <code class="inl">echo -n</code> when base64-encoding a password?</summary>
+          <p class="ans">Plain <code class="inl">echo</code> adds a newline, which gets encoded into the value (<code class="inl">...Zsb3cK</code> instead of <code class="inl">...Zsb3c=</code>), so the stored password ends with <code class="inl">\n</code> and authentication fails.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 12: Kubernetes Ingress, ConfigMaps &amp; Secrets.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/" target="_blank" rel="noopener">Ingress</a> — rules, pathType, TLS, IngressClass.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress-controllers/" target="_blank" rel="noopener">Ingress Controllers</a> — list of controllers.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/configuration/configmap/" target="_blank" rel="noopener">ConfigMaps</a> — creation, env/volume consumption, updates.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/configuration/secret/" target="_blank" rel="noopener">Secrets</a> — types, imagePullSecrets, good practices.</li>
+          <li><a href="https://kubernetes.io/docs/tasks/inject-data-application/environment-variable-expose-pod-information/" target="_blank" rel="noopener">Expose Pod information via environment variables</a> — downward API <code class="inl">fieldRef</code>/<code class="inl">resourceFieldRef</code>.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-11.html"><div class="dir">← Previous</div><div class="ttl">Session 11: K8s Networking &amp; Services</div></a>
+        <a class="next" href="session-13.html"><div class="dir">Next →</div><div class="ttl">Session 13: Storage, HPA &amp; Probes</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 12 — Kubernetes Ingress, ConfigMaps &amp; Secrets</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

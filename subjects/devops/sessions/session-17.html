@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 17 — Helm — Kubernetes Package Manager</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 17</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 17</span>
+      <h1>Helm — Kubernetes Package Manager</h1>
+      <p class="lead">
+        Turn TaskFlow's pile of Kubernetes YAML into one versioned Helm chart, deploy it to dev and prod with
+        different values files, and upgrade or roll back the whole app with one command.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 28 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#what-is-helm">What is Helm?</a></li>
+          <li><a href="#chart-structure">Chart structure &amp; Chart.yaml</a></li>
+          <li><a href="#values">values.yaml</a></li>
+          <li><a href="#templates">Templates</a></li>
+          <li><a href="#install-upgrade">Install &amp; upgrade</a></li>
+          <li><a href="#rollback">Rollback &amp; release history</a></li>
+          <li><a href="#deploy-taskflow">Deploying TaskFlow with Helm</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. WHAT IS HELM ===================== -->
+      <section id="what-is-helm">
+        <h2><span class="sec-num">1</span> What is Helm?</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Helm is <code class="inl">npm</code>/<code class="inl">apt</code> for Kubernetes. A chart is a package of YAML templates; installing it with your settings creates a running copy called a release.</p>
+        </div>
+
+        <p>The problem with plain <code class="inl">kubectl apply -f k8s/</code> for TaskFlow:</p>
+        <ul>
+          <li>7 YAML files × dev/staging/prod = copy-pasted folders that drift apart (only replicas, image tag, host and resources really differ).</li>
+          <li>No version for "the app": which set of files is running in prod right now?</li>
+          <li>Rollback means finding old files in Git and re-applying them by hand. No clean "uninstall the whole app".</li>
+        </ul>
+        <p>Helm fixes it: write the YAML once as <strong>templates</strong>, put the differences in <strong>values</strong>, and Helm tracks every install/upgrade as a numbered <strong>revision</strong>.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Concept</th><th>Meaning</th><th>TaskFlow example</th></tr></thead>
+            <tbody>
+              <tr><td><span class="term">Chart</span></td><td>Package: templates + default values + metadata</td><td><code class="inl">charts/taskflow/</code></td></tr>
+              <tr><td><span class="term">Values</span></td><td>Settings injected into templates</td><td><code class="inl">image.tag=1.2.0</code>, <code class="inl">replicaCount=3</code></td></tr>
+              <tr><td><span class="term">Release</span></td><td>One installed instance of a chart in a namespace</td><td>release <code class="inl">taskflow</code> in ns <code class="inl">taskflow</code></td></tr>
+              <tr><td><span class="term">Revision</span></td><td>Version of a release; +1 on every install/upgrade/rollback</td><td>revision 1, 2, 3…</td></tr>
+              <tr><td><span class="term">Repository</span></td><td>Where charts are published (HTTP index or OCI registry)</td><td><code class="inl">bitnami</code>, <code class="inl">oci://ghcr.io/shauryav/charts</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre>values.yaml + -f values-prod.yaml + --set image.tag=1.2.0
+                │
+templates/*.yaml ──► helm (Go templating, on YOUR machine) ──► plain K8s YAML ──► kube-apiserver
+                                                                        │
+                                         release record stored as a Secret in the release namespace
+                                         (sh.helm.release.v1.taskflow.v3) → history &amp; rollback</pre>
+        <ul>
+          <li><strong>Helm 3+ is client-only</strong>: it uses your kubeconfig and your RBAC permissions. Helm 2 needed an in-cluster server, <em>Tiller</em>, usually with cluster-admin rights — a security hole, removed in Helm 3.</li>
+        </ul>
+
+        <div class="callout note">
+          <span class="c-title">Helm 3 vs Helm 4</span>
+          <p>Helm 4 went GA in Nov 2025 (<code class="inl">brew install helm</code> now gives v4.x; Helm 3 still gets patches). Charts (<code class="inl">apiVersion: v2</code>) and every command on this page work in both. Differences you'll see in v4: <code class="inl">--atomic</code> is renamed <code class="inl">--rollback-on-failure</code> (old name still works, with a deprecation warning), <code class="inl">--force</code> → <code class="inl">--force-replace</code>, and installs use server-side apply by default.</p>
+        </div>
+
+<pre><span class="pr">$</span> brew install helm          <span class="cm"># or: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash</span>
+<span class="pr">$</span> helm version --short
+<span class="out">v4.3.0+gbec5b06</span></pre>
+
+        <h3>Using a public chart (Redis)</h3>
+<pre><span class="pr">$</span> helm repo add bitnami https://charts.bitnami.com/bitnami
+<span class="out">"bitnami" has been added to your repositories</span>
+<span class="pr">$</span> helm repo update
+<span class="out">Hang tight while we grab the latest from your chart repositories...
+...Successfully got an update from the "bitnami" chart repository
+Update Complete. ⎈Happy Helming!⎈</span>
+<span class="pr">$</span> helm search repo redis
+<span class="out">NAME                    CHART VERSION   APP VERSION   DESCRIPTION
+bitnami/redis           28.3.1          8.10.2        Redis(R) is an open source, advanced key-value ...
+bitnami/redis-cluster   13.0.4          8.2.1         Redis(R) is an open source, scalable, distribut...</span>
+<span class="pr">$</span> helm show values bitnami/redis | grep -A3 '^image:'      <span class="cm"># what can I configure?</span>
+<span class="out">image:
+  registry: registry-1.docker.io
+  repository: bitnami/redis
+  tag: latest</span>
+
+<span class="pr">$</span> helm install my-redis bitnami/redis -n taskflow --set architecture=standalone
+<span class="out">NAME: my-redis
+LAST DEPLOYED: Fri Oct  9 10:12:31 2026
+NAMESPACE: taskflow
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+NOTES:
+CHART NAME: redis
+CHART VERSION: 28.3.1
+APP VERSION: 8.10.2
+** Please be patient while the chart is being deployed **
+Redis can be accessed via port 6379 on the following DNS name from within your cluster:
+    my-redis-master.taskflow.svc.cluster.local
+...</span>
+
+<span class="pr">$</span> helm list -n taskflow
+<span class="out">NAME       NAMESPACE   REVISION   UPDATED                                STATUS     CHART          APP VERSION
+my-redis   taskflow    1          2026-10-09 10:12:31.48211 +0530 IST    deployed   redis-28.3.1   8.10.2</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app.kubernetes.io/instance=my-redis
+<span class="out">NAME                READY   STATUS    RESTARTS   AGE
+my-redis-master-0   1/1     Running   0          70s</span>
+<span class="pr">$</span> helm status my-redis -n taskflow           <span class="cm"># re-prints the block + NOTES</span>
+<span class="pr">$</span> helm uninstall my-redis -n taskflow
+<span class="out">release "my-redis" uninstalled</span></pre>
+        <ul>
+          <li>Install straight from an OCI registry, no <code class="inl">repo add</code>: <code class="inl">helm install my-redis oci://registry-1.docker.io/bitnamicharts/redis</code>.</li>
+          <li>Find charts on <a href="https://artifacthub.io" target="_blank" rel="noopener">Artifact Hub</a> or with <code class="inl">helm search hub redis</code>.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Forgetting <code class="inl">-n taskflow</code> on <code class="inl">list</code>/<code class="inl">status</code>/<code class="inl">uninstall</code> → <code class="inl">Error: release: not found</code>. Releases are per namespace; <code class="inl">helm list -A</code> shows all.</li>
+            <li><code class="inl">helm search repo</code> shows old versions → run <code class="inl">helm repo update</code> (the index is cached locally).</li>
+            <li>Bitnami's free images are now published only as <code class="inl">latest</code> (catalog change, Sept 2025). Fine for learning; for production pin an image digest or use another image source.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Chart = package, values = settings, release = installed instance, revision = its version. Helm renders templates locally and stores release state as Secrets in the namespace.
+        </div>
+      </section>
+
+      <!-- ===================== 2. CHART STRUCTURE ===================== -->
+      <section id="chart-structure">
+        <h2><span class="sec-num">2</span> Helm charts: structure &amp; Chart.yaml</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A chart is a folder with a fixed layout: an ID card (<code class="inl">Chart.yaml</code>), a settings sheet (<code class="inl">values.yaml</code>), and fill-in-the-blanks YAML (<code class="inl">templates/</code>).</p>
+        </div>
+
+<pre><span class="pr">$</span> mkdir -p charts &amp;&amp; cd charts &amp;&amp; helm create taskflow
+<span class="out">Creating taskflow</span>
+<span class="pr">$</span> tree -a taskflow
+<span class="out">taskflow
+├── .helmignore
+├── Chart.yaml
+├── charts
+├── templates
+│   ├── NOTES.txt
+│   ├── _helpers.tpl
+│   ├── deployment.yaml
+│   ├── hpa.yaml
+│   ├── httproute.yaml
+│   ├── ingress.yaml
+│   ├── service.yaml
+│   ├── serviceaccount.yaml
+│   └── tests
+│       └── test-connection.yaml
+└── values.yaml</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Chart.yaml</code></td><td>Required. Chart metadata: name, chart version, app version, dependencies.</td></tr>
+              <tr><td><code class="inl">values.yaml</code></td><td>Default values for every <code class="inl">.Values.x</code> used in templates.</td></tr>
+              <tr><td><code class="inl">charts/</code></td><td>Dependency (sub-)charts, filled by <code class="inl">helm dependency update</code>.</td></tr>
+              <tr><td><code class="inl">templates/</code></td><td>Every <code class="inl">*.yaml</code> here is rendered and sent to Kubernetes.</td></tr>
+              <tr><td><code class="inl">templates/_helpers.tpl</code></td><td>Files starting with <code class="inl">_</code> are not rendered as manifests; they hold reusable named templates (<code class="inl">define</code>).</td></tr>
+              <tr><td><code class="inl">templates/NOTES.txt</code></td><td>Template printed after install/upgrade (how to reach the app).</td></tr>
+              <tr><td><code class="inl">templates/tests/</code></td><td>Pods run by <code class="inl">helm test &lt;release&gt;</code> (e.g. curl the Service).</td></tr>
+              <tr><td><code class="inl">httproute.yaml</code></td><td>Gateway API route (generated by Helm 3.19+ / 4; older versions don't create it).</td></tr>
+              <tr><td><code class="inl">.helmignore</code></td><td>Like <code class="inl">.gitignore</code>: files left out of <code class="inl">helm package</code> (<code class="inl">.git/</code>, <code class="inl">*.swp</code>, <code class="inl">.vscode/</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>For TaskFlow we keep the layout but replace the generated files with smaller ones (deleted: <code class="inl">httproute.yaml</code>, <code class="inl">serviceaccount.yaml</code>, <code class="inl">tests/</code>). Final chart:</p>
+<pre>charts/taskflow/
+├── Chart.yaml
+├── values.yaml          <span class="cm"># defaults</span>
+├── values-dev.yaml      <span class="cm"># minikube overrides</span>
+├── values-prod.yaml     <span class="cm"># production overrides</span>
+├── .helmignore
+├── charts/              <span class="cm"># empty: no dependencies</span>
+└── templates/
+    ├── _helpers.tpl
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── ingress.yaml     <span class="cm"># only if ingress.enabled</span>
+    ├── hpa.yaml         <span class="cm"># only if autoscaling.enabled</span>
+    └── NOTES.txt</pre>
+
+        <h3>Chart.yaml</h3>
+        <div class="fname">charts/taskflow/Chart.yaml</div>
+<pre><span class="kw">apiVersion</span>: v2                <span class="cm"># chart API v2 = Helm 3+ (v1 was Helm 2)</span>
+<span class="kw">name</span>: taskflow                <span class="cm"># chart name; must match the folder name</span>
+<span class="kw">description</span>: TaskFlow REST API (Node.js + Express) on Kubernetes
+<span class="kw">type</span>: application             <span class="cm"># application = installable; library = only helpers, can't be installed</span>
+<span class="kw">version</span>: <span class="nm">0.1.0</span>                <span class="cm"># CHART version (SemVer). Bump on every chart change</span>
+<span class="kw">appVersion</span>: <span class="st">"1.0.0"</span>           <span class="cm"># version of the APP packaged (default image tag). Quote it</span>
+<span class="kw">maintainers</span>:
+  - name: shauryav</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th><code class="inl">version</code></th><th><code class="inl">appVersion</code></th></tr></thead>
+            <tbody>
+              <tr><td>Describes</td><td>The chart (templates + values)</td><td>The software inside (TaskFlow API)</td></tr>
+              <tr><td>Format</td><td>Strict SemVer 2, required</td><td>Any string, optional</td></tr>
+              <tr><td>Changes when</td><td>You edit a template or default value</td><td>You release a new app image</td></tr>
+              <tr><td>Shown as</td><td><code class="inl">CHART</code> column: <code class="inl">taskflow-0.1.0</code></td><td><code class="inl">APP VERSION</code> column: <code class="inl">1.0.0</code></td></tr>
+              <tr><td>Used in our templates</td><td><code class="inl">helm.sh/chart</code> label</td><td>Image tag fallback, <code class="inl">app.kubernetes.io/version</code> label</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Dependencies (sub-charts) are declared in Chart.yaml too. Example — if TaskFlow shipped its own Postgres instead of the StatefulSet from Session 15:</p>
+<pre><span class="kw">dependencies</span>:
+  - name: postgresql
+    version: <span class="st">"18.x.x"</span>                                  <span class="cm"># SemVer range of the sub-chart</span>
+    repository: oci://registry-1.docker.io/bitnamicharts
+    condition: postgresql.enabled                     <span class="cm"># installed only if values say true</span></pre>
+<pre><span class="pr">$</span> helm dependency update charts/taskflow        <span class="cm"># downloads into charts/taskflow/charts/ + writes Chart.lock</span>
+<span class="out">Saving 1 charts
+Downloading postgresql from repo oci://registry-1.docker.io/bitnamicharts
+Deleting outdated charts</span></pre>
+        <p>Sub-chart values are set under the sub-chart's name in the parent's values: <code class="inl">postgresql.auth.database: taskflow</code>.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">version: 0.1</code> → YAML makes it a number: <code class="inl">[ERROR] Chart.yaml: version should be of type string but it's of type float64</code>. <code class="inl">version: abc</code> → <code class="inl">version 'abc' is not a valid SemVer</code>. Use <code class="inl">0.1.0</code>.</li>
+            <li>Bumping only <code class="inl">appVersion</code> after editing templates → two different charts share version <code class="inl">0.1.0</code> in your registry.</li>
+            <li>Committing <code class="inl">charts/*.tgz</code> without <code class="inl">Chart.lock</code> — commit the lock file, re-download with <code class="inl">helm dependency build</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">helm create</code> scaffolds the layout. Chart.yaml: <code class="inl">apiVersion: v2</code>, name, <code class="inl">version</code> (chart SemVer) ≠ <code class="inl">appVersion</code> (app release), optional dependencies.
+        </div>
+      </section>
+
+      <!-- ===================== 3. VALUES ===================== -->
+      <section id="values">
+        <h2><span class="sec-num">3</span> values.yaml</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>values.yaml is the settings form. Templates read the form; dev and prod fill in a few boxes differently.</p>
+        </div>
+
+        <div class="fname">charts/taskflow/values.yaml</div>
+<pre><span class="kw">replicaCount</span>: <span class="nm">2</span>                      <span class="cm"># ignored when autoscaling.enabled=true (HPA owns replicas)</span>
+
+<span class="kw">image</span>:
+  repository: shauryav/taskflow-api
+  tag: <span class="st">""</span>                            <span class="cm"># empty → template falls back to Chart.appVersion</span>
+  pullPolicy: IfNotPresent
+
+<span class="kw">nameOverride</span>: <span class="st">""</span>
+<span class="kw">fullnameOverride</span>: <span class="st">"taskflow-api"</span>    <span class="cm"># keep object names from Sessions 10–16 (Ingress, NetworkPolicies)</span>
+
+<span class="kw">podLabels</span>:
+  app: taskflow-api                  <span class="cm"># extra pod label: the NetworkPolicies from Session 16 select on it</span>
+
+<span class="kw">service</span>:
+  type: ClusterIP
+  port: <span class="nm">80</span>                           <span class="cm"># Service port</span>
+  targetPort: <span class="nm">3000</span>                   <span class="cm"># container port (Express listens on PORT=3000)</span>
+
+<span class="kw">env</span>:                                 <span class="cm"># non-secret env vars, rendered with range</span>
+  NODE_ENV: production
+  LOG_LEVEL: info
+
+<span class="kw">database</span>:
+  existingSecret: taskflow-db-secret <span class="cm"># Secret created outside Helm (kubectl create secret)</span>
+  secretKey: DATABASE_URL
+
+<span class="kw">podSecurityContext</span>:                  <span class="cm"># passes the "restricted" Pod Security level (Session 16)</span>
+  runAsNonRoot: <span class="nm">true</span>
+  runAsUser: <span class="nm">1000</span>
+  seccompProfile:
+    type: RuntimeDefault
+
+<span class="kw">securityContext</span>:
+  allowPrivilegeEscalation: <span class="nm">false</span>
+  capabilities:
+    drop: [<span class="st">"ALL"</span>]
+
+<span class="kw">resources</span>:                           <span class="cm"># copied verbatim with toYaml</span>
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+<span class="kw">autoscaling</span>:
+  enabled: <span class="nm">false</span>                     <span class="cm"># true → hpa.yaml rendered, replicas omitted</span>
+  minReplicas: <span class="nm">2</span>
+  maxReplicas: <span class="nm">5</span>
+  targetCPUUtilizationPercentage: <span class="nm">70</span>
+
+<span class="kw">ingress</span>:
+  enabled: <span class="nm">false</span>                     <span class="cm"># true → ingress.yaml rendered</span>
+  className: nginx
+  host: taskflow.local</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Read in template as</th><th>Ends up in</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">image.repository</code>, <code class="inl">image.tag</code></td><td><code class="inl">{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}</code></td><td>Container <code class="inl">image:</code></td></tr>
+              <tr><td><code class="inl">fullnameOverride</code></td><td><code class="inl">include "taskflow.fullname" .</code></td><td><code class="inl">metadata.name</code> of every object</td></tr>
+              <tr><td><code class="inl">env</code> (map)</td><td><code class="inl">range $key, $value := .Values.env</code></td><td>One <code class="inl">- name/value</code> per entry</td></tr>
+              <tr><td><code class="inl">database.existingSecret</code></td><td><code class="inl">required "..." .Values.database.existingSecret</code></td><td><code class="inl">secretKeyRef.name</code>; render fails if empty</td></tr>
+              <tr><td><code class="inl">resources</code>, security contexts</td><td><code class="inl">with</code> + <code class="inl">toYaml . | nindent 12</code></td><td>Copied as a YAML block</td></tr>
+              <tr><td><code class="inl">autoscaling.enabled</code>, <code class="inl">ingress.enabled</code></td><td><code class="inl">if</code></td><td>Whole object present or absent</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Per-environment values files</h3>
+        <p>Override only what differs. Everything else comes from <code class="inl">values.yaml</code>.</p>
+        <div class="fname">charts/taskflow/values-dev.yaml</div>
+<pre><span class="kw">replicaCount</span>: <span class="nm">1</span>
+<span class="kw">env</span>:
+  NODE_ENV: development
+  LOG_LEVEL: debug
+<span class="kw">resources</span>:
+  requests:              <span class="cm"># limits not mentioned → still 500m / 256Mi from values.yaml</span>
+    cpu: 50m
+    memory: 64Mi
+<span class="kw">ingress</span>:
+  enabled: <span class="nm">true</span>
+  host: taskflow.local   <span class="cm"># add "$(minikube ip) taskflow.local" to /etc/hosts</span></pre>
+        <div class="fname">charts/taskflow/values-prod.yaml</div>
+<pre><span class="kw">image</span>:
+  tag: <span class="st">"1.2.0"</span>             <span class="cm"># always quote tags</span>
+<span class="kw">env</span>:
+  LOG_LEVEL: warn          <span class="cm"># NODE_ENV stays "production" from values.yaml</span>
+<span class="kw">resources</span>:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: <span class="st">"1"</span>
+    memory: 512Mi
+<span class="kw">autoscaling</span>:
+  enabled: <span class="nm">true</span>
+  minReplicas: <span class="nm">3</span>
+  maxReplicas: <span class="nm">10</span>
+<span class="kw">ingress</span>:
+  enabled: <span class="nm">true</span>
+  host: taskflow.example.com   <span class="cm"># your real domain</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>dev (minikube)</th><th>prod</th></tr></thead>
+            <tbody>
+              <tr><td>Replicas</td><td>1 (fixed)</td><td>HPA 3–10 at 70% CPU</td></tr>
+              <tr><td>Image</td><td><code class="inl">1.0.0</code> (appVersion)</td><td><code class="inl">1.2.0</code></td></tr>
+              <tr><td>Logging</td><td><code class="inl">development</code> / <code class="inl">debug</code></td><td><code class="inl">production</code> / <code class="inl">warn</code></td></tr>
+              <tr><td>Requests</td><td>50m CPU / 64Mi</td><td>250m CPU / 256Mi</td></tr>
+              <tr><td>Host</td><td><code class="inl">taskflow.local</code></td><td><code class="inl">taskflow.example.com</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Values precedence (exam favourite)</h3>
+<pre>chart's values.yaml  &lt;  parent chart's values  &lt;  -f file1.yaml  &lt;  -f file2.yaml  &lt;  --set / --set-string
+   (lowest)                                       (later -f wins)                    (highest)</pre>
+<pre><span class="pr">$</span> helm template taskflow charts/taskflow -f charts/taskflow/values-dev.yaml --set replicaCount=3 | grep replicas
+<span class="out">  replicas: 3</span>      <span class="cm"># values.yaml says 2, values-dev.yaml says 1, --set says 3 → 3</span></pre>
+        <ul>
+          <li><strong>Maps merge deeply</strong> (dev set only <code class="inl">resources.requests</code>; <code class="inl">limits</code> survived). <strong>Lists are replaced</strong> as a whole.</li>
+          <li>Remove a default key by setting it to <code class="inl">null</code> (e.g. <code class="inl">--set ingress.className=null</code>).</li>
+          <li><code class="inl">--set</code> syntax: nested <code class="inl">a.b=c</code>, several <code class="inl">a=1,b=2</code>, list item <code class="inl">hosts[0]=x</code>.</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake: unquoted versions</span>
+          <p>YAML reads <code class="inl">tag: 1.20</code> as the number 1.2, so the chart deploys <code class="inl">shauryav/taskflow-api:1.2</code> (verified with <code class="inl">helm template</code>). Always write <code class="inl">tag: "1.20"</code>. On the command line, <code class="inl">--set-string image.tag=1.20</code> forces a string.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          values.yaml = defaults; <code class="inl">values-&lt;env&gt;.yaml</code> = small overrides. Precedence: chart defaults &lt; <code class="inl">-f</code> (last wins) &lt; <code class="inl">--set</code>. Maps merge, lists replace. Quote tags.
+        </div>
+      </section>
+
+      <!-- ===================== 4. TEMPLATES ===================== -->
+      <section id="templates">
+        <h2><span class="sec-num">4</span> Templates</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A template is YAML with blanks like <code class="inl">{{ .Values.image.tag }}</code>. Helm fills the blanks from the values and hands normal YAML to Kubernetes.</p>
+        </div>
+
+        <ul>
+          <li>Syntax is Go templates plus the Sprig function library. Everything between <code class="inl">{{ }}</code> is evaluated; the rest is copied as is.</li>
+          <li><code class="inl">.</code> (dot) is the current scope; at the top it holds the built-in objects below.</li>
+          <li><code class="inl">{{-</code> trims whitespace/newlines on the left, <code class="inl">-}}</code> on the right. Most indentation bugs come from these.</li>
+          <li>Pipelines work like the shell: <code class="inl">{{ .Values.env.LOG_LEVEL | upper | quote }}</code> → <code class="inl">"INFO"</code>.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Built-in object</th><th>Value for <code class="inl">helm install taskflow charts/taskflow -n taskflow</code></th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">.Values</code></td><td>Merged values (defaults + <code class="inl">-f</code> + <code class="inl">--set</code>)</td></tr>
+              <tr><td><code class="inl">.Release.Name</code> / <code class="inl">.Release.Namespace</code></td><td><code class="inl">taskflow</code> / <code class="inl">taskflow</code></td></tr>
+              <tr><td><code class="inl">.Release.Revision</code></td><td>1 on install, 2 after first upgrade…</td></tr>
+              <tr><td><code class="inl">.Release.Service</code></td><td><code class="inl">Helm</code></td></tr>
+              <tr><td><code class="inl">.Chart.Name</code> / <code class="inl">.Chart.Version</code> / <code class="inl">.Chart.AppVersion</code></td><td><code class="inl">taskflow</code> / <code class="inl">0.1.0</code> / <code class="inl">1.0.0</code></td></tr>
+              <tr><td><code class="inl">.Capabilities.KubeVersion</code></td><td>Cluster version, e.g. to pick an API version</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>_helpers.tpl — named templates</h3>
+        <div class="fname">charts/taskflow/templates/_helpers.tpl</div>
+<pre>{{/* Chart name, overridable with .Values.nameOverride */}}
+{{- define "taskflow.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/* Full name: "&lt;release&gt;-&lt;chart&gt;", or just "&lt;release&gt;" if it already contains the chart name */}}
+{{- define "taskflow.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/* Labels put on every object */}}
+{{- define "taskflow.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+{{ include "taskflow.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/* Labels used in selectors — must never change after the first install */}}
+{{- define "taskflow.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "taskflow.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}</pre>
+        <ul>
+          <li><code class="inl">define "x"</code> creates a named template; <code class="inl">include "x" .</code> renders it, passing the current scope <code class="inl">.</code> (forget the dot → empty values).</li>
+          <li><code class="inl">trunc 63</code>: Kubernetes names/labels max 63 chars. <code class="inl">{{/* */}}</code> comments disappear on render; a <code class="inl"># comment</code> would be copied into the output YAML.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Release name</th><th><code class="inl">fullnameOverride</code></th><th>Object name (<code class="inl">taskflow.fullname</code>)</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">taskflow</code></td><td>""</td><td><code class="inl">taskflow</code> (release contains chart name)</td></tr>
+              <tr><td><code class="inl">demo</code></td><td>""</td><td><code class="inl">demo-taskflow</code></td></tr>
+              <tr><td>anything</td><td><code class="inl">taskflow-api</code></td><td><code class="inl">taskflow-api</code> (our values.yaml)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>deployment.yaml</h3>
+        <div class="fname">charts/taskflow/templates/deployment.yaml</div>
+<pre><span class="kw">apiVersion</span>: apps/v1
+<span class="kw">kind</span>: Deployment
+<span class="kw">metadata</span>:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+<span class="kw">spec</span>:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "taskflow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "taskflow.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.service.targetPort | quote }}
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "database.existingSecret is required" .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKey }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Construct</th><th>What it does here</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">include "taskflow.labels" . | nindent 4</code></td><td>Render the helper, then add a newline + indent every line by 4 spaces so it sits under <code class="inl">labels:</code>.</td></tr>
+              <tr><td><code class="inl">if not .Values.autoscaling.enabled</code></td><td>Omit <code class="inl">replicas</code> when an HPA manages it (otherwise every upgrade resets the HPA's count).</td></tr>
+              <tr><td><code class="inl">with .Values.podLabels</code></td><td>Runs the block only if the value is non-empty, and sets <code class="inl">.</code> to it — so <code class="inl">toYaml .</code> means <code class="inl">toYaml .Values.podLabels</code>.</td></tr>
+              <tr><td><code class="inl">toYaml . | nindent 12</code></td><td>Convert a values map/list to YAML text, indented 12 spaces (under <code class="inl">resources:</code>).</td></tr>
+              <tr><td><code class="inl">.Values.image.tag | default .Chart.AppVersion</code></td><td>Use the tag if set, else <code class="inl">1.0.0</code> from Chart.yaml.</td></tr>
+              <tr><td><code class="inl">| quote</code></td><td>Wraps in double quotes. Env values must be strings: <code class="inl">value: 3000</code> would be rejected.</td></tr>
+              <tr><td><code class="inl">range $key, $value := .Values.env</code></td><td>Loop over the map (keys come out sorted alphabetically).</td></tr>
+              <tr><td><code class="inl">required "msg" X</code></td><td>Abort rendering with <code class="inl">msg</code> if X is empty.</td></tr>
+              <tr><td><code class="inl">{{-</code> on control lines</td><td>Eats the newline before <code class="inl">if</code>/<code class="inl">end</code>/<code class="inl">range</code> so they leave no blank lines.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>service.yaml, ingress.yaml, hpa.yaml, NOTES.txt</h3>
+        <div class="fname">charts/taskflow/templates/service.yaml</div>
+<pre><span class="kw">apiVersion</span>: v1
+<span class="kw">kind</span>: Service
+<span class="kw">metadata</span>:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+<span class="kw">spec</span>:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "taskflow.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http</pre>
+        <div class="fname">charts/taskflow/templates/ingress.yaml</div>
+<pre>{{- if .Values.ingress.enabled }}
+<span class="kw">apiVersion</span>: networking.k8s.io/v1
+<span class="kw">kind</span>: Ingress
+<span class="kw">metadata</span>:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+<span class="kw">spec</span>:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "taskflow.fullname" . }}
+                port:
+                  name: http
+{{- end }}</pre>
+        <div class="fname">charts/taskflow/templates/hpa.yaml</div>
+<pre>{{- if .Values.autoscaling.enabled }}
+<span class="kw">apiVersion</span>: autoscaling/v2
+<span class="kw">kind</span>: HorizontalPodAutoscaler
+<span class="kw">metadata</span>:
+  name: {{ include "taskflow.fullname" . }}
+  labels:
+    {{- include "taskflow.labels" . | nindent 4 }}
+<span class="kw">spec</span>:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "taskflow.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}</pre>
+        <div class="fname">charts/taskflow/templates/NOTES.txt</div>
+<pre>TaskFlow {{ .Values.image.tag | default .Chart.AppVersion }} is running as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+{{- if .Values.ingress.enabled }}
+  curl http://{{ .Values.ingress.host }}/health
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "taskflow.fullname" . }} 8080:{{ .Values.service.port }}
+  curl localhost:8080/health
+{{- end }}</pre>
+
+        <h3>See the rendered output before touching the cluster</h3>
+<pre><span class="pr">$</span> helm lint charts/taskflow
+<span class="out">==&gt; Linting charts/taskflow
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed</span>
+
+<span class="pr">$</span> helm template taskflow charts/taskflow -n taskflow
+<span class="out">---
+# Source: taskflow/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-api
+  labels:
+    helm.sh/chart: taskflow-0.1.0
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/instance: taskflow
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Source: taskflow/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-api
+  labels:
+    helm.sh/chart: taskflow-0.1.0
+    app.kubernetes.io/name: taskflow
+    app.kubernetes.io/instance: taskflow
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taskflow
+      app.kubernetes.io/instance: taskflow
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taskflow
+        app.kubernetes.io/instance: taskflow
+        app: taskflow-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: taskflow
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          image: "shauryav/taskflow-api:1.0.0"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: NODE_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: taskflow-db-secret
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi</span></pre>
+        <p>Notice: no Ingress/HPA (both disabled by default); <code class="inl">env</code> sorted by key; <code class="inl">toYaml</code> sorted <code class="inl">limits</code> before <code class="inl">requests</code>. With the prod file the Deployment loses <code class="inl">replicas</code> and gains an HPA and an Ingress:</p>
+<pre><span class="pr">$</span> helm template taskflow charts/taskflow -f charts/taskflow/values-prod.yaml --show-only templates/hpa.yaml | grep -A8 minReplicas
+<span class="out">  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</span>
+
+<span class="pr">$</span> helm template taskflow charts/taskflow --set database.existingSecret=""
+<span class="out">Error: execution error at (taskflow/templates/deployment.yaml:47:27): database.existingSecret is required</span>
+
+<span class="cm"># full dry run: renders + NOTES, no cluster changes (=server also validates against the API)</span>
+<span class="pr">$</span> helm install taskflow charts/taskflow -n taskflow --dry-run=client --debug</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake: indent vs nindent</span>
+          <p><code class="inl">{{- include "taskflow.selectorLabels" . | indent 8 }}</code> — the <code class="inl">{{-</code> eats the newline and <code class="inl">indent</code> doesn't add one, so the first label lands on the <code class="inl">labels:</code> line:</p>
+        </div>
+<pre><span class="pr">$</span> helm lint charts/taskflow
+<span class="out">[ERROR] templates/deployment.yaml: unable to parse YAML: error converting YAML to JSON: yaml: line 19: mapping values are not allowed in this context
+
+Error: 1 chart(s) linted, 1 chart(s) failed</span></pre>
+        <p>Use <code class="inl">nindent</code> after <code class="inl">{{-</code>. Debug with <code class="inl">helm template --debug</code> (prints the broken YAML) and <code class="inl">--show-only templates/deployment.yaml</code>.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Templates = YAML + <code class="inl">{{ }}</code>. Know: <code class="inl">.Values/.Release/.Chart</code>, <code class="inl">include … | nindent</code>, <code class="inl">toYaml</code>, <code class="inl">if</code>, <code class="inl">with</code>, <code class="inl">range</code>, <code class="inl">default</code>, <code class="inl">quote</code>, <code class="inl">required</code>. Always <code class="inl">helm lint</code> + <code class="inl">helm template</code> first.
+        </div>
+      </section>
+
+      <!-- ===================== 5. INSTALL & UPGRADE ===================== -->
+      <section id="install-upgrade">
+        <h2><span class="sec-num">5</span> Install &amp; upgrade</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Install puts the app in the cluster for the first time; upgrade changes it in place and writes a new page in its history book.</p>
+        </div>
+
+        <p>The chart expects a Secret it doesn't create (passwords stay out of values files and Git):</p>
+<pre><span class="pr">$</span> kubectl create namespace taskflow
+<span class="pr">$</span> kubectl create secret generic taskflow-db-secret -n taskflow \
+    --from-literal=DATABASE_URL='postgres://taskflow:S3cretPw@taskflow-db:5432/taskflow'
+<span class="out">secret/taskflow-db-secret created</span>
+
+<span class="pr">$</span> helm install taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-dev.yaml
+<span class="out">NAME: taskflow
+LAST DEPLOYED: Fri Oct  9 17:20:05 2026
+NAMESPACE: taskflow
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+TEST SUITE: None
+NOTES:
+TaskFlow 1.0.0 is running as release "taskflow" in namespace "taskflow".
+  curl http://taskflow.local/health</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Part of <code class="inl">helm install</code></th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">taskflow</code></td><td>Release name (unique per namespace).</td></tr>
+              <tr><td><code class="inl">./charts/taskflow</code></td><td>Chart: local dir, <code class="inl">.tgz</code>, <code class="inl">repo/chart</code>, or <code class="inl">oci://…</code>.</td></tr>
+              <tr><td><code class="inl">-n taskflow</code> (<code class="inl">--create-namespace</code>)</td><td>Target namespace (create it if missing).</td></tr>
+              <tr><td><code class="inl">-f values-dev.yaml</code></td><td>Values file(s); repeatable, later wins.</td></tr>
+              <tr><td><code class="inl">--set image.tag=1.2.0</code></td><td>Single value override (highest precedence).</td></tr>
+              <tr><td><code class="inl">--wait</code> / <code class="inl">--timeout 5m</code></td><td>Only report success once pods are Ready (default timeout 5m).</td></tr>
+              <tr><td><code class="inl">--atomic</code></td><td>On failure, roll back (upgrade) or uninstall (install). Implies <code class="inl">--wait</code>. Helm 4 name: <code class="inl">--rollback-on-failure</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> helm list -n taskflow
+<span class="out">NAME       NAMESPACE   REVISION   UPDATED                                 STATUS     CHART            APP VERSION
+taskflow   taskflow    1          2026-10-09 17:20:05.913384 +0530 IST    deployed   taskflow-0.1.0   1.0.0</span>
+<span class="pr">$</span> kubectl get deploy,svc,ing -n taskflow -l app.kubernetes.io/instance=taskflow
+<span class="out">NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/taskflow-api   1/1     1            1           45s
+
+NAME                   TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+service/taskflow-api   ClusterIP   10.104.38.201   &lt;none&gt;        80/TCP    45s
+
+NAME                                     CLASS   HOSTS            ADDRESS        PORTS   AGE
+ingress.networking.k8s.io/taskflow-api   nginx   taskflow.local   192.168.49.2   80      45s</span>
+<span class="pr">$</span> curl http://taskflow.local/health
+<span class="out">{"status":"ok"}</span>
+
+<span class="pr">$</span> helm get values taskflow -n taskflow        <span class="cm"># only what YOU supplied (add --all for merged)</span>
+<span class="out">USER-SUPPLIED VALUES:
+env:
+  LOG_LEVEL: debug
+  NODE_ENV: development
+ingress:
+  enabled: true
+  host: taskflow.local
+replicaCount: 1
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi</span>
+<span class="pr">$</span> helm get manifest taskflow -n taskflow | grep -E '^kind|image:'   <span class="cm"># exact YAML that was applied</span>
+<span class="out">kind: Service
+kind: Deployment
+          image: "shauryav/taskflow-api:1.0.0"
+kind: Ingress</span></pre>
+
+        <h3>Upgrade</h3>
+<pre><span class="pr">$</span> helm upgrade taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-dev.yaml --set image.tag=1.1.0
+<span class="out">Release "taskflow" has been upgraded. Happy Helming!
+NAME: taskflow
+LAST DEPLOYED: Fri Oct  9 17:31:40 2026
+NAMESPACE: taskflow
+STATUS: deployed
+REVISION: 2
+...</span>
+<span class="pr">$</span> kubectl rollout status deploy/taskflow-api -n taskflow
+<span class="out">deployment "taskflow-api" successfully rolled out</span></pre>
+        <p>Helm computes the diff and patches changed objects; the Deployment then does its normal rolling update (Session 10).</p>
+
+        <p>The command to use in scripts and CI — installs the first time, upgrades afterwards, and auto-reverts a bad release:</p>
+<pre><span class="pr">$</span> helm upgrade --install taskflow ./charts/taskflow \
+    -n taskflow --create-namespace \
+    -f charts/taskflow/values-prod.yaml \
+    --set image.tag=1.2.0 \
+    --atomic --wait --timeout 5m
+<span class="out">Release "taskflow" does not exist. Installing it now.     <span class="cm"># first run only</span>
+NAME: taskflow
+...
+STATUS: deployed</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>Values silently reset on upgrade.</strong> <code class="inl">helm upgrade taskflow ./charts/taskflow --set image.tag=1.2.1</code> (no <code class="inl">-f</code>) builds values from chart defaults + that <code class="inl">--set</code> only — dev's 1 replica and debug logging are gone. Helm reuses old values automatically only when you pass <em>no</em> values at all. Always pass the same <code class="inl">-f</code> files (or <code class="inl">--reuse-values</code>, carefully).</li>
+            <li><code class="inl">Error: INSTALLATION FAILED: Unable to continue with install: Service "taskflow-api" in namespace "taskflow" exists and cannot be imported into the current release: invalid ownership metadata ...</code> — objects created earlier with <code class="inl">kubectl apply</code>. Delete them (<code class="inl">kubectl delete -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml</code>) or adopt them with <code class="inl">--take-ownership</code>.</li>
+            <li><code class="inl">Error: INSTALLATION FAILED: cannot re-use a name that is still in use</code> → the release exists; use <code class="inl">helm upgrade</code> (or <code class="inl">upgrade --install</code>).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">helm install NAME CHART -n NS -f values --set k=v</code>; then <code class="inl">helm upgrade</code> with the same <code class="inl">-f</code> files. In CI: <code class="inl">helm upgrade --install … --atomic --wait</code>. Inspect with <code class="inl">helm list</code>, <code class="inl">get values</code>, <code class="inl">get manifest</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 6. ROLLBACK ===================== -->
+      <section id="rollback">
+        <h2><span class="sec-num">6</span> Rollback &amp; release history</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Every upgrade is saved like a game checkpoint. Rollback reloads an old checkpoint — and that reload is itself saved as a new checkpoint.</p>
+        </div>
+
+        <p>Scenario: revision 3 deploys a tag that doesn't exist. Pods hit <code class="inl">ImagePullBackOff</code>, but the old ReplicaSet keeps serving (rolling update), so you have time:</p>
+<pre><span class="pr">$</span> helm upgrade taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-dev.yaml --set image.tag=1.3.0-typo
+<span class="out">Release "taskflow" has been upgraded. Happy Helming!</span>      <span class="cm"># no --wait → Helm doesn't check pods!</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
+<span class="out">NAME                            READY   STATUS             RESTARTS   AGE
+taskflow-api-7c5d8b9f4-q8w2x    1/1     Running            0          9m
+taskflow-api-86f7d6c5b9-lm4zt   0/1     ImagePullBackOff   0          50s</span>
+
+<span class="pr">$</span> helm history taskflow -n taskflow
+<span class="out">REVISION   UPDATED                    STATUS       CHART            APP VERSION   DESCRIPTION
+1          Fri Oct  9 17:20:05 2026   superseded   taskflow-0.1.0   1.0.0         Install complete
+2          Fri Oct  9 17:31:40 2026   superseded   taskflow-0.1.0   1.0.0         Upgrade complete
+3          Fri Oct  9 17:44:12 2026   deployed     taskflow-0.1.0   1.0.0         Upgrade complete</span>
+
+<span class="pr">$</span> helm rollback taskflow 2 -n taskflow
+<span class="out">Rollback was a success! Happy Helming!</span>
+<span class="pr">$</span> helm history taskflow -n taskflow
+<span class="out">REVISION   UPDATED                    STATUS       CHART            APP VERSION   DESCRIPTION
+1          Fri Oct  9 17:20:05 2026   superseded   taskflow-0.1.0   1.0.0         Install complete
+2          Fri Oct  9 17:31:40 2026   superseded   taskflow-0.1.0   1.0.0         Upgrade complete
+3          Fri Oct  9 17:44:12 2026   superseded   taskflow-0.1.0   1.0.0         Upgrade complete
+4          Fri Oct  9 17:47:30 2026   deployed     taskflow-0.1.0   1.0.0         Rollback to 2</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Observation</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Rollback created revision <strong>4</strong>, not "back to 2"</td><td>History is append-only; revision 4 is a copy of 2's manifest + values.</td></tr>
+              <tr><td><code class="inl">helm rollback taskflow</code> (no number)</td><td>Goes to the previous revision.</td></tr>
+              <tr><td>Revision 3 says "Upgrade complete" though pods are broken</td><td>Without <code class="inl">--wait</code>, success = "API accepted the YAML".</td></tr>
+              <tr><td>APP VERSION stays <code class="inl">1.0.0</code> although tags changed</td><td>It shows Chart.yaml's <code class="inl">appVersion</code>, not <code class="inl">--set image.tag</code>. Use <code class="inl">helm get values</code> to see the tag.</td></tr>
+              <tr><td>Status values</td><td><code class="inl">deployed</code> (current), <code class="inl">superseded</code>, <code class="inl">failed</code>, <code class="inl">pending-install/upgrade/rollback</code>, <code class="inl">uninstalled</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Automatic rollback with --atomic</h3>
+<pre><span class="pr">$</span> helm upgrade taskflow ./charts/taskflow -n taskflow -f charts/taskflow/values-dev.yaml \
+    --set image.tag=1.3.0-typo --atomic --timeout 2m
+<span class="out">Error: UPGRADE FAILED: release taskflow failed, and has been rolled back due to atomic being set: context deadline exceeded</span>
+<span class="cm"># Helm 4 wording: "... due to rollback-on-failure being set: ..."</span>
+<span class="pr">$</span> helm history taskflow -n taskflow --max 2
+<span class="out">REVISION   UPDATED                    STATUS       CHART            APP VERSION   DESCRIPTION
+5          Fri Oct  9 17:52:01 2026   failed       taskflow-0.1.0   1.0.0         Upgrade "taskflow" failed: context deadline exceeded
+6          Fri Oct  9 17:54:02 2026   deployed     taskflow-0.1.0   1.0.0         Rollback to 4</span></pre>
+
+        <h3>Where is this history stored?</h3>
+<pre><span class="pr">$</span> kubectl get secrets -n taskflow -l owner=helm
+<span class="out">NAME                             TYPE                 DATA   AGE
+sh.helm.release.v1.taskflow.v1   helm.sh/release.v1   1      35m
+sh.helm.release.v1.taskflow.v2   helm.sh/release.v1   1      23m
+...
+sh.helm.release.v1.taskflow.v6   helm.sh/release.v1   1      1m</span></pre>
+        <ul>
+          <li>One Secret per revision, in the <strong>release's namespace</strong>: gzipped + base64 JSON of chart, values and rendered manifest.</li>
+          <li><code class="inl">helm upgrade</code> keeps the last 10 revisions (<code class="inl">--history-max</code>).</li>
+          <li><code class="inl">helm uninstall</code> deletes the objects <em>and</em> these Secrets (add <code class="inl">--keep-history</code> to keep them). Deleting the namespace wipes the release too.</li>
+          <li>Rollback restores Kubernetes objects only — not database data. A migration that changed the schema must be undone separately.</li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">helm history</code> → pick a revision → <code class="inl">helm rollback NAME REV</code> (creates a new revision). <code class="inl">--atomic</code> does it automatically. State lives in <code class="inl">sh.helm.release.v1.*</code> Secrets.
+        </div>
+      </section>
+
+      <!-- ===================== 7. DEPLOY END TO END ===================== -->
+      <section id="deploy-taskflow">
+        <h2><span class="sec-num">7</span> Deploying TaskFlow with Helm (end to end)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Same box of parts, two instruction sheets: build a small model in dev and a big one in prod.</p>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: from an empty minikube to TaskFlow at http://taskflow.local</span>
+          <p>Postgres comes from Session 15's StatefulSet (<code class="inl">k8s/postgres.yaml</code>); the API comes from the chart.</p>
+        </div>
+<pre><span class="cm"># 1. cluster + ingress controller</span>
+<span class="pr">$</span> minikube start
+<span class="pr">$</span> minikube addons enable ingress
+
+<span class="cm"># 2. namespace, DB secret, database</span>
+<span class="pr">$</span> kubectl create namespace taskflow
+<span class="pr">$</span> kubectl create secret generic taskflow-db-secret -n taskflow \
+    --from-literal=POSTGRES_PASSWORD='S3cretPw' \
+    --from-literal=DATABASE_URL='postgres://taskflow:S3cretPw@taskflow-db:5432/taskflow'
+<span class="pr">$</span> kubectl apply -n taskflow -f k8s/postgres.yaml      <span class="cm"># StatefulSet postgres + Service taskflow-db</span>
+
+<span class="cm"># 3. check the chart</span>
+<span class="pr">$</span> helm lint charts/taskflow -f charts/taskflow/values-dev.yaml
+<span class="pr">$</span> helm template taskflow charts/taskflow -f charts/taskflow/values-dev.yaml | kubectl apply -n taskflow --dry-run=server -f -
+<span class="out">service/taskflow-api created (server dry run)
+deployment.apps/taskflow-api created (server dry run)
+ingress.networking.k8s.io/taskflow-api created (server dry run)</span>
+
+<span class="cm"># 4. deploy dev</span>
+<span class="pr">$</span> helm upgrade --install taskflow charts/taskflow -n taskflow \
+    -f charts/taskflow/values-dev.yaml --atomic --wait --timeout 5m
+
+<span class="cm"># 5. reach it</span>
+<span class="pr">$</span> echo "$(minikube ip) taskflow.local" | sudo tee -a /etc/hosts
+<span class="out">192.168.49.2 taskflow.local</span>
+<span class="pr">$</span> curl -s http://taskflow.local/health
+<span class="out">{"status":"ok"}</span>
+
+<span class="cm"># 6. ship a new version = one value</span>
+<span class="pr">$</span> helm upgrade --install taskflow charts/taskflow -n taskflow \
+    -f charts/taskflow/values-dev.yaml --set image.tag=1.1.0 --atomic --wait
+
+<span class="cm"># 7. production: same chart, another namespace, prod values</span>
+<span class="pr">$</span> helm upgrade --install taskflow charts/taskflow -n taskflow-prod --create-namespace \
+    -f charts/taskflow/values-prod.yaml --atomic --wait
+<span class="pr">$</span> helm list -A
+<span class="out">NAME       NAMESPACE       REVISION   UPDATED                                 STATUS     CHART            APP VERSION
+taskflow   taskflow        2          2026-10-09 18:05:12.11823 +0530 IST     deployed   taskflow-0.1.0   1.0.0
+taskflow   taskflow-prod   1          2026-10-09 18:07:40.52014 +0530 IST     deployed   taskflow-0.1.0   1.0.0</span>
+
+<span class="cm"># 8. clean up</span>
+<span class="pr">$</span> helm uninstall taskflow -n taskflow-prod
+<span class="out">release "taskflow" uninstalled</span></pre>
+        <p>(Prod also needs its <code class="inl">taskflow-db-secret</code> Secret in <code class="inl">taskflow-prod</code>, a reachable database, and DNS for its host.) In Session 19 the CI pipeline runs step 6 with <code class="inl">--set image.tag=${{ github.sha }}</code>.</p>
+
+        <h3>Sharing the chart</h3>
+<pre><span class="pr">$</span> helm package charts/taskflow
+<span class="out">Successfully packaged chart and saved it to: /home/shaurya/taskflow/taskflow-0.1.0.tgz</span>
+<span class="pr">$</span> echo "$GHCR_TOKEN" | helm registry login ghcr.io -u shauryav --password-stdin
+<span class="out">Login Succeeded</span>
+<span class="pr">$</span> helm push taskflow-0.1.0.tgz oci://ghcr.io/shauryav/charts
+<span class="out">Pushed: ghcr.io/shauryav/charts/taskflow:0.1.0
+Digest: sha256:4f1c9b0e7d...</span>
+<span class="pr">$</span> helm install taskflow oci://ghcr.io/shauryav/charts/taskflow --version 0.1.0 -n taskflow</pre>
+
+        <h3>Helm vs Kustomize</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Helm</th><th>Kustomize</th></tr></thead>
+            <tbody>
+              <tr><td>Approach</td><td>Templates + values</td><td>Plain YAML base + patches per env (overlays)</td></tr>
+              <tr><td>Tooling</td><td>Separate <code class="inl">helm</code> CLI</td><td>Built into kubectl: <code class="inl">kubectl apply -k overlays/prod</code></td></tr>
+              <tr><td>Logic</td><td><code class="inl">if</code>, <code class="inl">range</code>, functions</td><td>None by design</td></tr>
+              <tr><td>Packaging &amp; versions</td><td>Charts with SemVer, repos/OCI</td><td>Just folders in Git</td></tr>
+              <tr><td>Release history / rollback</td><td>Yes (<code class="inl">history</code>, <code class="inl">rollback</code>)</td><td>No — use Git (<code class="inl">git revert</code>)</td></tr>
+              <tr><td>Best for</td><td>Distributing apps, third-party software (Redis, Prometheus)</td><td>Small env tweaks to your own manifests</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Not either/or: Argo CD (Session 22) deploys Helm charts and Kustomize overlays alike.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Pods stuck <code class="inl">CreateContainerConfigError</code> → the <code class="inl">taskflow-db-secret</code> Secret is missing in that namespace (Helm doesn't create it).</li>
+            <li>Changing <code class="inl">selectorLabels</code> (or the release name) after install → <code class="inl">spec.selector: Invalid value ... field is immutable</code>. Selector labels must never change; uninstall/reinstall if you must.</li>
+            <li>Running <code class="inl">kubectl edit</code> on Helm-managed objects → the next <code class="inl">helm upgrade</code> overwrites your edit. Change values, not live objects.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          lint → template (+ server dry run) → <code class="inl">upgrade --install --atomic --wait</code> with per-env <code class="inl">-f</code> files → verify → rollback if needed. Package and push to an OCI registry to share.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">helm repo add bitnami https://charts.bitnami.com/bitnami</code> / <code class="inl">helm repo update</code></td><td>Add a chart repo / refresh its index.</td></tr>
+              <tr><td><code class="inl">helm search repo redis</code> / <code class="inl">helm search hub redis</code></td><td>Search added repos / Artifact Hub.</td></tr>
+              <tr><td><code class="inl">helm show values bitnami/redis</code></td><td>Print a chart's default values.</td></tr>
+              <tr><td><code class="inl">helm create taskflow</code></td><td>Scaffold a new chart.</td></tr>
+              <tr><td><code class="inl">helm lint charts/taskflow</code></td><td>Check chart structure and template errors.</td></tr>
+              <tr><td><code class="inl">helm template taskflow charts/taskflow -f values-prod.yaml</code></td><td>Render YAML locally (add <code class="inl">--show-only templates/x.yaml</code>).</td></tr>
+              <tr><td><code class="inl">helm install taskflow charts/taskflow -n taskflow --dry-run=client --debug</code></td><td>Simulate an install, print manifests + NOTES.</td></tr>
+              <tr><td><code class="inl">helm install NAME CHART -n NS --create-namespace -f f.yaml --set k=v</code></td><td>Install a release.</td></tr>
+              <tr><td><code class="inl">helm upgrade --install NAME CHART -n NS -f f.yaml --atomic --wait --timeout 5m</code></td><td>Idempotent deploy with auto-rollback (CI).</td></tr>
+              <tr><td><code class="inl">helm list -n NS</code> / <code class="inl">helm list -A</code></td><td>Releases in a namespace / everywhere.</td></tr>
+              <tr><td><code class="inl">helm status NAME -n NS</code></td><td>Release status + NOTES.</td></tr>
+              <tr><td><code class="inl">helm get values NAME -n NS [--all]</code> / <code class="inl">helm get manifest NAME -n NS</code></td><td>Values used / YAML applied.</td></tr>
+              <tr><td><code class="inl">helm history NAME -n NS</code></td><td>All revisions with status and description.</td></tr>
+              <tr><td><code class="inl">helm rollback NAME 2 -n NS</code></td><td>Roll back to revision 2 (creates a new revision).</td></tr>
+              <tr><td><code class="inl">helm uninstall NAME -n NS</code></td><td>Delete the release's objects and history.</td></tr>
+              <tr><td><code class="inl">helm dependency update charts/taskflow</code></td><td>Download sub-charts listed in Chart.yaml.</td></tr>
+              <tr><td><code class="inl">helm package charts/taskflow</code> / <code class="inl">helm push x.tgz oci://ghcr.io/shauryav/charts</code></td><td>Build a <code class="inl">.tgz</code> / publish to an OCI registry.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>TaskFlow's Deployment, Service, Ingress and HPA are now written once, as templates in <code class="inl">charts/taskflow</code>. <code class="inl">Chart.yaml</code> versions the package, <code class="inl">values.yaml</code> holds defaults, and <code class="inl">values-dev.yaml</code>/<code class="inl">values-prod.yaml</code> hold only the differences. <code class="inl">helm upgrade --install --atomic --wait</code> deploys any environment in one command and records a revision, so a bad release is one <code class="inl">helm rollback</code> away. CI will run this same command with the new image tag.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>What is the difference between <code class="inl">version</code> and <code class="inl">appVersion</code> in Chart.yaml?</summary>
+          <p class="ans"><code class="inl">version</code> is the chart's own SemVer, bumped when templates/defaults change. <code class="inl">appVersion</code> is the version of the application inside (TaskFlow 1.0.0), used here as the default image tag.</p>
+        </details>
+        <details class="quiz">
+          <summary><code class="inl">values.yaml</code> sets <code class="inl">replicaCount: 2</code>, <code class="inl">values-prod.yaml</code> sets 4, and you run <code class="inl">-f values-prod.yaml --set replicaCount=6</code>. How many replicas?</summary>
+          <p class="ans">6. <code class="inl">--set</code> beats <code class="inl">-f</code> files, which beat the chart's values.yaml.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does <code class="inl">{{- toYaml .Values.resources | nindent 12 }}</code> do?</summary>
+          <p class="ans">Converts the <code class="inl">resources</code> map from values into YAML text, starts it on a new line and indents every line by 12 spaces; <code class="inl">{{-</code> trims the whitespace before the action so no blank line is left.</p>
+        </details>
+        <details class="quiz">
+          <summary>History shows revisions 1–3 (3 deployed). You run <code class="inl">helm rollback taskflow 1</code>. What does history show now?</summary>
+          <p class="ans">A new revision 4, status deployed, description "Rollback to 1". Revision 3 becomes superseded. Rollbacks never delete history.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why does Helm 3 not need Tiller, and where does it keep release state?</summary>
+          <p class="ans">Helm 3 is client-only: it renders templates locally and talks to the API server with your kubeconfig/RBAC. Release state is stored as Secrets (<code class="inl">sh.helm.release.v1.&lt;name&gt;.v&lt;rev&gt;</code>) in the release namespace.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why use <code class="inl">helm upgrade --install --atomic --wait</code> in CI instead of <code class="inl">helm install</code>?</summary>
+          <p class="ans"><code class="inl">upgrade --install</code> works on both the first and later runs. <code class="inl">--wait</code> fails the job if pods don't become Ready, and <code class="inl">--atomic</code> rolls back automatically, so a broken image never stays deployed.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your values file has <code class="inl">tag: 2.10</code> and the pod pulls <code class="inl">:2.1</code>. Why?</summary>
+          <p class="ans">YAML parsed the unquoted 2.10 as a float (2.1). Quote it: <code class="inl">tag: "2.10"</code>, or use <code class="inl">--set-string</code>.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 17: Helm.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://helm.sh/docs/intro/using_helm/" target="_blank" rel="noopener">Using Helm</a> — repos, install, upgrade, rollback, values precedence.</li>
+          <li><a href="https://helm.sh/docs/topics/charts/" target="_blank" rel="noopener">Charts</a> — chart layout, Chart.yaml fields, dependencies.</li>
+          <li><a href="https://helm.sh/docs/chart_template_guide/" target="_blank" rel="noopener">Chart Template Guide</a> — built-in objects, functions, flow control, named templates.</li>
+          <li><a href="https://helm.sh/docs/chart_best_practices/" target="_blank" rel="noopener">Chart Best Practices</a> — naming, labels, values conventions.</li>
+          <li><a href="https://kubectl.docs.kubernetes.io/references/kustomize/" target="_blank" rel="noopener">Kustomize reference</a> — for the Helm vs Kustomize comparison.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-16.html"><div class="dir">← Previous</div><div class="ttl">Session 16: K8s Security &amp; Scheduling</div></a>
+        <a class="next" href="session-18.html"><div class="dir">Next →</div><div class="ttl">Session 18: CI/CD &amp; GitHub Actions</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 17 — Helm — Kubernetes Package Manager</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

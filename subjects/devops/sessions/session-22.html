@@ -1,0 +1,1094 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 22 — Monitoring, Observability &amp; GitOps</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 22</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 22</span>
+      <h1>Monitoring, Observability &amp; GitOps</h1>
+      <p class="lead">
+        Expose TaskFlow metrics, scrape them with Prometheus, query them with PromQL, alert on errors, chart them in
+        Grafana — then deploy the app the GitOps way: Git holds the desired state and Argo CD keeps the cluster matching it.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 31 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#observability">Monitoring vs observability</a></li>
+          <li><a href="#pillars">Metrics, logs &amp; traces</a></li>
+          <li><a href="#prometheus">Prometheus</a></li>
+          <li><a href="#promql">PromQL &amp; alerting</a></li>
+          <li><a href="#grafana">Prometheus &amp; Grafana on Kubernetes</a></li>
+          <li><a href="#gitops">GitOps &amp; Git as source of truth</a></li>
+          <li><a href="#argocd">Argo CD &amp; continuous deployment</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. MONITORING VS OBSERVABILITY ===================== -->
+      <section id="observability">
+        <h2><span class="sec-num">1</span> Monitoring vs observability</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Monitoring is the warning light on the car dashboard. Observability is being able to open the bonnet and work out <em>why</em> it lit up — even for a fault nobody predicted.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Monitoring</span>: collect a <strong>predefined</strong> set of signals, compare them with thresholds, alert. Answers <em>"is it broken?"</em></li>
+          <li><span class="term">Observability</span>: a property of the system — how well you can explain its internal state from what it emits (metrics, logs, traces). Answers <em>"why is it broken?"</em>, including for failures you never wrote an alert for.</li>
+          <li>Monitoring is a <strong>subset</strong> of observability: you still need alerts, but you also need rich, correlated data to debug.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Monitoring</th><th>Observability</th></tr></thead>
+            <tbody>
+              <tr><td>Question</td><td>Is the system healthy?</td><td>Why is it behaving like this?</td></tr>
+              <tr><td>Failure types</td><td><strong>Known unknowns</strong> — failure modes you predicted (disk full, 5xx spike)</td><td><strong>Unknown unknowns</strong> — new failures you can only find by exploring</td></tr>
+              <tr><td>Data</td><td>Fixed metrics + thresholds, dashboards</td><td>Metrics + structured logs + traces, linked by labels / trace IDs</td></tr>
+              <tr><td>Output</td><td>Alerts, status dashboards</td><td>Ability to ask new questions after the fact</td></tr>
+              <tr><td>TaskFlow example</td><td>"5xx ratio &gt; 5% for 5 min" pages you</td><td>Trace shows only <code class="inl">POST /tasks</code> is slow; logs show the DB pool is exhausted</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>What to measure: golden signals, RED, USE</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Golden signal (Google SRE)</th><th>Meaning</th><th>TaskFlow PromQL</th></tr></thead>
+            <tbody>
+              <tr><td>Latency</td><td>Time to serve a request (track p95/p99, not average)</td><td><code class="inl">histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code></td></tr>
+              <tr><td>Traffic</td><td>Demand on the system</td><td><code class="inl">sum(rate(http_requests_total[5m]))</code> (req/s)</td></tr>
+              <tr><td>Errors</td><td>Rate of failed requests</td><td><code class="inl">sum(rate(http_requests_total{status=~"5.."}[5m]))</code></td></tr>
+              <tr><td>Saturation</td><td>How "full" a resource is</td><td>CPU vs limit, DB connections in use, event-loop lag</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>RED</strong> (for services/requests): <strong>R</strong>ate, <strong>E</strong>rrors, <strong>D</strong>uration. Use it for <code class="inl">taskflow-api</code>.</li>
+          <li><strong>USE</strong> (for resources): <strong>U</strong>tilization, <strong>S</strong>aturation, <strong>E</strong>rrors. Use it for nodes, disks, the Postgres volume.</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Example: one incident, both views</span>
+          <p>Monitoring: alert <code class="inl">HighErrorRate</code> fires at 14:05 (6% of requests return 500). Observability: the Grafana graph shows only <code class="inl">route="/tasks"</code>, <code class="inl">method="POST"</code> failing → a trace shows the <code class="inl">INSERT INTO tasks</code> span taking 1.8&nbsp;s → the matching log line (same <code class="inl">traceId</code>) says <code class="inl">connection terminated unexpectedly</code> → Postgres pod was OOMKilled.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>Alerting on <em>causes</em> (CPU 80%) instead of <em>symptoms</em> (users see errors/latency). High CPU with happy users is not an incident; page on golden signals, use cause metrics for debugging.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Monitoring = known failure modes + alerts. Observability = enough correlated data to debug unknown failures. Measure golden signals (latency, traffic, errors, saturation); RED for services, USE for resources.
+        </div>
+      </section>
+
+      <!-- ===================== 2. THREE PILLARS ===================== -->
+      <section id="pillars">
+        <h2><span class="sec-num">2</span> Metrics, logs &amp; traces</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A metric is your heart-rate number, a log is your diary entry, a trace is the GPS track of one trip.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pillar</th><th>What it is</th><th>Answers</th><th>Cost</th><th>Typical tools</th></tr></thead>
+            <tbody>
+              <tr><td>Metrics</td><td>Numbers over time, identified by name + labels</td><td>How much / how fast / how often? Trends, alerts</td><td>Cheap (aggregated)</td><td>Prometheus, Grafana Mimir, CloudWatch</td></tr>
+              <tr><td>Logs</td><td>Timestamped event records (ideally JSON)</td><td>What exactly happened in this request?</td><td>Expensive at volume</td><td>Loki + Grafana Alloy, ELK/EFK (Elasticsearch + Logstash/Fluent Bit + Kibana)</td></tr>
+              <tr><td>Traces</td><td>One request's path across services, as timed <span class="term">spans</span></td><td>Where did the time go? Which service failed?</td><td>Medium (usually sampled)</td><td>Jaeger, Grafana Tempo, Zipkin</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The same failing TaskFlow request seen through each pillar:</p>
+        <div class="fname">metric (Prometheus exposition line)</div>
+<pre>http_requests_total{method="POST",route="/tasks",status="500"} 12</pre>
+
+        <div class="fname">log (one JSON line on stdout)</div>
+<pre>{"level":"error","time":"2026-10-09T14:05:17.311Z","service":"taskflow-api","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","method":"POST","path":"/tasks","status":500,"durationMs":1834,"msg":"insert into tasks failed: connection terminated unexpectedly"}</pre>
+
+        <div class="fname">trace 4bf92f35… (waterfall)</div>
+<pre>POST /tasks                                   1840 ms  ████████████████████████
+├─ taskflow-web   nginx proxy_pass            1838 ms  ████████████████████████
+│  └─ taskflow-api  POST /tasks               1834 ms  ███████████████████████
+│     ├─ middleware  auth + json parse           3 ms  ▏
+│     ├─ redis       GET user:42                 2 ms  ▏
+│     └─ pg          INSERT INTO tasks        1820 ms  ███████████████████████  <span class="cm">← error, slow span</span></pre>
+
+        <ul>
+          <li>Correlate pillars with shared fields: put <code class="inl">traceId</code> in every log line; use the same labels (<code class="inl">service</code>, <code class="inl">namespace</code>, <code class="inl">pod</code>) on metrics and logs.</li>
+          <li>Containers should log to <strong>stdout/stderr</strong> (not files). Docker/Kubernetes capture it (<code class="inl">kubectl logs</code>); a collector (Alloy, Fluent Bit) ships it to Loki/Elasticsearch.</li>
+          <li>Loki query (LogQL) for the line above: <code class="inl">{namespace="taskflow", container="taskflow"} | json | status &gt;= 500</code></li>
+        </ul>
+
+        <h3>OpenTelemetry (OTel)</h3>
+        <ul>
+          <li><span class="term">OpenTelemetry</span> = vendor-neutral standard (APIs, SDKs, the <strong>OTLP</strong> protocol and the <strong>Collector</strong>) for producing all three signals. Instrument once, send anywhere (Jaeger, Tempo, Datadog…).</li>
+          <li>Zero-code instrumentation for Node.js (Express, <code class="inl">pg</code>, <code class="inl">http</code> spans automatically):</li>
+        </ul>
+<pre><span class="pr">$</span> npm install @opentelemetry/api @opentelemetry/auto-instrumentations-node
+<span class="pr">$</span> export OTEL_SERVICE_NAME=taskflow-api
+<span class="pr">$</span> export OTEL_TRACES_EXPORTER=otlp
+<span class="pr">$</span> export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318   <span class="cm"># Collector's OTLP/HTTP port</span>
+<span class="pr">$</span> node --require @opentelemetry/auto-instrumentations-node/register server.js</pre>
+<pre>app (OTel SDK) ──OTLP──▶ OTel Collector ──▶ traces → Tempo/Jaeger
+                                         ├─▶ metrics → Prometheus
+                                         └─▶ logs → Loki</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>High-cardinality labels</strong>: a label like <code class="inl">user_id</code> or a raw URL (<code class="inl">/tasks/9812</code>) creates one time series per value and can crash Prometheus. Use the route template (<code class="inl">/tasks/:id</code>). Put IDs in logs/traces instead.</li>
+            <li>Logging secrets or full request bodies (passwords, tokens, PII).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Metrics tell you <em>that</em> something is wrong, traces tell you <em>where</em>, logs tell you <em>what</em>. OpenTelemetry is the standard way to emit all three; link them with a shared trace ID.
+        </div>
+      </section>
+
+      <!-- ===================== 3. PROMETHEUS ===================== -->
+      <section id="prometheus">
+        <h2><span class="sec-num">3</span> Prometheus</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Every 15 seconds Prometheus walks round to each app and reads the numbers written on its <code class="inl">/metrics</code> page, then files them in a big notebook sorted by time.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Prometheus</span> = open-source metrics system (CNCF graduated): scraper + time-series database (<span class="term">TSDB</span>) + query language (PromQL) + rule engine.</li>
+          <li><strong>Pull model</strong>: Prometheus scrapes <code class="inl">GET /metrics</code> over HTTP on every <span class="term">target</span> each <code class="inl">scrape_interval</code>. A dead target is detected for free (<code class="inl">up == 0</code>). Short-lived batch jobs that can't be scraped push to a <strong>Pushgateway</strong> instead.</li>
+          <li>A <span class="term">time series</span> = metric name + unique label set, e.g. <code class="inl">http_requests_total{route="/tasks",status="200"}</code>. Each scrape adds one (timestamp, value) sample.</li>
+          <li><span class="term">Exporters</span> translate other systems into <code class="inl">/metrics</code>: <code class="inl">node_exporter</code> (Linux host, :9100), <code class="inl">postgres_exporter</code> (:9187), <code class="inl">kube-state-metrics</code> (K8s objects), <code class="inl">blackbox_exporter</code> (probe URLs).</li>
+        </ul>
+
+<pre>                      ┌────────────── Prometheus server ──────────────┐
+ taskflow-api:3000 ◀──┤ scrape (pull)  →  TSDB (local disk)  →  PromQL ├──▶ Grafana (dashboards)
+ node-exporter:9100 ◀─┤      ▲                     │                    │
+ kube-state-metrics ◀─┤      │ targets from        ▼                    │
+                      │  service discovery    rule engine ──alerts──────┼──▶ Alertmanager ──▶ Slack / email / PagerDuty
+                      │  (static, kubernetes_sd, ServiceMonitor)        │    (group, dedupe, silence, route)
+                      └─────────────────────────────────────────────────┘
+ batch job ──push──▶ Pushgateway ◀── scrape</pre>
+
+        <h3>Metric types</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>Behaviour</th><th>TaskFlow example</th><th>Query it with</th></tr></thead>
+            <tbody>
+              <tr><td>Counter</td><td>Only goes up (resets to 0 on restart). Name ends in <code class="inl">_total</code>.</td><td><code class="inl">http_requests_total</code></td><td><code class="inl">rate()</code>, <code class="inl">increase()</code> — never the raw value</td></tr>
+              <tr><td>Gauge</td><td>Goes up and down; a current value.</td><td><code class="inl">process_resident_memory_bytes</code>, active DB connections</td><td>Raw value, <code class="inl">avg_over_time()</code>, <code class="inl">max()</code></td></tr>
+              <tr><td>Histogram</td><td>Counts observations into cumulative buckets (<code class="inl">_bucket{le=…}</code>, <code class="inl">_sum</code>, <code class="inl">_count</code>). Aggregatable across pods.</td><td><code class="inl">http_request_duration_seconds</code></td><td><code class="inl">histogram_quantile()</code> over <code class="inl">rate(…_bucket[5m])</code></td></tr>
+              <tr><td>Summary</td><td>Client computes quantiles (<code class="inl">{quantile="0.95"}</code>). Cannot be aggregated across instances.</td><td>Rarely used; prefer histograms</td><td>Read the quantile series directly</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Instrument TaskFlow with <code class="inl">prom-client</code></h3>
+        <div class="fname">server.js (metrics part)</div>
+<pre><span class="kw">const</span> express = require(<span class="st">'express'</span>);
+<span class="kw">const</span> client = require(<span class="st">'prom-client'</span>);              <span class="cm">// npm install prom-client</span>
+<span class="kw">const</span> app = express();
+
+client.collectDefaultMetrics();                         <span class="cm">// free process_* and nodejs_* metrics</span>
+
+<span class="kw">const</span> httpRequests = <span class="kw">new</span> client.Counter({
+  name: <span class="st">'http_requests_total'</span>,                         <span class="cm">// counters end in _total</span>
+  help: <span class="st">'HTTP requests handled'</span>,
+  labelNames: [<span class="st">'method'</span>, <span class="st">'route'</span>, <span class="st">'status'</span>],
+});
+<span class="kw">const</span> httpDuration = <span class="kw">new</span> client.Histogram({
+  name: <span class="st">'http_request_duration_seconds'</span>,               <span class="cm">// base unit = seconds</span>
+  help: <span class="st">'HTTP request latency'</span>,
+  labelNames: [<span class="st">'method'</span>, <span class="st">'route'</span>],
+  buckets: [<span class="nm">0.05</span>, <span class="nm">0.1</span>, <span class="nm">0.25</span>, <span class="nm">0.5</span>, <span class="nm">1</span>, <span class="nm">2.5</span>],             <span class="cm">// bucket upper bounds (le)</span>
+});
+
+app.use((req, res, next) =&gt; {
+  <span class="kw">const</span> stopTimer = httpDuration.startTimer();
+  res.on(<span class="st">'finish'</span>, () =&gt; {
+    <span class="kw">const</span> route = req.route ? req.route.path : <span class="st">'unmatched'</span>;   <span class="cm">// '/tasks/:id', never '/tasks/42'</span>
+    httpRequests.inc({ method: req.method, route, status: res.statusCode });
+    stopTimer({ method: req.method, route });
+  });
+  next();
+});
+
+app.get(<span class="st">'/metrics'</span>, <span class="kw">async</span> (req, res) =&gt; {
+  res.set(<span class="st">'Content-Type'</span>, client.register.contentType);   <span class="cm">// Prometheus 3 fails scrapes without a valid one</span>
+  res.send(<span class="kw">await</span> client.register.metrics());
+});</pre>
+
+<pre><span class="pr">$</span> curl -s localhost:3000/metrics | grep -E '^(# (HELP|TYPE) )?http_'
+<span class="out"># HELP http_requests_total HTTP requests handled
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/tasks",status="200"} 1027
+http_requests_total{method="POST",route="/tasks",status="201"} 214
+http_requests_total{method="GET",route="/tasks",status="500"} 12
+# HELP http_request_duration_seconds HTTP request latency
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.05",method="GET",route="/tasks"} 812
+http_request_duration_seconds_bucket{le="0.1",method="GET",route="/tasks"} 961
+http_request_duration_seconds_bucket{le="0.25",method="GET",route="/tasks"} 1018
+http_request_duration_seconds_bucket{le="0.5",method="GET",route="/tasks"} 1031
+http_request_duration_seconds_bucket{le="1",method="GET",route="/tasks"} 1036
+http_request_duration_seconds_bucket{le="2.5",method="GET",route="/tasks"} 1039
+http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/tasks"} 1039
+http_request_duration_seconds_sum{method="GET",route="/tasks"} 61.84
+http_request_duration_seconds_count{method="GET",route="/tasks"} 1039</span></pre>
+        <ul>
+          <li><code class="inl"># HELP</code> = description, <code class="inl"># TYPE</code> = metric type, then one <code class="inl">name{labels} value</code> line per series.</li>
+          <li>Buckets are <strong>cumulative</strong>: 961 requests took ≤ 0.1&nbsp;s (that includes the 812 that took ≤ 0.05&nbsp;s). <code class="inl">+Inf</code> = <code class="inl">_count</code> = 1039 = 1027 + 12 GET requests.</li>
+        </ul>
+
+        <h3>Run Prometheus + Grafana next to TaskFlow (Docker Compose)</h3>
+        <p>Add these files to the repo and start them together with the <code class="inl">compose.yaml</code> from <a href="session-8.html">Session 8</a> (services <code class="inl">web</code>, <code class="inl">api</code>, <code class="inl">db</code>, <code class="inl">redis</code> on networks <code class="inl">frontend</code>/<code class="inl">backend</code>).</p>
+        <div class="fname">monitoring/prometheus.yml</div>
+<pre><span class="kw">global:</span>
+  scrape_interval: <span class="nm">15s</span>            <span class="cm"># how often every target is scraped</span>
+  evaluation_interval: <span class="nm">15s</span>        <span class="cm"># how often rule_files are evaluated</span>
+  external_labels:
+    env: dev                      <span class="cm"># attached to alerts / remote-write, tells environments apart</span>
+
+<span class="kw">rule_files:</span>
+  - /etc/prometheus/alerts.yml    <span class="cm"># alerting rules (topic 4)</span>
+
+<span class="kw">alerting:</span>
+  alertmanagers:
+    - static_configs:
+        - targets: [<span class="st">"alertmanager:9093"</span>]
+
+<span class="kw">scrape_configs:</span>
+  - job_name: prometheus          <span class="cm"># Prometheus scrapes itself</span>
+    static_configs:
+      - targets: [<span class="st">"localhost:9090"</span>]
+
+  - job_name: taskflow-api
+    metrics_path: /metrics        <span class="cm"># the default, shown for clarity</span>
+    scrape_interval: <span class="nm">10s</span>          <span class="cm"># per-job override of global</span>
+    static_configs:
+      - targets: [<span class="st">"api:3000"</span>]     <span class="cm"># Compose service name : container port</span>
+        labels:
+          service: taskflow       <span class="cm"># extra label added to every series from this target</span>
+
+  - job_name: node
+    static_configs:
+      - targets: [<span class="st">"node-exporter:9100"</span>]</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">global.scrape_interval</code></td><td>Default scrape period (default 1m; 15s is common). Lower = more detail + more storage.</td></tr>
+              <tr><td><code class="inl">evaluation_interval</code></td><td>How often alert/recording rules run.</td></tr>
+              <tr><td><code class="inl">rule_files</code></td><td>List of rule files (globs allowed). Paths are inside the container.</td></tr>
+              <tr><td><code class="inl">alerting.alertmanagers</code></td><td>Where firing alerts are sent.</td></tr>
+              <tr><td><code class="inl">scrape_configs[].job_name</code></td><td>Becomes the <code class="inl">job</code> label on every series (<code class="inl">up{job="taskflow-api"}</code>).</td></tr>
+              <tr><td><code class="inl">static_configs.targets</code></td><td><code class="inl">host:port</code> list; each becomes the <code class="inl">instance</code> label. Fine for fixed hosts.</td></tr>
+              <tr><td><code class="inl">kubernetes_sd_configs</code> (not used here)</td><td>Discover pods/services/nodes from the K8s API; filter with <code class="inl">relabel_configs</code>. On K8s you normally use ServiceMonitors instead (topic 5).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">monitoring/grafana/provisioning/datasources/prometheus.yml</div>
+<pre>apiVersion: <span class="nm">1</span>
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy                  <span class="cm"># Grafana's backend calls Prometheus (not the browser)</span>
+    url: http://prometheus:9090    <span class="cm"># Compose service name</span>
+    isDefault: <span class="kw">true</span></pre>
+
+        <div class="fname">compose.monitoring.yaml</div>
+<pre><span class="cm"># use together with compose.yaml (Session 8): it defines the "backend" network that api is on</span>
+<span class="kw">services:</span>
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    networks: [backend]                   <span class="cm"># same network as api → "api:3000" resolves</span>
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d   <span class="cm"># delete samples older than 7 days</span>
+      - --web.enable-lifecycle             <span class="cm"># enables POST /-/reload</span>
+    ports: [<span class="st">"9090:9090"</span>]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom-data:/prometheus
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    networks: [backend]
+    ports: [<span class="st">"9093:9093"</span>]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1     <span class="cm"># on Docker Desktop this sees the Linux VM, not macOS</span>
+    networks: [backend]
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    networks: [backend]
+    ports: [<span class="st">"3001:3000"</span>]                   <span class="cm"># host 3000 is already taskflow-api</span>
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: change-me
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+
+<span class="kw">volumes:</span>
+  prom-data:
+  grafana-data:</pre>
+
+<pre><span class="pr">$</span> docker run --rm --entrypoint promtool -v "$PWD/monitoring":/etc/prometheus \
+    prom/prometheus:v3.15.0 check config /etc/prometheus/prometheus.yml
+<span class="out">Checking /etc/prometheus/prometheus.yml
+  SUCCESS: 1 rule files found
+ SUCCESS: /etc/prometheus/prometheus.yml is valid prometheus config file syntax
+
+Checking /etc/prometheus/alerts.yml
+  SUCCESS: 2 rules found</span>
+
+<span class="pr">$</span> docker compose -f compose.yaml -f compose.monitoring.yaml up -d
+<span class="out">[+] Running 10/10
+ ✔ Network taskflow_backend             Created
+ ✔ Network taskflow_frontend            Created
+ ✔ Container taskflow-db-1              Healthy
+ ✔ Container taskflow-redis-1           Started
+ ✔ Container taskflow-api-1             Healthy
+ ✔ Container taskflow-web-1             Started
+ ✔ Container taskflow-prometheus-1      Started
+ ✔ Container taskflow-alertmanager-1    Started
+ ✔ Container taskflow-node-exporter-1   Started
+ ✔ Container taskflow-grafana-1         Started</span>
+
+<span class="pr">$</span> curl -s localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | [.labels.job, .scrapeUrl, .health] | @tsv'
+<span class="out">node            http://node-exporter:9100/metrics   up
+prometheus      http://localhost:9090/metrics       up
+taskflow-api    http://api:3000/metrics             up</span>
+
+<span class="pr">$</span> curl -X POST localhost:9090/-/reload      <span class="cm"># after editing prometheus.yml (needs --web.enable-lifecycle)</span></pre>
+        <p>UI: <code class="inl">http://localhost:9090</code> → <em>Status → Target health</em> (<code class="inl">/targets</code>); Grafana: <code class="inl">http://localhost:3001</code> (admin / change-me), Prometheus data source already provisioned.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes (target shows DOWN)</span>
+          <ul>
+            <li><code class="inl">targets: ["localhost:3000"]</code> — inside the Prometheus container, localhost is Prometheus itself. Use the service name (<code class="inl">api:3000</code>), or <code class="inl">host.docker.internal:3000</code> for an app running on your Mac.</li>
+            <li><code class="inl">dial tcp: lookup api … no such host</code> — Prometheus isn't on the same Compose network as <code class="inl">api</code> (here: <code class="inl">backend</code>).</li>
+            <li><code class="inl">server returned HTTP status 404</code> — the app has no <code class="inl">/metrics</code> route, or <code class="inl">metrics_path</code> is wrong.</li>
+            <li><code class="inl">received unsupported Content-Type</code> — Prometheus 3 rejects a missing/invalid Content-Type. Set it from <code class="inl">client.register.contentType</code>.</li>
+            <li>Edited <code class="inl">prometheus.yml</code> but nothing changed — reload (<code class="inl">/-/reload</code>) or <code class="inl">docker compose restart prometheus</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Prometheus pulls <code class="inl">/metrics</code> from targets, stores samples in its TSDB, and evaluates rules. Counters only go up, gauges go up/down, histograms bucket latencies. <code class="inl">job_name</code> → <code class="inl">job</code> label, target → <code class="inl">instance</code> label.
+        </div>
+      </section>
+
+      <!-- ===================== 4. PROMQL & ALERTING ===================== -->
+      <section id="promql">
+        <h2><span class="sec-num">4</span> PromQL &amp; alerting</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>PromQL is the calculator you use on Prometheus's notebook: "how many per second?", "what fraction failed?", "how slow were the slowest 5%?"</p>
+        </div>
+
+        <ul>
+          <li><strong>Instant vector</strong>: one latest value per series — <code class="inl">http_requests_total</code>. <strong>Range vector</strong>: a window of samples per series — <code class="inl">http_requests_total[5m]</code> (only valid as a function input).</li>
+          <li>Label matchers: <code class="inl">=</code>, <code class="inl">!=</code>, <code class="inl">=~</code> (regex), <code class="inl">!~</code> — e.g. <code class="inl">{status=~"5.."}</code> = any 5xx.</li>
+          <li>Aggregation: <code class="inl">sum</code>, <code class="inl">avg</code>, <code class="inl">max</code>, <code class="inl">min</code>, <code class="inl">count</code>, <code class="inl">topk</code> with <code class="inl">by (label)</code> (keep) or <code class="inl">without (label)</code> (drop).</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Query</th><th>Meaning</th><th>Example result</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">up</code></td><td>1 if the last scrape of a target worked, else 0</td><td><code class="inl">up{job="taskflow-api",instance="api:3000"} 1</code></td></tr>
+              <tr><td><code class="inl">rate(http_requests_total[5m])</code></td><td>Per-second increase, averaged over 5&nbsp;min, per series (handles counter resets)</td><td>one value per method/route/status</td></tr>
+              <tr><td><code class="inl">sum by (status) (rate(http_requests_total[5m]))</code></td><td>Requests/s grouped by status code</td><td><code class="inl">{status="200"} 3.9</code>, <code class="inl">{status="201"} 0.8</code>, <code class="inl">{status="500"} 0.3</code></td></tr>
+              <tr><td><code class="inl">sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))</code></td><td>Error ratio (0–1)</td><td><code class="inl">0.06</code> → 6%</td></tr>
+              <tr><td><code class="inl">increase(http_requests_total[1h])</code></td><td>How many requests in the last hour</td><td><code class="inl">18000</code></td></tr>
+              <tr><td><code class="inl">histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code></td><td>p95 latency: 95% of requests were faster than this (seconds)</td><td><code class="inl">0.169</code></td></tr>
+              <tr><td><code class="inl">topk(3, sum by (route) (rate(http_requests_total[5m])))</code></td><td>Three busiest routes</td><td><code class="inl">/tasks</code>, <code class="inl">/health</code>, <code class="inl">/metrics</code></td></tr>
+              <tr><td><code class="inl">100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))</code></td><td>Node CPU busy % (saturation)</td><td><code class="inl">37.5</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: rate and p95 by hand</span>
+          <ul>
+            <li><strong>rate</strong>: total counter = 18&nbsp;400 at 14:00:00 and 19&nbsp;900 at 14:05:00 → (19&nbsp;900 − 18&nbsp;400) / 300&nbsp;s = <strong>5.0 req/s</strong>. If 0.3 req/s are 5xx → error ratio 0.3 / 5.0 = <strong>6%</strong> (above a 5% threshold).</li>
+            <li><strong>p95</strong> from the buckets above (1039 requests): rank = 0.95 × 1039 = 987. Bucket <code class="inl">le="0.1"</code> holds 961, <code class="inl">le="0.25"</code> holds 1018, so p95 is inside 0.1–0.25&nbsp;s. Linear interpolation: 0.1 + 0.15 × (987 − 961)/(1018 − 961) ≈ <strong>0.169&nbsp;s</strong>. That's what <code class="inl">histogram_quantile</code> does (an estimate — accuracy depends on bucket choice).</li>
+          </ul>
+        </div>
+
+        <h3>Alerting rules</h3>
+        <div class="fname">monitoring/alerts.yml</div>
+<pre><span class="kw">groups:</span>
+  - name: taskflow                      <span class="cm"># rules in a group are evaluated together, in order</span>
+    rules:
+      - alert: TaskflowApiDown
+        expr: up{job="taskflow-api"} == 0
+        for: <span class="nm">1m</span>                         <span class="cm"># must be true for 1m before firing</span>
+        labels:
+          severity: critical            <span class="cm"># used by Alertmanager routing</span>
+        annotations:
+          summary: <span class="st">"TaskFlow API {{ $labels.instance }} is down"</span>
+          description: <span class="st">"Prometheus could not scrape {{ $labels.instance }} for 1 minute."</span>
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="taskflow-api", status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="taskflow-api"}[5m]))
+            &gt; 0.05
+        for: <span class="nm">5m</span>
+        labels:
+          severity: warning
+        annotations:
+          summary: <span class="st">"TaskFlow 5xx ratio above 5%"</span>
+          description: <span class="st">"{{ $value | humanizePercentage }} of requests failed over the last 5m."</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">alert</code></td><td>Alert name (becomes label <code class="inl">alertname</code>).</td></tr>
+              <tr><td><code class="inl">expr</code></td><td>PromQL; every series it returns is an active alert. The comparison (<code class="inl">&gt; 0.05</code>) is the threshold.</td></tr>
+              <tr><td><code class="inl">for</code></td><td>Condition must hold this long. Meanwhile the alert is <strong>pending</strong>; after it, <strong>firing</strong>. Stops flapping on brief spikes.</td></tr>
+              <tr><td><code class="inl">labels</code></td><td>Added to the alert; Alertmanager routes on them (<code class="inl">severity</code>, <code class="inl">team</code>).</td></tr>
+              <tr><td><code class="inl">annotations</code></td><td>Human text; templating: <code class="inl">{{ $labels.x }}</code>, <code class="inl">{{ $value }}</code>, <code class="inl">humanizePercentage</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Alert states: <strong>inactive</strong> → (expr true) → <strong>pending</strong> → (true for <code class="inl">for</code>) → <strong>firing</strong> → sent to Alertmanager → (expr false) → resolved.</p>
+
+        <div class="fname">monitoring/alertmanager.yml</div>
+<pre><span class="kw">route:</span>
+  receiver: slack-dev                   <span class="cm"># default receiver</span>
+  group_by: [<span class="st">"alertname"</span>, <span class="st">"job"</span>]        <span class="cm"># one notification per alertname+job group</span>
+  group_wait: <span class="nm">30s</span>                       <span class="cm"># wait to batch the first alerts of a new group</span>
+  group_interval: <span class="nm">5m</span>                    <span class="cm"># wait before sending new alerts added to a group</span>
+  repeat_interval: <span class="nm">4h</span>                   <span class="cm"># re-send if still firing</span>
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: slack-oncall
+
+<span class="kw">receivers:</span>
+  - name: slack-dev
+    slack_configs:
+      - api_url: https://hooks.slack.com/services/T000/B000/XXXX   <span class="cm"># incoming-webhook URL (keep out of Git)</span>
+        channel: <span class="st">"#taskflow-alerts"</span>
+        send_resolved: <span class="kw">true</span>
+  - name: slack-oncall
+    slack_configs:
+      - api_url: https://hooks.slack.com/services/T000/B000/YYYY
+        channel: <span class="st">"#taskflow-oncall"</span>
+        send_resolved: <span class="kw">true</span>
+
+<span class="kw">inhibit_rules:</span>                          <span class="cm"># if a critical fires, mute warnings for the same job</span>
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: [job]</pre>
+        <p>Alertmanager's jobs: <strong>group</strong> (one message for 10 pods), <strong>deduplicate</strong>, <strong>route</strong> by labels, <strong>silence</strong> (mute during maintenance, via UI on :9093), <strong>inhibit</strong>.</p>
+
+<pre><span class="pr">$</span> docker compose stop api                        <span class="cm"># simulate an outage</span>
+<span class="pr">$</span> curl -s localhost:9090/api/v1/alerts | jq -c '.data.alerts[] | {alert: .labels.alertname, state}'
+<span class="out">{"alert":"TaskflowApiDown","state":"pending"}</span>
+<span class="cm"># ~1 minute later</span>
+<span class="out">{"alert":"TaskflowApiDown","state":"firing"}</span>
+<span class="pr">$</span> docker compose start api                       <span class="cm"># alert resolves; Slack gets a RESOLVED message</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common PromQL mistakes</span>
+          <ul>
+            <li><code class="inl">rate()</code> on a gauge, or graphing a raw counter (a line that only goes up tells you nothing).</li>
+            <li><code class="inl">rate(sum(...))</code> — wrong order. Always <code class="inl">sum(rate(...))</code>: rate first (per series, handles resets), then aggregate.</li>
+            <li>Range shorter than ~4× the scrape interval (<code class="inl">[15s]</code> with 15s scrapes) → empty results. Use <code class="inl">[1m]</code>–<code class="inl">[5m]</code>.</li>
+            <li>Averaging percentiles across pods. Aggregate the buckets (<code class="inl">sum by (le)</code>), then call <code class="inl">histogram_quantile</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">rate()</code> turns counters into per-second rates; <code class="inl">sum by</code> aggregates; error ratio = 5xx rate / total rate; p95 = <code class="inl">histogram_quantile(0.95, sum by (le) (rate(..._bucket[5m])))</code>. Rules go pending → firing after <code class="inl">for</code>; Alertmanager groups and routes them.
+        </div>
+      </section>
+
+      <!-- ===================== 5. K8S: KUBE-PROMETHEUS-STACK & GRAFANA ===================== -->
+      <section id="grafana">
+        <h2><span class="sec-num">5</span> Prometheus &amp; Grafana on Kubernetes</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of writing Prometheus's address book by hand, you stick a label on your Service ("please watch me") and the operator adds you to the list automatically.</p>
+        </div>
+
+        <ul>
+          <li>On Kubernetes, install everything with one Helm chart (<a href="session-17.html">Session 17</a>): <strong>kube-prometheus-stack</strong>.</li>
+          <li>It runs the <span class="term">Prometheus Operator</span>, which adds CRDs so monitoring config is just more YAML:</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Installed component / CRD</th><th>Role</th></tr></thead>
+            <tbody>
+              <tr><td>Prometheus Operator</td><td>Watches the CRDs below and generates Prometheus/Alertmanager config.</td></tr>
+              <tr><td>Prometheus, Alertmanager (StatefulSets)</td><td>Same as topic 3–4, managed for you.</td></tr>
+              <tr><td>Grafana</td><td>Pre-wired to Prometheus, ships ~20 Kubernetes dashboards.</td></tr>
+              <tr><td>node-exporter (DaemonSet)</td><td>Node CPU/memory/disk — one pod per node (<a href="session-15.html">Session 15</a>).</td></tr>
+              <tr><td>kube-state-metrics</td><td>Object state: <code class="inl">kube_deployment_status_replicas_available</code>, pod restarts, HPA replicas.</td></tr>
+              <tr><td><code class="inl">ServiceMonitor</code> / <code class="inl">PodMonitor</code></td><td>"Scrape the Services/Pods matching these labels on this port."</td></tr>
+              <tr><td><code class="inl">PrometheusRule</code></td><td>Alerting/recording rules as a K8s object (same <code class="inl">groups:</code> format as <code class="inl">alerts.yml</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+<span class="out">"prometheus-community" has been added to your repositories</span>
+<span class="pr">$</span> helm repo update
+<span class="pr">$</span> helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+    -n monitoring --create-namespace --wait
+<span class="out">Release "monitoring" does not exist. Installing it now.
+NAME: monitoring
+NAMESPACE: monitoring
+STATUS: deployed
+REVISION: 1
+NOTES:
+kube-prometheus-stack has been installed. Check its status by running:
+  kubectl --namespace monitoring get pods -l "release=monitoring"</span>
+
+<span class="pr">$</span> kubectl get pods -n monitoring
+<span class="out">NAME                                                     READY   STATUS    RESTARTS   AGE
+alertmanager-monitoring-kube-prometheus-alertmanager-0   2/2     Running   0          2m
+monitoring-grafana-6c8f9d7b5d-x2kqp                      3/3     Running   0          2m
+monitoring-kube-prometheus-operator-7d9f5c6b8-lw4zt      1/1     Running   0          2m
+monitoring-kube-state-metrics-5f6d8c9b7-9qj2m            1/1     Running   0          2m
+monitoring-prometheus-node-exporter-h7x4k                1/1     Running   0          2m
+prometheus-monitoring-kube-prometheus-prometheus-0       2/2     Running   0          2m</span>
+
+<span class="pr">$</span> kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090   <span class="cm"># http://localhost:9090</span>
+<span class="pr">$</span> kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80                         <span class="cm"># http://localhost:3000</span>
+<span class="pr">$</span> kubectl get secret -n monitoring monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d ; echo
+<span class="out">Xq7vR2mT9pLk4sWz</span>          <span class="cm"># user: admin (the chart generates a random password unless you set grafana.adminPassword)</span></pre>
+
+        <h3>ServiceMonitor for taskflow-api</h3>
+        <p>A ServiceMonitor selects <strong>Services</strong> (by the Service's own <code class="inl">metadata.labels</code>) and scrapes a <strong>named port</strong> on the pods behind them. So the Service needs both:</p>
+        <div class="fname">k8s/service.yaml (the parts that matter)</div>
+<pre>apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    app: taskflow-api          <span class="cm"># ← what the ServiceMonitor matches</span>
+spec:
+  selector:
+    app: taskflow-api          <span class="cm"># pods (Session 11)</span>
+  ports:
+    - name: http               <span class="cm"># ← ServiceMonitor refers to the port by NAME</span>
+      port: <span class="nm">80</span>
+      targetPort: <span class="nm">3000</span></pre>
+
+        <div class="fname">k8s/servicemonitor.yaml</div>
+<pre>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taskflow-api
+  namespace: taskflow
+  labels:
+    release: monitoring        <span class="cm"># REQUIRED: the chart's Prometheus only picks up monitors with this label</span>
+spec:
+  selector:
+    matchLabels:
+      app: taskflow-api        <span class="cm"># match the Service's labels</span>
+  namespaceSelector:
+    matchNames: [taskflow]     <span class="cm"># optional; default = the ServiceMonitor's own namespace</span>
+  endpoints:
+    - port: http               <span class="cm"># named Service port</span>
+      path: /metrics
+      interval: <span class="nm">15s</span></pre>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/servicemonitor.yaml
+<span class="out">servicemonitor.monitoring.coreos.com/taskflow-api created</span>
+<span class="pr">$</span> kubectl get servicemonitors -A
+<span class="out">NAMESPACE    NAME                                      AGE
+monitoring   monitoring-kube-prometheus-apiserver      12m
+monitoring   monitoring-kube-prometheus-kubelet        12m
+...          (≈10 more from the chart)
+taskflow     taskflow-api                              20s</span></pre>
+        <p>(Deploying with the Helm chart instead? Session 23 ships this as <code class="inl">templates/servicemonitor.yaml</code>, matching the chart's own labels.) After ~30&nbsp;s Prometheus <em>Target health</em> shows <code class="inl">serviceMonitor/taskflow/taskflow-api/0</code> with <strong>2/2 up</strong> (one target per pod). Series carry K8s labels: <code class="inl">namespace</code>, <code class="inl">pod</code>, <code class="inl">service</code>, and <code class="inl">job="taskflow-api"</code> (the Service name).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake: ServiceMonitor ignored</span>
+          <ul>
+            <li>Missing <code class="inl">release: monitoring</code> label (must equal your Helm release name). Or install the chart with <code class="inl">--set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false</code> to select all monitors.</li>
+            <li><code class="inl">port: http</code> but the Service port has no <code class="inl">name</code>, or the selector matches pod labels that aren't on the Service itself.</li>
+            <li>Same rules for <code class="inl">PrometheusRule</code>: it needs <code class="inl">release: monitoring</code> too.</li>
+          </ul>
+        </div>
+
+        <h3>Grafana</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Concept</th><th>What it is</th><th>TaskFlow example</th></tr></thead>
+            <tbody>
+              <tr><td>Data source</td><td>Where queries go (Prometheus, Loki, Tempo, PostgreSQL, CloudWatch…)</td><td>Prometheus (pre-configured by the chart)</td></tr>
+              <tr><td>Dashboard</td><td>A page of panels, stored as JSON</td><td>"TaskFlow API"</td></tr>
+              <tr><td>Panel</td><td>One visualisation of one or more queries (Time series, Stat, Gauge, Table)</td><td>Time series: <code class="inl">sum by (status) (rate(http_requests_total{namespace="taskflow"}[5m]))</code>, legend <code class="inl">{{status}}</code>, unit req/s</td></tr>
+              <tr><td>Variable</td><td>Dropdown at the top that templates queries</td><td><code class="inl">$namespace</code> = query <code class="inl">label_values(kube_pod_info, namespace)</code>; use <code class="inl">{namespace="$namespace"}</code></td></tr>
+              <tr><td>Alert rule</td><td>Grafana-managed alert on any data source → <em>contact point</em> (Slack/email) via <em>notification policies</em></td><td>p95 &gt; 0.5&nbsp;s for 5m → email</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>Import a community dashboard</strong>: Dashboards → New → Import → enter ID <code class="inl">1860</code> (<em>Node Exporter Full</em>) → Load → pick the Prometheus data source → Import.</li>
+          <li>Built-in ones worth showing: <em>Kubernetes / Compute Resources / Namespace (Pods)</em> (CPU/memory per pod in <code class="inl">taskflow</code>), <em>Node Exporter / Nodes</em>.</li>
+          <li><strong>Dashboards as code</strong>: export the JSON and put it in a ConfigMap labelled <code class="inl">grafana_dashboard: "1"</code> — the chart's Grafana sidecar loads it automatically (no clicking after a reinstall).</li>
+          <li>Prometheus rules vs Grafana alerts: both work; Prometheus rules live in Git with the app (PrometheusRule) and go through Alertmanager — the usual choice on K8s.</li>
+        </ul>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">helm install monitoring prometheus-community/kube-prometheus-stack</code> gives Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics. Scrape your app with a ServiceMonitor (label <code class="inl">release: monitoring</code>, named port). Grafana = data sources + dashboards of panels + variables + alerts.
+        </div>
+      </section>
+
+      <!-- ===================== 6. GITOPS ===================== -->
+      <section id="gitops">
+        <h2><span class="sec-num">6</span> GitOps &amp; Git as the source of truth</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Git is the one recipe book. A robot in the kitchen keeps cooking exactly what the book says — if someone sneaks in a change, the robot puts it back.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">GitOps</span> = operating infrastructure and apps by declaring the desired state in Git and letting an <strong>in-cluster agent</strong> (Argo CD, Flux) continuously make reality match it.</li>
+          <li>It's the Kubernetes reconciliation loop (<a href="session-9.html">Session 9</a>) applied one level up: desired state lives in Git instead of whatever someone last <code class="inl">kubectl apply</code>'d.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>OpenGitOps principle</th><th>Meaning</th><th>For TaskFlow</th></tr></thead>
+            <tbody>
+              <tr><td>1. Declarative</td><td>Desired state is described, not scripted</td><td>Helm chart + <code class="inl">values-prod.yaml</code>, not a deploy.sh</td></tr>
+              <tr><td>2. Versioned &amp; immutable</td><td>Stored so every version is kept and can't be silently changed</td><td>Git history; image tags = git SHAs (never re-pushed)</td></tr>
+              <tr><td>3. Pulled automatically</td><td>Agents fetch the desired state themselves</td><td>Argo CD polls GitHub (every ~3 min) or gets a webhook</td></tr>
+              <tr><td>4. Continuously reconciled</td><td>Agents keep comparing actual vs desired and fix drift</td><td>Someone runs <code class="inl">kubectl scale</code> → Argo CD reverts it</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Push-based vs pull-based deployment</h3>
+<pre>PUSH (classic CI/CD, Session 19)
+  dev ──push──▶ GitHub ──▶ Actions runner ──helm upgrade / kubectl apply──▶ cluster
+                           (holds the kubeconfig = cluster-admin credentials outside the cluster)
+
+PULL (GitOps)
+  dev ──push──▶ GitHub ◀──watch/poll── Argo CD (runs INSIDE the cluster) ──apply──▶ cluster
+                                       (credentials never leave the cluster; drift is reverted)</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Push (CI runs kubectl/helm)</th><th>Pull (GitOps agent)</th></tr></thead>
+            <tbody>
+              <tr><td>Who applies changes</td><td>CI pipeline</td><td>Agent in the cluster</td></tr>
+              <tr><td>Cluster credentials</td><td>Stored in CI secrets</td><td>Stay inside the cluster; CI only needs Git write</td></tr>
+              <tr><td>Drift (manual changes)</td><td>Not detected until next deploy</td><td>Detected and optionally auto-reverted</td></tr>
+              <tr><td>Cluster behind NAT / on a laptop</td><td>CI can't reach it (needs self-hosted runner)</td><td>Works — the agent dials out to GitHub</td></tr>
+              <tr><td>Rollback</td><td>Re-run old pipeline / <code class="inl">helm rollback</code></td><td><code class="inl">git revert</code></td></tr>
+              <tr><td>Audit trail</td><td>CI logs</td><td>Git history (who, what, when, reviewed in a PR)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Repository layout</h3>
+<pre>Option A — one repo (fine for the course project)
+shauryav/taskflow
+├── server.js, Dockerfile, ...           <span class="cm"># app code → CI builds ghcr.io/shauryav/taskflow-api:&lt;sha&gt;</span>
+├── charts/taskflow/values-prod.yaml     <span class="cm"># image.tag: &lt;sha&gt;  ← CI commits the new tag here</span>
+└── argocd/taskflow.yaml                 <span class="cm"># Argo CD Application → watches charts/taskflow</span>
+
+Option B — app repo + config (environment) repo (common in teams)
+shauryav/taskflow          (code, Dockerfile, CI)    ──CI opens PR / commits tag──▶
+shauryav/taskflow-config   envs/dev/values.yaml   (image.tag: 9d41f7a…)
+                           envs/prod/values.yaml  (image.tag: 5be0c3e…)   ◀── Argo CD watches</pre>
+        <ul>
+          <li>Separate config repo: different permissions (devs push code; only reviewers merge to prod config), and config commits don't trigger app builds.</li>
+          <li>Promotion dev → prod = a PR that copies the tag from <code class="inl">envs/dev</code> to <code class="inl">envs/prod</code>.</li>
+          <li>The CI step that "bumps" the tag (full workflow in <a href="session-23.html">Session 23</a>):</li>
+        </ul>
+<pre><span class="pr">$</span> yq -i '.image.tag = "5be0c3e9a1f04d7c8b6e2a3f9d0c1b4e7a8f6d2c"' charts/taskflow/values-prod.yaml
+<span class="pr">$</span> git commit -am "deploy: taskflow-api 5be0c3e [skip ci]" &amp;&amp; git push</pre>
+
+        <h3>Rollback = <code class="inl">git revert</code></h3>
+<pre><span class="pr">$</span> git log --oneline -2 -- charts/taskflow/values-prod.yaml
+<span class="out">a71d0b4 deploy: taskflow-api 5be0c3e [skip ci]
+3f9c2e1 deploy: taskflow-api 9d41f7a [skip ci]</span>
+<span class="pr">$</span> git revert --no-edit a71d0b4                   <span class="cm"># new commit that restores image.tag 9d41f7a…</span>
+<span class="out">[main 6c2d8e0] Revert "deploy: taskflow-api 5be0c3e [skip ci]"
+ 1 file changed, 1 insertion(+), 1 deletion(-)</span>
+<span class="pr">$</span> git push                                       <span class="cm"># (or via PR) → Argo CD syncs the old version</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><strong>Plain Secrets in Git</strong> (base64 isn't encryption — <a href="session-12.html">Session 12</a>). Use Sealed Secrets, External Secrets Operator or SOPS, or create the Secret out-of-band.</li>
+            <li><strong>Deploying <code class="inl">:latest</code></strong>: Git doesn't change when you push a new <code class="inl">latest</code>, so nothing syncs (and you can't roll back). Use immutable SHA tags.</li>
+            <li>Hot-fixing with <code class="inl">kubectl edit</code> in a GitOps cluster: self-heal reverts it within seconds. Change Git instead.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          GitOps = declarative + versioned + pulled + continuously reconciled. Pull beats push for credentials and drift. Deploy = commit a new image tag; rollback = <code class="inl">git revert</code>.
+        </div>
+      </section>
+
+      <!-- ===================== 7. ARGO CD ===================== -->
+      <section id="argocd">
+        <h2><span class="sec-num">7</span> Argo CD &amp; continuous deployment with GitOps</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Argo CD is the robot: it reads the folder in Git, renders it into Kubernetes YAML, compares with the cluster, and fixes any difference.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Argo CD</span> (CNCF graduated) runs in namespace <code class="inl">argocd</code>: <strong>repo-server</strong> clones Git and renders Helm/Kustomize/plain YAML, <strong>application-controller</strong> diffs and syncs, <strong>argocd-server</strong> serves the UI/API/CLI, plus redis, dex (SSO), applicationset- and notifications-controllers.</li>
+          <li>Unit of deployment: an <span class="term">Application</span> CRD = "this Git path → this cluster/namespace".</li>
+        </ul>
+
+<pre><span class="pr">$</span> kubectl create namespace argocd
+<span class="out">namespace/argocd created</span>
+<span class="pr">$</span> kubectl apply -n argocd --server-side --force-conflicts \
+    -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+<span class="out">customresourcedefinition.apiextensions.k8s.io/applications.argoproj.io serverside-applied
+customresourcedefinition.apiextensions.k8s.io/applicationsets.argoproj.io serverside-applied
+...
+deployment.apps/argocd-server serverside-applied
+statefulset.apps/argocd-application-controller serverside-applied</span>
+<span class="pr">$</span> kubectl get pods -n argocd
+<span class="out">NAME                                               READY   STATUS    RESTARTS   AGE
+argocd-application-controller-0                    1/1     Running   0          90s
+argocd-applicationset-controller-6b9f7d7c8-4xk2p   1/1     Running   0          90s
+argocd-dex-server-7c6d8f9b5-mq8rt                  1/1     Running   0          90s
+argocd-notifications-controller-5d8b9c7f6-zt2lw    1/1     Running   0          90s
+argocd-redis-6f9c8d7b4-p9xvn                       1/1     Running   0          90s
+argocd-repo-server-7b8c9d6f5-h3jkq                 1/1     Running   0          90s
+argocd-server-5c7d8b9f6-wr4mz                      1/1     Running   0          90s</span>
+
+<span class="pr">$</span> brew install argocd                              <span class="cm"># CLI (Linux: download from the GitHub releases page)</span>
+<span class="pr">$</span> argocd admin initial-password -n argocd
+<span class="out">x7Gk2pQ9vLmN3sTa
+
+ This password must be only used for first time login. We strongly recommend you update the password using `argocd account update-password`.</span>
+<span class="pr">$</span> kubectl port-forward svc/argocd-server -n argocd 8080:443    <span class="cm"># UI: https://localhost:8080 (self-signed cert)</span>
+<span class="pr">$</span> argocd login localhost:8080 --username admin --password 'x7Gk2pQ9vLmN3sTa' --insecure
+<span class="out">'admin:login' logged in successfully
+Context 'localhost:8080' updated</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>Plain <code class="inl">kubectl apply -f install.yaml</code> can fail with <code class="inl">metadata.annotations: Too long</code> — Argo CD's CRDs exceed the client-side apply annotation limit. Use <code class="inl">--server-side --force-conflicts</code> as above.</p>
+        </div>
+
+        <h3>The Application</h3>
+        <div class="fname">argocd/taskflow.yaml</div>
+<pre>apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: taskflow
+  namespace: argocd                          <span class="cm"># Applications live in Argo CD's namespace</span>
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io <span class="cm"># deleting the app also deletes its K8s resources</span>
+spec:
+  project: default                           <span class="cm"># AppProject: limits allowed repos/clusters/namespaces</span>
+  source:
+    repoURL: https://github.com/shauryav/taskflow.git
+    targetRevision: main                     <span class="cm"># branch, tag or commit SHA to track</span>
+    path: charts/taskflow                    <span class="cm"># folder inside the repo</span>
+    helm:
+      valueFiles:
+        - values-prod.yaml                   <span class="cm"># relative to path; like helm -f</span>
+  destination:
+    server: https://kubernetes.default.svc   <span class="cm"># "this cluster" (where Argo CD runs)</span>
+    namespace: taskflow                      <span class="cm"># target namespace for the chart's resources</span>
+  syncPolicy:
+    automated:                               <span class="cm"># sync on every Git change (no manual "Sync" click)</span>
+      prune: <span class="kw">true</span>                            <span class="cm"># delete resources that were removed from Git</span>
+      selfHeal: <span class="kw">true</span>                         <span class="cm"># revert manual changes made in the cluster</span>
+    syncOptions:
+      - CreateNamespace=true                 <span class="cm"># create "taskflow" if missing</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning / gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">source.repoURL</code></td><td>Public repo works as is. Private: <code class="inl">argocd repo add https://github.com/shauryav/taskflow.git --username shauryav --password &lt;PAT&gt;</code> first.</td></tr>
+              <tr><td><code class="inl">targetRevision</code></td><td><code class="inl">main</code> = follow the branch; a tag/SHA pins it.</td></tr>
+              <tr><td><code class="inl">helm.valueFiles</code></td><td>Argo CD runs the equivalent of <code class="inl">helm template</code> and applies the output — so the release does <strong>not</strong> show in <code class="inl">helm list</code>, and <code class="inl">helm rollback</code> doesn't apply.</td></tr>
+              <tr><td><code class="inl">automated</code></td><td>Without it the app just shows <em>OutOfSync</em> until you click Sync / run <code class="inl">argocd app sync</code>.</td></tr>
+              <tr><td><code class="inl">prune</code></td><td>Off by default for safety: removing a file from Git won't delete the live object unless this is true.</td></tr>
+              <tr><td><code class="inl">selfHeal</code></td><td>Re-syncs when the live state drifts (after a 5&nbsp;s self-heal timeout).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl apply -f argocd/taskflow.yaml
+<span class="out">application.argoproj.io/taskflow created</span>
+<span class="pr">$</span> argocd app list
+<span class="out">NAME             CLUSTER                         NAMESPACE  PROJECT  STATUS  HEALTH   SYNCPOLICY  CONDITIONS  REPO                                      PATH             TARGET
+argocd/taskflow  https://kubernetes.default.svc  taskflow   default  Synced  Healthy  Auto-Prune  &lt;none&gt;      https://github.com/shauryav/taskflow.git  charts/taskflow  main</span>
+<span class="pr">$</span> argocd app get taskflow
+<span class="out">Name:               argocd/taskflow
+Project:            default
+Server:             https://kubernetes.default.svc
+Namespace:          taskflow
+Source:
+- Repo:             https://github.com/shauryav/taskflow.git
+  Target:           main
+  Path:             charts/taskflow
+  Helm Values:      values-prod.yaml
+Sync Policy:        Automated (Prune)
+Sync Status:        Synced to main (a71d0b4)
+Health Status:      Healthy
+
+GROUP              KIND                     NAMESPACE  NAME          STATUS  HEALTH
+                   Service                  taskflow   taskflow-api  Synced  Healthy
+apps               Deployment               taskflow   taskflow-api  Synced  Healthy
+autoscaling        HorizontalPodAutoscaler  taskflow   taskflow-api  Synced  Healthy
+networking.k8s.io  Ingress                  taskflow   taskflow-api  Synced  Healthy</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Sync status (Git vs cluster)</th><th>Health status (is it working?)</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Synced</strong> — live objects match what Git renders</td><td><strong>Healthy</strong> — e.g. Deployment has all replicas available</td></tr>
+              <tr><td><strong>OutOfSync</strong> — Git changed, or someone changed the cluster</td><td><strong>Progressing</strong> — rollout in progress, waiting for pods</td></tr>
+              <tr><td><strong>Unknown</strong> — couldn't render/compare (bad repo URL, chart error)</td><td><strong>Degraded</strong> — failed (CrashLoopBackOff, rollout deadline exceeded); also <strong>Missing</strong>, <strong>Suspended</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>They're independent: <em>Synced + Degraded</em> = Git was applied faithfully but the new image crashes. Fix Git (revert), not the cluster.</p>
+
+        <h3>Day-to-day CLI</h3>
+<pre><span class="pr">$</span> argocd app diff taskflow                 <span class="cm"># what would change (live vs Git)</span>
+<span class="pr">$</span> argocd app sync taskflow                 <span class="cm"># sync now instead of waiting for the ~3 min poll</span>
+<span class="pr">$</span> argocd app history taskflow
+<span class="out">SOURCE  https://github.com/shauryav/taskflow.git
+ID      DATE                           REVISION
+0       2026-10-09 14:10:21 +0530 IST  main (3f9c2e1)
+1       2026-10-09 15:02:47 +0530 IST  main (a71d0b4)</span>
+<span class="pr">$</span> argocd app rollback taskflow 0
+<span class="out">FATA[0000] rpc error: code = FailedPrecondition desc = rollback cannot be initiated when auto-sync is enabled</span>
+<span class="cm"># → with automated sync, roll back with git revert (topic 6); or disable auto-sync first:</span>
+<span class="pr">$</span> argocd app set taskflow --sync-policy none &amp;&amp; argocd app rollback taskflow 0</pre>
+
+        <h3>Drift demo: self-heal</h3>
+<pre><span class="pr">$</span> kubectl scale deploy/taskflow-api -n taskflow --replicas=5     <span class="cm"># a "quick fix" outside Git</span>
+<span class="out">deployment.apps/taskflow-api scaled</span>
+<span class="pr">$</span> argocd app get taskflow | grep -E 'Sync Status|Health Status'
+<span class="out">Sync Status:        OutOfSync from main (a71d0b4)
+Health Status:      Progressing</span>
+<span class="pr">$</span> kubectl get deploy taskflow-api -n taskflow -w
+<span class="out">NAME           READY   UP-TO-DATE   AVAILABLE   AGE
+taskflow-api   2/5     5            2           2h
+taskflow-api   2/2     2            2           2h       </span><span class="cm"># Argo CD re-applied replicas: 2 from Git</span></pre>
+        <div class="callout note">
+          <span class="c-title">HPA + Argo CD</span>
+          <p>The demo above assumes the chart sets <code class="inl">replicas</code> (<code class="inl">autoscaling.enabled: false</code>). With HPA on, the chart omits <code class="inl">replicas</code>, so Argo CD doesn't own it and the HPA scales it back instead. To demo self-heal then, try <code class="inl">kubectl delete svc taskflow-api -n taskflow</code> — Argo CD recreates it within seconds. If a chart <em>does</em> set replicas alongside an HPA, Argo CD and the HPA fight; add <code class="inl">ignoreDifferences</code> for <code class="inl">/spec/replicas</code>.</p>
+        </div>
+
+        <h3>End-to-end GitOps CD flow</h3>
+        <div class="flow">
+          <div class="step"><div class="s-ico">👩‍💻</div><div class="s-t">Merge PR</div><div class="s-d">code change on main</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">⚙️</div><div class="s-t">CI</div><div class="s-d">test, scan, build, push <code class="inl">:&lt;sha&gt;</code></div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">✏️</div><div class="s-t">Bump tag</div><div class="s-d">CI commits <code class="inl">image.tag</code> to values-prod.yaml</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">🐙</div><div class="s-t">Argo CD</div><div class="s-d">detects new commit → OutOfSync</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">☸️</div><div class="s-t">Sync</div><div class="s-d">helm template + apply → rolling update</div></div>
+          <div class="arrow">→</div>
+          <div class="step"><div class="s-ico">📈</div><div class="s-t">Observe</div><div class="s-d">Grafana/alerts; bad? <code class="inl">git revert</code></div></div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Argo CD</th><th>Flux</th></tr></thead>
+            <tbody>
+              <tr><td>Model</td><td><code class="inl">Application</code> / <code class="inl">ApplicationSet</code> CRDs</td><td><code class="inl">GitRepository</code> + <code class="inl">Kustomization</code> / <code class="inl">HelmRelease</code> CRDs</td></tr>
+              <tr><td>UI</td><td>Rich built-in web UI (resource tree, diffs)</td><td>No built-in UI (CLI-first; third-party UIs)</td></tr>
+              <tr><td>Setup</td><td><code class="inl">kubectl apply</code> install.yaml</td><td><code class="inl">flux bootstrap github --owner=shauryav --repository=taskflow-config --path=clusters/minikube --personal</code></td></tr>
+              <tr><td>Helm</td><td>Renders charts itself (no Helm release)</td><td>Uses the Helm SDK — real Helm releases</td></tr>
+              <tr><td>Both</td><td colspan="2">CNCF graduated, pull-based, drift detection, image-update automation available</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Application created in the wrong namespace (e.g. <code class="inl">taskflow</code>) — by default Argo CD only watches Applications in <code class="inl">argocd</code>.</li>
+            <li><code class="inl">ComparisonError … app path does not exist</code> — wrong <code class="inl">path</code>/branch, or the commit isn't pushed yet.</li>
+            <li>Stuck <em>OutOfSync</em> with nothing to fix — usually a field the cluster mutates (replicas under HPA, defaulted fields); use <code class="inl">ignoreDifferences</code>.</li>
+            <li>Turning on <code class="inl">prune</code> and then deleting the wrong file from Git = deleting it from the cluster. Review PRs.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Install Argo CD in <code class="inl">argocd</code>, log in, and declare an <code class="inl">Application</code> (repo + path + values → cluster + namespace). Automated sync with prune + selfHeal = Git is the only way to change prod. Synced/OutOfSync compares Git; Healthy/Degraded checks the app.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">curl -s localhost:3000/metrics</code></td><td>See what the app exposes to Prometheus.</td></tr>
+              <tr><td><code class="inl">docker compose -f compose.yaml -f compose.monitoring.yaml up -d</code></td><td>Run TaskFlow + Prometheus + Alertmanager + Grafana locally.</td></tr>
+              <tr><td><code class="inl">promtool check config prometheus.yml</code> / <code class="inl">promtool check rules alerts.yml</code></td><td>Validate config and rule files before loading them.</td></tr>
+              <tr><td><code class="inl">curl -X POST localhost:9090/-/reload</code></td><td>Reload Prometheus config (needs <code class="inl">--web.enable-lifecycle</code>).</td></tr>
+              <tr><td><code class="inl">curl -s localhost:9090/api/v1/query --data-urlencode 'query=up'</code></td><td>Run a PromQL query over the HTTP API.</td></tr>
+              <tr><td><code class="inl">helm upgrade --install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace</code></td><td>Install the full monitoring stack on K8s.</td></tr>
+              <tr><td><code class="inl">kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090</code></td><td>Open the Prometheus UI.</td></tr>
+              <tr><td><code class="inl">kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80</code></td><td>Open Grafana.</td></tr>
+              <tr><td><code class="inl">kubectl get secret -n monitoring monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d</code></td><td>Grafana admin password.</td></tr>
+              <tr><td><code class="inl">kubectl get servicemonitors,prometheusrules -A</code></td><td>List scrape configs and rules managed by the operator.</td></tr>
+              <tr><td><code class="inl">kubectl apply -n argocd --server-side --force-conflicts -f …/install.yaml</code></td><td>Install Argo CD.</td></tr>
+              <tr><td><code class="inl">argocd admin initial-password -n argocd</code></td><td>First admin password.</td></tr>
+              <tr><td><code class="inl">kubectl port-forward svc/argocd-server -n argocd 8080:443</code></td><td>Open the Argo CD UI / API locally.</td></tr>
+              <tr><td><code class="inl">argocd login localhost:8080 --insecure</code></td><td>Log the CLI in.</td></tr>
+              <tr><td><code class="inl">argocd app list</code> / <code class="inl">get</code> / <code class="inl">diff</code> / <code class="inl">sync</code> / <code class="inl">history</code> <code class="inl">taskflow</code></td><td>Inspect and drive an Application.</td></tr>
+              <tr><td><code class="inl">argocd app rollback taskflow &lt;ID&gt;</code></td><td>Roll back to a history ID (only when auto-sync is off).</td></tr>
+              <tr><td><code class="inl">git revert &lt;sha&gt; &amp;&amp; git push</code></td><td>GitOps rollback.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>TaskFlow exposes RED metrics on <code class="inl">/metrics</code>; Prometheus (installed by kube-prometheus-stack, pointed at the app by a ServiceMonitor) scrapes them, PromQL turns counters into rates, error ratios and p95 latency, alert rules page you through Alertmanager, and Grafana charts it all. Logs and traces, linked by a trace ID, explain <em>why</em>. Deployment is GitOps: CI builds an immutable <code class="inl">:&lt;sha&gt;</code> image and commits that tag to Git; Argo CD, running inside the cluster, pulls the change, syncs it, and reverts any drift — so Git is the single source of truth and <code class="inl">git revert</code> is the rollback button.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Which metric type for "requests served" and which for "memory in use"? Why do you wrap the first in rate()?</summary>
+          <p class="ans">Requests served = counter (only increases); memory = gauge. A counter's raw value just grows forever and resets on restart; <code class="inl">rate()</code> gives the per-second increase and handles resets.</p>
+        </details>
+        <details class="quiz">
+          <summary>Write PromQL for TaskFlow's 5xx error ratio over 5 minutes, and for p95 latency.</summary>
+          <p class="ans"><code class="inl">sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))</code> and <code class="inl">histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>What does <code class="inl">for: 5m</code> do in an alert rule?</summary>
+          <p class="ans">The expression must stay true for 5 minutes; until then the alert is <em>pending</em>, after that it's <em>firing</em> and goes to Alertmanager. It filters out short spikes.</p>
+        </details>
+        <details class="quiz">
+          <summary>Your ServiceMonitor is applied but the target never appears in Prometheus. Name three likely causes.</summary>
+          <p class="ans">(1) Missing <code class="inl">release: monitoring</code> label, so the chart's Prometheus doesn't select it; (2) <code class="inl">selector.matchLabels</code> doesn't match the <em>Service's</em> labels; (3) <code class="inl">endpoints.port</code> names a port that isn't named on the Service (or namespaceSelector excludes it).</p>
+        </details>
+        <details class="quiz">
+          <summary>Monitoring vs observability in one line each?</summary>
+          <p class="ans">Monitoring: watch predefined metrics/thresholds to know <em>that</em> something is wrong (known unknowns). Observability: enough correlated metrics, logs and traces to find out <em>why</em>, even for unforeseen failures (unknown unknowns).</p>
+        </details>
+        <details class="quiz">
+          <summary>Push vs pull deployment: why does GitOps work for a minikube cluster on a laptop when a GitHub-hosted runner can't deploy to it?</summary>
+          <p class="ans">Push needs the CI runner to reach the cluster API (impossible behind NAT) and to hold its credentials. Pull runs the agent inside the cluster, which makes outbound calls to GitHub, so nothing needs to reach in and credentials stay in the cluster.</p>
+        </details>
+        <details class="quiz">
+          <summary>Can an Argo CD app be Synced but Degraded? How do you roll it back with auto-sync on?</summary>
+          <p class="ans">Yes — Git was applied exactly, but the new version is failing (e.g. CrashLoopBackOff). <code class="inl">argocd app rollback</code> is refused while auto-sync is on, so <code class="inl">git revert</code> the tag-bump commit and push; Argo CD syncs the previous version.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 22: Monitoring, Observability &amp; GitOps.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://prometheus.io/docs/introduction/overview/" target="_blank" rel="noopener">Prometheus overview</a> and <a href="https://prometheus.io/docs/prometheus/latest/querying/basics/" target="_blank" rel="noopener">PromQL basics</a>.</li>
+          <li><a href="https://prometheus.io/docs/alerting/latest/configuration/" target="_blank" rel="noopener">Alertmanager configuration</a> — routes, receivers, inhibition.</li>
+          <li><a href="https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack" target="_blank" rel="noopener">kube-prometheus-stack chart</a> and the <a href="https://prometheus-operator.dev/docs/api-reference/api/" target="_blank" rel="noopener">Prometheus Operator API</a> (ServiceMonitor, PrometheusRule).</li>
+          <li><a href="https://grafana.com/docs/grafana/latest/" target="_blank" rel="noopener">Grafana documentation</a> · <a href="https://opentelemetry.io/docs/" target="_blank" rel="noopener">OpenTelemetry docs</a>.</li>
+          <li><a href="https://argo-cd.readthedocs.io/en/stable/" target="_blank" rel="noopener">Argo CD docs</a> · <a href="https://opengitops.dev/" target="_blank" rel="noopener">OpenGitOps principles</a>.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-21.html"><div class="dir">← Previous</div><div class="ttl">Session 21: Cloud &amp; Terraform in Action</div></a>
+        <a class="next" href="session-23.html"><div class="dir">Next →</div><div class="ttl">Session 23: Final DevOps Project</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 22 — Monitoring, Observability &amp; GitOps</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

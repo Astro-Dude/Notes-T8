@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 7 — Docker Images &amp; Dockerfile</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 7</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 07</span>
+      <h1>Docker Images &amp; Dockerfile</h1>
+      <p class="lead">
+        Write a production Dockerfile for the TaskFlow API, explain every instruction in it, and cut the
+        image from ~1.2&nbsp;GB to ~140&nbsp;MB with <code class="inl">.dockerignore</code>, layer caching and multi-stage builds.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 28 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#dockerfile">Dockerfile &amp; docker build</a></li>
+          <li><a href="#from-run-copy">FROM, RUN, COPY (and ADD)</a></li>
+          <li><a href="#workdir-env-expose">WORKDIR, ENV, ARG, EXPOSE, USER…</a></li>
+          <li><a href="#cmd-entrypoint">CMD vs ENTRYPOINT</a></li>
+          <li><a href="#dockerignore">.dockerignore &amp; layer caching</a></li>
+          <li><a href="#multi-stage">Multi-stage builds</a></li>
+          <li><a href="#optimization">Image optimization</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. DOCKERFILE ===================== -->
+      <section id="dockerfile">
+        <h2><span class="sec-num">1</span> Dockerfile &amp; <code class="inl">docker build</code></h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A Dockerfile is a recipe card. <code class="inl">docker build</code> follows it top to bottom and bakes an image; every step is a cake layer that can be reused next time.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">Dockerfile</span> is a text file of instructions (<code class="inl">FROM</code>, <code class="inl">RUN</code>, <code class="inl">COPY</code>…). <code class="inl">docker build</code> turns it into an image.</li>
+          <li>The <span class="term">build context</span> is the folder you pass (the final <code class="inl">.</code>). Only files in it can be <code class="inl">COPY</code>-ed; it is sent to the builder (BuildKit) first.</li>
+          <li><code class="inl">RUN</code>, <code class="inl">COPY</code>, <code class="inl">ADD</code> add filesystem <span class="term">layers</span>. Everything else (<code class="inl">ENV</code>, <code class="inl">CMD</code>, <code class="inl">EXPOSE</code>, <code class="inl">USER</code>…) only changes image metadata (0&nbsp;B layers).</li>
+          <li>BuildKit is the default builder since Docker Engine 23; <code class="inl">docker build</code> = <code class="inl">docker buildx build</code>.</li>
+          <li>Comments: a line starting with <code class="inl">#</code>. A <code class="inl">#</code> <em>after</em> an instruction is <strong>not</strong> a comment — it becomes part of the arguments.</li>
+        </ul>
+
+        <p>The app we're packaging — TaskFlow's dependency manifest:</p>
+        <div class="fname">package.json</div>
+<pre>{
+  <span class="st">"name"</span>: <span class="st">"taskflow-api"</span>,
+  <span class="st">"version"</span>: <span class="st">"1.0.0"</span>,
+  <span class="st">"main"</span>: <span class="st">"server.js"</span>,
+  <span class="st">"scripts"</span>: { <span class="st">"start"</span>: <span class="st">"node server.js"</span>, <span class="st">"test"</span>: <span class="st">"jest"</span> },
+  <span class="st">"dependencies"</span>:    { <span class="st">"express"</span>: <span class="st">"^5.1.0"</span>, <span class="st">"pg"</span>: <span class="st">"^8.13.1"</span>, <span class="st">"prom-client"</span>: <span class="st">"^15.1.3"</span> },
+  <span class="st">"devDependencies"</span>: { <span class="st">"jest"</span>: <span class="st">"^29.7.0"</span>, <span class="st">"supertest"</span>: <span class="st">"^7.0.0"</span> }
+}</pre>
+        <p><code class="inl">dependencies</code> are needed at runtime; <code class="inl">devDependencies</code> only for tests. <code class="inl">npm ci --omit=dev</code> installs just the first group, exactly as pinned in <code class="inl">package-lock.json</code>.</p>
+
+        <p>First working Dockerfile (single stage; we improve it in §6):</p>
+        <div class="fname">Dockerfile (v1)</div>
+<pre><span class="cm"># base image: Node 20 on Alpine Linux (~135 MB)</span>
+<span class="kw">FROM</span> node:20-alpine
+<span class="cm"># all following paths are relative to /app (created if missing)</span>
+<span class="kw">WORKDIR</span> /app
+<span class="cm"># dependency manifests first → the npm ci layer stays cached until they change</span>
+<span class="kw">COPY</span> package*.json ./
+<span class="kw">RUN</span> npm ci --omit=dev
+<span class="cm"># then the source code (changes often)</span>
+<span class="kw">COPY</span> . .
+<span class="kw">ENV</span> PORT=3000
+<span class="kw">EXPOSE</span> 3000
+<span class="kw">USER</span> node
+<span class="kw">CMD</span> [<span class="st">"node"</span>, <span class="st">"server.js"</span>]</pre>
+
+        <p>Build, run, test:</p>
+<pre><span class="pr">$</span> docker build -t shauryav/taskflow-api:1.0 .
+<span class="out">[+] Building 21.7s (10/10) FINISHED                                    docker:default
+ =&gt; [internal] load build definition from Dockerfile                             0.0s
+ =&gt; =&gt; transferring dockerfile: 389B                                             0.0s
+ =&gt; [internal] load metadata for docker.io/library/node:20-alpine                1.3s
+ =&gt; [internal] load .dockerignore                                                0.0s
+ =&gt; [1/5] FROM docker.io/library/node:20-alpine@sha256:2d07db07a2df…             4.2s
+ =&gt; [internal] load build context                                                0.1s
+ =&gt; =&gt; transferring context: 58.12kB                                             0.0s
+ =&gt; [2/5] WORKDIR /app                                                           0.1s
+ =&gt; [3/5] COPY package*.json ./                                                  0.0s
+ =&gt; [4/5] RUN npm ci --omit=dev                                                 13.8s
+ =&gt; [5/5] COPY . .                                                               0.1s
+ =&gt; exporting to image                                                           0.6s
+ =&gt; =&gt; naming to docker.io/shauryav/taskflow-api:1.0                             0.0s</span>
+
+<span class="pr">$</span> docker run -d --name api -p 3000:3000 shauryav/taskflow-api:1.0
+<span class="out">5b8e2f1c9a7d3e6f0b4c8a2d1e9f7c6b5a4d3e2f1c0b9a8d7e6f5c4b3a2d1e0f</span>
+<span class="pr">$</span> curl -s localhost:3000/health
+<span class="out">{"status":"ok"}</span></pre>
+        <p>Reading the output: <code class="inl">[4/5]</code> = step 4 of 5 build steps; <code class="inl">transferring context</code> = how much of your folder was sent (watch this number, §5); the last line is the final image name.</p>
+
+        <h3>Build flags you'll actually use</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Example</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-t</code></td><td><code class="inl">-t shauryav/taskflow-api:1.0 -t shauryav/taskflow-api:latest</code></td><td>Name:tag (repeatable).</td></tr>
+              <tr><td><code class="inl">-f</code></td><td><code class="inl">-f docker/Dockerfile.prod .</code></td><td>Use a Dockerfile not named <code class="inl">Dockerfile</code> / not in the context root.</td></tr>
+              <tr><td><code class="inl">--target</code></td><td><code class="inl">--target build</code></td><td>Stop at a named stage of a multi-stage build (§6).</td></tr>
+              <tr><td><code class="inl">--build-arg</code></td><td><code class="inl">--build-arg NODE_VERSION=22</code></td><td>Set an <code class="inl">ARG</code> (§3).</td></tr>
+              <tr><td><code class="inl">--platform</code></td><td><code class="inl">--platform linux/amd64</code></td><td>Build for another CPU arch (e.g. on an M-series Mac for an x86 server).</td></tr>
+              <tr><td><code class="inl">--progress=plain</code></td><td></td><td>Full, uncollapsed logs of every <code class="inl">RUN</code> — use when a step fails.</td></tr>
+              <tr><td><code class="inl">--no-cache</code></td><td></td><td>Ignore the layer cache, rebuild everything.</td></tr>
+              <tr><td><code class="inl">--pull</code></td><td></td><td>Always check for a newer base image.</td></tr>
+              <tr><td><code class="inl">.</code> (last arg)</td><td><code class="inl">docker build -t x ./api</code></td><td>The build context directory.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> docker build --progress=plain --no-cache -t shauryav/taskflow-api:1.0 . 2&gt;&amp;1 | grep -A3 "npm ci"
+<span class="out">#8 [4/5] RUN npm ci --omit=dev
+#8 12.904 added 71 packages, and audited 72 packages in 12s
+#8 12.906 found 0 vulnerabilities
+#8 DONE 13.4s</span></pre>
+
+        <h3>Inspect what you built</h3>
+<pre><span class="pr">$</span> docker images shauryav/taskflow-api
+<span class="out">REPOSITORY             TAG       IMAGE ID       CREATED          SIZE
+shauryav/taskflow-api  1.0       9b3e1f7a2c44   2 minutes ago    152MB</span>
+
+<span class="pr">$</span> docker history shauryav/taskflow-api:1.0
+<span class="out">IMAGE          CREATED         CREATED BY                                      SIZE      COMMENT
+9b3e1f7a2c44   2 minutes ago   CMD ["node" "server.js"]                        0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   USER node                                       0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   EXPOSE map[3000/tcp:{}]                         0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   ENV PORT=3000                                   0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   COPY . . # buildkit                             41.2kB    buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   RUN /bin/sh -c npm ci --omit=dev # buildkit     14.6MB    buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   COPY package*.json ./ # buildkit                61.4kB    buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+&lt;missing&gt;      3 weeks ago     CMD ["node"]                                    0B        buildkit.dockerfile.v0
+&lt;missing&gt;      3 weeks ago     ENTRYPOINT ["docker-entrypoint.sh"]             0B        buildkit.dockerfile.v0
+<span class="cm">…base image layers…</span></span></pre>
+        <p>Newest layer on top. <code class="inl">&lt;missing&gt;</code> just means the intermediate layer has no image ID of its own (normal with BuildKit). Add <code class="inl">--no-trunc</code> to see full commands.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">WORKDIR /app # set dir</code> — the "comment" becomes part of the path. Put comments on their own line.</li>
+            <li>Forgetting the trailing <code class="inl">.</code>: <code class="inl">ERROR: "docker buildx build" requires exactly 1 argument.</code></li>
+            <li><code class="inl">COPY ../shared ./</code> fails — you can't copy from outside the build context. Move the context up a level and use <code class="inl">-f</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Dockerfile + context → <code class="inl">docker build -t name:tag .</code> → image. RUN/COPY/ADD = layers; the rest = metadata. Use <code class="inl">docker history</code> to see layers and sizes.
+        </div>
+      </section>
+
+      <!-- ===================== 2. FROM RUN COPY ===================== -->
+      <section id="from-run-copy">
+        <h2><span class="sec-num">2</span> FROM, RUN, COPY (and ADD)</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>FROM picks the starting kitchen, RUN cooks something in it, COPY brings ingredients in from your bag.</p>
+        </div>
+
+        <h3>FROM — the base image</h3>
+        <ul>
+          <li>Must be the first instruction (only <code class="inl">ARG</code> and parser directives like <code class="inl"># syntax=</code> may come before it).</li>
+          <li>Forms: <code class="inl">FROM node:20-alpine</code> · <code class="inl">FROM node:20-alpine AS build</code> (named stage) · <code class="inl">FROM node:20-alpine@sha256:2d07…</code> (pinned by <span class="term">digest</span> — immutable).</li>
+          <li>Pin at least the major version. <code class="inl">FROM node</code> means <code class="inl">node:latest</code> → a new Node major can break your build overnight.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Base</th><th>What's inside</th><th>~Size</th><th>Shell / pkg mgr</th><th>Use for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">node:20</code></td><td>Full Debian + gcc, python, git</td><td>~1.1 GB</td><td>yes / apt</td><td>Build stages that compile native modules</td></tr>
+              <tr><td><code class="inl">node:20-slim</code></td><td>Minimal Debian (glibc)</td><td>~200 MB</td><td>yes / apt</td><td>Runtime when a dependency needs glibc</td></tr>
+              <tr><td><code class="inl">node:20-alpine</code></td><td>Alpine Linux (musl libc, busybox)</td><td>~135 MB</td><td>yes / apk</td><td>Default small runtime</td></tr>
+              <tr><td><code class="inl">gcr.io/distroless/nodejs20-debian12</code></td><td>Node + libs only; no shell, no package manager</td><td>~130 MB</td><td>no / no</td><td>Hardened runtime stage (fewer CVEs)</td></tr>
+              <tr><td><code class="inl">scratch</code></td><td>Empty</td><td>0 B</td><td>no / no</td><td>Static binaries (Go, Rust)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note">
+          <span class="c-title">Version note</span>
+          <p>Node 20 reached end-of-life in April 2026. The course uses 20 for consistency; for a real project use <code class="inl">node:22-alpine</code> or <code class="inl">node:24-alpine</code> — with the <code class="inl">ARG NODE_VERSION</code> trick (§3) it's a one-flag change.</p>
+        </div>
+
+        <h3>RUN — execute a command at build time</h3>
+        <ul>
+          <li><strong>Shell form</strong> <code class="inl">RUN npm ci</code> → runs <code class="inl">/bin/sh -c "npm ci"</code> (variables, <code class="inl">&amp;&amp;</code>, pipes work).</li>
+          <li><strong>Exec form</strong> <code class="inl">RUN ["npm", "ci"]</code> → no shell. Rarely needed for RUN.</li>
+          <li>Each RUN is a new shell and a new layer. <code class="inl">RUN cd /app</code> does nothing for the next line — use <code class="inl">WORKDIR</code>.</li>
+          <li>Deleting a file in a <em>later</em> layer doesn't shrink the image — the earlier layer still contains it. Install and clean up <strong>in the same RUN</strong>.</li>
+        </ul>
+        <div class="fname">Bad — 3 layers, stale cache, no size saving</div>
+<pre><span class="kw">FROM</span> node:20-slim
+<span class="kw">RUN</span> apt-get update
+<span class="kw">RUN</span> apt-get install -y curl
+<span class="kw">RUN</span> rm -rf /var/lib/apt/lists/*</pre>
+        <div class="fname">Good — 1 layer, always-fresh index, cleaned</div>
+<pre><span class="kw">FROM</span> node:20-slim
+<span class="kw">RUN</span> apt-get update \
+ &amp;&amp; apt-get install -y --no-install-recommends curl ca-certificates \
+ &amp;&amp; rm -rf /var/lib/apt/lists/*</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Piece</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">apt-get update &amp;&amp; install</code> together</td><td>RUN's cache key is the command text. A separate cached <code class="inl">apt-get update</code> layer is reused forever → later installs hit a stale index ("Unable to locate package").</td></tr>
+              <tr><td><code class="inl">-y</code></td><td>No interactive prompt (there's no keyboard during a build).</td></tr>
+              <tr><td><code class="inl">--no-install-recommends</code></td><td>Skip "recommended" extras — often 30–50% smaller.</td></tr>
+              <tr><td><code class="inl">rm -rf /var/lib/apt/lists/*</code></td><td>Remove the ~40 MB package index in the same layer.</td></tr>
+              <tr><td><code class="inl">\</code> at line end</td><td>Line continuation; still one instruction.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>On Alpine the equivalent is one short line: <code class="inl">RUN apk add --no-cache curl</code> (<code class="inl">--no-cache</code> = don't store the index at all).</p>
+
+        <h3>COPY vs ADD</h3>
+<pre><span class="kw">COPY</span> package.json package-lock.json ./
+<span class="kw">COPY</span> --chown=node:node . .
+<span class="kw">COPY</span> --chmod=755 scripts/entrypoint.sh /usr/local/bin/
+<span class="kw">COPY</span> --from=build /app/node_modules ./node_modules</pre>
+        <ul>
+          <li><code class="inl">COPY &lt;src&gt;... &lt;dest&gt;</code>: src is relative to the build context; dest is relative to <code class="inl">WORKDIR</code>. With several sources, dest must end in <code class="inl">/</code>.</li>
+          <li><code class="inl">--chown=user:group</code> sets ownership (default is root). <code class="inl">--chmod</code> sets permissions. <code class="inl">--from=&lt;stage|image&gt;</code> copies from another stage or image (§6).</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>COPY</th><th>ADD</th></tr></thead>
+            <tbody>
+              <tr><td>Local files / directories</td><td>✅</td><td>✅</td></tr>
+              <tr><td>Remote URL (<code class="inl">ADD https://…/file /x</code>)</td><td>❌</td><td>✅ downloads it (not extracted; use <code class="inl">--checksum=sha256:…</code>)</td></tr>
+              <tr><td>Auto-extracts local <code class="inl">.tar</code>, <code class="inl">.tar.gz</code>, <code class="inl">.tgz</code>, <code class="inl">.tar.xz</code>…</td><td>❌</td><td>✅</td></tr>
+              <tr><td>Git repo URL</td><td>❌</td><td>✅ (BuildKit)</td></tr>
+              <tr><td>Predictable?</td><td>Yes — does one thing</td><td>"Magic" behaviour surprises people</td></tr>
+              <tr><td>Rule of thumb</td><td><strong>Default choice</strong></td><td>Only when you need extraction or a URL</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Pin FROM tags; prefer alpine/slim/distroless. Chain install + cleanup in one RUN with <code class="inl">&amp;&amp;</code>. Use COPY unless you specifically need ADD's URL/tar features.
+        </div>
+      </section>
+
+      <!-- ===================== 3. WORKDIR ENV ARG EXPOSE ===================== -->
+      <section id="workdir-env-expose">
+        <h2><span class="sec-num">3</span> WORKDIR, ENV, ARG, EXPOSE, USER, LABEL, HEALTHCHECK</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>These are the labels and settings stuck on the box: which folder to work in, what settings to start with, which door the app listens at, and who's allowed to run it.</p>
+        </div>
+
+        <h3>WORKDIR</h3>
+<pre><span class="kw">WORKDIR</span> /app
+<span class="kw">WORKDIR</span> src
+<span class="cm"># prints /app/src — relative WORKDIR builds on the previous one</span>
+<span class="kw">RUN</span> pwd</pre>
+        <ul>
+          <li>Creates the directory if missing and sets the cwd for RUN, CMD, ENTRYPOINT, COPY, ADD — and for <code class="inl">docker exec</code>.</li>
+          <li>Always use absolute paths; never <code class="inl">RUN cd …</code>.</li>
+        </ul>
+
+        <h3>ENV vs ARG</h3>
+        <div class="fname">Dockerfile (excerpt)</div>
+<pre><span class="cm"># ARG before FROM: usable only in FROM lines</span>
+<span class="kw">ARG</span> NODE_VERSION=20
+<span class="kw">FROM</span> node:${NODE_VERSION}-alpine
+<span class="cm"># ARG inside the stage: available to the RUN/ENV lines below, NOT at runtime</span>
+<span class="kw">ARG</span> APP_VERSION=dev
+<span class="cm"># ENV: baked into the image, visible to the running app</span>
+<span class="kw">ENV</span> NODE_ENV=production \
+    PORT=3000 \
+    APP_VERSION=${APP_VERSION}</pre>
+<pre><span class="pr">$</span> docker build --build-arg NODE_VERSION=22 --build-arg APP_VERSION=1.2.0 -t shauryav/taskflow-api:1.2.0 .
+<span class="pr">$</span> docker run --rm shauryav/taskflow-api:1.2.0 node -e "console.log(process.version, process.env.APP_VERSION, process.env.PORT)"
+<span class="out">v22.20.0 1.2.0 3000</span>
+<span class="pr">$</span> docker run --rm -e PORT=8080 shauryav/taskflow-api:1.2.0 node -e "console.log(process.env.PORT)"
+<span class="out">8080</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>ARG</th><th>ENV</th></tr></thead>
+            <tbody>
+              <tr><td>Available during build (RUN)</td><td>✅</td><td>✅</td></tr>
+              <tr><td>Available in the running container</td><td>❌ (copy it into an ENV if needed)</td><td>✅</td></tr>
+              <tr><td>Set / override with</td><td><code class="inl">docker build --build-arg K=V</code></td><td>Dockerfile; override with <code class="inl">docker run -e K=V</code></td></tr>
+              <tr><td>Scope</td><td>Declaration → end of that stage. A pre-FROM ARG must be re-declared (<code class="inl">ARG NODE_VERSION</code>) to use it inside a stage.</td><td>Rest of the stage + every container + child images</td></tr>
+              <tr><td>Typical use</td><td>Base version, build metadata</td><td><code class="inl">NODE_ENV</code>, <code class="inl">PORT</code>, defaults</td></tr>
+              <tr><td>Safe for secrets?</td><td>❌ shows up in <code class="inl">docker history</code></td><td>❌ shows in <code class="inl">docker inspect</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>EXPOSE</h3>
+        <ul>
+          <li><code class="inl">EXPOSE 3000</code> (default TCP; <code class="inl">EXPOSE 53/udp</code>) is <strong>documentation only</strong>. It does not open or publish anything.</li>
+          <li>Publishing happens at run time: <code class="inl">-p 8080:3000</code>. <code class="inl">-P</code> publishes every EXPOSEd port to a random host port.</li>
+        </ul>
+<pre><span class="pr">$</span> docker run -d -P --name api2 shauryav/taskflow-api:1.0
+<span class="pr">$</span> docker port api2
+<span class="out">3000/tcp -&gt; 0.0.0.0:32768
+3000/tcp -&gt; [::]:32768</span></pre>
+
+        <h3>USER</h3>
+        <ul>
+          <li>Containers run as <strong>root</strong> by default. If the app is compromised, root in the container is a big step toward the host.</li>
+          <li>Official Node images ship a <code class="inl">node</code> user (uid 1000). Other images: Alpine <code class="inl">RUN addgroup -S app &amp;&amp; adduser -S -G app app</code>; Debian <code class="inl">RUN groupadd -r app &amp;&amp; useradd -r -g app app</code>.</li>
+          <li>Applies to every RUN / CMD / ENTRYPOINT after it. Put it late (after installs that need root).</li>
+        </ul>
+<pre><span class="pr">$</span> docker run --rm shauryav/taskflow-api:1.0 id
+<span class="out">uid=1000(node) gid=1000(node) groups=1000(node)</span></pre>
+
+        <h3>LABEL</h3>
+<pre><span class="kw">LABEL</span> org.opencontainers.image.title=<span class="st">"taskflow-api"</span> \
+      org.opencontainers.image.version=<span class="st">"1.0.0"</span> \
+      org.opencontainers.image.source=<span class="st">"https://github.com/shauryav/taskflow"</span></pre>
+        <p>Key/value metadata. The <code class="inl">org.opencontainers.image.*</code> keys are the OCI standard; GHCR uses <code class="inl">…source</code> to link the image to its repo (S19). Read them: <code class="inl">docker inspect --format '{{json .Config.Labels}}' shauryav/taskflow-api:1.0</code>.</p>
+
+        <h3>HEALTHCHECK</h3>
+<pre><span class="kw">HEALTHCHECK</span> --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">--interval</code></td><td>30s</td><td>Time between checks.</td></tr>
+              <tr><td><code class="inl">--timeout</code></td><td>30s</td><td>A check taking longer counts as failed.</td></tr>
+              <tr><td><code class="inl">--start-period</code></td><td>0s</td><td>Grace period on boot; failures don't count yet.</td></tr>
+              <tr><td><code class="inl">--retries</code></td><td>3</td><td>Consecutive failures before status = <code class="inl">unhealthy</code>.</td></tr>
+              <tr><td><code class="inl">CMD …</code></td><td></td><td>Exit 0 = healthy, 1 = unhealthy. <code class="inl">wget</code> is in Alpine (busybox); <code class="inl">-slim</code> images have neither curl nor wget.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> docker ps --format 'table {{.Names}}\t{{.Status}}'
+<span class="out">NAMES     STATUS
+api       Up 48 seconds (healthy)</span>
+<span class="pr">$</span> docker inspect --format '{{.State.Health.Status}} {{.State.Health.FailingStreak}}' api
+<span class="out">healthy 0</span></pre>
+        <p>Docker and Compose use HEALTHCHECK (Compose's <code class="inl">depends_on: condition: service_healthy</code>, S8). Kubernetes <strong>ignores</strong> it and uses its own probes (S13).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Files copied before <code class="inl">USER node</code> are owned by root → app crashes with <code class="inl">EACCES: permission denied, open '/app/uploads/…'</code>. Fix: <code class="inl">COPY --chown=node:node</code>.</li>
+            <li>Passing a token via <code class="inl">--build-arg NPM_TOKEN=…</code> — BuildKit even warns: <code class="inl">SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data</code>. Use build secrets (§7).</li>
+            <li>Thinking <code class="inl">EXPOSE</code> makes the app reachable. It doesn't; <code class="inl">-p</code> does.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          WORKDIR = cwd. ARG = build-time, ENV = build + run time. EXPOSE = docs. USER = drop root. LABEL = metadata. HEALTHCHECK = Docker-level liveness (not used by K8s).
+        </div>
+      </section>
+
+      <!-- ===================== 4. CMD vs ENTRYPOINT ===================== -->
+      <section id="cmd-entrypoint">
+        <h2><span class="sec-num">4</span> CMD vs ENTRYPOINT</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>ENTRYPOINT is the machine (a blender); CMD is the default thing you put in it (a banana). You can easily swap the banana; swapping the machine needs a special flag.</p>
+        </div>
+
+        <ul>
+          <li><code class="inl">CMD</code> — the default command/arguments. <strong>Replaced</strong> by anything you type after the image name in <code class="inl">docker run</code>.</li>
+          <li><code class="inl">ENTRYPOINT</code> — the fixed executable. Args after the image name are <strong>appended</strong> to it. Replace it only with <code class="inl">--entrypoint</code>.</li>
+          <li>Only the last CMD and the last ENTRYPOINT in a Dockerfile count.</li>
+        </ul>
+
+        <h3>Shell form vs exec form</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Exec form <code class="inl">CMD ["node", "server.js"]</code></th><th>Shell form <code class="inl">CMD node server.js</code></th></tr></thead>
+            <tbody>
+              <tr><td>Process actually started</td><td><code class="inl">node server.js</code> (PID 1)</td><td><code class="inl">/bin/sh -c "node server.js"</code> — the shell is PID 1</td></tr>
+              <tr><td><code class="inl">docker stop</code> (SIGTERM)</td><td>Delivered to your app</td><td>Goes to <code class="inl">sh</code>, which may not forward it → killed after 10 s</td></tr>
+              <tr><td><code class="inl">$PORT</code> expansion</td><td>No (no shell)</td><td>Yes</td></tr>
+              <tr><td>Needs <code class="inl">/bin/sh</code> in the image</td><td>No (works on distroless/scratch)</td><td>Yes</td></tr>
+              <tr><td>Syntax trap</td><td>Must be a JSON array with <strong>double</strong> quotes</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Use exec form for CMD and ENTRYPOINT. BuildKit warns otherwise:</p>
+<pre><span class="out"> 1 warning found (use docker --debug to expand):
+ - JSONArgsRecommended: JSON arguments recommended for CMD to prevent unintended behavior related to OS signals (line 12)</span></pre>
+
+        <h3>PID 1 and signals (why <code class="inl">docker stop</code> takes 10 seconds)</h3>
+        <ul>
+          <li><code class="inl">docker stop</code> sends <strong>SIGTERM</strong>, waits 10 s (<code class="inl">-t</code> to change), then sends <strong>SIGKILL</strong> → exit code <strong>137</strong>.</li>
+          <li>The Linux kernel ignores signals sent to PID 1 unless that process installed a handler. Node doesn't install a SIGTERM handler by default → even with exec form, an unprepared Node app ignores SIGTERM.</li>
+          <li>Fix (do one or both): handle SIGTERM in code, and/or run a tiny init as PID 1 (<code class="inl">docker run --init</code>, or <code class="inl">tini</code> in the image) that forwards signals and reaps zombie processes.</li>
+        </ul>
+        <div class="fname">server.js (excerpt)</div>
+<pre><span class="cm">// listen on all interfaces — 127.0.0.1 would be unreachable from outside the container</span>
+const server = app.listen(PORT, <span class="st">'0.0.0.0'</span>, () =&gt; console.log(`listening on ${PORT}`));
+
+<span class="cm">// docker stop / kubectl delete pod send SIGTERM</span>
+process.on(<span class="st">'SIGTERM'</span>, () =&gt; {
+  console.log(<span class="st">'SIGTERM received, closing server'</span>);
+  server.close(() =&gt; process.exit(<span class="nm">0</span>));   <span class="cm">// finish in-flight requests, then exit 0</span>
+});</pre>
+<pre><span class="cm"># before the handler</span>
+<span class="pr">$</span> time docker stop api
+<span class="out">api
+real    0m10.38s</span>
+<span class="pr">$</span> docker inspect --format '{{.State.ExitCode}}' api
+<span class="out">137</span>
+
+<span class="cm"># after adding the SIGTERM handler (or with tini / --init)</span>
+<span class="pr">$</span> time docker stop api
+<span class="out">api
+real    0m0.52s</span>
+<span class="pr">$</span> docker inspect --format '{{.State.ExitCode}}' api
+<span class="out">0</span></pre>
+
+        <h3>How ENTRYPOINT and CMD combine (exam favourite)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>No ENTRYPOINT</th><th><code class="inl">ENTRYPOINT ["tini", "--"]</code></th><th><code class="inl">ENTRYPOINT tini --</code> (shell form)</th></tr></thead>
+            <tbody>
+              <tr><td>No CMD</td><td>Uses base image's CMD (error if none)</td><td><code class="inl">tini --</code></td><td><code class="inl">/bin/sh -c "tini --"</code></td></tr>
+              <tr><td><code class="inl">CMD ["node", "server.js"]</code></td><td><code class="inl">node server.js</code></td><td><code class="inl">tini -- node server.js</code> ✅</td><td><code class="inl">/bin/sh -c "tini --"</code> (CMD ignored!)</td></tr>
+              <tr><td><code class="inl">CMD node server.js</code></td><td><code class="inl">/bin/sh -c "node server.js"</code></td><td><code class="inl">tini -- /bin/sh -c "node server.js"</code></td><td><code class="inl">/bin/sh -c "tini --"</code> (CMD ignored!)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Pattern: <strong>exec-form ENTRYPOINT = the program, exec-form CMD = its default arguments.</strong> Note: setting ENTRYPOINT in your Dockerfile resets any CMD inherited from the base image.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: a health-check tool image</span>
+          <div class="fname">Dockerfile.hc</div>
+<pre><span class="kw">FROM</span> alpine:3.22
+<span class="kw">RUN</span> apk add --no-cache curl
+<span class="kw">ENTRYPOINT</span> [<span class="st">"curl"</span>, <span class="st">"-fsS"</span>]
+<span class="kw">CMD</span> [<span class="st">"http://taskflow-api:3000/health"</span>]</pre>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>You run</th><th>Process inside the container</th></tr></thead>
+              <tbody>
+                <tr><td><code class="inl">docker run --rm hc</code></td><td><code class="inl">curl -fsS http://taskflow-api:3000/health</code></td></tr>
+                <tr><td><code class="inl">docker run --rm hc http://taskflow-api:3000/tasks</code></td><td><code class="inl">curl -fsS http://taskflow-api:3000/tasks</code> (CMD replaced)</td></tr>
+                <tr><td><code class="inl">docker run --rm hc -I https://example.com</code></td><td><code class="inl">curl -fsS -I https://example.com</code></td></tr>
+                <tr><td><code class="inl">docker run --rm -it --entrypoint sh hc</code></td><td><code class="inl">sh</code> (ENTRYPOINT replaced, default CMD cleared)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <h3>Overriding on the TaskFlow image</h3>
+<pre><span class="cm"># replace CMD: run a one-off command instead of the server</span>
+<span class="pr">$</span> docker run --rm shauryav/taskflow-api:1.0 node -v
+<span class="out">v20.19.5</span>
+
+<span class="cm"># replace ENTRYPOINT: get a shell to poke around (flags go BEFORE the image name)</span>
+<span class="pr">$</span> docker run --rm -it --entrypoint sh shauryav/taskflow-api:1.0
+<span class="out">/app $ ls
+node_modules  package.json  server.js
+/app $ exit</span></pre>
+
+        <h3>Entrypoint script pattern</h3>
+        <p>When you need setup before the app starts, use a script as ENTRYPOINT that ends with <code class="inl">exec "$@"</code>:</p>
+        <div class="fname">taskflow-entrypoint.sh</div>
+<pre>#!/bin/sh
+<span class="cm"># stop on the first error</span>
+set -e
+
+<span class="cm"># one-time setup before the main process (only if enabled)</span>
+if [ "$RUN_MIGRATIONS" = "true" ]; then
+  echo "running migrations..."
+  node scripts/migrate.js
+fi
+
+<span class="cm"># "$@" = the CMD ("node server.js"). exec REPLACES this shell,</span>
+<span class="cm"># so node becomes PID 1 and receives SIGTERM directly.</span>
+exec "$@"</pre>
+<pre><span class="kw">COPY</span> --chmod=755 taskflow-entrypoint.sh /usr/local/bin/
+<span class="kw">ENTRYPOINT</span> [<span class="st">"taskflow-entrypoint.sh"</span>]
+<span class="kw">CMD</span> [<span class="st">"node"</span>, <span class="st">"server.js"</span>]</pre>
+        <p>The official <code class="inl">node</code> image does exactly this: <code class="inl">ENTRYPOINT ["docker-entrypoint.sh"]</code> + <code class="inl">CMD ["node"]</code>. That's why <code class="inl">docker run node:20-alpine -v</code> prints the Node version.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">CMD ['node', 'server.js']</code> (single quotes) is invalid JSON → silently treated as shell form → <code class="inl">/bin/sh: [node,: not found</code>.</li>
+            <li>Entrypoint script without <code class="inl">exec</code> → the shell stays PID 1 → slow stops, exit 137.</li>
+            <li>Script copied from Windows with CRLF line endings → <code class="inl">exec /usr/local/bin/taskflow-entrypoint.sh: no such file or directory</code>. Convert with <code class="inl">dos2unix</code>.</li>
+            <li><code class="inl">docker run img --entrypoint sh</code> — flags after the image name are passed to the container, not to Docker.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Always exec form. ENTRYPOINT = fixed program, CMD = overridable defaults. Handle SIGTERM or use tini/<code class="inl">--init</code> so <code class="inl">docker stop</code> is instant.
+        </div>
+      </section>
+
+      <!-- ===================== 5. DOCKERIGNORE + CACHE ===================== -->
+      <section id="dockerignore">
+        <h2><span class="sec-num">5</span> .dockerignore &amp; layer caching</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>.dockerignore is the "don't pack" list for your suitcase. Caching is the builder remembering steps it already did, as long as nothing before them changed.</p>
+        </div>
+
+        <h3>.dockerignore</h3>
+        <ul>
+          <li>Lives in the root of the build context. Matching paths are never sent to the builder → faster builds, smaller images, no leaked secrets via <code class="inl">COPY . .</code>.</li>
+          <li>Syntax like <code class="inl">.gitignore</code> but rooted at the context: <code class="inl">node_modules</code> matches only the top-level folder; <code class="inl">**/node_modules</code> matches at any depth; <code class="inl">!</code> re-includes.</li>
+          <li><code class="inl">#</code> comments only at the start of a line (inline <code class="inl">#</code> becomes part of the pattern).</li>
+        </ul>
+        <div class="fname">.dockerignore</div>
+<pre><span class="cm"># dependencies — reinstalled inside the image (host copy may be built for macOS)</span>
+node_modules
+<span class="cm"># logs and coverage output</span>
+npm-debug.log*
+*.log
+coverage/
+<span class="cm"># git history: often 100s of MB, can contain old secrets</span>
+.git
+.gitignore
+<span class="cm"># real secrets — never bake into an image… except the template</span>
+.env
+.env.*
+!.env.example
+<span class="cm"># Docker / deploy files the app doesn't need at runtime</span>
+Dockerfile*
+.dockerignore
+compose*.yaml
+k8s/
+charts/
+infra/
+.github/
+<span class="cm"># editor and OS junk</span>
+.vscode/
+.idea/
+.DS_Store
+*.md</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Entry</th><th>Why exclude it</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">node_modules</code></td><td>Huge; may contain native binaries for the wrong OS; <code class="inl">COPY . .</code> would overwrite the clean <code class="inl">npm ci</code> result.</td></tr>
+              <tr><td><code class="inl">.git</code></td><td>Size + history may hold secrets; also changes on every commit → busts the <code class="inl">COPY . .</code> cache.</td></tr>
+              <tr><td><code class="inl">.env</code>, <code class="inl">.env.*</code></td><td>Secrets belong in runtime config (<code class="inl">-e</code>, Compose, K8s Secrets), never in layers.</td></tr>
+              <tr><td><code class="inl">!.env.example</code></td><td>Exception: the harmless template is allowed.</td></tr>
+              <tr><td><code class="inl">Dockerfile*</code>, <code class="inl">.dockerignore</code></td><td>Builder still reads them; they just won't be COPY-ed into the image.</td></tr>
+              <tr><td><code class="inl">k8s/ charts/ infra/ .github/</code></td><td>Deploy config; editing it shouldn't trigger an image rebuild.</td></tr>
+              <tr><td><code class="inl">test/</code> — <em>not</em> excluded</td><td>The multi-stage build runs <code class="inl">npm test</code> (§6), so tests must be in the context.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="cm"># without .dockerignore</span>
+<span class="out"> =&gt; =&gt; transferring context: 312.45MB                                           6.8s</span>
+<span class="cm"># with it</span>
+<span class="out"> =&gt; =&gt; transferring context: 58.12kB                                            0.0s</span></pre>
+
+        <h3>How the layer cache decides</h3>
+        <ol>
+          <li>The builder walks instructions top to bottom.</li>
+          <li>A step is a cache hit if: its parent layer was a hit, the instruction text is identical, and (for COPY/ADD) the checksums of the copied files are identical.</li>
+          <li><strong>The first miss invalidates every step after it.</strong></li>
+          <li>RUN is keyed only on its text — it won't re-run just because the internet has newer packages. Use <code class="inl">--no-cache</code> or <code class="inl">--pull</code> when you want fresh.</li>
+        </ol>
+<pre><span class="cm"># edit server.js, rebuild</span>
+<span class="pr">$</span> docker build -t shauryav/taskflow-api:1.0 .
+<span class="out"> =&gt; CACHED [2/5] WORKDIR /app                                                    0.0s
+ =&gt; CACHED [3/5] COPY package*.json ./                                           0.0s
+ =&gt; CACHED [4/5] RUN npm ci --omit=dev                                           0.0s
+ =&gt; [5/5] COPY . .                                                               0.1s
+[+] Building 1.4s (10/10) FINISHED</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Change you make</th><th>Bad order: <code class="inl">COPY . .</code> → <code class="inl">RUN npm ci</code></th><th>Good order: manifests → <code class="inl">npm ci</code> → <code class="inl">COPY . .</code></th></tr></thead>
+            <tbody>
+              <tr><td>Edit <code class="inl">server.js</code></td><td><code class="inl">npm ci</code> re-runs (~14 s)</td><td>Only <code class="inl">COPY . .</code> (~1 s)</td></tr>
+              <tr><td>Add a dependency</td><td><code class="inl">npm ci</code> re-runs</td><td><code class="inl">npm ci</code> re-runs (expected)</td></tr>
+              <tr><td>Edit <code class="inl">README.md</code></td><td>Re-runs (if not ignored)</td><td>Nothing — it's in <code class="inl">.dockerignore</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Cache mounts (BuildKit)</h3>
+<pre><span class="kw">RUN</span> --mount=type=cache,target=/root/.npm npm ci --omit=dev</pre>
+        <p>Keeps npm's download cache between builds <em>outside</em> the image. Even when <code class="inl">package.json</code> changes, packages already downloaded aren't fetched again — and the cache never bloats the layer.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>No <code class="inl">.dockerignore</code> on a Mac: host <code class="inl">node_modules</code> (with macOS-compiled <code class="inl">bcrypt</code>/<code class="inl">sharp</code>) overwrites the Linux ones → <code class="inl">Error: … invalid ELF header</code> at startup.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Ignore node_modules, .git, .env. Order: rarely-changing steps first, source last. First cache miss rebuilds everything below it.
+        </div>
+      </section>
+
+      <!-- ===================== 6. MULTI-STAGE ===================== -->
+      <section id="multi-stage">
+        <h2><span class="sec-num">6</span> Multi-stage builds</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Build the furniture in a messy workshop, then move only the finished chair into your clean living room. The tools stay behind.</p>
+        </div>
+
+        <ul>
+          <li>A Dockerfile with several <code class="inl">FROM</code> lines = several <span class="term">stages</span>. Only the <strong>last</strong> stage (or the <code class="inl">--target</code>) becomes the image.</li>
+          <li><code class="inl">COPY --from=&lt;stage&gt;</code> pulls just the files you need from an earlier stage. Compilers, dev dependencies, test files and caches stay behind.</li>
+          <li>BuildKit builds only the stages the target depends on, running independent stages in parallel.</li>
+        </ul>
+
+        <h3>The final TaskFlow Dockerfile</h3>
+        <div class="fname">Dockerfile</div>
+<pre><span class="cm"># syntax=docker/dockerfile:1</span>
+
+<span class="cm"># Node major version — override with --build-arg NODE_VERSION=22</span>
+<span class="kw">ARG</span> NODE_VERSION=20
+
+<span class="cm"># ================= Stage 1: build — all deps + tests =================</span>
+<span class="kw">FROM</span> node:${NODE_VERSION}-alpine AS build
+<span class="kw">WORKDIR</span> /app
+<span class="kw">COPY</span> package.json package-lock.json ./
+<span class="kw">RUN</span> --mount=type=cache,target=/root/.npm npm ci
+<span class="kw">COPY</span> . .
+<span class="cm"># the build FAILS here if any test fails → no broken image is produced</span>
+<span class="kw">RUN</span> npm test
+<span class="cm"># drop devDependencies (jest, supertest) from node_modules</span>
+<span class="kw">RUN</span> npm prune --omit=dev
+
+<span class="cm"># ================= Stage 2: runtime — only what prod needs =================</span>
+<span class="kw">FROM</span> node:${NODE_VERSION}-alpine AS runtime
+<span class="cm"># tini: tiny init for PID 1 — forwards signals, reaps zombies</span>
+<span class="kw">RUN</span> apk add --no-cache tini
+<span class="kw">WORKDIR</span> /app
+<span class="kw">ENV</span> NODE_ENV=production \
+    PORT=3000
+<span class="kw">LABEL</span> org.opencontainers.image.title=<span class="st">"taskflow-api"</span> \
+      org.opencontainers.image.source=<span class="st">"https://github.com/shauryav/taskflow"</span>
+<span class="kw">COPY</span> --from=build --chown=node:node /app/node_modules ./node_modules
+<span class="kw">COPY</span> --from=build --chown=node:node /app/package.json /app/server.js ./
+<span class="kw">USER</span> node
+<span class="kw">EXPOSE</span> 3000
+<span class="kw">HEALTHCHECK</span> --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+<span class="kw">ENTRYPOINT</span> [<span class="st">"/sbin/tini"</span>, <span class="st">"--"</span>]
+<span class="kw">CMD</span> [<span class="st">"node"</span>, <span class="st">"server.js"</span>]</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line(s)</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl"># syntax=docker/dockerfile:1</code></td><td>Parser directive: use the latest stable 1.x Dockerfile frontend (cache/secret mounts etc.). Must be the very first line.</td></tr>
+              <tr><td><code class="inl">ARG NODE_VERSION=20</code></td><td>Global ARG, usable in both <code class="inl">FROM</code> lines → one place to bump Node.</td></tr>
+              <tr><td><code class="inl">AS build</code> / <code class="inl">AS runtime</code></td><td>Stage names for <code class="inl">--from=</code> and <code class="inl">--target</code>.</td></tr>
+              <tr><td><code class="inl">npm ci</code> (build stage)</td><td>All deps including dev — needed for jest. Cache mount speeds re-downloads.</td></tr>
+              <tr><td><code class="inl">RUN npm test</code></td><td>Tests are a build gate. Because runtime copies from <code class="inl">build</code>, this stage always runs.</td></tr>
+              <tr><td><code class="inl">npm prune --omit=dev</code></td><td>Leaves only production packages in <code class="inl">node_modules</code> for the copy.</td></tr>
+              <tr><td><code class="inl">apk add --no-cache tini</code></td><td>Installs <code class="inl">/sbin/tini</code> without keeping the apk index.</td></tr>
+              <tr><td><code class="inl">COPY --from=build --chown=node:node</code></td><td>Only node_modules, package.json, server.js reach the final image, owned by the non-root user.</td></tr>
+              <tr><td><code class="inl">USER node</code></td><td>Run as uid 1000, not root.</td></tr>
+              <tr><td><code class="inl">HEALTHCHECK</code></td><td>Lets Docker/Compose know when the API is really up.</td></tr>
+              <tr><td><code class="inl">ENTRYPOINT tini --</code> + <code class="inl">CMD node server.js</code></td><td>Runs <code class="inl">tini -- node server.js</code>; <code class="inl">docker run img node -v</code> still works (CMD replaced).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> docker build -t shauryav/taskflow-api:1.0 .
+<span class="out"> =&gt; [build 1/7] FROM docker.io/library/node:20-alpine@sha256:2d07db07a2df…       0.0s
+ =&gt; [build 4/7] RUN --mount=type=cache,target=/root/.npm npm ci                  9.1s
+ =&gt; [runtime 2/5] RUN apk add --no-cache tini                                    1.9s
+ =&gt; [build 6/7] RUN npm test                                                     3.2s
+ =&gt; [build 7/7] RUN npm prune --omit=dev                                         1.1s
+ =&gt; [runtime 4/5] COPY --from=build --chown=node:node /app/node_modules ./node_m 0.4s
+ =&gt; [runtime 5/5] COPY --from=build --chown=node:node /app/package.json /app/se  0.0s
+ =&gt; =&gt; naming to docker.io/shauryav/taskflow-api:1.0                             0.0s</span>
+
+<span class="cm"># stop after the build stage (debug a failing test inside the build env)</span>
+<span class="pr">$</span> docker build --target build -t taskflow-api:build .
+<span class="pr">$</span> docker run --rm -it taskflow-api:build sh</pre>
+        <p>Notice <code class="inl">[runtime 2/5]</code> runs while the build stage is still installing — stages run in parallel.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: a failing test blocks the image</span>
+<pre><span class="out"> =&gt; ERROR [build 6/7] RUN npm test                                               2.6s
+------
+ &gt; [build 6/7] RUN npm test:
+2.104 FAIL test/tasks.test.js
+2.105   ● POST /tasks › returns 201 with the created task
+2.106     expected 201 "Created", got 500 "Internal Server Error"
+------
+ERROR: failed to solve: process "/bin/sh -c npm test" did not complete successfully: exit code: 1</span></pre>
+          <p>No image is tagged, so CI can't push a broken build (S18).</p>
+        </div>
+
+        <h3>Go example: down to a few MB with <code class="inl">scratch</code></h3>
+        <div class="fname">Dockerfile (Go service)</div>
+<pre><span class="kw">FROM</span> golang:1.25-alpine AS build
+<span class="kw">WORKDIR</span> /src
+<span class="kw">COPY</span> go.mod go.sum ./
+<span class="kw">RUN</span> go mod download
+<span class="kw">COPY</span> . .
+<span class="cm"># CGO_ENABLED=0 → fully static binary (no libc needed); -s -w strips debug info</span>
+<span class="kw">RUN</span> CGO_ENABLED=0 GOOS=linux go build -ldflags=<span class="st">"-s -w"</span> -o /out/server .
+
+<span class="kw">FROM</span> scratch
+<span class="cm"># scratch has no CA bundle — copy it or HTTPS calls fail with "x509: certificate signed by unknown authority"</span>
+<span class="kw">COPY</span> --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+<span class="kw">COPY</span> --from=build /out/server /server
+<span class="cm"># "nobody" — scratch has no /etc/passwd, so use a numeric uid:gid</span>
+<span class="kw">USER</span> 65534:65534
+<span class="kw">EXPOSE</span> 8080
+<span class="kw">ENTRYPOINT</span> [<span class="st">"/server"</span>]</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Final base</th><th>Size</th><th>Shell for debugging?</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">golang:1.25-alpine</code> (single stage)</td><td>~300 MB</td><td>yes</td><td>Ships the whole Go toolchain</td></tr>
+              <tr><td><code class="inl">scratch</code></td><td>~8 MB</td><td>no</td><td>Static binary only; add CA certs, tzdata yourself</td></tr>
+              <tr><td><code class="inl">gcr.io/distroless/static-debian12:nonroot</code></td><td>~10 MB</td><td>no</td><td>Includes CA certs, tzdata, a non-root user</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>A <code class="inl">test</code> stage that nothing copies from is <strong>skipped</strong> by BuildKit when you build the final stage. Either copy from it (as above) or build it explicitly: <code class="inl">docker build --target test .</code></li>
+            <li><code class="inl">COPY --from=build /app .</code> copies everything back, dev deps and tests included — be specific.</li>
+            <li>Shell-form <code class="inl">CMD</code> in a <code class="inl">scratch</code>/distroless image → <code class="inl">exec: "/bin/sh": stat /bin/sh: no such file or directory</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Build/test in a fat stage, copy only artifacts into a slim stage. <code class="inl">--target</code> picks a stage. Go/Rust → <code class="inl">scratch</code> or distroless for single-digit MB images.
+        </div>
+      </section>
+
+      <!-- ===================== 7. OPTIMIZATION ===================== -->
+      <section id="optimization">
+        <h2><span class="sec-num">7</span> Image optimization</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Smaller boxes ship faster, cost less to store, and have fewer places for bugs to hide.</p>
+        </div>
+
+        <h3>Same app, five Dockerfiles</h3>
+        <p>SIZE column of <code class="inl">docker images shauryav/taskflow-api</code> after building each variant:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Tag</th><th>Dockerfile</th><th>~Size</th><th>What changed</th></tr></thead>
+            <tbody>
+              <tr><td>v0-naive</td><td><code class="inl">FROM node:20</code>, <code class="inl">COPY . .</code>, <code class="inl">npm install</code>, no .dockerignore</td><td>1.21 GB</td><td>Full Debian + dev deps + host node_modules + .git</td></tr>
+              <tr><td>v1-slim</td><td><code class="inl">node:20-slim</code>, <code class="inl">npm ci --omit=dev</code>, .dockerignore</td><td>243 MB</td><td>Smaller base, prod deps only</td></tr>
+              <tr><td>v2-alpine</td><td>§1 Dockerfile</td><td>152 MB</td><td>Alpine base</td></tr>
+              <tr><td>v3-multistage</td><td>§6 Dockerfile</td><td>141 MB</td><td>No npm cache, no tests, pruned deps; tests gate the build</td></tr>
+              <tr><td>v4-distroless</td><td>runtime stage <code class="inl">FROM gcr.io/distroless/nodejs20-debian12</code></td><td>138 MB</td><td>No shell/package manager → far fewer CVEs</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Sizes are uncompressed on-disk sizes and vary by a few MB with versions. For Node, most of the win is base image + no dev deps; for compiled languages multi-stage is a 30–100× win.</p>
+
+        <h3>Optimization checklist</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Do this</th><th>Why</th><th>How</th></tr></thead>
+            <tbody>
+              <tr><td>Small base image</td><td>Size, pull time, attack surface</td><td><code class="inl">-alpine</code>, <code class="inl">-slim</code>, distroless, scratch</td></tr>
+              <tr><td>Pin versions</td><td>Reproducible builds</td><td><code class="inl">node:20.19-alpine3.22</code> or <code class="inl">@sha256:…</code>; <code class="inl">npm ci</code> + lockfile</td></tr>
+              <tr><td>Multi-stage</td><td>Build tools/dev deps never ship</td><td>§6</td></tr>
+              <tr><td>Fewer, cleaner layers</td><td>Deleted files in later layers still count</td><td>Chain with <code class="inl">&amp;&amp;</code>, clean caches in the same RUN</td></tr>
+              <tr><td>Order for cache</td><td>Fast rebuilds</td><td>Manifests → install → source</td></tr>
+              <tr><td>.dockerignore</td><td>Small context, no secrets</td><td>§5</td></tr>
+              <tr><td>Non-root</td><td>Limit damage if compromised</td><td><code class="inl">USER node</code></td></tr>
+              <tr><td>No secrets in the image</td><td>Anyone who can pull can read every layer</td><td>Build secrets; runtime env/Secrets</td></tr>
+              <tr><td>Scan</td><td>Find CVEs in base + deps</td><td><code class="inl">docker scout</code>, Trivy (S19)</td></tr>
+              <tr><td>Inspect layers</td><td>Find what's big</td><td><code class="inl">docker history</code>, <code class="inl">dive</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Secrets leak through layers — demo</h3>
+        <div class="fname">Dockerfile.leaky (DON'T)</div>
+<pre><span class="kw">FROM</span> node:20-alpine
+<span class="kw">ARG</span> NPM_TOKEN
+<span class="kw">WORKDIR</span> /app
+<span class="kw">COPY</span> package*.json ./
+<span class="kw">RUN</span> echo <span class="st">"//registry.npmjs.org/:_authToken=${NPM_TOKEN}"</span> &gt; .npmrc &amp;&amp; npm ci &amp;&amp; rm .npmrc</pre>
+<pre><span class="pr">$</span> docker build -f Dockerfile.leaky --build-arg NPM_TOKEN=npm_9fQx2LkP7aB3 -t leaky .
+<span class="pr">$</span> docker history --no-trunc leaky | grep authToken
+<span class="out">&lt;missing&gt;   1 minute ago   RUN |1 NPM_TOKEN=npm_9fQx2LkP7aB3 /bin/sh -c echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" &gt; .npmrc …</span></pre>
+        <p>The <code class="inl">rm .npmrc</code> worked, but the token is in the image metadata forever. Same if you <code class="inl">COPY .env</code> and delete it later — it's still in that layer (<code class="inl">docker save leaky | tar -x</code> and look).</p>
+        <div class="fname">Dockerfile (fixed: build secret)</div>
+<pre><span class="kw">FROM</span> node:20-alpine
+<span class="kw">WORKDIR</span> /app
+<span class="kw">COPY</span> package*.json ./
+<span class="cm"># the secret is mounted only for this RUN; it is never written to a layer</span>
+<span class="kw">RUN</span> --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci --omit=dev</pre>
+<pre><span class="pr">$</span> docker build --secret id=npmrc,src=$HOME/.npmrc -t shauryav/taskflow-api:1.0 .</pre>
+
+        <h3>Scanning and inspecting</h3>
+<pre><span class="pr">$</span> docker scout quickview shauryav/taskflow-api:1.0
+<span class="out">    ✓ Image stored for indexing
+    ✓ Indexed 187 packages
+
+  Target     │  shauryav/taskflow-api:1.0  │    0C     0H     2M     1L
+    digest   │  7d2f9c1e4b8a               │
+  Base image │  node:20-alpine             │    0C     0H     1M     1L</span>
+
+<span class="pr">$</span> docker scout cves shauryav/taskflow-api:1.0      <span class="cm"># list each CVE + fixed version</span>
+<span class="pr">$</span> dive shauryav/taskflow-api:1.0                   <span class="cm"># TUI: browse each layer's files, "wasted space" score</span>
+<span class="pr">$</span> docker builder prune                            <span class="cm"># free disk used by the build cache</span></pre>
+        <p>C/H/M/L = Critical/High/Medium/Low vulnerabilities. In CI you'll gate on these with Trivy (S19).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>Built on an M1/M2/M3 Mac, deployed to an amd64 server → container exits immediately with <code class="inl">exec /sbin/tini: exec format error</code>. Rebuild with <code class="inl">--platform linux/amd64</code>, or publish one multi-arch tag: <code class="inl">docker buildx build --platform linux/amd64,linux/arm64 -t shauryav/taskflow-api:1.0 --push .</code></p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Anything that ever lands in a layer is public to whoever can pull the image. Keep secrets out with <code class="inl">.dockerignore</code> + <code class="inl">--mount=type=secret</code>, and inject runtime secrets via env/Secrets.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Small base + prod deps only + multi-stage + non-root + no secrets + scan. Measure with <code class="inl">docker images</code>, <code class="inl">docker history</code>, <code class="inl">dive</code>.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">docker build -t user/app:1.0 .</code></td><td>Build from <code class="inl">./Dockerfile</code> with the current dir as context.</td></tr>
+              <tr><td><code class="inl">docker build -f path/Dockerfile.prod -t app .</code></td><td>Use a different Dockerfile.</td></tr>
+              <tr><td><code class="inl">docker build --target build -t app:build .</code></td><td>Build only up to a named stage.</td></tr>
+              <tr><td><code class="inl">docker build --build-arg NODE_VERSION=22 .</code></td><td>Set an ARG.</td></tr>
+              <tr><td><code class="inl">docker build --no-cache --pull .</code></td><td>Fresh build: ignore cache, re-pull base.</td></tr>
+              <tr><td><code class="inl">docker build --progress=plain .</code></td><td>Full logs for every step (debug failing RUNs).</td></tr>
+              <tr><td><code class="inl">docker build --platform linux/amd64 .</code></td><td>Build for another architecture.</td></tr>
+              <tr><td><code class="inl">docker build --secret id=npmrc,src=$HOME/.npmrc .</code></td><td>Pass a build secret (used with <code class="inl">RUN --mount=type=secret</code>).</td></tr>
+              <tr><td><code class="inl">docker build --check .</code></td><td>Run build checks (lint) without building.</td></tr>
+              <tr><td><code class="inl">docker history [--no-trunc] img</code></td><td>Layers, the instruction that made each, and size.</td></tr>
+              <tr><td><code class="inl">docker image inspect img --format '{{.Config.Cmd}}'</code></td><td>Read CMD / ENTRYPOINT / Env / Labels of an image.</td></tr>
+              <tr><td><code class="inl">docker run --rm img node -v</code></td><td>Override CMD.</td></tr>
+              <tr><td><code class="inl">docker run --rm -it --entrypoint sh img</code></td><td>Override ENTRYPOINT (get a shell).</td></tr>
+              <tr><td><code class="inl">docker run --init img</code></td><td>Run tini as PID 1 for correct signal handling.</td></tr>
+              <tr><td><code class="inl">docker scout quickview img</code> / <code class="inl">dive img</code></td><td>Vulnerability summary / layer explorer.</td></tr>
+              <tr><td><code class="inl">docker builder prune</code></td><td>Delete build cache.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>The TaskFlow Dockerfile is a pipeline: a pinned <code class="inl">FROM</code>, cache-friendly <code class="inl">COPY</code> → <code class="inl">RUN npm ci</code> → <code class="inl">COPY . .</code>, tests as a build gate in the <code class="inl">build</code> stage, and a slim <code class="inl">runtime</code> stage that copies only prod files, runs as <code class="inl">node</code>, declares <code class="inl">ENV</code>/<code class="inl">EXPOSE</code>/<code class="inl">HEALTHCHECK</code>, and starts via exec-form <code class="inl">ENTRYPOINT</code> + <code class="inl">CMD</code> so signals work. <code class="inl">.dockerignore</code> keeps the context tiny and secrets out. Result: a ~140&nbsp;MB, non-root, testable image that Compose (S8) and Kubernetes (S9+) will run.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Image has <code class="inl">ENTRYPOINT ["python", "app.py"]</code> and <code class="inl">CMD ["--port", "80"]</code>. What runs for <code class="inl">docker run img --port 9000</code>?</summary>
+          <p class="ans"><code class="inl">python app.py --port 9000</code>. Arguments after the image name replace CMD and are appended to ENTRYPOINT.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why doesn't <code class="inl">RUN rm /app/.env</code> remove a secret copied in an earlier <code class="inl">COPY . .</code>?</summary>
+          <p class="ans">Layers are immutable and stacked; the rm only hides the file in a new layer. The earlier layer (inside the image) still contains it. Exclude it via <code class="inl">.dockerignore</code> instead.</p>
+        </details>
+        <details class="quiz">
+          <summary>ARG vs ENV — which one can the running Node app read with <code class="inl">process.env</code>?</summary>
+          <p class="ans">Only ENV. ARG exists during the build only (unless you copy it into an ENV, e.g. <code class="inl">ENV APP_VERSION=${APP_VERSION}</code>).</p>
+        </details>
+        <details class="quiz">
+          <summary>A container takes exactly 10 s to stop and exits with 137. Why, and two fixes?</summary>
+          <p class="ans">SIGTERM wasn't handled (shell-form CMD, or Node as PID 1 without a handler), so Docker sent SIGKILL after the 10 s grace period (128 + 9 = 137). Fix: exec-form CMD plus a SIGTERM handler, and/or tini / <code class="inl">docker run --init</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Does <code class="inl">EXPOSE 3000</code> make the app reachable at <code class="inl">localhost:3000</code>?</summary>
+          <p class="ans">No. EXPOSE is documentation (and used by <code class="inl">-P</code>). You must publish with <code class="inl">-p 3000:3000</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why copy <code class="inl">package*.json</code> and run <code class="inl">npm ci</code> before <code class="inl">COPY . .</code>?</summary>
+          <p class="ans">Cache: the expensive install layer only rebuilds when the manifests change. Editing source only invalidates the final <code class="inl">COPY . .</code> layer.</p>
+        </details>
+        <details class="quiz">
+          <summary>In the TaskFlow multi-stage build, what is in the final image and what is left behind?</summary>
+          <p class="ans">Final: Alpine + Node + tini + prod <code class="inl">node_modules</code> + <code class="inl">package.json</code> + <code class="inl">server.js</code>. Left behind in <code class="inl">build</code>: jest/supertest, tests, npm cache, everything else from the context.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 7: Docker Images &amp; Dockerfile.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.docker.com/reference/dockerfile/" target="_blank" rel="noopener">Dockerfile reference</a> — every instruction, shell vs exec form, the CMD/ENTRYPOINT table.</li>
+          <li><a href="https://docs.docker.com/build/building/best-practices/" target="_blank" rel="noopener">Building best practices</a> — base images, layer caching, non-root.</li>
+          <li><a href="https://docs.docker.com/build/building/multi-stage/" target="_blank" rel="noopener">Multi-stage builds</a> — <code class="inl">AS</code>, <code class="inl">--from</code>, <code class="inl">--target</code>.</li>
+          <li><a href="https://docs.docker.com/build/concepts/context/" target="_blank" rel="noopener">Build context &amp; .dockerignore</a> — pattern syntax.</li>
+          <li><a href="https://docs.docker.com/build/building/secrets/" target="_blank" rel="noopener">Build secrets</a> — <code class="inl">--mount=type=secret</code>.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-6.html"><div class="dir">← Previous</div><div class="ttl">Session 6: Docker Fundamentals</div></a>
+        <a class="next" href="session-8.html"><div class="dir">Next →</div><div class="ttl">Session 8: Docker Networking, Volumes &amp; Compose</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 7 — Docker Images &amp; Dockerfile</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

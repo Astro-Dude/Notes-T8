@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 11 — Kubernetes Networking &amp; Services</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 11</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 11</span>
+      <h1>Kubernetes Networking &amp; Services</h1>
+      <p class="lead">
+        Give the TaskFlow API and database stable names with Services, find them through cluster DNS, expose the API
+        outside the cluster with NodePort/LoadBalancer, and never mix up port, targetPort and nodePort again.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 19 min read</span><span class="badge-rt">📖 5 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#pod-networking">Pod networking</a></li>
+          <li><a href="#services">Services, ClusterIP &amp; selectors</a></li>
+          <li><a href="#dns">Kubernetes DNS &amp; service discovery</a></li>
+          <li><a href="#service-types">NodePort &amp; LoadBalancer</a></li>
+          <li><a href="#ports">port vs targetPort vs nodePort</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. POD NETWORKING ===================== -->
+      <section id="pod-networking">
+        <h2><span class="sec-num">1</span> Pod networking</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Every flat (Pod) in the city gets its own street address, and anyone can post a letter to any address directly — no forwarding office in between.</p>
+        </div>
+
+        <h3>The Kubernetes network model (the rules every cluster must follow)</h3>
+        <ol>
+          <li>Every Pod gets its <strong>own IP</strong> (from its node's <span class="term">podCIDR</span>).</li>
+          <li>Any Pod can reach any other Pod, on any node, <strong>using that IP — without NAT</strong>.</li>
+          <li>Node agents (kubelet) can reach all Pods on their node.</li>
+          <li>Containers in one Pod share the IP and talk over <code class="inl">localhost</code> (a tiny <code class="inl">pause</code> container holds the network namespace).</li>
+        </ol>
+        <p>Compare Docker (Session 8): there you publish ports with <code class="inl">-p</code> and containers on different hosts can't see each other. In K8s, flat Pod-to-Pod networking is guaranteed.</p>
+
+<pre> Node minikube (192.168.49.2)             Node minikube-m02 (192.168.49.3)
+ podCIDR 10.244.0.0/24                    podCIDR 10.244.1.0/24
+┌───────────────────────────────┐        ┌───────────────────────────────┐
+│ pod taskflow-api  10.244.0.12 │        │ pod taskflow-api  10.244.1.7  │
+│ pod taskflow-api  10.244.0.13 │        │ pod taskflow-db   10.244.1.9  │
+│   veth pairs ─► bridge cni0   │        │   veth pairs ─► bridge cni0   │
+└───────────────┬───────────────┘        └───────────────┬───────────────┘
+                └── CNI: routes / VXLAN / BGP / eBPF ────┘
+       10.244.0.12 → 10.244.1.9:5432 directly, source IP preserved (no NAT)</pre>
+
+        <h3>CNI plugins implement the model</h3>
+        <p>Kubernetes doesn't do Pod networking itself. The kubelet asks the runtime to call a <span class="term">CNI</span> (Container Network Interface) plugin, which creates the veth pair, assigns the IP and sets routes.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Plugin</th><th>How it moves packets</th><th>NetworkPolicy?</th><th>Typical use</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Flannel</strong></td><td>Simple VXLAN overlay</td><td>No</td><td>Learning, small clusters</td></tr>
+              <tr><td><strong>Calico</strong></td><td>BGP routing or IP-in-IP/VXLAN</td><td>Yes (rich)</td><td>Very common in production, on-prem</td></tr>
+              <tr><td><strong>Cilium</strong></td><td>eBPF in the kernel (can replace kube-proxy)</td><td>Yes (+ L7, Hubble observability)</td><td>Modern default on many managed clusters</td></tr>
+              <tr><td><strong>AWS VPC CNI</strong></td><td>Pods get real VPC IPs from the subnet</td><td>Yes (with policy agent)</td><td>EKS default</td></tr>
+              <tr><td>kindnet / bridge</td><td>Simple routes / Linux bridge</td><td>No</td><td>kind, minikube (<code class="inl">--cni=auto</code>)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><span class="pr">$</span> kubectl get nodes -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR   <span class="cm"># 2-node: minikube start --nodes 2</span>
+<span class="out">NAME           PODCIDR
+minikube       10.244.0.0/24
+minikube-m02   10.244.1.0/24</span>
+
+<span class="pr">$</span> kubectl get pods -o wide -l tier=api
+<span class="out">NAME                            READY   STATUS    RESTARTS   AGE   IP            NODE       NOMINATED NODE   READINESS GATES
+taskflow-api-5b9c4f7d8b-w7hzk   1/1     Running   0          5m    10.244.0.12   minikube   &lt;none&gt;           &lt;none&gt;
+taskflow-api-5b9c4f7d8b-fq5rl   1/1     Running   0          5m    10.244.0.13   minikube   &lt;none&gt;           &lt;none&gt;
+taskflow-api-5b9c4f7d8b-k8mzt   1/1     Running   0          5m    10.244.0.14   minikube   &lt;none&gt;           &lt;none&gt;</span>
+
+<span class="pr">$</span> kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- 10.244.0.12:3000/health
+<span class="out">{"status":"ok"}
+pod "tmp" deleted</span>                                    <span class="cm"># Pod → Pod by IP works</span>
+
+<span class="pr">$</span> kubectl delete pod taskflow-api-5b9c4f7d8b-w7hzk
+<span class="pr">$</span> kubectl get pods -o wide -l tier=api | awk '{print $1, $6}'
+<span class="out">NAME IP
+taskflow-api-5b9c4f7d8b-fq5rl 10.244.0.13
+taskflow-api-5b9c4f7d8b-k8mzt 10.244.0.14
+taskflow-api-5b9c4f7d8b-p9xvd 10.244.0.15</span>          <span class="cm"># replacement got a NEW IP; 10.244.0.12 is gone</span></pre>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Pod IPs are real but <strong>ephemeral</strong> — every reschedule, rollout or scale event changes them. Never put a Pod IP in config. You need a stable front door: a <strong>Service</strong>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Every Pod has an IP; Pod ↔ Pod works across nodes without NAT; a CNI plugin (Calico, Flannel, Cilium…) makes it happen.
+          Pod IPs change constantly → Services.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SERVICES ===================== -->
+      <section id="services">
+        <h2><span class="sec-num">2</span> Services, ClusterIP &amp; selectors</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A Service is a shop's phone number. Staff (Pods) come and go, but you always dial the same number and whoever is free picks up.</p>
+        </div>
+
+        <p>A <span class="term">Service</span> gives a set of Pods (picked by a <strong>label selector</strong>):</p>
+        <ul>
+          <li>a stable virtual IP — the <span class="term">ClusterIP</span> — that never changes while the Service exists;</li>
+          <li>a stable DNS name: <code class="inl">taskflow-api</code> (§3);</li>
+          <li>L4 (TCP/UDP) load balancing across the <strong>ready</strong> matching Pods.</li>
+        </ul>
+
+        <div class="fname">k8s/service.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
+  name: taskflow-api                <span class="cm"># becomes the DNS name</span>
+  namespace: taskflow
+  labels:
+    app: taskflow
+    tier: api
+<span class="kw">spec:</span>
+  type: ClusterIP                   <span class="cm"># default: reachable only inside the cluster</span>
+  selector:                         <span class="cm"># send traffic to Pods with BOTH labels</span>
+    app: taskflow
+    tier: api
+  ports:
+    - name: http                    <span class="cm"># required once a Service has &gt;1 port; good habit anyway</span>
+      protocol: TCP                 <span class="cm"># default TCP; UDP/SCTP also possible</span>
+      port: <span class="nm">80</span>                      <span class="cm"># what clients dial: taskflow-api:80</span>
+      targetPort: http              <span class="cm"># the Pod's port named "http" (= 3000 in deployment.yaml)</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">metadata.name</code></td><td>Service name = DNS name inside the namespace.</td><td>Must be a valid DNS label (lowercase, <code class="inl">-</code>, ≤ 63 chars).</td></tr>
+              <tr><td><code class="inl">spec.type</code></td><td><code class="inl">ClusterIP</code> (default), <code class="inl">NodePort</code>, <code class="inl">LoadBalancer</code>, <code class="inl">ExternalName</code>.</td><td>Each type builds on the previous one (§4).</td></tr>
+              <tr><td><code class="inl">spec.selector</code></td><td>Plain label map (equality only, ANDed).</td><td>No <code class="inl">matchLabels</code>/<code class="inl">matchExpressions</code> here — unlike Deployments.</td></tr>
+              <tr><td><code class="inl">ports[].port</code></td><td>Port on the ClusterIP.</td><td>Can differ from the app's port.</td></tr>
+              <tr><td><code class="inl">ports[].targetPort</code></td><td>Port on the Pod (number or container port <em>name</em>).</td><td>Defaults to <code class="inl">port</code> if omitted. Full story in §5.</td></tr>
+              <tr><td><code class="inl">spec.clusterIP</code></td><td>Auto-assigned from the service CIDR (minikube: <code class="inl">10.96.0.0/12</code>).</td><td>Set to <code class="inl">None</code> for a headless Service (§3).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The database gets a Service too. Temporary <code class="inl">k8s/postgres.yaml</code> (password moves to a Secret in Session 12, storage to a PVC in Session 13):</p>
+        <div class="fname">k8s/postgres.yaml</div>
+<pre><span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
+  name: taskflow-db
+  namespace: taskflow
+<span class="kw">spec:</span>
+  replicas: <span class="nm">1</span>
+  selector:
+    matchLabels: { app: taskflow, tier: db }
+  template:
+    metadata:
+      labels: { app: taskflow, tier: db }  <span class="cm"># tier=db keeps it OUT of the api Service</span>
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - name: postgres
+              containerPort: <span class="nm">5432</span>
+          env:
+            - { name: POSTGRES_USER,     value: taskflow }
+            - { name: POSTGRES_DB,       value: taskflow }
+            - { name: POSTGRES_PASSWORD, value: changeme }   <span class="cm"># TEMPORARY — Secret in Session 12</span>
+---
+<span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
+  name: taskflow-db                 <span class="cm"># the API connects to taskflow-db:5432</span>
+  namespace: taskflow
+<span class="kw">spec:</span>
+  selector: { app: taskflow, tier: db }
+  ports:
+    - name: postgres
+      port: <span class="nm">5432</span>
+      targetPort: postgres</pre>
+
+<pre><span class="pr">$</span> kubectl apply -f k8s/service.yaml -f k8s/postgres.yaml
+<span class="out">service/taskflow-api created
+deployment.apps/taskflow-db created
+service/taskflow-db created</span>
+
+<span class="pr">$</span> kubectl get svc -o wide
+<span class="out">NAME           TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE   SELECTOR
+taskflow-api   ClusterIP   10.96.120.15   &lt;none&gt;        80/TCP     15s   app=taskflow,tier=api
+taskflow-db    ClusterIP   10.96.48.200   &lt;none&gt;        5432/TCP   15s   app=taskflow,tier=db</span>
+
+<span class="pr">$</span> kubectl describe svc taskflow-api
+<span class="out">Name:                     taskflow-api
+Namespace:                taskflow
+Selector:                 app=taskflow,tier=api
+Type:                     ClusterIP
+IP:                       10.96.120.15
+Port:                     http  80/TCP
+TargetPort:               http/TCP
+Endpoints:                10.244.0.13:3000,10.244.0.14:3000,10.244.0.15:3000
+Session Affinity:         None
+Internal Traffic Policy:  Cluster
+Events:                   &lt;none&gt;</span>
+
+<span class="pr">$</span> kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- taskflow-api/health
+<span class="out">{"status":"ok"}
+pod "tmp" deleted</span></pre>
+
+        <h3>Endpoints / EndpointSlices — the Service's live Pod list</h3>
+        <p>The EndpointSlice controller watches Pods matching the selector and writes their <strong>ready</strong> IP:port pairs into <span class="term">EndpointSlice</span> objects. Not ready (readiness probe failing) = not listed = no traffic.</p>
+<pre><span class="pr">$</span> kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api
+<span class="out">NAME                 ADDRESSTYPE   PORTS   ENDPOINTS                             AGE
+taskflow-api-x7k2p   IPv4          3000    10.244.0.13,10.244.0.14,10.244.0.15   2m</span>
+
+<span class="pr">$</span> kubectl get endpoints taskflow-api            <span class="cm"># older API, still works</span>
+<span class="out">Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME           ENDPOINTS                                            AGE
+taskflow-api   10.244.0.13:3000,10.244.0.14:3000,10.244.0.15:3000   2m</span></pre>
+
+        <h3>How the ClusterIP actually works: kube-proxy</h3>
+        <ul>
+          <li>No process listens on <code class="inl">10.96.120.15</code>. It's a <strong>virtual IP</strong>.</li>
+          <li><span class="term">kube-proxy</span> (one per node) watches Services + EndpointSlices and writes kernel rules: "packet to 10.96.120.15:80 → DNAT to a random endpoint, port 3000".</li>
+          <li>Modes: <code class="inl">iptables</code> (default), <code class="inl">nftables</code> (GA since 1.33, the recommended future), <code class="inl">ipvs</code> (deprecated in 1.35). Cilium can replace kube-proxy entirely with eBPF.</li>
+        </ul>
+<pre><span class="pr">$</span> minikube ssh -- sudo iptables -t nat -L KUBE-SERVICES -n | grep taskflow
+<span class="out">KUBE-SVC-K2Q3ZVJ7VQX5DJ3O  tcp  --  0.0.0.0/0  10.96.120.15  /* taskflow/taskflow-api:http cluster IP */ tcp dpt:80
+KUBE-SVC-5QZKX2NYV4C7HJ6M  tcp  --  0.0.0.0/0  10.96.48.200  /* taskflow/taskflow-db:postgres cluster IP */ tcp dpt:5432</span></pre>
+        <p>Because it's only NAT rules, <code class="inl">ping 10.96.120.15</code> usually fails even when the Service works. Test with TCP (<code class="inl">wget</code>/<code class="inl">curl</code>), not ping.</p>
+
+        <h3>Selector bugs (the #1 Service problem)</h3>
+        <div class="callout example">
+          <span class="c-title">Example 1: "Service has no endpoints"</span>
+          <p>Someone writes <code class="inl">selector: { app: taskflow-api }</code> but the Pods are labelled <code class="inl">app=taskflow</code>.</p>
+<pre><span class="pr">$</span> kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- taskflow-api/health
+<span class="out">wget: can't connect to remote host (10.96.120.15): Connection refused</span>
+<span class="pr">$</span> kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api
+<span class="out">NAME                 ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+taskflow-api-x7k2p   IPv4          &lt;unset&gt;   &lt;unset&gt;     1m</span>
+<span class="pr">$</span> kubectl get svc taskflow-api -o jsonpath='{.spec.selector}'
+<span class="out">{"app":"taskflow-api"}</span>
+<span class="pr">$</span> kubectl get pods -l app=taskflow-api
+<span class="out">No resources found in taskflow namespace.</span>          <span class="cm"># ← selector matches nothing</span>
+<span class="pr">$</span> kubectl get pods --show-labels | head -2
+<span class="out">NAME                            READY   STATUS    RESTARTS   AGE   LABELS
+taskflow-api-5b9c4f7d8b-fq5rl   1/1     Running   0          9m    app=taskflow,pod-template-hash=5b9c4f7d8b,tier=api</span></pre>
+          <p><strong>Fix:</strong> make the Service selector a subset of the Pod labels (<code class="inl">app: taskflow, tier: api</code>) and re-apply. Endpoints appear within a second. Same symptom if every Pod is failing readiness.</p>
+        </div>
+        <div class="callout example">
+          <span class="c-title">Example 2: selector too broad</span>
+          <p><code class="inl">selector: { app: taskflow }</code> with <code class="inl">targetPort: 3000</code> also matches the Postgres Pod (<code class="inl">app=taskflow,tier=db</code>):</p>
+<pre><span class="pr">$</span> kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api
+<span class="out">NAME                 ADDRESSTYPE   PORTS   ENDPOINTS                                         AGE
+taskflow-api-x7k2p   IPv4          3000    10.244.0.13,10.244.0.14,10.244.0.15,10.244.0.20   1m</span></pre>
+          <p>~1 in 4 requests go to Postgres on port 3000 → random "connection refused". Fix: add <code class="inl">tier: api</code> to the selector. (A named <code class="inl">targetPort: http</code> would also have skipped the DB Pod, since it has no port named <code class="inl">http</code>.)</p>
+        </div>
+
+        <h3>Generate a Service with kubectl expose</h3>
+<pre><span class="pr">$</span> kubectl expose deployment taskflow-api --port=80 --target-port=3000 --dry-run=client -o yaml
+<span class="out">apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: taskflow
+    tier: api
+  name: taskflow-api            </span><span class="cm"># name defaults to the Deployment's name</span><span class="out">
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 3000
+  selector:                     </span><span class="cm"># copied from the Deployment's selector</span><span class="out">
+    app: taskflow
+    tier: api
+status:
+  loadBalancer: {}</span></pre>
+        <p>Drop <code class="inl">--dry-run=client -o yaml</code> to create it directly (<code class="inl">service/taskflow-api exposed</code>); add <code class="inl">--type=NodePort</code> for §4. For the repo, save the YAML and <code class="inl">apply</code> it.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Service = stable ClusterIP + DNS name + load balancing over ready Pods matched by label selector. EndpointSlices hold the live Pod list;
+          empty list = selector or readiness problem. kube-proxy turns it into NAT rules on every node.
+        </div>
+      </section>
+
+      <!-- ===================== 3. DNS ===================== -->
+      <section id="dns">
+        <h2><span class="sec-num">3</span> Kubernetes DNS &amp; service discovery</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of memorising the shop's phone number, you look up "taskflow-db" in the cluster's phone book.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Service discovery</span> = how a client finds where a service lives. In K8s: <strong>DNS</strong> (preferred) or injected <strong>environment variables</strong>.</li>
+          <li><span class="term">CoreDNS</span> runs as a Deployment in <code class="inl">kube-system</code>, behind a Service still called <code class="inl">kube-dns</code>. It watches Services and answers DNS queries for them.</li>
+        </ul>
+<pre><span class="pr">$</span> kubectl get deploy,svc -n kube-system -l k8s-app=kube-dns
+<span class="out">NAME                      READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/coredns   1/1     1            1           3d
+
+NAME               TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)                  AGE
+service/kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP   3d</span></pre>
+
+        <h3>DNS names you can use</h3>
+        <p>Format: <code class="inl">&lt;service&gt;.&lt;namespace&gt;.svc.&lt;cluster-domain&gt;</code>, cluster domain = <code class="inl">cluster.local</code>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Name queried</th><th>Resolves to</th><th>Works from</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">taskflow-db</code></td><td>10.96.48.200 (ClusterIP)</td><td>Pods in the <strong>same</strong> namespace (<code class="inl">taskflow</code>)</td></tr>
+              <tr><td><code class="inl">taskflow-db.taskflow</code></td><td>same</td><td>Any namespace</td></tr>
+              <tr><td><code class="inl">taskflow-db.taskflow.svc.cluster.local</code></td><td>same (FQDN)</td><td>Any namespace</td></tr>
+              <tr><td><code class="inl">_postgres._tcp.taskflow-db.taskflow.svc.cluster.local</code></td><td>SRV record: port 5432 + host</td><td>Any (needs a named port)</td></tr>
+              <tr><td>Headless Service name</td><td>The <strong>Pod IPs</strong> directly (below)</td><td>Any</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>So TaskFlow's connection string in K8s is <code class="inl">postgres://taskflow:&lt;pw&gt;@taskflow-db:5432/taskflow</code> — same as Compose's <code class="inl">db</code>, just a different host name.</p>
+
+        <h3>Why short names work: /etc/resolv.conf in every Pod</h3>
+<pre><span class="pr">$</span> kubectl exec deploy/taskflow-api -- cat /etc/resolv.conf
+<span class="out">search taskflow.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">nameserver 10.96.0.10</code></td><td>Send DNS queries to the <code class="inl">kube-dns</code> Service (CoreDNS), written by the kubelet.</td></tr>
+              <tr><td><code class="inl">search taskflow.svc.cluster.local ...</code></td><td>Suffixes tried in order. <code class="inl">taskflow-db</code> → <code class="inl">taskflow-db.taskflow.svc.cluster.local</code> ✔. The first entry is the Pod's own namespace — that's why short names only work in-namespace.</td></tr>
+              <tr><td><code class="inl">options ndots:5</code></td><td>Names with fewer than 5 dots try the search list first. <code class="inl">api.github.com</code> causes a few wasted lookups before the real one; a trailing dot (<code class="inl">api.github.com.</code>) skips them.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Test it from a throwaway Pod</h3>
+<pre><span class="pr">$</span> kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- sh
+<span class="out">If you don't see a command prompt, try pressing enter.</span>
+<span class="pr">/ #</span> nslookup taskflow-db.taskflow.svc.cluster.local
+<span class="out">Server:    10.96.0.10
+Address:   10.96.0.10:53
+
+Name:      taskflow-db.taskflow.svc.cluster.local
+Address:   10.96.48.200</span>
+<span class="pr">/ #</span> wget -qO- taskflow-api:80/health          <span class="cm"># short name + Service port</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">/ #</span> exit
+<span class="out">pod "tmp" deleted</span>
+
+<span class="cm"># from ANOTHER namespace the short name fails:</span>
+<span class="pr">$</span> kubectl run tmp -n default --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- taskflow-api/health
+<span class="out">wget: bad address 'taskflow-api'
+pod "tmp" deleted
+pod default/tmp terminated (Error)</span>
+<span class="pr">$</span> kubectl run tmp -n default --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- taskflow-api.taskflow/health
+<span class="out">{"status":"ok"}
+pod "tmp" deleted</span></pre>
+
+        <h3>Discovery via environment variables</h3>
+        <p>When a Pod starts, the kubelet injects variables for every Service that <strong>already exists</strong> in its namespace:</p>
+<pre><span class="pr">$</span> kubectl exec deploy/taskflow-api -- env | grep TASKFLOW_DB
+<span class="out">TASKFLOW_DB_SERVICE_HOST=10.96.48.200
+TASKFLOW_DB_SERVICE_PORT=5432
+TASKFLOW_DB_SERVICE_PORT_POSTGRES=5432
+TASKFLOW_DB_PORT=tcp://10.96.48.200:5432
+TASKFLOW_DB_PORT_5432_TCP_ADDR=10.96.48.200
+TASKFLOW_DB_PORT_5432_TCP_PORT=5432
+TASKFLOW_DB_PORT_5432_TCP_PROTO=tcp</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>DNS</th><th>Environment variables</th></tr></thead>
+            <tbody>
+              <tr><td>Ordering</td><td>Works for Services created any time</td><td>Service must exist <strong>before</strong> the Pod starts</td></tr>
+              <tr><td>Other namespaces</td><td>Yes (<code class="inl">svc.ns</code>)</td><td>No</td></tr>
+              <tr><td>Updates</td><td>Live</td><td>Frozen at Pod start</td></tr>
+              <tr><td>Needs</td><td>CoreDNS running</td><td>Nothing</td></tr>
+              <tr><td>Verdict</td><td><strong>Use this</strong></td><td>Legacy (Docker links style); disable with <code class="inl">enableServiceLinks: false</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Headless Services (<code class="inl">clusterIP: None</code>)</h3>
+        <p>No virtual IP, no kube-proxy load balancing — DNS returns every ready Pod IP. Used when the client must pick a specific Pod (StatefulSets like <code class="inl">postgres-0</code>, Session 15) or does its own balancing.</p>
+        <div class="fname">headless-demo.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
+  name: taskflow-api-headless
+<span class="kw">spec:</span>
+  clusterIP: None                   <span class="cm"># ← the only difference that matters</span>
+  selector: { app: taskflow, tier: api }
+  ports:
+    - name: http
+      port: <span class="nm">3000</span>
+      targetPort: http</pre>
+<pre><span class="pr">/ #</span> nslookup taskflow-api-headless.taskflow.svc.cluster.local
+<span class="out">Server:    10.96.0.10
+Address:   10.96.0.10:53
+
+Name:      taskflow-api-headless.taskflow.svc.cluster.local
+Address:   10.244.0.13
+Name:      taskflow-api-headless.taskflow.svc.cluster.local
+Address:   10.244.0.14
+Name:      taskflow-api-headless.taskflow.svc.cluster.local
+Address:   10.244.0.15</span></pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">bad address 'taskflow-api'</code> → wrong namespace (use <code class="inl">taskflow-api.taskflow</code>), typo, or CoreDNS down (<code class="inl">kubectl get pods -n kube-system -l k8s-app=kube-dns</code>).</li>
+            <li>Using <code class="inl">localhost:5432</code> from the API to reach Postgres. <code class="inl">localhost</code> is the API's own Pod; use <code class="inl">taskflow-db</code>.</li>
+            <li>busybox's <code class="inl">nslookup</code> may print extra <code class="inl">NXDOMAIN</code> lines for search domains it tries — harmless; look for the <code class="inl">Address:</code> line.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          CoreDNS answers <code class="inl">svc.ns.svc.cluster.local</code>; the search list makes <code class="inl">svc</code> work in-namespace and <code class="inl">svc.ns</code> across namespaces.
+          Prefer DNS over env vars. Headless = DNS returns Pod IPs.
+        </div>
+      </section>
+
+      <!-- ===================== 4. SERVICE TYPES ===================== -->
+      <section id="service-types">
+        <h2><span class="sec-num">4</span> NodePort &amp; LoadBalancer</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>ClusterIP is an internal extension number. NodePort opens a side door on every building. LoadBalancer hires a receptionist at the main gate.</p>
+        </div>
+
+        <h3>NodePort — open a port on every node</h3>
+        <div class="fname">k8s/service-nodeport.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
+  name: taskflow-api-nodeport
+  namespace: taskflow
+<span class="kw">spec:</span>
+  type: NodePort                    <span class="cm"># ClusterIP + a port on every node's IP</span>
+  selector: { app: taskflow, tier: api }
+  ports:
+    - name: http
+      port: <span class="nm">80</span>                      <span class="cm"># ClusterIP port (still works inside)</span>
+      targetPort: http              <span class="cm"># Pod port 3000</span>
+      nodePort: <span class="nm">30080</span>                <span class="cm"># 30000–32767; omit to get a random one</span></pre>
+<pre><span class="pr">$</span> kubectl apply -f k8s/service-nodeport.yaml
+<span class="out">service/taskflow-api-nodeport created</span>
+<span class="pr">$</span> kubectl get svc taskflow-api-nodeport
+<span class="out">NAME                    TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+taskflow-api-nodeport   NodePort   10.104.33.170   &lt;none&gt;        80:30080/TCP   5s</span>   <span class="cm"># port:nodePort</span>
+
+<span class="cm"># Linux, or VM drivers: the node IP is reachable</span>
+<span class="pr">$</span> curl http://$(minikube ip):30080/health
+<span class="out">{"status":"ok"}</span>
+
+<span class="cm"># macOS/Windows with the Docker driver: node IP is NOT reachable → let minikube tunnel it</span>
+<span class="pr">$</span> minikube service taskflow-api-nodeport -n taskflow --url
+<span class="out">http://127.0.0.1:58123
+❗  Because you are using a Docker driver on darwin, the terminal needs to be open to run it.</span>
+<span class="pr">$</span> curl http://127.0.0.1:58123/health        <span class="cm"># from a second terminal</span>
+<span class="out">{"status":"ok"}</span></pre>
+
+        <h3>LoadBalancer — ask the cloud for an external load balancer</h3>
+        <div class="fname">k8s/service-lb.yaml</div>
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
+  name: taskflow-api-lb
+  namespace: taskflow
+<span class="kw">spec:</span>
+  type: LoadBalancer                <span class="cm"># NodePort + ClusterIP + an external LB from the cloud</span>
+  selector: { app: taskflow, tier: api }
+  ports:
+    - name: http
+      port: <span class="nm">80</span>                      <span class="cm"># port the LB listens on</span>
+      targetPort: http</pre>
+        <ul>
+          <li>The <strong>cloud-controller-manager</strong> sees the Service and creates a real load balancer (AWS NLB/ELB, Azure LB, GCP LB), pointing at every node's nodePort.</li>
+          <li>Cloud-specific behaviour is set with annotations, e.g. <code class="inl">service.beta.kubernetes.io/aws-load-balancer-...</code> on EKS.</li>
+          <li>minikube has no cloud → <code class="inl">EXTERNAL-IP</code> stays <code class="inl">&lt;pending&gt;</code> until you run <code class="inl">minikube tunnel</code>.</li>
+        </ul>
+<pre><span class="pr">$</span> kubectl get svc taskflow-api-lb
+<span class="out">NAME              TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+taskflow-api-lb   LoadBalancer   10.98.211.40   &lt;pending&gt;     80:31467/TCP   10s</span>   <span class="cm"># note: it got a nodePort too</span>
+
+<span class="pr">$</span> minikube tunnel                            <span class="cm"># separate terminal, keep it open; may ask for sudo</span>
+<span class="out">✅  Tunnel successfully started
+🏃  Starting tunnel for service taskflow-api-lb.</span>
+
+<span class="pr">$</span> kubectl get svc taskflow-api-lb
+<span class="out">NAME              TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+taskflow-api-lb   LoadBalancer   10.98.211.40   127.0.0.1     80:31467/TCP   1m</span>   <span class="cm"># Linux shows the ClusterIP here</span>
+<span class="pr">$</span> curl http://127.0.0.1/health
+<span class="out">{"status":"ok"}</span>
+
+<span class="cm"># the same Service on EKS (ap-south-1):</span>
+<span class="out">NAME              TYPE           CLUSTER-IP     EXTERNAL-IP                                                                PORT(S)        AGE
+taskflow-api-lb   LoadBalancer   172.20.87.14   a3f9c1e2b4d54e6f8a9b0c1d2e3f4a5b-1234567890.ap-south-1.elb.amazonaws.com   80:31467/TCP   2m</span></pre>
+
+        <h3>port-forward — debugging shortcut, not exposure</h3>
+<pre><span class="pr">$</span> kubectl port-forward svc/taskflow-api 8080:80     <span class="cm"># laptop:8080 → Service port 80</span>
+<span class="out">Forwarding from 127.0.0.1:8080 -&gt; 3000
+Forwarding from [::1]:8080 -&gt; 3000</span>                <span class="cm"># resolved to the targetPort of ONE Pod</span>
+<span class="pr">$</span> curl localhost:8080/health                      <span class="cm"># second terminal</span>
+<span class="out">{"status":"ok"}</span></pre>
+        <p>It tunnels through the API server to a <em>single</em> Pod — no load balancing, dies when you press Ctrl-C. Great for checking a Service/DB without exposing it (<code class="inl">kubectl port-forward svc/taskflow-db 5432:5432</code> → <code class="inl">psql -h localhost -U taskflow</code>).</p>
+
+        <h3>Service types compared (exam favourite)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>Reachable from</th><th>Address</th><th>Port</th><th>Use for</th></tr></thead>
+            <tbody>
+              <tr><td><strong>ClusterIP</strong> (default)</td><td>Inside the cluster only</td><td>Virtual IP 10.96.x.x + DNS name</td><td><code class="inl">port</code></td><td>Service-to-service (API → DB). Most Services.</td></tr>
+              <tr><td><strong>NodePort</strong></td><td>Outside, via any node</td><td><code class="inl">&lt;NodeIP&gt;:&lt;nodePort&gt;</code> (+ ClusterIP)</td><td>30000–32767</td><td>Dev/test, bare-metal, behind your own LB</td></tr>
+              <tr><td><strong>LoadBalancer</strong></td><td>Internet / VPC</td><td>Cloud LB IP or hostname (+ NodePort + ClusterIP)</td><td>any (e.g. 80)</td><td>Exposing one service in the cloud. One LB per Service = cost.</td></tr>
+              <tr><td>Headless (<code class="inl">clusterIP: None</code>)</td><td>Inside</td><td>DNS → Pod IPs</td><td>—</td><td>StatefulSets, client-side balancing</td></tr>
+              <tr><td>ExternalName</td><td>Inside</td><td>DNS CNAME to an outside name</td><td>—</td><td>Alias e.g. <code class="inl">db</code> → an RDS hostname</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For many HTTP services behind one entry point, use an <strong>Ingress</strong> instead of many LoadBalancers (Session 12).</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">nodePort: 8080</code> → <code class="inl">spec.ports[0].nodePort: Invalid value: 8080: provided port is not in the valid range. The range of valid ports is 30000-32767</code>.</li>
+            <li>Waiting forever for <code class="inl">&lt;pending&gt;</code> on minikube/kind — there's no cloud. Run <code class="inl">minikube tunnel</code> (or install MetalLB on bare metal).</li>
+            <li>On AWS, NodePort traffic is blocked unless the node Security Group allows 30000–32767 (Session 21).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          ClusterIP ⊂ NodePort ⊂ LoadBalancer — each type adds an outer layer. minikube: <code class="inl">minikube service --url</code> for NodePort, <code class="inl">minikube tunnel</code> for LoadBalancer.
+          <code class="inl">port-forward</code> is for debugging only.
+        </div>
+      </section>
+
+      <!-- ===================== 5. PORTS ===================== -->
+      <section id="ports">
+        <h2><span class="sec-num">5</span> port vs targetPort vs nodePort</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>nodePort is the building's side door, port is the reception desk's extension, targetPort is the actual desk where the worker sits.</p>
+        </div>
+
+<pre>  curl from your laptop                     another Pod in the cluster
+          │                                          │
+          ▼                                          ▼
+  192.168.49.2:<span class="nm">30080</span>   ── nodePort ──►   10.96.120.15:<span class="nm">80</span>   (= taskflow-api:80)   ── port
+  (any node's IP)                              │  kube-proxy DNAT + load-balance
+                                               ▼
+                                  10.244.0.13:<span class="nm">3000</span>   ── targetPort  (= containerPort "http")
+                                  node server.js listening on PORT=3000</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Defined in</th><th>Who connects to it</th><th>Default / range</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">containerPort</code></td><td>Pod/Deployment <code class="inl">ports[]</code></td><td>Nobody directly — documents the app port and gives it a <em>name</em></td><td>—</td></tr>
+              <tr><td><code class="inl">targetPort</code></td><td>Service <code class="inl">ports[]</code></td><td>kube-proxy, on the Pod IP</td><td>Same as <code class="inl">port</code> if omitted; number or name</td></tr>
+              <tr><td><code class="inl">port</code></td><td>Service <code class="inl">ports[]</code></td><td>Clients inside the cluster: <code class="inl">taskflow-api:80</code></td><td>Required</td></tr>
+              <tr><td><code class="inl">nodePort</code></td><td>Service <code class="inl">ports[]</code> (NodePort/LB only)</td><td>Clients outside: <code class="inl">&lt;NodeIP&gt;:30080</code></td><td>30000–32767, random if omitted</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Docker analogy: <code class="inl">docker run -p 8080:3000</code> → 8080 ≈ <code class="inl">nodePort</code>, 3000 ≈ <code class="inl">targetPort</code>. Kubernetes adds the middle layer, <code class="inl">port</code>, on the Service's own IP.</p>
+
+        <h3>Named ports</h3>
+        <div class="fname">k8s/deployment.yaml (excerpt) + k8s/service.yaml (excerpt)</div>
+<pre><span class="cm"># Deployment → Pod template</span>
+          ports:
+            - name: http              <span class="cm"># the name</span>
+              containerPort: <span class="nm">3000</span>     <span class="cm"># the number lives only here</span>
+<span class="cm"># Service</span>
+  ports:
+    - name: http
+      port: <span class="nm">80</span>
+      targetPort: http                <span class="cm"># refer by name, not 3000</span></pre>
+        <ul>
+          <li>Move the app to 8080? Change <code class="inl">containerPort</code> (and <code class="inl">PORT</code>) only — the Service follows the name.</li>
+          <li>Different Pods behind one Service can use different numbers for the same name (e.g. during a migration).</li>
+          <li>Pods that don't have the named port are skipped — a cheap guard against over-broad selectors (§2).</li>
+        </ul>
+
+        <div class="callout example">
+          <span class="c-title">Worked example: endpoints exist but connection refused</span>
+          <p>Service has <code class="inl">port: 80, targetPort: 8080</code>; TaskFlow listens on 3000.</p>
+<pre><span class="pr">$</span> kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api
+<span class="out">NAME                 ADDRESSTYPE   PORTS   ENDPOINTS                             AGE
+taskflow-api-x7k2p   IPv4          8080    10.244.0.13,10.244.0.14,10.244.0.15   5m</span>     <span class="cm"># Pods found, wrong port</span>
+<span class="pr">/ #</span> wget -qO- taskflow-api/health
+<span class="out">wget: can't connect to remote host (10.96.120.15): Connection refused</span>
+<span class="pr">/ #</span> wget -qO- 10.244.0.13:3000/health                 <span class="cm"># bypass the Service: app is fine on 3000</span>
+<span class="out">{"status":"ok"}</span></pre>
+          <p><strong>Diagnosis:</strong> no endpoints → selector problem; endpoints but refused → <code class="inl">targetPort</code> wrong (or app bound to 127.0.0.1 instead of 0.0.0.0 — Session 4). <strong>Fix:</strong> <code class="inl">targetPort: http</code> (or 3000) and re-apply.</p>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Clients use <code class="inl">port</code> (inside) or <code class="inl">nodePort</code> (outside). The app only ever sees <code class="inl">targetPort</code>. Only <code class="inl">targetPort</code> must equal what the app really listens on.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          nodePort (node, 30000–32767) → port (Service ClusterIP) → targetPort (Pod = containerPort). Name your ports and point targetPort at the name.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">kubectl get pods -o wide</code></td><td>Pod IPs and nodes.</td></tr>
+              <tr><td><code class="inl">kubectl get svc -o wide</code></td><td>Services with type, ClusterIP, ports and selector.</td></tr>
+              <tr><td><code class="inl">kubectl describe svc NAME</code></td><td>Selector, ports, TargetPort, Endpoints.</td></tr>
+              <tr><td><code class="inl">kubectl get endpointslices -l kubernetes.io/service-name=NAME</code></td><td>Which Pod IPs the Service sends to (empty = bug).</td></tr>
+              <tr><td><code class="inl">kubectl get endpoints NAME</code></td><td>Same, older API (deprecation warning on 1.33+).</td></tr>
+              <tr><td><code class="inl">kubectl expose deploy NAME --port=80 --target-port=3000 [--type=NodePort]</code></td><td>Create a Service for a Deployment.</td></tr>
+              <tr><td><code class="inl">kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- sh</code></td><td>Throwaway Pod for <code class="inl">nslookup</code>/<code class="inl">wget</code> tests.</td></tr>
+              <tr><td><code class="inl">kubectl exec deploy/NAME -- cat /etc/resolv.conf</code></td><td>See a Pod's DNS config.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -n kube-system -l k8s-app=kube-dns</code></td><td>Is CoreDNS running?</td></tr>
+              <tr><td><code class="inl">kubectl port-forward svc/NAME 8080:80</code></td><td>Laptop → Service (one Pod), for debugging.</td></tr>
+              <tr><td><code class="inl">minikube ip</code></td><td>Node IP for NodePort URLs.</td></tr>
+              <tr><td><code class="inl">minikube service NAME -n NS --url</code></td><td>Reachable URL for a NodePort Service.</td></tr>
+              <tr><td><code class="inl">minikube tunnel</code></td><td>Gives LoadBalancer Services an EXTERNAL-IP locally.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>Every TaskFlow Pod gets its own routable IP from the CNI, but those IPs change on every rollout. A Service selects the Pods by label, publishes
+          their ready IPs as EndpointSlices, and kube-proxy load-balances its stable ClusterIP across them. CoreDNS names it, so the API simply dials
+          <code class="inl">taskflow-db:5432</code> and other Pods dial <code class="inl">taskflow-api:80</code>, which lands on <code class="inl">targetPort</code> 3000.
+          To reach the API from outside, wrap it in a NodePort (dev) or LoadBalancer (cloud) — or, better for HTTP, an Ingress (next session).</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Service: <code class="inl">port: 80, targetPort: 3000, nodePort: 30080</code>. Which port does another Pod use, which does your browser use, and where must the app listen?</summary>
+          <p class="ans">Pod → <code class="inl">taskflow-api:80</code>; browser → <code class="inl">&lt;NodeIP&gt;:30080</code>; the app listens on 3000 (targetPort).</p>
+        </details>
+        <details class="quiz">
+          <summary><code class="inl">kubectl get endpoints taskflow-api</code> shows <code class="inl">&lt;none&gt;</code>. Give two causes.</summary>
+          <p class="ans">(1) The selector doesn't match any Pod's labels; (2) matching Pods exist but none are Ready (readiness probe failing / still starting).</p>
+        </details>
+        <details class="quiz">
+          <summary>A Pod in namespace <code class="inl">default</code> gets <code class="inl">bad address 'taskflow-api'</code>. Why, and what name should it use?</summary>
+          <p class="ans">The search list starts with the Pod's own namespace (<code class="inl">default.svc.cluster.local</code>). Use <code class="inl">taskflow-api.taskflow</code> or the FQDN <code class="inl">taskflow-api.taskflow.svc.cluster.local</code>.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why not just connect to Pod IPs directly?</summary>
+          <p class="ans">Pod IPs are ephemeral (new IP on every restart/reschedule/rollout) and there are several replicas; a Service gives one stable IP + DNS name and load-balances across ready Pods.</p>
+        </details>
+        <details class="quiz">
+          <summary>A LoadBalancer Service on minikube shows <code class="inl">EXTERNAL-IP &lt;pending&gt;</code>. Why, and how do you test it?</summary>
+          <p class="ans">No cloud-controller-manager to create a load balancer. Run <code class="inl">minikube tunnel</code> in another terminal; EXTERNAL-IP becomes reachable (127.0.0.1 on macOS Docker driver).</p>
+        </details>
+        <details class="quiz">
+          <summary>What does a DNS lookup of a headless Service return, versus a normal ClusterIP Service?</summary>
+          <p class="ans">Headless (<code class="inl">clusterIP: None</code>): one A record per ready Pod IP. Normal: a single A record with the ClusterIP.</p>
+        </details>
+        <details class="quiz">
+          <summary>Endpoints list three Pod IPs, but requests to the Service get "Connection refused". What's the likely bug?</summary>
+          <p class="ans"><code class="inl">targetPort</code> doesn't match the port the app listens on (or the app binds to 127.0.0.1). Check the PORTS column of the EndpointSlice vs the container's port.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 11: Kubernetes Networking &amp; Services.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/" target="_blank" rel="noopener">Services, Load Balancing, and Networking</a> — the network model.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">Service</a> — types, ports, selectors, headless, ExternalName.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/" target="_blank" rel="noopener">DNS for Services and Pods</a> — record formats, resolv.conf.</li>
+          <li><a href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/" target="_blank" rel="noopener">EndpointSlices</a> — how Services track Pods.</li>
+          <li><a href="https://minikube.sigs.k8s.io/docs/handbook/accessing/" target="_blank" rel="noopener">minikube: Accessing apps</a> — NodePort, <code class="inl">minikube service</code>, <code class="inl">minikube tunnel</code>.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-10.html"><div class="dir">← Previous</div><div class="ttl">Session 10: Pods, ReplicaSets &amp; Deployments</div></a>
+        <a class="next" href="session-12.html"><div class="dir">Next →</div><div class="ttl">Session 12: Ingress, ConfigMaps &amp; Secrets</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 11 — Kubernetes Networking &amp; Services</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

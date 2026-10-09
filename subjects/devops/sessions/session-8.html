@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 8 — Docker Networking, Volumes &amp; Compose</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 8</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 08</span>
+      <h1>Docker Networking, Volumes &amp; Compose</h1>
+      <p class="lead">
+        Connect containers by name, publish the right ports, keep Postgres data across restarts, and run the
+        whole TaskFlow stack (nginx + API + Postgres + Redis) with one <code class="inl">compose.yaml</code>.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 22 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#networking">Docker networking &amp; drivers</a></li>
+          <li><a href="#c2c">Container-to-container communication</a></li>
+          <li><a href="#ports">Port mapping</a></li>
+          <li><a href="#volumes">Docker volumes</a></li>
+          <li><a href="#bind-mounts">Bind mounts &amp; tmpfs</a></li>
+          <li><a href="#compose">Docker Compose: the files</a></li>
+          <li><a href="#compose-run">Running the multi-container app</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. NETWORKING ===================== -->
+      <section id="networking">
+        <h2><span class="sec-num">1</span> Docker networking &amp; drivers</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A Docker network is a private Wi-Fi for containers. Containers on the same network can talk; containers on different networks can't hear each other.</p>
+        </div>
+
+        <ul>
+          <li>Every container gets its own <span class="term">network namespace</span>: its own interfaces, IP, routing table and ports. <code class="inl">localhost</code> inside a container = that container only.</li>
+          <li>Docker connects containers to virtual networks using a <span class="term">network driver</span>. Three networks exist out of the box:</li>
+        </ul>
+<pre><span class="pr">$</span> docker network ls
+<span class="out">NETWORK ID     NAME      DRIVER    SCOPE
+5c1f3e2a9b10   bridge    bridge    local
+a8d2c6e4f7b3   host      host      local
+0e9b7d1c2f45   none      null      local</span></pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Driver</th><th>What you get</th><th>DNS by name</th><th>Use for</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">bridge</code> (default network)</td><td>Private subnet <code class="inl">172.17.0.0/16</code> on the <code class="inl">docker0</code> bridge, NAT to the outside</td><td>❌</td><td>Quick one-off containers</td></tr>
+              <tr><td>user-defined bridge</td><td>Your own isolated subnet (<code class="inl">docker network create</code>)</td><td>✅</td><td><strong>Multi-container apps on one host</strong> (Compose uses this)</td></tr>
+              <tr><td><code class="inl">host</code></td><td>No network isolation — container uses the host's interfaces; <code class="inl">-p</code> is ignored</td><td>n/a</td><td>Max performance, many ports. Linux only (Docker Desktop: opt-in setting)</td></tr>
+              <tr><td><code class="inl">none</code></td><td>Only loopback <code class="inl">lo</code></td><td>n/a</td><td>Fully isolated batch jobs</td></tr>
+              <tr><td><code class="inl">overlay</code></td><td>One network spanning many hosts (VXLAN)</td><td>✅</td><td>Docker Swarm (K8s uses CNI instead, S11)</td></tr>
+              <tr><td><code class="inl">macvlan</code> / <code class="inl">ipvlan</code></td><td>Container gets an IP on your physical LAN</td><td>—</td><td>Legacy apps that must look like a real machine</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>How the default bridge works on a Linux host:</p>
+<pre>host (Ubuntu)                                   eth0 192.168.1.20 ──▶ internet
+┌──────────────────────────────────────────────────────┐
+│  docker0 (bridge) 172.17.0.1                         │
+│     ├── veth ─── container web1   172.17.0.2         │
+│     └── veth ─── container web2   172.17.0.3         │
+│  iptables: MASQUERADE (outbound NAT), DNAT for -p    │
+└──────────────────────────────────────────────────────┘</pre>
+<pre><span class="pr">$</span> docker run -d --name web1 nginx:1.28-alpine
+<span class="pr">$</span> docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' web1
+<span class="out">172.17.0.2</span>
+<span class="pr">$</span> docker run --rm --network none alpine:3.22 ip addr
+<span class="out">1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo</span>              <span class="cm">← no eth0 at all</span>
+<span class="pr">$</span> docker run -d --name web-host --network host nginx:1.28-alpine     <span class="cm"># now on host port 80 directly</span></pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Each container has its own network stack. Default <code class="inl">bridge</code> = NAT'd private subnet without name resolution; use user-defined bridges for real apps; <code class="inl">host</code> removes isolation; <code class="inl">none</code> removes networking.
+        </div>
+      </section>
+
+      <!-- ===================== 2. C2C ===================== -->
+      <section id="c2c">
+        <h2><span class="sec-num">2</span> Container-to-container communication</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>On a user-defined network Docker keeps a phone book, so the API can just "call db" instead of remembering db's number.</p>
+        </div>
+
+        <h3>The default bridge has no name resolution</h3>
+<pre><span class="pr">$</span> docker run -d --name db -e POSTGRES_PASSWORD=devpass postgres:16-alpine
+<span class="pr">$</span> docker run --rm busybox:1.36 ping -c1 db
+<span class="out">ping: bad address 'db'</span>
+<span class="pr">$</span> docker rm -f db</pre>
+
+        <h3>User-defined bridge: TaskFlow API → <code class="inl">db</code> by name</h3>
+<pre><span class="pr">$</span> docker network create taskflow-net
+<span class="out">9f2c4e7a1b3d58e6c0a9f1b2d3e4c5a6b7f8091a2b3c4d5e6f708192a3b4c5d6</span>
+
+<span class="pr">$</span> docker run -d --name db --network taskflow-net \
+    -e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=taskflow \
+    postgres:16-alpine
+
+<span class="pr">$</span> docker run -d --name api --network taskflow-net -p 3000:3000 \
+    -e DATABASE_URL=postgres://taskflow:devpass@db:5432/taskflow \
+    shauryav/taskflow-api:1.0
+
+<span class="pr">$</span> docker run --rm --network taskflow-net busybox:1.36 ping -c1 db
+<span class="out">PING db (172.18.0.2): 56 data bytes
+64 bytes from 172.18.0.2: seq=0 ttl=64 time=0.091 ms
+
+--- db ping statistics ---
+1 packets transmitted, 1 packets received, 0% packet loss</span>
+
+<span class="pr">$</span> curl -s localhost:3000/tasks
+<span class="out">[]</span></pre>
+        <ul>
+          <li>Docker runs an <span class="term">embedded DNS server</span> at <code class="inl">127.0.0.11</code> in every container on a user-defined network. It answers with the container name (and any <code class="inl">--network-alias</code>).</li>
+          <li>Containers talk to each other on the <strong>container port</strong> (<code class="inl">db:5432</code>). Publishing (<code class="inl">-p</code>) is only for traffic from <em>outside</em> Docker.</li>
+        </ul>
+<pre><span class="pr">$</span> docker exec api cat /etc/resolv.conf | grep -v '^#'
+<span class="out">nameserver 127.0.0.11
+options ndots:0</span>
+
+<span class="pr">$</span> docker network inspect taskflow-net --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+<span class="out">db 172.18.0.2/16
+api 172.18.0.3/16</span>
+
+<span class="cm"># attach a running container to a second network (and give it an extra DNS name)</span>
+<span class="pr">$</span> docker network connect --alias web taskflow-net web1
+<span class="pr">$</span> docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' web1
+<span class="out">bridge taskflow-net</span>
+<span class="pr">$</span> docker network disconnect bridge web1</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Default <code class="inl">bridge</code></th><th>User-defined bridge</th></tr></thead>
+            <tbody>
+              <tr><td>DNS by container name</td><td>❌ (IPs only; legacy <code class="inl">--link</code>)</td><td>✅ via 127.0.0.11</td></tr>
+              <tr><td>Isolation</td><td>Every container started without <code class="inl">--network</code> shares it</td><td>Only containers you attach</td></tr>
+              <tr><td>Attach / detach a running container</td><td>Must recreate the container</td><td>✅ <code class="inl">docker network connect/disconnect</code></td></tr>
+              <tr><td>Settings (subnet, MTU…)</td><td>Daemon-wide</td><td>Per network</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">DATABASE_URL=postgres://…@localhost:5432/…</code> inside the API container → <code class="inl">Error: connect ECONNREFUSED 127.0.0.1:5432</code>. <code class="inl">localhost</code> is the API container itself; use the name <code class="inl">db</code>.</li>
+            <li>Using the host-published port between containers (<code class="inl">db:15432</code>) — inside the network it's always the container port.</li>
+            <li>Need to reach a service on your laptop from a container? Use <code class="inl">host.docker.internal</code> (Docker Desktop; on Linux add <code class="inl">--add-host=host.docker.internal:host-gateway</code>).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">docker network create</code> → <code class="inl">--network</code> on each container → reach others as <code class="inl">name:containerPort</code>. Different networks = no connectivity.
+        </div>
+      </section>
+
+      <!-- ===================== 3. PORTS ===================== -->
+      <section id="ports">
+        <h2><span class="sec-num">3</span> Port mapping</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The host is a building with numbered front doors. <code class="inl">-p 8080:3000</code> means "anyone knocking on door 8080 gets sent to room 3000 of this container".</p>
+        </div>
+
+<pre>browser ── http://192.168.1.20:8080 ──▶ host :8080 ──(iptables DNAT)──▶ 172.18.0.3:3000  (api container)</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-p 8080:3000</code></td><td>Host port 8080 on <strong>all</strong> interfaces (0.0.0.0 and [::]) → container port 3000. Format is always <code class="inl">HOST:CONTAINER</code>.</td></tr>
+              <tr><td><code class="inl">-p 127.0.0.1:8080:3000</code></td><td>Only reachable from this machine (good for DBs, admin UIs).</td></tr>
+              <tr><td><code class="inl">-p 3000</code></td><td>Random free host port → container 3000.</td></tr>
+              <tr><td><code class="inl">-P</code></td><td>Every <code class="inl">EXPOSE</code>d port → random host ports (S7).</td></tr>
+              <tr><td><code class="inl">-p 5353:53/udp</code></td><td>UDP (default is TCP).</td></tr>
+              <tr><td><code class="inl">-p 8080-8081:3000-3001</code></td><td>Port ranges.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> docker run -d --name api-pub -p 8080:3000 shauryav/taskflow-api:1.0
+<span class="pr">$</span> docker port api-pub
+<span class="out">3000/tcp -&gt; 0.0.0.0:8080
+3000/tcp -&gt; [::]:8080</span>
+<span class="pr">$</span> docker ps --format 'table {{.Names}}\t{{.Ports}}'
+<span class="out">NAMES     PORTS
+api-pub   0.0.0.0:8080-&gt;3000/tcp, [::]:8080-&gt;3000/tcp</span>
+
+<span class="cm"># same host port twice</span>
+<span class="pr">$</span> docker run -d --name api-pub2 -p 8080:3000 shauryav/taskflow-api:1.0
+<span class="out">docker: Error response from daemon: driver failed programming external connectivity on endpoint api-pub2 (3c5e…): Bind for 0.0.0.0:8080 failed: port is already allocated.</span>
+
+<span class="cm"># host port held by a non-Docker process (e.g. `node server.js` running on the host)</span>
+<span class="pr">$</span> docker run -d --name api-pub3 -p 3000:3000 shauryav/taskflow-api:1.0
+<span class="out">docker: Error response from daemon: … 0.0.0.0:3000 … bind: address already in use.</span>
+<span class="pr">$</span> sudo ss -tulpn | grep ':3000'
+<span class="out">tcp   LISTEN 0   511   0.0.0.0:3000   0.0.0.0:*   users:(("node",pid=48211,fd=21))</span></pre>
+        <p>Fix: pick another host port (<code class="inl">-p 8081:3000</code>), or stop the other container/process.</p>
+
+        <div class="callout example">
+          <span class="c-title">Example: app bound to 127.0.0.1 inside the container</span>
+<pre><span class="cm"># server.js has app.listen(3000, '127.0.0.1')</span>
+<span class="pr">$</span> curl localhost:8080/health
+<span class="out">curl: (56) Recv failure: Connection reset by peer</span></pre>
+          <p>The port mapping works, but the app only accepts connections from <em>inside</em> its own namespace. Listen on <code class="inl">0.0.0.0</code> (S4) — Docker's NAT delivers traffic to the container's <code class="inl">eth0</code>, not its loopback.</p>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Reversing the order: <code class="inl">-p 3000:8080</code> maps host 3000 to container 8080, where nothing listens.</li>
+            <li>On an Ubuntu server with <code class="inl">ufw</code>: Docker writes its own iptables rules, so <code class="inl">-p 5432:5432</code> is reachable from the internet <strong>even if ufw denies 5432</strong>. Bind to <code class="inl">127.0.0.1</code> or don't publish internal services at all.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">-p HOST:CONTAINER</code>, optionally prefixed with a host IP. Publish only the entry point (web), keep DBs internal. App must listen on 0.0.0.0.
+        </div>
+      </section>
+
+      <!-- ===================== 4. VOLUMES ===================== -->
+      <section id="volumes">
+        <h2><span class="sec-num">4</span> Docker volumes</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A container is a hotel room — cleaned out when you leave. A volume is a locker you rent: whatever you put in stays, no matter how many rooms you check in and out of.</p>
+        </div>
+
+        <ul>
+          <li>A container's writable layer is deleted with <code class="inl">docker rm</code>. Anything that must survive (DB files, uploads) goes on a mount.</li>
+          <li>A <span class="term">named volume</span> is storage managed by Docker, stored at <code class="inl">/var/lib/docker/volumes/&lt;name&gt;/_data</code> on Linux (inside the Docker Desktop VM on Mac/Windows).</li>
+        </ul>
+<pre>┌──────────── container ────────────┐
+│ /var/lib/postgresql/data  ────────┼──▶ volume  pgdata   (Docker-managed area)
+│ /app                      ────────┼──▶ bind    /home/shaurya/taskflow (any host path)
+│ /tmp                      ────────┼──▶ tmpfs   host RAM, gone when container stops
+└───────────────────────────────────┘</pre>
+
+        <h3>Demo: Postgres data survives <code class="inl">docker rm</code></h3>
+<pre><span class="pr">$</span> docker volume create pgdata
+<span class="out">pgdata</span>
+<span class="pr">$</span> docker run -d --name db --network taskflow-net \
+    -e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=taskflow \
+    -v pgdata:/var/lib/postgresql/data \
+    postgres:16-alpine
+<span class="pr">$</span> docker exec db psql -U taskflow -c "CREATE TABLE notes(msg text);"
+<span class="out">CREATE TABLE</span>
+<span class="pr">$</span> docker exec db psql -U taskflow -c "INSERT INTO notes VALUES ('survives rm');"
+<span class="out">INSERT 0 1</span>
+
+<span class="pr">$</span> docker rm -f db                         <span class="cm"># container gone…</span>
+<span class="pr">$</span> docker run -d --name db --network taskflow-net \
+    -e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=taskflow \
+    -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+<span class="pr">$</span> docker exec db psql -U taskflow -c "SELECT * FROM notes;"
+<span class="out">     msg
+-------------
+ survives rm
+(1 row)</span></pre>
+
+        <h3>Managing volumes</h3>
+<pre><span class="pr">$</span> docker volume ls
+<span class="out">DRIVER    VOLUME NAME
+local     4e1f9c2b7a0d63e58f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7
+local     pgdata</span>
+
+<span class="pr">$</span> docker volume inspect pgdata
+<span class="out">[
+    {
+        "CreatedAt": "2026-10-09T10:12:31Z",
+        "Driver": "local",
+        "Labels": null,
+        "Mountpoint": "/var/lib/docker/volumes/pgdata/_data",
+        "Name": "pgdata",
+        "Options": null,
+        "Scope": "local"
+    }
+]</span>
+
+<span class="pr">$</span> docker volume rm pgdata
+<span class="out">Error response from daemon: remove pgdata: volume is in use - [8b1e4f2a9c7d…]</span>
+
+<span class="pr">$</span> docker volume prune            <span class="cm"># removes unused ANONYMOUS volumes only</span>
+<span class="out">WARNING! This will remove anonymous local volumes not used by at least one container.
+Are you sure you want to continue? [y/N] y
+Deleted Volumes:
+4e1f9c2b7a0d63e58f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7
+
+Total reclaimed space: 47.2MB</span>
+<span class="pr">$</span> docker volume prune -a         <span class="cm"># also unused NAMED volumes — data loss!</span></pre>
+        <ul>
+          <li>The long hex name above is an <span class="term">anonymous volume</span>: the <code class="inl">postgres</code> image declares <code class="inl">VOLUME /var/lib/postgresql/data</code>, so a container started without <code class="inl">-v</code> gets a random-named one. Hard to find again — always name your volumes.</li>
+          <li><code class="inl">docker rm -v &lt;ctr&gt;</code> and <code class="inl">docker run --rm</code> delete anonymous volumes with the container; named volumes are never deleted implicitly.</li>
+          <li>Long syntax (same thing): <code class="inl">--mount type=volume,src=pgdata,dst=/var/lib/postgresql/data</code>.</li>
+        </ul>
+
+        <h3>Backups</h3>
+<pre><span class="cm"># logical DB backup (preferred for databases)</span>
+<span class="pr">$</span> docker exec db pg_dump -U taskflow taskflow &gt; taskflow-2026-10-09.sql
+<span class="cm"># raw copy of any volume via a throwaway container</span>
+<span class="pr">$</span> docker run --rm -v pgdata:/data:ro -v "$(pwd)":/backup alpine:3.22 \
+    tar czf /backup/pgdata-2026-10-09.tgz -C /data .</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Typo in the volume name (<code class="inl">-v pgdta:/var/lib/…</code>) silently creates a new empty volume → "my data is gone".</li>
+            <li><strong>postgres:18+</strong> moved its data directory: mount the volume at <code class="inl">/var/lib/postgresql</code>, not <code class="inl">…/data</code>. This page uses postgres:16, where <code class="inl">/var/lib/postgresql/data</code> is correct.</li>
+            <li>Copying a live Postgres volume with <code class="inl">tar</code> can produce a corrupt backup — stop the container first or use <code class="inl">pg_dump</code>.</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Named volume = persistent, Docker-managed storage that outlives containers. <code class="inl">-v name:/path</code>. Prune carefully: <code class="inl">prune</code> = anonymous only, <code class="inl">prune -a</code> = named too.
+        </div>
+      </section>
+
+      <!-- ===================== 5. BIND MOUNTS ===================== -->
+      <section id="bind-mounts">
+        <h2><span class="sec-num">5</span> Bind mounts &amp; tmpfs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A bind mount is a window from the container straight into a folder on your laptop. Change a file on either side, the other side sees it instantly.</p>
+        </div>
+
+        <ul>
+          <li>A <span class="term">bind mount</span> maps an existing host path into the container. You choose the path; Docker doesn't manage it.</li>
+          <li>Main uses: live code reload in development, injecting config files (<code class="inl">:ro</code>), sharing host files like <code class="inl">/var/run/docker.sock</code> (dangerous — full control of Docker).</li>
+        </ul>
+
+        <h3>Dev live-reload for TaskFlow</h3>
+<pre><span class="pr">$</span> cd ~/taskflow
+<span class="pr">$</span> docker run -d --name api-dev --network taskflow-net -p 3000:3000 \
+    -e DATABASE_URL=postgres://taskflow:devpass@db:5432/taskflow \
+    -v "$(pwd)":/app \
+    -v /app/node_modules \
+    shauryav/taskflow-api:1.0 node --watch server.js
+<span class="pr">$</span> docker logs -f api-dev
+<span class="out">listening on 3000
+Restarting 'server.js'
+listening on 3000</span>     <span class="cm">← after you saved server.js on the host</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Part</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-v "$(pwd)":/app</code></td><td>Host project folder replaces the image's <code class="inl">/app</code>. Quote it — paths with spaces break otherwise.</td></tr>
+              <tr><td><code class="inl">-v /app/node_modules</code></td><td>Anonymous volume over <code class="inl">node_modules</code> so the image's Linux-built modules aren't hidden by your host (macOS) folder.</td></tr>
+              <tr><td><code class="inl">node --watch server.js</code></td><td>Overrides CMD; Node restarts on file change (or use <code class="inl">nodemon</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Read-only config &amp; the two syntaxes</h3>
+<pre><span class="cm"># -v short syntax, read-only</span>
+<span class="pr">$</span> docker run -d --name web -p 8080:80 \
+    -v "$(pwd)"/web/nginx.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+<span class="cm"># --mount long syntax — same effect, explicit keys</span>
+<span class="pr">$</span> docker run -d --name web -p 8080:80 \
+    --mount type=bind,src="$(pwd)"/web/nginx.conf,dst=/etc/nginx/conf.d/default.conf,readonly \
+    nginx:1.28-alpine</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Host path doesn't exist</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-v ./nginx.conf:/etc/nginx/conf.d/default.conf</code></td><td>Docker <strong>creates an empty directory</strong> named <code class="inl">nginx.conf</code> → <code class="inl">error mounting … not a directory: Are you trying to mount a directory onto a file (or vice-versa)?</code></td></tr>
+              <tr><td><code class="inl">--mount type=bind,src=./nginx.conf,…</code></td><td>Fails fast: <code class="inl">invalid mount config for type "bind": bind source path does not exist: /home/shaurya/taskflow/nginx.conf</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>tmpfs</h3>
+<pre><span class="pr">$</span> docker run -d --read-only --tmpfs /tmp:size=64m shauryav/taskflow-api:1.0
+<span class="pr">$</span> docker run -d --mount type=tmpfs,dst=/tmp,tmpfs-size=64m shauryav/taskflow-api:1.0</pre>
+        <p>In-memory, never written to disk, gone when the container stops (Linux only). Pairs well with <code class="inl">--read-only</code> root filesystems.</p>
+
+        <h3>Volumes vs bind mounts vs tmpfs</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Named volume</th><th>Bind mount</th><th>tmpfs</th></tr></thead>
+            <tbody>
+              <tr><td>Where data lives</td><td><code class="inl">/var/lib/docker/volumes/…</code></td><td>Any host path you pick</td><td>Host RAM</td></tr>
+              <tr><td>Managed by Docker (<code class="inl">docker volume ls</code>)</td><td>✅</td><td>❌</td><td>❌</td></tr>
+              <tr><td>Survives <code class="inl">docker rm</code></td><td>✅</td><td>✅ (it's your folder)</td><td>❌</td></tr>
+              <tr><td>Pre-filled from image</td><td>✅ empty volume gets the image's files at that path</td><td>❌ host folder hides image files</td><td>❌</td></tr>
+              <tr><td>Speed on Mac/Windows</td><td>Fast (inside the VM)</td><td>Slower (file sharing)</td><td>Fastest</td></tr>
+              <tr><td>Short syntax</td><td><code class="inl">-v pgdata:/path</code></td><td><code class="inl">-v /abs/or/./rel:/path</code></td><td><code class="inl">--tmpfs /path</code></td></tr>
+              <tr><td>Use for</td><td>Databases, persistent app data</td><td>Dev source code, config files</td><td>Secrets/scratch you don't want on disk</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Rule of thumb: <code class="inl">-v</code> value starting with <code class="inl">/</code> or <code class="inl">.</code> = bind mount; a plain name = named volume.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake (Linux)</span>
+          <p>A container running as root writes files into your bind-mounted folder → they show up owned by <code class="inl">root</code> and you can't edit them. Run with <code class="inl">--user "$(id -u):$(id -g)"</code> or use an image with a matching non-root user (node = uid 1000 = usually your user).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Bind mount = host folder inside the container (dev, config). Volume = Docker-managed persistence (DBs). tmpfs = RAM only. Prefer <code class="inl">--mount</code> when you want errors instead of surprises.
+        </div>
+      </section>
+
+      <!-- ===================== 6. COMPOSE FILES ===================== -->
+      <section id="compose">
+        <h2><span class="sec-num">6</span> Docker Compose: the files</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of shouting ten long <code class="inl">docker run</code> commands, you write one shopping list. <code class="inl">docker compose up</code> buys everything on it, in the right order.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Docker Compose</span> describes a multi-container app — services, networks, volumes — in one YAML file and runs it with <code class="inl">docker compose</code> (v2, a Docker CLI plugin; the old Python <code class="inl">docker-compose</code> is retired).</li>
+          <li>Default file name <code class="inl">compose.yaml</code> (<code class="inl">docker-compose.yml</code> still works). The top-level <code class="inl">version:</code> key is obsolete — leave it out.</li>
+          <li>Compose creates a network per project, so every service can reach every other by its <strong>service name</strong> (<code class="inl">db</code>, <code class="inl">redis</code>…).</li>
+        </ul>
+
+<pre>taskflow/
+├── compose.yaml              <span class="cm"># the stack</span>
+├── compose.override.yaml     <span class="cm"># dev-only tweaks, auto-merged (§7)</span>
+├── .env                      <span class="cm"># variables for ${…} substitution (gitignored)</span>
+├── .env.example              <span class="cm"># committed template of .env</span>
+├── api.env                   <span class="cm"># env vars injected into the api container</span>
+├── Dockerfile  .dockerignore  server.js  package.json  package-lock.json
+├── db/init.sql               <span class="cm"># creates the tasks table on first start</span>
+└── web/
+    ├── nginx.conf            <span class="cm"># reverse proxy config</span>
+    └── public/index.html     <span class="cm"># static frontend</span></pre>
+
+<pre>browser ──:8080──▶ web (nginx :80) ──/api/*──▶ api (:3000) ──▶ db (postgres :5432)
+                   └─ frontend net ─┘           │  └───────▶ redis (:6379)
+                                                └──────── backend net ────────┘</pre>
+        <p><code class="inl">api</code> sits on both networks; <code class="inl">web</code> can't reach <code class="inl">db</code> at all.</p>
+
+        <div class="fname">compose.yaml</div>
+<pre><span class="kw">name:</span> taskflow                                    <span class="cm"># project name → prefix for containers/networks/volumes</span>
+
+<span class="kw">services:</span>
+  web:
+    image: nginx:1.28-alpine
+    ports:
+      - <span class="st">"${WEB_PORT:-8080}:80"</span>                    <span class="cm"># the ONLY public entry point</span>
+    volumes:
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./web/public:/usr/share/nginx/html:ro
+    depends_on:
+      api:
+        condition: service_healthy                <span class="cm"># nginx needs "api" resolvable at startup</span>
+    networks: [frontend]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .                                  <span class="cm"># folder containing the Dockerfile (S7)</span>
+      target: runtime                             <span class="cm"># stage to build</span>
+    image: shauryav/taskflow-api:${TAG:-dev}      <span class="cm"># name:tag for the built image</span>
+    env_file: ./api.env                           <span class="cm"># NODE_ENV, LOG_LEVEL, … into the container</span>
+    environment:
+      PORT: <span class="st">"3000"</span>
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - <span class="st">"127.0.0.1:3000:3000"</span>                     <span class="cm"># debug access from this machine only</span>
+    healthcheck:
+      test: [<span class="st">"CMD"</span>, <span class="st">"wget"</span>, <span class="st">"-qO-"</span>, <span class="st">"http://127.0.0.1:3000/health"</span>]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      db:
+        condition: service_healthy                <span class="cm"># wait until pg_isready succeeds</span>
+      redis:
+        condition: service_started
+    networks: [frontend, backend]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data          <span class="cm"># named volume → survives "down"</span>
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: [<span class="st">"CMD-SHELL"</span>, <span class="st">"pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"</span>]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]                           <span class="cm"># no ports: → not reachable from the host</span>
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: [<span class="st">"redis-server"</span>, <span class="st">"--appendonly"</span>, <span class="st">"yes"</span>]   <span class="cm"># persist to /data</span>
+    volumes:
+      - redis-data:/data
+    networks: [backend]
+    restart: unless-stopped
+
+<span class="kw">networks:</span>
+  frontend:
+  backend:
+
+<span class="kw">volumes:</span>
+  db-data:
+  redis-data:</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Key</th><th>What it does</th><th><code class="inl">docker run</code> equivalent</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">name</code></td><td>Project name (default: folder name). Resources become <code class="inl">taskflow-api-1</code>, <code class="inl">taskflow_backend</code>, <code class="inl">taskflow_db-data</code>.</td><td>—</td></tr>
+              <tr><td><code class="inl">services.&lt;name&gt;</code></td><td>One container definition; the name is also its DNS name.</td><td><code class="inl">--name</code></td></tr>
+              <tr><td><code class="inl">image</code></td><td>Image to run. With <code class="inl">build</code> too: the tag given to the built image.</td><td>image argument</td></tr>
+              <tr><td><code class="inl">build.context</code> / <code class="inl">target</code></td><td>Build from a Dockerfile (optionally <code class="inl">dockerfile:</code>, <code class="inl">args:</code>).</td><td><code class="inl">docker build --target</code></td></tr>
+              <tr><td><code class="inl">ports</code></td><td><code class="inl">"HOST:CONTAINER"</code> — quote them (YAML can misread <code class="inl">22:22</code>-style values).</td><td><code class="inl">-p</code></td></tr>
+              <tr><td><code class="inl">environment</code></td><td>Env vars set directly (map or list).</td><td><code class="inl">-e</code></td></tr>
+              <tr><td><code class="inl">env_file</code></td><td>Load env vars from a file into the container.</td><td><code class="inl">--env-file</code></td></tr>
+              <tr><td><code class="inl">volumes</code> (service)</td><td><code class="inl">name:/path</code> = named volume, <code class="inl">./path:/path</code> = bind mount, <code class="inl">:ro</code> = read-only.</td><td><code class="inl">-v</code></td></tr>
+              <tr><td><code class="inl">healthcheck</code></td><td>Same as Dockerfile HEALTHCHECK; overrides it. <code class="inl">CMD</code> = exec form, <code class="inl">CMD-SHELL</code> = via <code class="inl">sh -c</code>.</td><td><code class="inl">--health-cmd</code> …</td></tr>
+              <tr><td><code class="inl">depends_on</code> + <code class="inl">condition</code></td><td>Start order. <code class="inl">service_started</code> (default), <code class="inl">service_healthy</code> (waits for healthcheck), <code class="inl">service_completed_successfully</code> (one-shot jobs like migrations).</td><td>—</td></tr>
+              <tr><td><code class="inl">command</code></td><td>Overrides the image's CMD (<code class="inl">entrypoint:</code> overrides ENTRYPOINT).</td><td>args after image</td></tr>
+              <tr><td><code class="inl">networks</code> (service)</td><td>Which networks to join. If omitted, all services join <code class="inl">taskflow_default</code>.</td><td><code class="inl">--network</code></td></tr>
+              <tr><td><code class="inl">restart</code></td><td><code class="inl">no</code> | <code class="inl">always</code> | <code class="inl">on-failure</code> | <code class="inl">unless-stopped</code>.</td><td><code class="inl">--restart</code></td></tr>
+              <tr><td>top-level <code class="inl">networks</code> / <code class="inl">volumes</code></td><td>Declare them (created on <code class="inl">up</code>). Empty value = defaults (bridge / local).</td><td><code class="inl">docker network/volume create</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3><code class="inl">.env</code> — variables for the compose file</h3>
+        <div class="fname">.env</div>
+<pre><span class="cm"># Read automatically by `docker compose` from the project folder.</span>
+<span class="cm"># Used for ${VAR} substitution in compose.yaml — NOT injected into containers by itself.</span>
+<span class="cm"># Gitignored. Commit .env.example (same keys, dummy values) instead.</span>
+TAG=1.0
+WEB_PORT=8080
+POSTGRES_USER=taskflow
+POSTGRES_PASSWORD=dev-only-Xk82pQ
+POSTGRES_DB=taskflow</pre>
+        <div class="fname">api.env</div>
+<pre><span class="cm"># env_file: every KEY=VALUE line becomes an env var inside the api container</span>
+NODE_ENV=production
+LOG_LEVEL=info
+CACHE_TTL_SECONDS=30</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Syntax in compose.yaml</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">${TAG}</code></td><td>Value from shell env or <code class="inl">.env</code> (shell wins); empty string + warning if unset.</td></tr>
+              <tr><td><code class="inl">${WEB_PORT:-8080}</code></td><td>Default 8080 if unset or empty.</td></tr>
+              <tr><td><code class="inl">${POSTGRES_PASSWORD:?msg}</code></td><td>Abort with <code class="inl">msg</code> if unset — fail fast instead of an empty DB password.</td></tr>
+              <tr><td><code class="inl">$$HOME</code></td><td>Literal <code class="inl">$HOME</code>, expanded later inside the container.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Inside a container, precedence (highest first): <code class="inl">docker compose run -e</code> → <code class="inl">environment:</code> → <code class="inl">env_file:</code> → image <code class="inl">ENV</code>.</p>
+
+        <h3>Supporting files</h3>
+        <div class="fname">web/nginx.conf</div>
+<pre><span class="cm"># mounted as /etc/nginx/conf.d/default.conf</span>
+server {
+    listen 80;
+    server_name _;
+
+    <span class="cm"># static frontend</span>
+    root  /usr/share/nginx/html;
+    index index.html;
+
+    <span class="cm"># /api/tasks → http://api:3000/tasks  (trailing "/" on proxy_pass strips the /api prefix)</span>
+    location /api/ {
+        proxy_pass http://api:3000/;
+        proxy_set_header Host            $host;
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    <span class="cm"># single-page app: unknown paths fall back to index.html</span>
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}</pre>
+        <div class="fname">db/init.sql</div>
+<pre><span class="cm">-- runs ONCE: only when the db-data volume is empty (first start)</span>
+CREATE TABLE IF NOT EXISTS tasks (
+  id         SERIAL PRIMARY KEY,
+  title      TEXT        NOT NULL,
+  done       BOOLEAN     NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Changed <code class="inl">init.sql</code> or <code class="inl">POSTGRES_PASSWORD</code> but nothing happened? Both apply only when the data volume is empty. Existing volume = old password, old schema. (Reset with <code class="inl">down -v</code> — destroys data.)</li>
+            <li><code class="inl">depends_on: [db]</code> (short form) only waits for the container to <em>start</em>, not for Postgres to accept connections → API crashes with <code class="inl">ECONNREFUSED</code> on first boot. Use <code class="inl">condition: service_healthy</code> + a healthcheck.</li>
+            <li>Putting secrets in <code class="inl">compose.yaml</code> and committing it. Keep them in <code class="inl">.env</code> (gitignored).</li>
+          </ul>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          services + networks + volumes in one file. <code class="inl">.env</code> = substitution, <code class="inl">env_file</code>/<code class="inl">environment</code> = container env. <code class="inl">depends_on</code> + <code class="inl">service_healthy</code> for real readiness.
+        </div>
+      </section>
+
+      <!-- ===================== 7. COMPOSE RUN ===================== -->
+      <section id="compose-run">
+        <h2><span class="sec-num">7</span> Running the multi-container app</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>One command to start the whole band, one to see who's playing, one to read their notes, one to send everyone home.</p>
+        </div>
+
+        <h3>Check, then start</h3>
+<pre><span class="cm"># validate + show the fully-resolved file (variables substituted). Careful: prints secrets.</span>
+<span class="pr">$</span> docker compose config | grep DATABASE_URL
+<span class="out">      DATABASE_URL: postgres://taskflow:dev-only-Xk82pQ@db:5432/taskflow</span>
+
+<span class="pr">$</span> docker compose up -d --build
+<span class="out">[+] Building 16.3s (17/17) FINISHED
+ =&gt; [api build 4/7] RUN --mount=type=cache,target=/root/.npm npm ci             9.0s
+ =&gt; [api build 6/7] RUN npm test                                                3.1s
+[+] Running 9/9
+ ✔ api                          Built                                           0.0s
+ ✔ Network taskflow_frontend    Created                                         0.1s
+ ✔ Network taskflow_backend     Created                                         0.1s
+ ✔ Volume "taskflow_db-data"    Created                                         0.0s
+ ✔ Volume "taskflow_redis-data" Created                                         0.0s
+ ✔ Container taskflow-db-1      Healthy                                         6.4s
+ ✔ Container taskflow-redis-1   Started                                         0.6s
+ ✔ Container taskflow-api-1     Healthy                                        17.9s
+ ✔ Container taskflow-web-1     Started                                        18.2s</span></pre>
+        <p>Order follows <code class="inl">depends_on</code>: db (healthy) → api (healthy) → web. <code class="inl">-d</code> = detached, <code class="inl">--build</code> = rebuild images that have a <code class="inl">build:</code> section.</p>
+
+<pre><span class="pr">$</span> docker compose ps
+<span class="out">NAME               IMAGE                       COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+taskflow-api-1     shauryav/taskflow-api:1.0   "/sbin/tini -- node …"   api       52 seconds ago   Up 40 seconds (healthy)   127.0.0.1:3000-&gt;3000/tcp
+taskflow-db-1      postgres:16-alpine          "docker-entrypoint.s…"   db        52 seconds ago   Up 51 seconds (healthy)   5432/tcp
+taskflow-redis-1   redis:7-alpine              "docker-entrypoint.s…"   redis     52 seconds ago   Up 51 seconds             6379/tcp
+taskflow-web-1     nginx:1.28-alpine           "/docker-entrypoint.…"   web       52 seconds ago   Up 29 seconds             0.0.0.0:8080-&gt;80/tcp, [::]:8080-&gt;80/tcp</span></pre>
+        <p><code class="inl">5432/tcp</code> without an arrow = port open inside the network but <strong>not</strong> published to the host.</p>
+
+        <h3>Use it</h3>
+<pre><span class="pr">$</span> curl -s localhost:8080/api/health
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -s -X POST localhost:8080/api/tasks -H 'Content-Type: application/json' -d '{"title":"Write S8 notes"}'
+<span class="out">{"id":1,"title":"Write S8 notes","done":false}</span>
+
+<span class="pr">$</span> docker compose logs -f --tail=20 api
+<span class="out">api-1  | listening on 3000
+api-1  | GET /health 200 1.8ms
+api-1  | POST /tasks 201 14.2ms</span>
+
+<span class="pr">$</span> docker compose exec db psql -U taskflow
+<span class="out">psql (16.10)
+Type "help" for help.
+
+taskflow=# SELECT id, title, done FROM tasks;
+ id |     title      | done
+----+----------------+------
+  1 | Write S8 notes | f
+(1 row)
+
+taskflow=# \q</span></pre>
+
+        <h3>Network isolation check</h3>
+<pre><span class="pr">$</span> docker compose exec api nslookup db
+<span class="out">Server:		127.0.0.11
+Address:	127.0.0.11:53
+
+Non-authoritative answer:
+Name:	db
+Address: 172.19.0.3</span>
+<span class="pr">$</span> docker compose exec web ping -c1 db
+<span class="out">ping: bad address 'db'</span>          <span class="cm">← web is only on "frontend"; db only on "backend"</span></pre>
+
+        <h3>Day-2 commands</h3>
+<pre><span class="pr">$</span> docker compose restart api              <span class="cm"># restart one service (no rebuild, no config reload)</span>
+<span class="pr">$</span> docker compose up -d api                <span class="cm"># re-create api if compose.yaml/.env changed</span>
+<span class="pr">$</span> docker compose pull                     <span class="cm"># fetch newer images for image-only services</span>
+<span class="pr">$</span> docker compose stop                     <span class="cm"># stop containers, keep them</span>
+<span class="pr">$</span> docker compose down                     <span class="cm"># remove containers + networks; volumes KEPT</span>
+<span class="out">[+] Running 6/6
+ ✔ Container taskflow-web-1    Removed                                          0.3s
+ ✔ Container taskflow-api-1    Removed                                          0.6s
+ ✔ Container taskflow-redis-1  Removed                                          0.2s
+ ✔ Container taskflow-db-1     Removed                                          0.3s
+ ✔ Network taskflow_frontend   Removed                                          0.2s
+ ✔ Network taskflow_backend    Removed                                          0.2s</span>
+<span class="pr">$</span> docker compose up -d &amp;&amp; curl -s localhost:8080/api/tasks
+<span class="out">[{"id":1,"title":"Write S8 notes","done":false}]</span>   <span class="cm">← data survived (named volume)</span>
+
+<span class="pr">$</span> docker compose down -v                  <span class="cm"># ALSO deletes db-data and redis-data → all data gone</span></pre>
+
+        <h3>Dev override file</h3>
+        <div class="fname">compose.override.yaml</div>
+<pre><span class="cm"># merged automatically on top of compose.yaml by `docker compose up` (dev only)</span>
+<span class="kw">services:</span>
+  api:
+    command: [<span class="st">"node"</span>, <span class="st">"--watch"</span>, <span class="st">"server.js"</span>]   <span class="cm"># replaces CMD: restart on file change</span>
+    environment:
+      NODE_ENV: development                        <span class="cm"># merged key by key with the base file</span>
+      LOG_LEVEL: debug
+    volumes:
+      - ./:/app                                    <span class="cm"># bind mount: live source code</span>
+      - /app/node_modules                          <span class="cm"># keep the image's node_modules</span>
+  db:
+    ports:
+      - <span class="st">"127.0.0.1:5432:5432"</span>                      <span class="cm"># psql / DBeaver from the host</span></pre>
+        <ul>
+          <li>Merge rules: single values (<code class="inl">command</code>, <code class="inl">image</code>) are replaced; <code class="inl">environment</code> merges by key; <code class="inl">ports</code>/<code class="inl">volumes</code> are combined.</li>
+          <li>Passing <code class="inl">-f</code> disables the automatic override: production = <code class="inl">docker compose -f compose.yaml up -d</code> (or <code class="inl">-f compose.yaml -f compose.prod.yaml</code>).</li>
+          <li><code class="inl">docker compose config</code> shows the merged result. (Alternative for dev: <code class="inl">develop.watch</code> + <code class="inl">docker compose watch</code> syncs files without bind mounts.)</li>
+        </ul>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li><code class="inl">docker compose up -d --scale api=3</code> fails with <code class="inl">port is already allocated</code> — three replicas can't share host port 3000. Remove <code class="inl">ports:</code> from scaled services and go through nginx.</li>
+            <li>Edited code but <code class="inl">docker compose up -d</code> runs the old version → you forgot <code class="inl">--build</code>.</li>
+            <li><code class="inl">nginx: [emerg] host not found in upstream "api"</code> → web started before api existed or isn't on a shared network.</li>
+          </ul>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p><code class="inl">down</code> is safe for data; <code class="inl">down -v</code> is not. Everything in the stack is reproducible from <code class="inl">compose.yaml</code> + <code class="inl">.env</code> — except what lives in volumes.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          <code class="inl">config</code> → <code class="inl">up -d --build</code> → <code class="inl">ps</code> / <code class="inl">logs -f</code> / <code class="inl">exec</code> → <code class="inl">down</code>. Override files for dev, <code class="inl">-f</code> for prod.
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">docker network ls / create NAME / rm NAME</code></td><td>List / create (bridge) / delete networks.</td></tr>
+              <tr><td><code class="inl">docker network inspect NAME</code></td><td>Subnet, gateway, attached containers + IPs.</td></tr>
+              <tr><td><code class="inl">docker network connect [--alias X] NET CTR</code></td><td>Attach a running container to a network.</td></tr>
+              <tr><td><code class="inl">docker run --network NET --name db …</code></td><td>Start a container on a network (reachable as <code class="inl">db</code>).</td></tr>
+              <tr><td><code class="inl">docker run -p [IP:]HOST:CTR …</code> / <code class="inl">-P</code></td><td>Publish ports.</td></tr>
+              <tr><td><code class="inl">docker port CTR</code></td><td>Show a container's published ports.</td></tr>
+              <tr><td><code class="inl">docker volume create / ls / inspect / rm NAME</code></td><td>Manage named volumes.</td></tr>
+              <tr><td><code class="inl">docker volume prune [-a]</code></td><td>Delete unused anonymous [and named] volumes.</td></tr>
+              <tr><td><code class="inl">docker run -v NAME:/path</code> / <code class="inl">-v "$(pwd)":/app</code> / <code class="inl">--tmpfs /tmp</code></td><td>Volume / bind mount / tmpfs.</td></tr>
+              <tr><td><code class="inl">docker compose config</code></td><td>Validate + print the resolved (merged, substituted) config.</td></tr>
+              <tr><td><code class="inl">docker compose up -d --build</code></td><td>Build if needed and start the stack in the background.</td></tr>
+              <tr><td><code class="inl">docker compose ps</code></td><td>Status, health and ports of the project's containers.</td></tr>
+              <tr><td><code class="inl">docker compose logs -f [--tail=50] api</code></td><td>Follow one service's logs.</td></tr>
+              <tr><td><code class="inl">docker compose exec db psql -U taskflow</code></td><td>Run a command in a running service container.</td></tr>
+              <tr><td><code class="inl">docker compose restart api</code> / <code class="inl">pull</code> / <code class="inl">stop</code></td><td>Restart a service / update images / stop without removing.</td></tr>
+              <tr><td><code class="inl">docker compose down</code> / <code class="inl">down -v</code></td><td>Remove containers + networks / also delete volumes (data loss).</td></tr>
+              <tr><td><code class="inl">docker compose -f compose.yaml -f compose.prod.yaml up -d</code></td><td>Use explicit files (skips the auto override).</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>TaskFlow is four containers that find each other by name over user-defined bridge networks (Docker's DNS at 127.0.0.11), with only nginx published to the host via <code class="inl">-p</code>/<code class="inl">ports</code>. Postgres and Redis keep state in named volumes that survive <code class="inl">down</code>; bind mounts feed nginx its config and give you live reload in dev. <code class="inl">compose.yaml</code> + <code class="inl">.env</code> capture all of it, and <code class="inl">depends_on: service_healthy</code> starts things in the right order. Kubernetes (S9+) replaces these pieces with Services, PersistentVolumes and Deployments across many machines.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>Two containers on the default <code class="inl">bridge</code> can't reach each other by name, but on a network you created they can. Why?</summary>
+          <p class="ans">Only user-defined networks get Docker's embedded DNS (127.0.0.11) that resolves container/service names. The default bridge supports IPs only (or legacy <code class="inl">--link</code>).</p>
+        </details>
+        <details class="quiz">
+          <summary>In <code class="inl">-p 8080:3000</code>, which number is the container port, and what URL does another container on the same network use?</summary>
+          <p class="ans">3000 is the container port (format HOST:CONTAINER). Another container uses <code class="inl">http://api:3000</code> — the published 8080 is only for the host/outside.</p>
+        </details>
+        <details class="quiz">
+          <summary>What's the difference between <code class="inl">docker compose down</code> and <code class="inl">docker compose down -v</code>?</summary>
+          <p class="ans"><code class="inl">down</code> removes containers and networks but keeps named volumes (data survives). <code class="inl">-v</code> also removes the named volumes declared in the file — the database is wiped.</p>
+        </details>
+        <details class="quiz">
+          <summary>Named volume vs bind mount — which would you use for Postgres data and which for live-reloading source code?</summary>
+          <p class="ans">Named volume for Postgres (Docker-managed, portable, fast, survives container removal). Bind mount for source code (you edit host files, the container sees them immediately).</p>
+        </details>
+        <details class="quiz">
+          <summary>The API crashes on <code class="inl">docker compose up</code> with <code class="inl">ECONNREFUSED db:5432</code>, then works after a restart. Fix?</summary>
+          <p class="ans">Postgres wasn't ready yet. Add a <code class="inl">pg_isready</code> healthcheck to db and <code class="inl">depends_on: db: condition: service_healthy</code> on api (plus retry logic in the app).</p>
+        </details>
+        <details class="quiz">
+          <summary><code class="inl">.env</code> vs <code class="inl">env_file:</code> — which one puts variables inside the container?</summary>
+          <p class="ans"><code class="inl">env_file:</code> (and <code class="inl">environment:</code>). The project <code class="inl">.env</code> is read by Compose only for <code class="inl">${VAR}</code> substitution in the YAML.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 8: Docker Networking, Volumes &amp; Compose.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.docker.com/engine/network/" target="_blank" rel="noopener">Networking overview</a> and <a href="https://docs.docker.com/engine/network/drivers/bridge/" target="_blank" rel="noopener">bridge driver</a> — default vs user-defined bridges.</li>
+          <li><a href="https://docs.docker.com/engine/storage/volumes/" target="_blank" rel="noopener">Volumes</a> and <a href="https://docs.docker.com/engine/storage/bind-mounts/" target="_blank" rel="noopener">bind mounts</a> — <code class="inl">-v</code> vs <code class="inl">--mount</code>.</li>
+          <li><a href="https://docs.docker.com/reference/compose-file/" target="_blank" rel="noopener">Compose file reference</a> — every key in <code class="inl">compose.yaml</code>.</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/startup-order/" target="_blank" rel="noopener">Control startup order</a> — <code class="inl">depends_on</code> conditions.</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/environment-variables/" target="_blank" rel="noopener">Environment variables in Compose</a> — <code class="inl">.env</code>, interpolation, precedence.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-7.html"><div class="dir">← Previous</div><div class="ttl">Session 7: Docker Images &amp; Dockerfile</div></a>
+        <a class="next" href="session-9.html"><div class="dir">Next →</div><div class="ttl">Session 9: Kubernetes Fundamentals</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 8 — Docker Networking, Volumes &amp; Compose</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>

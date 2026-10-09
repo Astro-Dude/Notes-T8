@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>DevOps · Session 21 — Cloud &amp; Terraform in Action</title>
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+</head>
+<body data-accent="devops">
+  <div id="progress"></div>
+
+  <header class="topbar">
+    <a class="brand" href="../../../index.html"><span class="brand-dot">📚</span> Study Notes</a>
+    <span class="crumbs">/ <a href="../../../index.html">Home</a> / <a href="../index.html">DevOps</a> / Session 21</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="theme-btn" title="Toggle dark mode">🌙</button>
+  </header>
+
+  <main class="wrap">
+    <section class="page-hero">
+      <span class="kicker">Term 9 · DevOps · Session 21</span>
+      <h1>Cloud &amp; Terraform in Action</h1>
+      <p class="lead">
+        Learn the cloud building blocks (service models, regions/AZs, VPC, subnets, route tables, security groups), then
+        provision a VPC and an EC2 instance running TaskFlow in <code class="inl">ap-south-1</code> with Terraform, and tear it all down again.
+      </p>
+      <div class="hero-meta"><span class="badge-rt">⏱ 31 min read</span><span class="badge-rt">📖 7 topics</span></div>
+    </section>
+
+    <div class="article-layout">
+
+      <nav class="toc" aria-label="Table of contents">
+        <h4>On this page</h4>
+        <ol>
+          <li><a href="#cloud">Cloud fundamentals</a></li>
+          <li><a href="#service-models">IaaS, PaaS, SaaS</a></li>
+          <li><a href="#regions">Regions &amp; Availability Zones</a></li>
+          <li><a href="#vpc">VPC, subnets &amp; route tables</a></li>
+          <li><a href="#security-groups">Security groups vs NACLs</a></li>
+          <li><a href="#tf-project">The Terraform project files</a></li>
+          <li><a href="#provision">Provision, verify, destroy</a></li>
+          <li><a href="#commands">Commands you must know</a></li>
+          <li><a href="#wrapup">Putting it all together</a></li>
+          <li><a href="#refs">References</a></li>
+        </ol>
+      </nav>
+
+      <article class="article">
+
+      <!-- ===================== 1. CLOUD ===================== -->
+      <section id="cloud">
+        <h2><span class="sec-num">1</span> Cloud fundamentals</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Instead of buying a generator for your house, you plug into the power grid and pay for the units you use. Cloud is the grid for computers.</p>
+        </div>
+
+        <p><span class="term">Cloud computing</span> = on-demand compute, storage and networking over the internet, paid per use. NIST's five characteristics: on-demand self-service, broad network access, resource pooling, rapid elasticity, measured service.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>On-premises</th><th>Cloud</th></tr></thead>
+            <tbody>
+              <tr><td>Cost model</td><td><strong>CapEx</strong>: buy servers up front, depreciate over years</td><td><strong>OpEx</strong>: pay-as-you-go, monthly bill</td></tr>
+              <tr><td>Getting a server</td><td>Weeks (order, rack, cable)</td><td>Minutes (API call / <code class="inl">terraform apply</code>)</td></tr>
+              <tr><td>Scaling</td><td>Buy for peak; idle the rest of the time</td><td><span class="term">Elasticity</span>: scale out and back in automatically</td></tr>
+              <tr><td>Maintenance</td><td>You: power, cooling, disks, hardware failures</td><td>Provider runs the data centres</td></tr>
+              <tr><td>Global reach</td><td>One building</td><td>Regions on every continent</td></tr>
+              <tr><td>Control</td><td>Full (hardware, network)</td><td>Limited to what the provider exposes</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: TaskFlow launch day</span>
+          <p>Normal load needs 2 servers; launch-day peak needs 10 for 3 hours. On-prem you buy 10 and 8 sit idle almost all year. In the cloud you run 2, auto-scale to 10, and pay for 8 × 3 extra instance-hours.</p>
+        </div>
+
+        <p>Deployment models: <strong>public</strong> (AWS, Azure, GCP), <strong>private</strong> (your own OpenStack/VMware), <strong>hybrid</strong> (on-prem + public, connected by VPN/Direct Connect), <strong>multi-cloud</strong> (several public clouds).</p>
+
+        <h3>Shared responsibility model</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>AWS — security <em>of</em> the cloud</th><th>You — security <em>in</em> the cloud</th></tr></thead>
+            <tbody>
+              <tr><td>Data centres, physical access, hardware, hypervisor, global network, internals of managed services</td><td>Your data, IAM users/policies, OS patches on EC2, app code, security group rules, encryption settings, keys</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The line moves with the service: on <strong>EC2</strong> you patch Ubuntu; on <strong>RDS</strong> AWS patches the OS and Postgres, you manage DB users and network access; on <strong>S3</strong> you only own bucket policies, encryption and "block public access".</p>
+
+        <h3>Same service, three clouds</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Category</th><th>AWS</th><th>Azure</th><th>GCP</th></tr></thead>
+            <tbody>
+              <tr><td>Virtual machines</td><td>EC2</td><td>Virtual Machines</td><td>Compute Engine</td></tr>
+              <tr><td>Managed Kubernetes</td><td>EKS</td><td>AKS</td><td>GKE</td></tr>
+              <tr><td>Serverless functions</td><td>Lambda</td><td>Azure Functions</td><td>Cloud Run functions</td></tr>
+              <tr><td>Object storage</td><td>S3</td><td>Blob Storage</td><td>Cloud Storage</td></tr>
+              <tr><td>Block disks</td><td>EBS</td><td>Managed Disks</td><td>Persistent Disk</td></tr>
+              <tr><td>Managed PostgreSQL</td><td>RDS / Aurora</td><td>Azure Database for PostgreSQL</td><td>Cloud SQL</td></tr>
+              <tr><td>Private network</td><td>VPC</td><td>VNet</td><td>VPC</td></tr>
+              <tr><td>Firewall</td><td>Security Groups + NACLs</td><td>Network Security Groups</td><td>VPC firewall rules</td></tr>
+              <tr><td>Load balancer</td><td>ELB (ALB / NLB)</td><td>Load Balancer / Application Gateway</td><td>Cloud Load Balancing</td></tr>
+              <tr><td>DNS</td><td>Route 53</td><td>Azure DNS</td><td>Cloud DNS</td></tr>
+              <tr><td>Identity &amp; access</td><td>IAM</td><td>Entra ID + Azure RBAC</td><td>Cloud IAM</td></tr>
+              <tr><td>Container registry</td><td>ECR</td><td>ACR</td><td>Artifact Registry</td></tr>
+              <tr><td>Monitoring</td><td>CloudWatch</td><td>Azure Monitor</td><td>Cloud Monitoring</td></tr>
+              <tr><td>Terraform provider</td><td><code class="inl">hashicorp/aws</code></td><td><code class="inl">hashicorp/azurerm</code></td><td><code class="inl">hashicorp/google</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Talking to AWS from the terminal</h3>
+<pre><span class="pr">$</span> aws --version
+<span class="out">aws-cli/2.31.12 Python/3.13.7 Darwin/25.0.0 exe/arm64</span>
+<span class="pr">$</span> aws configure                                  <span class="cm"># keys from IAM → Users → shaurya-terraform → Security credentials</span>
+<span class="out">AWS Access Key ID [None]: AKIA****************
+AWS Secret Access Key [None]: ****************************************
+Default region name [None]: ap-south-1
+Default output format [None]: json</span>
+<span class="pr">$</span> aws sts get-caller-identity                    <span class="cm"># "who am I?" — first thing to run when anything fails</span>
+<span class="out">{
+    "UserId": "AIDA4QX7EXAMPLE2K3LMN",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/shaurya-terraform"
+}</span>
+<span class="pr">$</span> aws configure list
+<span class="out">      Name                    Value             Type    Location
+      ----                    -----             ----    --------
+   profile                &lt;not set&gt;             None    None
+access_key     ****************7QXA shared-credentials-file
+secret_key     ****************k9Lm shared-credentials-file
+    region               ap-south-1      config-file    ~/.aws/config</span></pre>
+        <p><code class="inl">aws configure</code> writes two files: <code class="inl">~/.aws/credentials</code> (<code class="inl">[default]</code> + <code class="inl">aws_access_key_id</code> / <code class="inl">aws_secret_access_key</code>) and <code class="inl">~/.aws/config</code> (<code class="inl">[default]</code> + <code class="inl">region = ap-south-1</code>, <code class="inl">output = json</code>). Terraform's AWS provider reads the same files.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>Creating access keys for the <strong>root</strong> user. Enable MFA on root, never use it day to day, and create an IAM user (or IAM Identity Center + <code class="inl">aws sso login</code>). For this page <code class="inl">AmazonEC2FullAccess</code> is enough — VPC APIs live under <code class="inl">ec2:*</code>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Cloud = rented, elastic, pay-per-use infrastructure (OpEx). AWS secures the cloud, you secure what you put in it. Every AWS service has an Azure/GCP twin.
+        </div>
+      </section>
+
+      <!-- ===================== 2. SERVICE MODELS ===================== -->
+      <section id="service-models">
+        <h2><span class="sec-num">2</span> IaaS, PaaS, SaaS</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Pizza: make it at home (on-prem), rent a kitchen with an oven (IaaS), order a pizza kit that the shop bakes (PaaS), or just eat at the restaurant (SaaS).</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Layer</th><th>On-prem</th><th>IaaS</th><th>PaaS</th><th>SaaS</th></tr></thead>
+            <tbody>
+              <tr><td>Application</td><td>You</td><td>You</td><td>You</td><td>Provider</td></tr>
+              <tr><td>Data</td><td>You</td><td>You</td><td>You</td><td>Provider (you own the content)</td></tr>
+              <tr><td>Runtime (Node 20) &amp; middleware</td><td>You</td><td>You</td><td>Provider</td><td>Provider</td></tr>
+              <tr><td>Operating system</td><td>You</td><td>You</td><td>Provider</td><td>Provider</td></tr>
+              <tr><td>Virtualization</td><td>You</td><td>Provider</td><td>Provider</td><td>Provider</td></tr>
+              <tr><td>Servers, storage, networking</td><td>You</td><td>Provider</td><td>Provider</td><td>Provider</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Model</th><th>You hand over</th><th>Examples</th><th>TaskFlow on it</th></tr></thead>
+            <tbody>
+              <tr><td><strong>IaaS</strong></td><td>A VM image + your setup</td><td>AWS EC2, Azure VMs, GCP Compute Engine, DigitalOcean</td><td>Install Docker, run the containers yourself (§6–7 of this page)</td></tr>
+              <tr><td><strong>CaaS</strong></td><td>Container images</td><td>ECS on Fargate, EKS/AKS/GKE (managed control plane), Cloud Run, Azure Container Apps</td><td>Push <code class="inl">taskflow-api</code> image; platform schedules it</td></tr>
+              <tr><td><strong>PaaS</strong></td><td>Source code</td><td>AWS Elastic Beanstalk, Heroku, Google App Engine, Azure App Service; RDS as a managed DB</td><td><code class="inl">git push</code>; platform builds, runs, scales</td></tr>
+              <tr><td><strong>FaaS</strong> (serverless)</td><td>A function</td><td>AWS Lambda, Azure Functions, Cloud Run functions</td><td>One function per endpoint; pay per request, scales to zero</td></tr>
+              <tr><td><strong>SaaS</strong></td><td>Nothing — you just use it</td><td>Gmail, Slack, Salesforce, GitHub, Jira</td><td>If you sold TaskFlow, your customers would use it as SaaS</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout key">
+          <span class="c-title">Key takeaway</span>
+          <p>Moving right (IaaS → PaaS → SaaS) = less control, less ops work, faster start. EC2 is IaaS, so <em>you</em> patch the OS — exactly what the shared responsibility model says.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          IaaS = VMs (you manage OS up), PaaS = platform runs your code (you manage app + data), SaaS = finished product. CaaS and FaaS sit between IaaS and PaaS.
+        </div>
+      </section>
+
+      <!-- ===================== 3. REGIONS / AZS ===================== -->
+      <section id="regions">
+        <h2><span class="sec-num">3</span> Regions &amp; Availability Zones</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A region is a city where AWS has data centres; AZs are separate buildings in that city, on different power and network lines. If one building floods, the others keep running.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Region</span> = a geographic area with its own independent set of services, e.g. <code class="inl">ap-south-1</code> (Mumbai), <code class="inl">ap-south-2</code> (Hyderabad), <code class="inl">us-east-1</code> (N. Virginia). Most resources (VPC, EC2) live in exactly one region.</li>
+          <li><span class="term">Availability Zone (AZ)</span> = one or more isolated data centres inside a region, connected by low-latency links: <code class="inl">ap-south-1a</code>, <code class="inl">-1b</code>, <code class="inl">-1c</code>.</li>
+          <li>Edge locations (CloudFront CDN, Route 53) are many more, smaller sites close to users.</li>
+        </ul>
+
+<pre><span class="pr">$</span> aws ec2 describe-availability-zones --region ap-south-1 \
+    --query "AvailabilityZones[].[ZoneName,ZoneId,State]" --output table
+<span class="out">-------------------------------------------
+|        DescribeAvailabilityZones        |
++--------------+------------+-------------+
+|  ap-south-1a |  aps1-az1  |  available  |
+|  ap-south-1b |  aps1-az3  |  available  |
+|  ap-south-1c |  aps1-az2  |  available  |
++--------------+------------+-------------+</span>
+<span class="pr">$</span> aws ec2 describe-regions --all-regions --query "Regions[?starts_with(RegionName,'ap-south')].[RegionName,OptInStatus]" --output text
+<span class="out">ap-south-2      not-opted-in
+ap-south-1      opt-in-not-required</span></pre>
+        <p><code class="inl">ZoneName</code> (<code class="inl">ap-south-1a</code>) is mapped to a physical zone differently per account; <code class="inl">ZoneId</code> (<code class="inl">aps1-az1</code>) is the same for everyone. Newer regions like Hyderabad are opt-in.</p>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Pick a region by</th><th>TaskFlow reasoning</th></tr></thead>
+            <tbody>
+              <tr><td>Latency to users</td><td>Users in India: Mumbai ≈ 10–30 ms vs <code class="inl">us-east-1</code> ≈ 200+ ms</td></tr>
+              <tr><td>Compliance / data residency</td><td>Customer data may need to stay in India (contracts, India's DPDP Act 2023)</td></tr>
+              <tr><td>Service availability</td><td>New services/instance types often launch in <code class="inl">us-east-1</code> first</td></tr>
+              <tr><td>Price</td><td>Same service costs differ by region; <code class="inl">us-east-1</code> is usually cheapest</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: multi-AZ for high availability</span>
+          <p>Run 2 TaskFlow instances, one in <code class="inl">ap-south-1a</code> and one in <code class="inl">ap-south-1b</code>, behind a load balancer; RDS in Multi-AZ mode (standby in another AZ). Losing a whole AZ halves capacity but nothing goes down. One instance in one AZ = single point of failure.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>AWS</th><th>Azure</th><th>GCP</th></tr></thead>
+            <tbody>
+              <tr><td>Region name</td><td><code class="inl">ap-south-1</code></td><td>Central India</td><td><code class="inl">asia-south1</code></td></tr>
+              <tr><td>Zone name</td><td><code class="inl">ap-south-1a</code></td><td>Zone 1 / 2 / 3</td><td><code class="inl">asia-south1-a</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>"My EC2 instance disappeared!" — the console is showing a different region (top-right selector). Resources are per region; Terraform created them in <code class="inl">var.aws_region</code>.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          Region = city, AZ = isolated building(s) in it. Choose region by latency, compliance, services, price; spread across ≥ 2 AZs for HA.
+        </div>
+      </section>
+
+      <!-- ===================== 4. VPC ===================== -->
+      <section id="vpc">
+        <h2><span class="sec-num">4</span> VPC, subnets &amp; route tables</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>The VPC is your private gated campus, subnets are the buildings, route tables are the signposts, the Internet Gateway is the main gate, and a NAT gateway is an exit-only turnstile.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">VPC</span> (Virtual Private Cloud) = your logically isolated network in one region, spanning all its AZs. You pick its private IP range as a CIDR, between <code class="inl">/16</code> and <code class="inl">/28</code> — TaskFlow uses <code class="inl">10.0.0.0/16</code> (65,536 addresses, RFC 1918 private, Session 4).</li>
+          <li>Every region has a <strong>default VPC</strong> (<code class="inl">172.31.0.0/16</code>, all subnets public) — fine for a quick test, not for real projects.</li>
+        </ul>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>AWS VPC</th><th>Azure VNet</th><th>GCP VPC</th></tr></thead>
+            <tbody>
+              <tr><td>Scope</td><td>One region</td><td>One region</td><td><strong>Global</strong></td></tr>
+              <tr><td>Subnet scope</td><td>One AZ</td><td>Whole region (spans zones)</td><td>One region</td></tr>
+              <tr><td>Firewall</td><td>Security groups + NACLs</td><td>NSGs</td><td>Firewall rules</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Subnets</h3>
+        <ul>
+          <li>A <span class="term">subnet</span> is a slice of the VPC CIDR that lives in <strong>exactly one AZ</strong>.</li>
+          <li><strong>Public subnet</strong> = its route table sends <code class="inl">0.0.0.0/0</code> to an Internet Gateway (and instances get a public IP). <strong>Private subnet</strong> = no route to the IGW; reachable only from inside the VPC.</li>
+          <li>AWS reserves <strong>5 IPs</strong> in every subnet. In <code class="inl">10.0.1.0/24</code>: <code class="inl">.0</code> network, <code class="inl">.1</code> VPC router, <code class="inl">.2</code> DNS, <code class="inl">.3</code> reserved, <code class="inl">.255</code> broadcast → 256 − 5 = <strong>251 usable</strong> (<code class="inl">10.0.1.4</code>–<code class="inl">10.0.1.254</code>). Azure also reserves 5; GCP 4.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Subnet</th><th>CIDR</th><th>AZ</th><th>Tier</th><th>Usable IPs</th></tr></thead>
+            <tbody>
+              <tr><td>public-a</td><td><code class="inl">10.0.1.0/24</code></td><td>ap-south-1a</td><td>public (ALB, NAT, our EC2)</td><td>251</td></tr>
+              <tr><td>public-b</td><td><code class="inl">10.0.2.0/24</code></td><td>ap-south-1b</td><td>public</td><td>251</td></tr>
+              <tr><td>private-a</td><td><code class="inl">10.0.11.0/24</code></td><td>ap-south-1a</td><td>private (app / DB)</td><td>251</td></tr>
+              <tr><td>private-b</td><td><code class="inl">10.0.12.0/24</code></td><td>ap-south-1b</td><td>private</td><td>251</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> terraform console                      <span class="cm"># compute subnets instead of doing binary by hand</span>
+<span class="pr">&gt;</span> cidrsubnet("10.0.0.0/16", 8, 1)        <span class="cm"># add 8 bits to /16 → /24, take network number 1</span>
+<span class="out">"10.0.1.0/24"</span>
+<span class="pr">&gt;</span> cidrsubnet("10.0.0.0/16", 8, 11)
+<span class="out">"10.0.11.0/24"</span>
+<span class="pr">&gt;</span> pow(2, 32 - 24) - 5
+<span class="out">251</span></pre>
+
+        <h3>Route tables</h3>
+        <ul>
+          <li>A <span class="term">route table</span> is a list of <em>destination CIDR → target</em>. Each subnet is associated with exactly one (the VPC's main table if you don't choose).</li>
+          <li>Every table has an automatic <code class="inl">local</code> route for the VPC CIDR. The most specific match wins: <code class="inl">10.0.11.25</code> matches both <code class="inl">10.0.0.0/16</code> and <code class="inl">0.0.0.0/0</code> → <code class="inl">/16</code> wins, traffic stays inside.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Table</th><th>Destination</th><th>Target</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td rowspan="2">public-rt</td><td><code class="inl">10.0.0.0/16</code></td><td><code class="inl">local</code></td><td>VPC-internal traffic</td></tr>
+              <tr><td><code class="inl">0.0.0.0/0</code></td><td><code class="inl">igw-0b2c3d4e5f6a78901</code></td><td>Everything else ↔ internet</td></tr>
+              <tr><td rowspan="2">private-rt</td><td><code class="inl">10.0.0.0/16</code></td><td><code class="inl">local</code></td><td>VPC-internal traffic</td></tr>
+              <tr><td><code class="inl">0.0.0.0/0</code></td><td><code class="inl">nat-0f1e2d3c4b5a69788</code></td><td>Outbound only (apt, docker pull); nothing can connect in</td></tr>
+              <tr><td>db-rt</td><td><code class="inl">10.0.0.0/16</code></td><td><code class="inl">local</code></td><td>No internet at all</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Internet Gateway (IGW)</th><th>NAT Gateway</th></tr></thead>
+            <tbody>
+              <tr><td>Direction</td><td>In and out</td><td>Out only (replies come back; new inbound connections can't)</td></tr>
+              <tr><td>Lives</td><td>Attached to the VPC (one per VPC)</td><td>In a <strong>public</strong> subnet, with an Elastic IP; one per AZ for HA</td></tr>
+              <tr><td>Used by</td><td>Public subnets</td><td>Private subnets</td></tr>
+              <tr><td>Instance needs public IP?</td><td>Yes</td><td>No</td></tr>
+              <tr><td>Cost</td><td>Free (data transfer billed)</td><td>Hourly (≈ US$0.05/h ≈ $40/month) + per-GB processing</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The classic 3-tier layout</h3>
+<pre>                                   Internet
+                                      │
+ VPC 10.0.0.0/16 (ap-south-1) ── Internet Gateway ──────────────────────────
+ │          ap-south-1a               │               ap-south-1b          │
+ │  ┌────────────────────────────┐    │    ┌────────────────────────────┐  │
+ │  │ public  10.0.1.0/24        │◀───┴───▶│ public  10.0.2.0/24        │  │ web tier: ALB, NAT GW
+ │  │ ALB · NAT GW               │         │ ALB                        │  │ RT: 0.0.0.0/0 → igw
+ │  └─────────────┬──────────────┘         └─────────────┬──────────────┘  │
+ │  ┌─────────────▼──────────────┐         ┌─────────────▼──────────────┐  │
+ │  │ private 10.0.11.0/24       │         │ private 10.0.12.0/24       │  │ app tier: taskflow-api
+ │  │ taskflow-api (EC2 / EKS)   │         │ taskflow-api (EC2 / EKS)   │  │ RT: 0.0.0.0/0 → nat
+ │  └─────────────┬──────────────┘         └─────────────┬──────────────┘  │
+ │  ┌─────────────▼──────────────┐         ┌─────────────▼──────────────┐  │
+ │  │ db      10.0.21.0/24       │         │ db      10.0.22.0/24       │  │ data tier: RDS Postgres
+ │  │ RDS primary                │         │ RDS standby (Multi-AZ)     │  │ RT: local only
+ │  └────────────────────────────┘         └────────────────────────────┘  │
+ └─────────────────────────────────────────────────────────────────────────┘</pre>
+        <p>Our Terraform project (§6) builds the public + private subnets of this picture but, to stay free-tier friendly, runs one EC2 directly in a public subnet and leaves the NAT gateway off.</p>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          VPC = regional private network (CIDR). Subnet = one AZ; public if its route table points <code class="inl">0.0.0.0/0</code> at an IGW. Private subnets go out via NAT. A /24 gives 251 usable IPs on AWS.
+        </div>
+      </section>
+
+      <!-- ===================== 5. SG vs NACL ===================== -->
+      <section id="security-groups">
+        <h2><span class="sec-num">5</span> Security groups vs NACLs</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>A security group is a bouncer at each flat's door who remembers who went out, so they can come back in. A NACL is a guard at the building gate with a checklist who checks everyone, in both directions, every time.</p>
+        </div>
+
+        <ul>
+          <li><span class="term">Security group (SG)</span>: virtual firewall on an instance's network interface. <strong>Stateful</strong>: if a request is allowed in, its reply is allowed out automatically. <strong>Allow rules only</strong>; anything not allowed is denied. A new SG allows all outbound, no inbound.</li>
+          <li>A rule's source can be a CIDR <em>or another security group</em> ("anything wearing the app-SG badge").</li>
+        </ul>
+
+        <p>TaskFlow app SG (what §6 creates):</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Direction</th><th>Port</th><th>Source / destination</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Inbound</td><td>22 (SSH)</td><td><code class="inl">203.0.113.45/32</code></td><td>Only your laptop</td></tr>
+              <tr><td>Inbound</td><td>80 (HTTP)</td><td><code class="inl">0.0.0.0/0</code></td><td>Public web</td></tr>
+              <tr><td>Inbound</td><td>3000</td><td><code class="inl">0.0.0.0/0</code></td><td>TaskFlow API directly</td></tr>
+              <tr><td>Outbound</td><td>All</td><td><code class="inl">0.0.0.0/0</code></td><td><code class="inl">apt-get</code>, Docker Hub pulls</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>A database SG that trusts the app servers by SG reference instead of IPs (for a future RDS in the private subnets):</p>
+<pre>resource "aws_security_group" "db" {
+  name   = "taskflow-dev-db-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    description     = "Postgres from app servers only"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]   <span class="cm"># source = another SG, not a CIDR</span>
+  }
+}</pre>
+
+        <ul>
+          <li><span class="term">Network ACL (NACL)</span>: firewall at the <strong>subnet</strong> boundary. <strong>Stateless</strong>: replies must be allowed explicitly. Has <strong>allow and deny</strong> rules, evaluated in rule-number order, first match wins. The default NACL allows everything; a new custom NACL denies everything.</li>
+        </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Rule #</th><th>Direction</th><th>Port</th><th>Source / dest</th><th>Action</th></tr></thead>
+            <tbody>
+              <tr><td>90</td><td>In</td><td>All</td><td><code class="inl">198.51.100.0/24</code></td><td>DENY (abusive range)</td></tr>
+              <tr><td>100</td><td>In</td><td>80, 3000</td><td><code class="inl">0.0.0.0/0</code></td><td>ALLOW</td></tr>
+              <tr><td>110</td><td>In</td><td>22</td><td><code class="inl">203.0.113.45/32</code></td><td>ALLOW</td></tr>
+              <tr><td>120</td><td>In</td><td>1024–65535</td><td><code class="inl">0.0.0.0/0</code></td><td>ALLOW (replies to our apt/docker downloads)</td></tr>
+              <tr><td>100</td><td>Out</td><td>80, 443</td><td><code class="inl">0.0.0.0/0</code></td><td>ALLOW</td></tr>
+              <tr><td>110</td><td>Out</td><td>1024–65535</td><td><code class="inl">0.0.0.0/0</code></td><td>ALLOW (replies to clients)</td></tr>
+              <tr><td>*</td><td>Both</td><td>All</td><td><code class="inl">0.0.0.0/0</code></td><td>DENY (implicit last rule)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout example">
+          <span class="c-title">Example: why "stateless" needs ephemeral ports</span>
+          <p>Your laptop <code class="inl">203.0.113.45:51514</code> calls <code class="inl">10.0.1.37:3000</code>. The reply goes back to port <code class="inl">51514</code>. The SG lets it out automatically (stateful). The NACL only lets it out because of outbound rule 110 for 1024–65535 — delete that rule and the request arrives but the reply is dropped: <code class="inl">curl</code> just hangs.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Security group</th><th>Network ACL</th></tr></thead>
+            <tbody>
+              <tr><td>Level</td><td>Instance (network interface)</td><td>Subnet</td></tr>
+              <tr><td>State</td><td><strong>Stateful</strong> — replies auto-allowed</td><td><strong>Stateless</strong> — allow replies explicitly</td></tr>
+              <tr><td>Rules</td><td>Allow only</td><td>Allow and deny</td></tr>
+              <tr><td>Evaluation</td><td>All rules, most permissive wins</td><td>In number order, first match wins</td></tr>
+              <tr><td>Source can be</td><td>CIDR or another SG</td><td>CIDR only</td></tr>
+              <tr><td>Default</td><td>New SG: no inbound, all outbound</td><td>Default NACL: allow all; custom NACL: deny all</td></tr>
+              <tr><td>Typical use</td><td>Main tool for every app</td><td>Coarse subnet guard, blocking specific IP ranges</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <p>In Terraform, <code class="inl">aws_security_group</code> <strong>removes</strong> AWS's default allow-all egress rule. Forget the <code class="inl">egress</code> block and the instance can't reach apt or Docker Hub; <code class="inl">user_data</code> fails silently.<br>
+          Opening port 22 to <code class="inl">0.0.0.0/0</code>: bots start brute-forcing SSH within minutes. Use <code class="inl">/32</code> of your IP (or SSM Session Manager).</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          SG = stateful, allow-only, per instance, can reference other SGs. NACL = stateless, allow + deny, numbered, per subnet, needs ephemeral-port rules for replies.
+        </div>
+      </section>
+
+      <!-- ===================== 6. TF PROJECT ===================== -->
+      <section id="tf-project">
+        <h2><span class="sec-num">6</span> The Terraform project files</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Everything from §3–§5 written down as a Terraform blueprint: AWS reads it and builds the campus, the gate, the signposts, the bouncer and one server.</p>
+        </div>
+
+<pre><span class="out"> VPC taskflow-dev-vpc 10.0.0.0/16 (ap-south-1)
+ ├── Internet Gateway ── public route table (0.0.0.0/0 → igw)
+ ├── public  10.0.1.0/24  (1a) ── EC2 t3.micro "taskflow-dev-app", Ubuntu 24.04
+ │                                Docker: api :3000 (+ :80) and postgres:16
+ │                                SG: 22 from my IP · 80, 3000 from anywhere
+ ├── public  10.0.2.0/24  (1b)    spare (second instance / ALB later)
+ ├── private 10.0.11.0/24 (1a) ─┐
+ ├── private 10.0.12.0/24 (1b) ─┴─ private route table (local only; NAT optional)
+ └── key pair taskflow-dev-key (your ~/.ssh/taskflow.pub)</span></pre>
+
+<pre><span class="out">taskflow/infra/
+├── providers.tf          terraform block + aws provider with default tags
+├── variables.tf          every input, with types and validation
+├── terraform.tfvars      values for this environment (no secrets)
+├── main.tf               network, security group, key pair, EC2
+├── user_data.sh.tftpl    first-boot script, rendered by templatefile()
+├── outputs.tf            public_ip, url, ssh_command
+└── backend.tf            optional: S3 state with use_lockfile (Session 20)</span></pre>
+
+        <div class="fname">infra/providers.tf</div>
+<pre>terraform {
+  required_version = "&gt;= 1.10.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region            <span class="cm"># ap-south-1</span>
+
+  default_tags {                     <span class="cm"># merged into the tags of EVERY resource below</span>
+    tags = {
+      Project     = var.project
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}</pre>
+        <p><code class="inl">default_tags</code> means you can find (and bill) everything by <code class="inl">Project=taskflow</code>; in plans they appear under <code class="inl">tags_all</code>.</p>
+
+        <div class="fname">infra/variables.tf</div>
+<pre>variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "ap-south-1"
+}
+
+variable "project" {
+  type    = string
+  default = "taskflow"
+}
+
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "azs" {
+  description = "AZs for the subnets (one public + one private subnet each)"
+  type        = list(string)
+  default     = ["ap-south-1a", "ap-south-1b"]
+}
+
+variable "public_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "private_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.11.0/24", "10.0.12.0/24"]
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"                <span class="cm"># free-tier eligible</span>
+}
+
+variable "my_ip_cidr" {
+  description = "Your public IP as /32 — the only source allowed to SSH"
+  type        = string                <span class="cm"># no default: you must set it</span>
+  validation {
+    condition     = can(cidrhost(var.my_ip_cidr, 0)) &amp;&amp; endswith(var.my_ip_cidr, "/32")
+    error_message = "my_ip_cidr must be a single IPv4 address like 203.0.113.45/32."
+  }
+}
+
+variable "public_key_path" {
+  type    = string
+  default = "~/.ssh/taskflow.pub"
+}
+
+variable "app_image" {
+  description = "Public Docker Hub image to run"
+  type        = string
+  default     = "shauryav/taskflow-api:1.0"
+}
+
+variable "enable_nat_gateway" {
+  description = "NAT gateway for private subnets — billed every hour"
+  type        = bool
+  default     = false
+}
+
+variable "db_password" {
+  description = "Postgres password; set with export TF_VAR_db_password=..."
+  type        = string
+  sensitive   = true
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]{12,}$", var.db_password))
+    error_message = "db_password: 12+ chars, only letters, digits, _ and - (it goes inside a URL)."
+  }
+}</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Variable</th><th>Note</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">azs</code>, <code class="inl">*_subnet_cidrs</code></td><td>Lists of the same length; index <code class="inl">i</code> of each belongs together (used with <code class="inl">count.index</code>).</td></tr>
+              <tr><td><code class="inl">my_ip_cidr</code></td><td><code class="inl">cidrhost()</code> fails on garbage, <code class="inl">can()</code> turns that into <code class="inl">false</code>; plus it must end in <code class="inl">/32</code>.</td></tr>
+              <tr><td><code class="inl">enable_nat_gateway</code></td><td>Feature flag → <code class="inl">count = var.enable_nat_gateway ? 1 : 0</code> in main.tf.</td></tr>
+              <tr><td><code class="inl">db_password</code></td><td>No default, <code class="inl">sensitive</code>, URL-safe characters only (an <code class="inl">@</code> or <code class="inl">:</code> would break <code class="inl">DATABASE_URL</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">infra/terraform.tfvars</div>
+<pre>aws_region         = "ap-south-1"
+environment        = "dev"
+instance_type      = "t3.micro"
+my_ip_cidr         = "203.0.113.45/32"      <span class="cm"># curl -s https://checkip.amazonaws.com, then add /32</span>
+public_key_path    = "~/.ssh/taskflow.pub"
+app_image          = "shauryav/taskflow-api:1.0"
+enable_nat_gateway = false
+<span class="cm"># db_password is deliberately NOT here: export TF_VAR_db_password='...'</span></pre>
+
+        <div class="fname">infra/main.tf</div>
+<pre>locals {
+  name = "${var.project}-${var.environment}"          <span class="cm"># "taskflow-dev" — prefix for Name tags</span>
+}
+
+<span class="cm"># ---------- Lookups ----------</span>
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]                       <span class="cm"># Canonical's AWS account (official Ubuntu)</span>
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+<span class="cm"># ---------- Network ----------</span>
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true                          <span class="cm"># Amazon DNS at 10.0.0.2</span>
+  enable_dns_hostnames = true                          <span class="cm"># instances get ec2-…compute.amazonaws.com names</span>
+  tags = { Name = "${local.name}-vpc" }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${local.name}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  count                   = length(var.public_subnet_cidrs)       <span class="cm"># 2 → public[0], public[1]</span>
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true                       <span class="cm"># instances here get a public IPv4</span>
+  tags = { Name = "${local.name}-public-${var.azs[count.index]}", Tier = "public" }
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.azs[count.index]
+  tags = { Name = "${local.name}-private-${var.azs[count.index]}", Tier = "private" }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"                           <span class="cm"># everything not local…</span>
+    gateway_id = aws_internet_gateway.main.id          <span class="cm"># …goes to the internet gateway</span>
+  }
+  tags = { Name = "${local.name}-public-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id           <span class="cm"># THIS is what makes the subnet "public"</span>
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id                             <span class="cm"># only the implicit local route</span>
+  tags   = { Name = "${local.name}-private-rt" }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(var.private_subnet_cidrs)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+<span class="cm"># ---------- Optional NAT (off by default: ~$40/month) ----------</span>
+resource "aws_eip" "nat" {
+  count  = var.enable_nat_gateway ? 1 : 0
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = var.enable_nat_gateway ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public[0].id              <span class="cm"># a NAT gateway lives in a PUBLIC subnet</span>
+  depends_on    = [aws_internet_gateway.main]
+  tags          = { Name = "${local.name}-nat" }
+}
+
+resource "aws_route" "private_nat" {
+  count                  = var.enable_nat_gateway ? 1 : 0
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.main[0].id
+}
+
+<span class="cm"># ---------- Security ----------</span>
+resource "aws_security_group" "app" {
+  name        = "${local.name}-app-sg"
+  description = "TaskFlow app: SSH from my IP, HTTP and 3000 from anywhere"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "SSH from my laptop only"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "TaskFlow API"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    description = "All outbound (apt, Docker Hub)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"                                 <span class="cm"># -1 = all protocols</span>
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "${local.name}-app-sg" }
+}
+
+<span class="cm"># ---------- Compute ----------</span>
+resource "aws_key_pair" "deployer" {
+  key_name   = "${local.name}-key"
+  public_key = file(var.public_key_path)               <span class="cm"># only the PUBLIC key goes to AWS</span>
+}
+
+resource "aws_instance" "app" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.public[0].id      <span class="cm"># 10.0.1.0/24 in ap-south-1a</span>
+  vpc_security_group_ids = [aws_security_group.app.id]
+  key_name               = aws_key_pair.deployer.key_name
+
+  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+    app_image   = var.app_image
+    db_password = var.db_password
+  })
+  user_data_replace_on_change = true                   <span class="cm"># edit the script → new instance (it only runs on 1st boot)</span>
+
+  root_block_device {
+    volume_size = 20                                   <span class="cm"># GB; free tier covers 30 GB of EBS</span>
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  metadata_options {
+    http_tokens = "required"                           <span class="cm"># IMDSv2 only (blocks SSRF-style metadata theft)</span>
+  }
+
+  depends_on = [aws_route_table_association.public]    <span class="cm"># boot script needs the internet route first</span>
+
+  lifecycle {
+    ignore_changes = [ami]                             <span class="cm"># a newer Ubuntu AMI next week must NOT replace the server</span>
+  }
+
+  tags = { Name = "${local.name}-app" }
+}</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Block</th><th>What / why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">data "aws_ami" "ubuntu"</code></td><td>Finds the newest official Ubuntu 24.04 (Noble) x86_64 image in the region. AMI IDs differ per region, so never hard-code one copied from a blog.</td></tr>
+              <tr><td><code class="inl">aws_vpc.main</code></td><td>The <code class="inl">10.0.0.0/16</code> network. DNS options let instances resolve names.</td></tr>
+              <tr><td><code class="inl">aws_internet_gateway.main</code></td><td>The internet door, attached to the VPC.</td></tr>
+              <tr><td><code class="inl">aws_subnet.public[*]</code> / <code class="inl">private[*]</code></td><td><code class="inl">count</code> creates one per AZ. Only public subnets auto-assign public IPs.</td></tr>
+              <tr><td><code class="inl">aws_route_table.public</code> + associations</td><td>Route <code class="inl">0.0.0.0/0 → igw</code>; associating it is what turns a subnet public.</td></tr>
+              <tr><td><code class="inl">aws_route_table.private</code></td><td>Local route only. With <code class="inl">enable_nat_gateway = true</code>, <code class="inl">aws_route.private_nat</code> adds <code class="inl">0.0.0.0/0 → nat</code>.</td></tr>
+              <tr><td><code class="inl">aws_eip</code> / <code class="inl">aws_nat_gateway</code></td><td><code class="inl">count = cond ? 1 : 0</code> = on/off switch. Referenced as <code class="inl">[0]</code> because they're lists.</td></tr>
+              <tr><td><code class="inl">aws_security_group.app</code></td><td>The SG table from §5. Inline <code class="inl">ingress</code>/<code class="inl">egress</code> blocks; the provider also offers separate <code class="inl">aws_vpc_security_group_ingress_rule</code> resources (recommended for big setups).</td></tr>
+              <tr><td><code class="inl">aws_key_pair.deployer</code></td><td>Uploads your public key; AWS puts it in <code class="inl">/home/ubuntu/.ssh/authorized_keys</code>.</td></tr>
+              <tr><td><code class="inl">user_data = templatefile(…)</code></td><td>Renders the script with the given variables; cloud-init runs it as root on first boot.</td></tr>
+              <tr><td><code class="inl">depends_on</code></td><td>Explicit dependency (Session 20): nothing in the instance references the route association, but <code class="inl">apt-get</code> needs it.</td></tr>
+              <tr><td><code class="inl">ignore_changes = [ami]</code></td><td>Without it, <code class="inl">most_recent = true</code> makes a later plan show <code class="inl">-/+ aws_instance.app</code> (destroy your server) whenever Canonical publishes a new image.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">infra/user_data.sh.tftpl</div>
+<pre>#!/bin/bash
+<span class="cm"># Rendered by Terraform templatefile(); cloud-init runs it ONCE, as root, on first boot.</span>
+<span class="cm"># Output goes to /var/log/cloud-init-output.log</span>
+set -euxo pipefail                     <span class="cm"># stop on errors, echo every command into the log</span>
+
+<span class="cm"># 1. Docker from Ubuntu's own repo; let the 'ubuntu' user run docker without sudo</span>
+apt-get update -y
+apt-get install -y docker.io
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+<span class="cm"># 2. Config for both containers. ${db_password} is replaced by TERRAFORM before bash runs.</span>
+<span class="cm">#    'EOF' is quoted so bash doesn't expand $ inside; set -x doesn't print heredoc lines.</span>
+mkdir -p /opt/taskflow
+cat &gt; /opt/taskflow/app.env &lt;&lt;'EOF'
+POSTGRES_USER=taskflow
+POSTGRES_DB=taskflow
+POSTGRES_PASSWORD=${db_password}
+PORT=3000
+DATABASE_URL=postgres://taskflow:${db_password}@db:5432/taskflow
+EOF
+chmod 600 /opt/taskflow/app.env
+
+<span class="cm"># 3. Network + Postgres + API (same as Session 8, without Compose)</span>
+docker network create taskflow-net
+docker run -d --name db --network taskflow-net --restart unless-stopped \
+  --env-file /opt/taskflow/app.env \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16
+docker run -d --name api --network taskflow-net --restart unless-stopped \
+  --env-file /opt/taskflow/app.env \
+  -p 80:3000 -p 3000:3000 \
+  ${app_image}
+
+echo "TaskFlow bootstrapped on $(hostname) at $(date -Is)"</pre>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">${db_password}</code>, <code class="inl">${app_image}</code></td><td>Template variables passed in <code class="inl">templatefile()</code>. Terraform only treats <code class="inl">${…}</code> and <code class="inl">%{…}</code> specially, so <code class="inl">$(hostname)</code> is left for bash. A literal bash <code class="inl">${VAR}</code> must be written <code class="inl">$${VAR}</code>.</td></tr>
+              <tr><td><code class="inl">&lt;&lt;'EOF'</code></td><td>Quoted heredoc: bash writes the lines exactly as rendered (a <code class="inl">$</code> in the password stays a <code class="inl">$</code>).</td></tr>
+              <tr><td><code class="inl">--env-file</code> (not <code class="inl">-e POSTGRES_PASSWORD=…</code>)</td><td>With <code class="inl">set -x</code>, every command line is copied into <code class="inl">/var/log/cloud-init-output.log</code>; a password passed with <code class="inl">-e</code> would end up in that log.</td></tr>
+              <tr><td><code class="inl">--restart unless-stopped</code></td><td>The API may start before Postgres is ready and exit; Docker restarts it until the DB answers. Also survives reboots.</td></tr>
+              <tr><td><code class="inl">-p 80:3000 -p 3000:3000</code></td><td>Same container on two host ports: <code class="inl">http://IP/</code> and <code class="inl">http://IP:3000/</code>.</td></tr>
+              <tr><td><code class="inl">-v pgdata:…</code></td><td>Named volume, so data survives a container restart (not instance termination — use RDS or EBS snapshots for that).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="fname">infra/outputs.tf</div>
+<pre>output "vpc_id" {
+  value = aws_vpc.main.id
+}
+
+output "public_ip" {
+  description = "Public IPv4 of the app server"
+  value       = aws_instance.app.public_ip
+}
+
+output "url" {
+  description = "TaskFlow base URL"
+  value       = "http://${aws_instance.app.public_ip}:3000"
+}
+
+output "ssh_command" {
+  value = "ssh -i ${trimsuffix(var.public_key_path, ".pub")} ubuntu@${aws_instance.app.public_ip}"
+}</pre>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistake</span>
+          <p>The rendered <code class="inl">user_data</code> (with the DB password) is stored in the instance metadata and in <code class="inl">terraform.tfstate</code>. Fine for a dev box; in production read secrets at boot from SSM Parameter Store / Secrets Manager via an IAM role.</p>
+        </div>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          providers.tf (region + default tags) · variables.tf (+ validation) · terraform.tfvars (no secrets) · main.tf (VPC → IGW → subnets → route tables → SG → key → EC2) · user_data template · outputs.tf.
+        </div>
+      </section>
+
+      <!-- ===================== 7. PROVISION ===================== -->
+      <section id="provision">
+        <h2><span class="sec-num">7</span> Provision, verify, destroy</h2>
+        <hr class="section-rule" />
+
+        <div class="callout eli5">
+          <span class="c-title">Explain like I'm 5</span>
+          <p>Press "build", check the house has lights and running water, then knock it down before the rent is due.</p>
+        </div>
+
+        <h3>0. One-time prerequisites</h3>
+<pre><span class="pr">$</span> aws sts get-caller-identity --query Arn --output text
+<span class="out">arn:aws:iam::123456789012:user/shaurya-terraform</span>
+<span class="pr">$</span> ssh-keygen -t ed25519 -f ~/.ssh/taskflow -C "taskflow-ec2" -N ""
+<span class="out">Generating public/private ed25519 key pair.
+Your identification has been saved in /Users/shaurya/.ssh/taskflow
+Your public key has been saved in /Users/shaurya/.ssh/taskflow.pub
+The key fingerprint is:
+SHA256:9mQ2v7cXr0Yb3kLs8TfN1pZ4hW6eJ5aD2uG7iO3qR1s taskflow-ec2</span>
+<span class="pr">$</span> curl -s https://checkip.amazonaws.com          <span class="cm"># → put "203.0.113.45/32" in terraform.tfvars</span>
+<span class="out">203.0.113.45</span>
+<span class="pr">$</span> export TF_VAR_db_password='Tf_dev_2026_x9Kq'</pre>
+
+        <h3>1. init, plan</h3>
+<pre><span class="pr">$</span> cd infra &amp;&amp; terraform init
+<span class="out">Initializing the backend...
+Initializing provider plugins...
+- Finding hashicorp/aws versions matching "~&gt; 5.0"...
+- Installing hashicorp/aws v5.100.0...
+- Installed hashicorp/aws v5.100.0 (signed by HashiCorp)
+Terraform has created a lock file .terraform.lock.hcl to record the provider
+selections it made above. …
+
+Terraform has been successfully initialized!</span>
+<span class="pr">$</span> terraform fmt -check &amp;&amp; terraform validate
+<span class="out">Success! The configuration is valid.</span>
+<span class="pr">$</span> terraform plan -out=tfplan
+<span class="out">data.aws_ami.ubuntu: Reading...
+data.aws_ami.ubuntu: Read complete after 1s [id=ami-0d1f9e2c3b4a59687]
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # aws_instance.app will be created
+  + resource "aws_instance" "app" {
+      + ami                         = "ami-0d1f9e2c3b4a59687"
+      + arn                         = (known after apply)
+      + availability_zone           = (known after apply)
+      + id                          = (known after apply)
+      + instance_type               = "t3.micro"
+      + key_name                    = "taskflow-dev-key"
+      + private_ip                  = (known after apply)
+      + public_ip                   = (known after apply)
+      + subnet_id                   = (known after apply)
+      + tags                        = {
+          + "Name" = "taskflow-dev-app"
+        }
+      + tags_all                    = {
+          + "Environment" = "dev"
+          + "ManagedBy"   = "terraform"
+          + "Name"        = "taskflow-dev-app"
+          + "Project"     = "taskflow"
+        }
+      + user_data                   = (sensitive value)
+      + user_data_replace_on_change = true
+      + vpc_security_group_ids      = (known after apply)
+        …
+      + metadata_options {
+          + http_tokens = "required"
+            …
+        }
+      + root_block_device {
+          + encrypted   = true
+          + volume_size = 20
+          + volume_type = "gp3"
+            …
+        }
+    }
+
+  # aws_subnet.public[0] will be created
+  + resource "aws_subnet" "public" {
+      + availability_zone       = "ap-south-1a"
+      + cidr_block              = "10.0.1.0/24"
+      + map_public_ip_on_launch = true
+      + vpc_id                  = (known after apply)
+        …
+    }
+
+  # aws_vpc.main will be created
+  + resource "aws_vpc" "main" {
+      + cidr_block           = "10.0.0.0/16"
+      + enable_dns_hostnames = true
+      + enable_dns_support   = true
+      + id                   = (known after apply)
+        …
+    }
+</span>  <span class="cm">… 12 more resources: igw, public[1], private[0..1], 2 route tables, 4 associations, SG, key pair …</span>
+<span class="out">
+Plan: 15 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + public_ip   = (known after apply)
+  + ssh_command = (known after apply)
+  + url         = (known after apply)
+  + vpc_id      = (known after apply)</span></pre>
+        <p>Check before applying: <strong>15 to add, 0 to destroy</strong>; <code class="inl">instance_type = "t3.micro"</code>; <code class="inl">user_data</code> is <code class="inl">(sensitive value)</code> because it contains <code class="inl">db_password</code>. The NAT resources aren't listed: <code class="inl">count = 0</code>.</p>
+
+        <h3>2. apply</h3>
+<pre><span class="pr">$</span> terraform apply tfplan
+<span class="out">aws_key_pair.deployer: Creating...
+aws_vpc.main: Creating...
+aws_key_pair.deployer: Creation complete after 1s [id=taskflow-dev-key]
+aws_vpc.main: Creation complete after 2s [id=vpc-0a1b2c3d4e5f67890]
+aws_internet_gateway.main: Creating...
+aws_subnet.public[0]: Creating...
+aws_subnet.public[1]: Creating...
+aws_security_group.app: Creating...
+aws_route_table.private: Creating...
+aws_internet_gateway.main: Creation complete after 1s [id=igw-0b2c3d4e5f6a78901]
+aws_route_table.public: Creating...
+aws_security_group.app: Creation complete after 3s [id=sg-0c3d4e5f6a7b89012]
+aws_subnet.public[0]: Still creating... [00m10s elapsed]
+aws_subnet.public[0]: Creation complete after 11s [id=subnet-0d4e5f6a7b8c90123]
+aws_route_table_association.public[0]: Creation complete after 1s [id=rtbassoc-0e5f6a7b8c9d01234]
+…
+aws_instance.app: Creating...
+aws_instance.app: Still creating... [00m10s elapsed]
+aws_instance.app: Creation complete after 13s [id=i-0c1d2e3f4a5b6c7d8]
+
+Apply complete! Resources: 15 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+public_ip = "13.233.150.21"
+ssh_command = "ssh -i ~/.ssh/taskflow ubuntu@13.233.150.21"
+url = "http://13.233.150.21:3000"
+vpc_id = "vpc-0a1b2c3d4e5f67890"</span></pre>
+        <p>Independent resources (key pair + VPC; subnets + SG + IGW) are created in parallel; the instance waits for subnet, SG, key and the route association.</p>
+
+        <h3>3. verify</h3>
+<pre><span class="pr">$</span> curl -sS "$(terraform output -raw url)/health"           <span class="cm"># 20 seconds after apply</span>
+<span class="out">curl: (7) Failed to connect to 13.233.150.21 port 3000 after 38 ms: Couldn't connect to server</span>
+<span class="pr">$</span> curl -sS "$(terraform output -raw url)/health"           <span class="cm"># ~2 minutes later: apt + docker pull finished</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> curl -s http://13.233.150.21/tasks                     <span class="cm"># port 80 → same container</span>
+<span class="out">[]</span>
+<span class="pr">$</span> ssh -i ~/.ssh/taskflow ubuntu@13.233.150.21
+<span class="out">The authenticity of host '13.233.150.21 (13.233.150.21)' can't be established.
+ED25519 key fingerprint is SHA256:Xb3l9mQ7rT2vK8pN5sW1yZ4cF6hJ0aD3gL7uE9iO2qM.
+Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
+Welcome to Ubuntu 24.04.3 LTS (GNU/Linux 6.14.0-1012-aws x86_64)</span>
+<span class="pr">ubuntu@ip-10-0-1-37:~$</span> cloud-init status --wait
+<span class="out">status: done</span>
+<span class="pr">ubuntu@ip-10-0-1-37:~$</span> docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+<span class="out">NAMES   IMAGE                       STATUS         PORTS
+api     shauryav/taskflow-api:1.0   Up 3 minutes   0.0.0.0:80-&gt;3000/tcp, 0.0.0.0:3000-&gt;3000/tcp
+db      postgres:16                 Up 3 minutes   5432/tcp</span>
+<span class="pr">ubuntu@ip-10-0-1-37:~$</span> sudo grep "TaskFlow bootstrapped" /var/log/cloud-init-output.log
+<span class="out">+ echo 'TaskFlow bootstrapped on ip-10-0-1-37 at 2026-10-09T05:31:02+00:00'
+TaskFlow bootstrapped on ip-10-0-1-37 at 2026-10-09T05:31:02+00:00</span></pre>
+        <p>The prompt shows the <em>private</em> IP (<code class="inl">10.0.1.37</code>, inside <code class="inl">10.0.1.0/24</code>); the public IP is mapped to it by the IGW. Note <code class="inl">5432/tcp</code> isn't published: Postgres is reachable only on <code class="inl">taskflow-net</code>.</p>
+<pre><span class="pr">$</span> aws ec2 describe-instances --filters "Name=tag:Project,Values=taskflow" "Name=instance-state-name,Values=running" \
+    --query "Reservations[].Instances[].{ID:InstanceId,Type:InstanceType,AZ:Placement.AvailabilityZone,IP:PublicIpAddress}" \
+    --output table
+<span class="out">------------------------------------------------------------------
+|                        DescribeInstances                       |
++--------------+-----------------------+----------------+--------+
+|      AZ      |          ID           |       IP       | Type   |
++--------------+-----------------------+----------------+--------+
+|  ap-south-1a |  i-0c1d2e3f4a5b6c7d8  |  13.233.150.21 |t3.micro|
++--------------+-----------------------+----------------+--------+</span></pre>
+
+        <div class="callout example">
+          <span class="c-title">Example: an in-place change</span>
+          <p>Set <code class="inl">instance_type = "t3.small"</code> and plan: <code class="inl">~ instance_type = "t3.micro" -&gt; "t3.small"</code>, <code class="inl">Plan: 0 to add, 1 to change, 0 to destroy</code>. AWS stops and starts the instance, so the <strong>public IP changes</strong> (attach an Elastic IP if it must stay fixed). Editing <code class="inl">user_data.sh.tftpl</code> instead gives <code class="inl">-/+</code> (replace), because of <code class="inl">user_data_replace_on_change</code>.</p>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Symptom</th><th>Likely cause</th><th>Check / fix</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">curl: (7) Failed to connect … port 3000</code> right after apply</td><td><code class="inl">user_data</code> still running</td><td>Wait; <code class="inl">cloud-init status --wait</code>; <code class="inl">docker ps</code></td></tr>
+              <tr><td><code class="inl">curl: (28) … timed out</code></td><td>Port not in SG, subnet not associated with the public route table, or no public IP</td><td><code class="inl">terraform state show aws_security_group.app</code>; check the association</td></tr>
+              <tr><td><code class="inl">ssh: … port 22: Operation timed out</code></td><td>Your public IP changed (hotspot / new Wi-Fi)</td><td>Update <code class="inl">my_ip_cidr</code>, <code class="inl">terraform apply</code></td></tr>
+              <tr><td><code class="inl">Permission denied (publickey)</code></td><td>Wrong key or user (<code class="inl">ubuntu</code> on Ubuntu, <code class="inl">ec2-user</code> on Amazon Linux)</td><td><code class="inl">ssh -i ~/.ssh/taskflow ubuntu@IP</code>; <code class="inl">chmod 600 ~/.ssh/taskflow</code></td></tr>
+              <tr><td><code class="inl">Error: No valid credential sources found</code></td><td>AWS CLI not configured</td><td><code class="inl">aws configure</code>, then <code class="inl">aws sts get-caller-identity</code></td></tr>
+              <tr><td><code class="inl">UnauthorizedOperation</code></td><td>IAM user lacks EC2 permissions</td><td>Attach <code class="inl">AmazonEC2FullAccess</code> (learning account)</td></tr>
+              <tr><td><code class="inl">InvalidKeyPair.Duplicate</code></td><td>Key name already exists (created by hand earlier)</td><td>Delete it in EC2 → Key pairs, or import it</td></tr>
+              <tr><td><code class="inl">docker logs api</code> → <code class="inl">exec format error</code></td><td>Image built for arm64 on a Mac</td><td>Build <code class="inl">--platform linux/amd64</code> or in CI (Session 19)</td></tr>
+              <tr><td><code class="inl">api</code> container keeps restarting</td><td>DB not ready yet / wrong <code class="inl">DATABASE_URL</code></td><td><code class="inl">docker logs api</code>, <code class="inl">cat /opt/taskflow/app.env</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>4. cost, then destroy</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Resource</th><th>Rough on-demand cost (ap-south-1)</th><th>Free tier</th></tr></thead>
+            <tbody>
+              <tr><td>EC2 t3.micro</td><td>≈ US$0.011/h (≈ $8/month)</td><td>Accounts created before 15 Jul 2025: 750 h/month of t2/t3.micro for 12 months. Newer accounts: Free plan with $100–200 credits for 6 months.</td></tr>
+              <tr><td>Public IPv4 address</td><td>$0.005/h (≈ $3.6/month)</td><td>750 h/month in the legacy free tier</td></tr>
+              <tr><td>EBS gp3, 20 GB</td><td>≈ $2/month</td><td>30 GB in the legacy free tier</td></tr>
+              <tr><td>NAT gateway (if enabled)</td><td>≈ $0.05/h + per-GB ≈ $40+/month</td><td><strong>Not free</strong></td></tr>
+              <tr><td>VPC, subnets, route tables, IGW, SG, key pair</td><td>Free</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <span class="c-title">Cost warning</span>
+          <p>Resources bill until <em>destroyed</em>, not when you close the laptop. Create a <strong>zero-spend budget</strong> (Billing → Budgets) so AWS emails you at the first cent, and run <code class="inl">terraform destroy</code> at the end of every session. Prices are approximate; check the AWS pricing page for your region.</p>
+        </div>
+
+<pre><span class="pr">$</span> terraform destroy
+<span class="out">…
+Plan: 0 to add, 0 to change, 15 to destroy.
+
+Changes to Outputs:
+  - public_ip   = "13.233.150.21" -&gt; null
+  - ssh_command = "ssh -i ~/.ssh/taskflow ubuntu@13.233.150.21" -&gt; null
+  - url         = "http://13.233.150.21:3000" -&gt; null
+  - vpc_id      = "vpc-0a1b2c3d4e5f67890" -&gt; null
+
+Do you really want to destroy all resources?
+  Terraform will destroy all your managed infrastructure, as shown above.
+  There is no undo. Only 'yes' will be accepted to confirm.
+
+  Enter a value: yes
+
+aws_route_table_association.private[0]: Destroying... [id=rtbassoc-0f6a7b8c9d0e12345]
+aws_instance.app: Destroying... [id=i-0c1d2e3f4a5b6c7d8]
+aws_instance.app: Still destroying... [id=i-0c1d2e3f4a5b6c7d8, 00m30s elapsed]
+aws_instance.app: Destruction complete after 42s
+aws_route_table_association.public[0]: Destroying... [id=rtbassoc-0e5f6a7b8c9d01234]
+aws_security_group.app: Destroying... [id=sg-0c3d4e5f6a7b89012]
+…
+aws_vpc.main: Destruction complete after 1s
+
+Destroy complete! Resources: 15 destroyed.</span>
+<span class="pr">$</span> aws ec2 describe-instances --filters "Name=tag:Project,Values=taskflow" "Name=instance-state-name,Values=running" \
+    --query "Reservations[].Instances[].InstanceId" --output text
+<span class="out"></span><span class="cm"># empty output = nothing left running</span></pre>
+
+        <div class="recap">
+          <span class="c-title">Recap</span>
+          prerequisites (credentials, key, IP, <code class="inl">TF_VAR_db_password</code>) → init → plan (15 to add) → apply → wait for cloud-init → curl / ssh / describe-instances → destroy (15 destroyed).
+        </div>
+      </section>
+
+      <!-- ===================== COMMANDS ===================== -->
+      <section id="commands">
+        <h2><span class="sec-num">⌘</span> Commands you must know</h2>
+        <hr class="section-rule" />
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">aws configure</code> · <code class="inl">aws configure list</code></td><td>Store / show CLI credentials and default region.</td></tr>
+              <tr><td><code class="inl">aws sts get-caller-identity</code></td><td>Which account and user am I using?</td></tr>
+              <tr><td><code class="inl">aws ec2 describe-availability-zones --region ap-south-1 --output table</code></td><td>List AZs (names + zone IDs).</td></tr>
+              <tr><td><code class="inl">aws ec2 describe-instances --filters … --query … --output table</code></td><td>Find instances by tag/state, show chosen fields.</td></tr>
+              <tr><td><code class="inl">aws ec2 describe-vpcs</code> · <code class="inl">describe-subnets</code> · <code class="inl">describe-security-groups</code></td><td>Inspect network resources.</td></tr>
+              <tr><td><code class="inl">ssh-keygen -t ed25519 -f ~/.ssh/taskflow -C taskflow-ec2</code></td><td>Create the key pair whose public half Terraform uploads.</td></tr>
+              <tr><td><code class="inl">curl -s https://checkip.amazonaws.com</code></td><td>Your public IP (for the SSH rule).</td></tr>
+              <tr><td><code class="inl">export TF_VAR_db_password='…'</code></td><td>Pass a secret variable without writing it to a file.</td></tr>
+              <tr><td><code class="inl">terraform console</code> → <code class="inl">cidrsubnet("10.0.0.0/16", 8, 1)</code></td><td>Compute subnet CIDRs.</td></tr>
+              <tr><td><code class="inl">terraform init</code> · <code class="inl">plan -out=tfplan</code> · <code class="inl">apply tfplan</code> · <code class="inl">destroy</code></td><td>The provisioning workflow (Session 20).</td></tr>
+              <tr><td><code class="inl">terraform output -raw url</code></td><td>Use an output in a script.</td></tr>
+              <tr><td><code class="inl">ssh -i ~/.ssh/taskflow ubuntu@IP</code></td><td>Log in to the instance.</td></tr>
+              <tr><td><code class="inl">cloud-init status --wait</code></td><td>On the instance: wait until <code class="inl">user_data</code> finished.</td></tr>
+              <tr><td><code class="inl">sudo cat /var/log/cloud-init-output.log</code></td><td>Output of the <code class="inl">user_data</code> script.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== WRAP-UP ===================== -->
+      <section id="wrapup">
+        <h2><span class="sec-num">★</span> Putting it all together</h2>
+        <hr class="section-rule" />
+        <div class="bigidea">
+          <span class="c-title">The big idea</span>
+          <p>EC2 is IaaS: you rent a VM in an AZ of a region and own everything from the OS up. It lives in a VPC you design: subnets per AZ, route tables that decide which are public (route to the IGW) and which are private (local, or NAT for outbound), and security groups that statefully allow only ports 22 (from you), 80 and 3000. Terraform turns that design into 15 resources from a handful of files, boots TaskFlow with a <code class="inl">user_data</code> template, and removes all of it with one <code class="inl">destroy</code> so the bill stops.</p>
+        </div>
+
+        <h3>Quick self-check</h3>
+        <details class="quiz">
+          <summary>How many usable IPs does a /24 subnet have on AWS, and why?</summary>
+          <p class="ans">251. 256 addresses minus 5 reserved by AWS: network (.0), VPC router (.1), DNS (.2), future use (.3), broadcast (.255).</p>
+        </details>
+        <details class="quiz">
+          <summary>What exactly makes a subnet "public"?</summary>
+          <p class="ans">Its associated route table has <code class="inl">0.0.0.0/0 → Internet Gateway</code>. Instances also need a public IP (<code class="inl">map_public_ip_on_launch</code> or an Elastic IP) to be reachable.</p>
+        </details>
+        <details class="quiz">
+          <summary>An SG allows inbound 3000 and has no outbound rule for high ports. Does the HTTP reply get out? What about a NACL with the same rules?</summary>
+          <p class="ans">SG: yes — stateful, replies are allowed automatically. NACL: no — stateless, it needs an outbound rule for ephemeral ports 1024–65535.</p>
+        </details>
+        <details class="quiz">
+          <summary>Internet Gateway vs NAT Gateway?</summary>
+          <p class="ans">IGW: two-way internet access for public subnets, free, attached to the VPC. NAT GW: outbound-only access for private subnets, lives in a public subnet with an Elastic IP, billed hourly + per GB.</p>
+        </details>
+        <details class="quiz">
+          <summary>TaskFlow on EC2 vs on RDS + Elastic Beanstalk — who patches the OS in each case?</summary>
+          <p class="ans">EC2 is IaaS: you patch Ubuntu. Beanstalk/RDS are PaaS-style managed services: AWS patches the OS (and the DB engine); you manage the app, data and access rules.</p>
+        </details>
+        <details class="quiz">
+          <summary><code class="inl">terraform apply</code> succeeded but <code class="inl">curl IP:3000/health</code> fails. List the checks in order.</summary>
+          <p class="ans">Wait for cloud-init (<code class="inl">cloud-init status --wait</code>) → <code class="inl">docker ps</code> / <code class="inl">docker logs api</code> → SG has port 3000 → subnet associated with the public route table (0.0.0.0/0 → igw) → instance has a public IP → app listens on 0.0.0.0, not 127.0.0.1.</p>
+        </details>
+        <details class="quiz">
+          <summary>Why <code class="inl">lifecycle { ignore_changes = [ami] }</code> on the instance?</summary>
+          <p class="ans"><code class="inl">data "aws_ami"</code> with <code class="inl">most_recent = true</code> returns a new ID whenever Canonical publishes an image; without ignoring it, the next plan would replace (destroy) the running server.</p>
+        </details>
+      </section>
+
+      <!-- ===================== REFERENCES ===================== -->
+      <section id="refs">
+        <h2><span class="sec-num">📚</span> References</h2>
+        <hr class="section-rule" />
+        <h4>Class material</h4>
+        <ul>
+          <li>📄 <a href="https://docs.google.com/spreadsheets/d/1aQ_sRTKwFHcVXNYr_hwVBqdjS7vZF25igFQXQZ-cz5s/edit?gid=1083311221" target="_blank" rel="noopener">Term 9 DevOps &amp; Cloud syllabus (source sheet)</a> — Session 21: Cloud &amp; Terraform in Action.</li>
+        </ul>
+        <h4>Official docs</h4>
+        <ul>
+          <li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html" target="_blank" rel="noopener">Amazon VPC user guide</a> — VPCs, subnets, route tables, gateways.</li>
+          <li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html" target="_blank" rel="noopener">Subnet CIDR blocks</a> — the 5 reserved IPs.</li>
+          <li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html" target="_blank" rel="noopener">Security groups</a> and <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html" target="_blank" rel="noopener">network ACLs</a>.</li>
+          <li><a href="https://aws.amazon.com/compliance/shared-responsibility-model/" target="_blank" rel="noopener">AWS shared responsibility model</a>.</li>
+          <li><a href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs" target="_blank" rel="noopener">Terraform AWS provider docs</a> — every <code class="inl">aws_*</code> resource used here.</li>
+        </ul>
+      </section>
+
+      <nav class="pager">
+        <a href="session-20.html"><div class="dir">← Previous</div><div class="ttl">Session 20: Terraform &amp; IaC</div></a>
+        <a class="next" href="session-22.html"><div class="dir">Next →</div><div class="ttl">Session 22: Monitoring, Observability &amp; GitOps</div></a>
+      </nav>
+
+      </article>
+    </div>
+  </main>
+
+  <footer class="foot wrap">DevOps &amp; Cloud · Session 21 — Cloud &amp; Terraform in Action</footer>
+
+  <script src="../../../assets/js/app.js?v=20261009a"></script>
+</body>
+</html>
