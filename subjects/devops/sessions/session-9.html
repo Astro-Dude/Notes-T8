@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 9 — Kubernetes Fundamentals &amp; Architecture</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,23 +24,25 @@
       <span class="kicker">Term 9 · DevOps · Session 09</span>
       <h1>Kubernetes Fundamentals &amp; Architecture</h1>
       <p class="lead">
-        Explain what every Kubernetes component does, trace a <code class="inl">kubectl apply</code> from your terminal to a
-        running container, and drive a local minikube cluster with kubectl, kubeconfig and YAML.
+        Explain what plain Docker can't do across many servers and how desired state fixes it. Name every Kubernetes component and its one job,
+        trace a <code class="inl">kubectl apply</code> from your terminal to a running TaskFlow container, and drive a local minikube cluster with kubectl, kubeconfig and YAML.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 26 min read</span><span class="badge-rt">📖 7 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 37 min read</span><span class="badge-rt">📖 8 topics</span></div>
     </section>
 
     <div class="article-layout">
 
+      <!-- TABLE OF CONTENTS -->
       <nav class="toc" aria-label="Table of contents">
         <h4>On this page</h4>
         <ol>
-          <li><a href="#why-k8s">Why Kubernetes?</a></li>
-          <li><a href="#architecture">Architecture: control plane &amp; workers</a></li>
+          <li><a href="#why-k8s">Why Kubernetes? Desired state</a></li>
+          <li><a href="#architecture">Control plane &amp; worker nodes</a></li>
           <li><a href="#api-etcd">API server &amp; etcd</a></li>
           <li><a href="#scheduler-controllers">Scheduler &amp; controller manager</a></li>
-          <li><a href="#worker-node">kubelet, kube-proxy &amp; the apply flow</a></li>
-          <li><a href="#kubectl">Cluster setup &amp; kubectl</a></li>
+          <li><a href="#worker-node">kubelet, kube-proxy &amp; the runtime</a></li>
+          <li><a href="#apply-flow">What happens on kubectl apply</a></li>
+          <li><a href="#kubectl">Cluster setup, kubectl &amp; kubeconfig</a></li>
           <li><a href="#first-pod">YAML anatomy &amp; imperative vs declarative</a></li>
           <li><a href="#commands">Commands you must know</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
@@ -48,44 +50,24 @@
         </ol>
       </nav>
 
+      <!-- ARTICLE -->
       <article class="article">
 
       <!-- ===================== 1. WHY K8S ===================== -->
       <section id="why-k8s">
-        <h2><span class="sec-num">1</span> Why Kubernetes?</h2>
+        <h2><span class="sec-num">1</span> Why Kubernetes? Desired state</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Docker is one musician. Kubernetes is the conductor of an orchestra: it replaces a musician who faints, adds violins when the hall fills up, and never stops the music to swap sheet music.</p>
-        </div>
+        <h3>The problem: TaskFlow outgrows one server</h3>
+        <p>In Session 8 one <code class="inl">docker compose up -d</code> ran TaskFlow on one server. Now it's popular, so you rent three servers and <code class="inl">docker run</code> API containers on each. Then a normal week happens:</p>
+<pre>02:13  server-2 loses power      → its API containers are gone, and nobody is awake
+09:00  traffic triples           → you ssh into each server and start more copies by hand
+14:00  deploy taskflow-api 1.1   → stop old, start new, three servers: downtime
+14:05  the API moved servers     → the web tier still points at the old server's IP</pre>
+        <p>Docker's <code class="inl">--restart</code> policy lives on the host, so it dies with the host. Your start-up script ran once at 09:00 and never finds out. It said what to <em>do</em>. Nothing says what should be <em>true</em>.</p>
 
-        <ul>
-          <li><span class="term">Kubernetes</span> (K8s) is an open-source <span class="term">container orchestrator</span>: it runs containers across a <span class="term">cluster</span> of machines and keeps them running. Born from Google's Borg, now a CNCF project.</li>
-          <li>Compose (S8) runs containers on <strong>one</strong> host. In production you need many hosts, and something that reacts when things break at 3 a.m.</li>
-        </ul>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Problem at scale</th><th>Plain Docker / Compose</th><th>Kubernetes</th></tr></thead>
-            <tbody>
-              <tr><td>Container crashes</td><td><code class="inl">restart:</code> on the same host</td><td>Restarted automatically (<span class="term">self-healing</span>)</td></tr>
-              <tr><td>Whole server dies</td><td>App is down until you act</td><td>Pods rescheduled onto healthy nodes</td></tr>
-              <tr><td>Scaling</td><td><code class="inl">--scale api=3</code>, one host, port clashes</td><td><code class="inl">kubectl scale --replicas=10</code> across nodes; HPA autoscaling (S13)</td></tr>
-              <tr><td>New version</td><td>Stop old, start new → downtime</td><td>Rolling update + one-command rollback (S10)</td></tr>
-              <tr><td>Service discovery / LB</td><td>Container names on one host</td><td>Services: stable IP + DNS + load balancing across nodes (S11)</td></tr>
-              <tr><td>Placement (<span class="term">bin-packing</span>)</td><td>You pick the server</td><td>Scheduler places pods by CPU/memory requests</td></tr>
-              <tr><td>Config &amp; secrets</td><td><code class="inl">.env</code> files</td><td>ConfigMaps &amp; Secrets (S12)</td></tr>
-              <tr><td>Storage</td><td>Local volumes on one disk</td><td>PersistentVolumes backed by cloud disks (S13)</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Declarative desired state &amp; the reconciliation loop</h3>
-        <ul>
-          <li>You don't say <em>"start 3 containers"</em> (imperative). You declare <em>"there should be 3 replicas of taskflow-api:1.0"</em> (declarative) and K8s stores that as the <span class="term">desired state</span>.</li>
-          <li><span class="term">Controllers</span> run a loop forever: <strong>observe</strong> actual state → <strong>diff</strong> with desired → <strong>act</strong> to close the gap.</li>
-        </ul>
+        <h3>The idea</h3>
+        <p><span class="term">Kubernetes</span> (K8s) is a <span class="term">container orchestrator</span>. You give it a <span class="term">cluster</span> of machines, called <span class="term">nodes</span>, and you store a fact: "there should be 3 replicas of <code class="inl">taskflow-api:1.0.0</code>". That fact is the <span class="term">desired state</span>. Programs called <span class="term">controllers</span> then loop forever: <strong>observe</strong> what's actually running, <strong>diff</strong> it with the desired state, and <strong>act</strong> to close the gap. This loop is <span class="term">reconciliation</span>, and it's why Kubernetes is called <strong>declarative</strong>.</p>
 <pre>desired state (stored in etcd)             actual state (what is running)
      replicas: 3        ───── compare ─────▶     2 pods running
           ▲                                           │
@@ -93,47 +75,101 @@
     you edit YAML                         controller acts: create 1 pod
           └────────────── observe again ◀─────────────┘</pre>
 
-        <div class="callout example">
-          <span class="c-title">Example: node failure at 02:00</span>
-          <p>TaskFlow runs <code class="inl">replicas: 3</code> on node-1/2/3. node-2 loses power. ~40–50&nbsp;s later the node controller marks it <code class="inl">NotReady</code>; after the default 5-minute toleration its pod is evicted, the ReplicaSet sees 2/3 and creates a replacement, and the scheduler puts it on node-1 or node-3. Back to 3/3 without anyone waking up.</p>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>In Session 6 a Docker host was one kitchen. Kubernetes is a <strong>restaurant</strong>: several kitchens (nodes) and a <strong>manager's office</strong> (the control plane). You don't walk into kitchens. You hand in an <strong>order ticket</strong>, "3 × taskflow-api, always", and a <strong>shift manager</strong> keeps counting what's cooking. Two? Fire one more. A kitchen burns down? Cook it elsewhere. The ticket says what should be true, never "cook one now". This restaurant runs through the next three sessions.</p>
         </div>
 
-        <h3>Compose → Kubernetes mapping</h3>
+        <h3>See it: a cluster on your laptop, then break it</h3>
+        <p><span class="term">minikube</span> runs a one-node cluster inside a Docker container (section 7 covers it fully):</p>
+<pre><span class="pr">$</span> minikube start --driver=docker --cpus=2 --memory=4096
+<span class="out">😄  minikube v1.37.0 on Ubuntu 24.04
+🔥  Creating docker container (CPUs=2, Memory=4096MB) ...
+🐳  Preparing Kubernetes v1.34.0 on Docker 28.4.0 ...
+🔎  Verifying Kubernetes components...
+🏄  Done! kubectl is now configured to use "minikube" cluster and "default" namespace by default</span>
+<span class="pr">$</span> kubectl create deployment hello --image=nginx:1.28-alpine --replicas=2
+<span class="out">deployment.apps/hello created</span>
+<span class="pr">$</span> kubectl get pods
+<span class="out">NAME                     READY   STATUS    RESTARTS   AGE
+hello-6d9f7c8b5d-4kq2x   1/1     Running   0          20s
+hello-6d9f7c8b5d-p8wzn   1/1     Running   0          20s</span>
+<span class="pr">$</span> kubectl delete pod hello-6d9f7c8b5d-4kq2x
+<span class="out">pod "hello-6d9f7c8b5d-4kq2x" deleted</span>
+<span class="pr">$</span> kubectl get pods
+<span class="out">NAME                     READY   STATUS    RESTARTS   AGE
+hello-6d9f7c8b5d-p8wzn   1/1     Running   0          48s
+hello-6d9f7c8b5d-zr7tm   1/1     Running   0          4s</span>     <span class="cm"># brand-new pod: desired 2, actual was 1</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Compose (S8)</th><th>Kubernetes</th><th>Session</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">services.api</code> (+ <code class="inl">deploy.replicas</code>)</td><td>Deployment → ReplicaSet → Pods</td><td>S10</td></tr>
-              <tr><td>Service name DNS (<code class="inl">db</code>)</td><td>Service + CoreDNS (<code class="inl">taskflow-db</code>)</td><td>S11</td></tr>
-              <tr><td><code class="inl">ports: "8080:80"</code></td><td>Service NodePort/LoadBalancer, Ingress</td><td>S11–S12</td></tr>
-              <tr><td><code class="inl">environment</code>, <code class="inl">.env</code></td><td>ConfigMap, Secret</td><td>S12</td></tr>
-              <tr><td><code class="inl">volumes: db-data</code></td><td>PersistentVolumeClaim</td><td>S13</td></tr>
-              <tr><td><code class="inl">healthcheck</code>, <code class="inl">depends_on</code></td><td>Liveness/readiness/startup probes</td><td>S13</td></tr>
+              <tr><td><code class="inl">minikube start --driver=docker</code></td><td>Create (or restart) the local cluster, with the node running as a Docker container; <code class="inl">--cpus</code>/<code class="inl">--memory</code> size it</td></tr>
+              <tr><td><code class="inl">kubectl</code></td><td>The Kubernetes CLI. Like the docker CLI, it only sends requests (section 3).</td></tr>
+              <tr><td><code class="inl">create deployment hello</code></td><td>Store a Deployment named <code class="inl">hello</code>: "keep N copies of this pod running" (Session 10)</td></tr>
+              <tr><td><code class="inl">--image=nginx:1.28-alpine --replicas=2</code></td><td>What each copy runs, and the desired state: 2 copies</td></tr>
+              <tr><td><code class="inl">get pods</code> / <code class="inl">delete pod NAME</code></td><td>List / delete <span class="term">pods</span>, Kubernetes' unit for one running copy (one or more containers)</td></tr>
             </tbody>
           </table>
         </div>
-        <p>When <em>not</em> to use K8s: one small app on one VM — Compose or a systemd service is simpler and cheaper.</p>
+        <p>Look at the new pod's name (<code class="inl">-zr7tm</code>) and AGE (4 s). Kubernetes didn't revive the deleted pod: a controller saw desired 2 ≠ actual 1 and made a <em>new</em> one. <strong>What it does <em>not</em> do:</strong> <code class="inl">delete pod</code> doesn't stop the app, because the desired state still says 2. Change the desired state instead (<code class="inl">kubectl scale deployment hello --replicas=0</code>), or <code class="inl">kubectl delete deployment hello</code> to clean up.</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          K8s = orchestration across many machines: self-healing, scaling, rollouts, discovery, bin-packing. You declare desired state; controllers reconcile reality to it, forever.
+        <h3>Build it up: a node dies at 02:13</h3>
+        <p>TaskFlow runs <code class="inl">replicas: 3</code> on three nodes. The same loop handles a dead machine, more slowly, because Kubernetes first makes sure the node is really gone:</p>
+<pre>02:13:00  node-2 loses power; its kubelet stops sending heartbeats
+02:13:50  node controller: no heartbeat for ~40–50 s → node-2 is NotReady
+02:18:50  after the default 5-minute toleration, node-2's pods are evicted
+02:18:51  ReplicaSet controller: desired 3, actual 2 → creates a pod
+02:18:52  scheduler puts it on node-1 or node-3 and that kubelet starts it: 3/3, nobody woke up</pre>
+        <p>The jobs this loop takes off you:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Problem at scale</th><th>Plain Docker / Compose</th><th>Kubernetes</th></tr></thead>
+            <tbody>
+              <tr><td>Container crashes</td><td><code class="inl">restart:</code> on the same host</td><td>Restarted automatically (<span class="term">self-healing</span>)</td></tr>
+              <tr><td>Whole server dies</td><td>App is down until you act</td><td>Pods recreated on healthy nodes</td></tr>
+              <tr><td>Scaling</td><td><code class="inl">--scale api=3</code> on one host, port clashes</td><td><code class="inl">kubectl scale --replicas=10</code> across nodes; autoscaling (S13)</td></tr>
+              <tr><td>New version</td><td>Stop old, start new → downtime</td><td>Rolling update + one-command rollback (S10)</td></tr>
+              <tr><td>Finding services</td><td>Container names on one host</td><td>Services: stable IP + DNS + load balancing (S11)</td></tr>
+              <tr><td>Placement (<span class="term">bin-packing</span>)</td><td>You pick the server</td><td>Scheduler places pods by CPU/memory requests (section 4)</td></tr>
+              <tr><td>Config, secrets, storage</td><td><code class="inl">.env</code> files, local volumes</td><td>ConfigMap <code class="inl">taskflow-config</code>, Secret <code class="inl">taskflow-db-secret</code> (S12); PersistentVolumes (S13)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>From <code class="inl">compose.yaml</code>: <code class="inl">services.api</code> → Deployment (S10), hostname <code class="inl">db</code> → Service (S11), <code class="inl">ports:</code> → NodePort/LoadBalancer/Ingress (S11–12), <code class="inl">healthcheck</code> → probes (S13). Skip Kubernetes for one small app on one VM, where Compose or systemd is simpler and cheaper.</p>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Kubernetes replaces Docker." <strong>✗</strong> It doesn't build images or run containers itself. You still build and push images, and a container runtime on each node runs them (section 5). Kubernetes decides what runs where and keeps it running.</p>
+          <p>"Kubernetes restarts the pod you deleted." <strong>✗</strong> It creates a new pod with a new name and IP. Restarting a crashed <em>container</em> inside the same pod is the kubelet's job (section 5).</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>You declare what should be true. Controllers make it true, forever: observe → diff → act.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. server-2 dies at 02:13. With Docker and <code class="inl">--restart unless-stopped</code>, what happens to its containers? With Kubernetes?</summary>
+            <p class="ans">Docker: nothing, because the restart policy lived on the dead host. Kubernetes marks the node NotReady, evicts its pods, and the controllers recreate them on healthy nodes.</p></details>
+          <details class="quiz"><summary>Q2. Predict: <code class="inl">hello</code> has 2 replicas and you delete <em>both</em> pods in one command. What does <code class="inl">kubectl get pods</code> show 5 seconds later?</summary>
+            <p class="ans">Two pods with new names, a few seconds old (maybe still <code class="inl">ContainerCreating</code>). Desired 2, actual 0, so the controller creates 2.</p></details>
+          <details class="quiz"><summary>Q3. True or false: "Self-healing, scaling and rolling updates are three separate mechanisms."</summary>
+            <p class="ans">False in spirit. All three are the same reconcile loop: actual drops (self-healing), you change the desired count (scaling), or you change the desired pod template (rollout, Session 10).</p></details>
         </div>
       </section>
 
       <!-- ===================== 2. ARCHITECTURE ===================== -->
       <section id="architecture">
-        <h2><span class="sec-num">2</span> Architecture: control plane &amp; worker nodes</h2>
+        <h2><span class="sec-num">2</span> Control plane &amp; worker nodes</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The control plane is the head office that decides and remembers; worker nodes are the factories that actually do the work and report back.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Count the jobs in section 1's demo. Somebody stored "2 replicas", noticed a pod was missing, picked a machine for the new one, and started nginx there. There's no single program called "kubernetes": four jobs, four programs, and the exam expects you to know which is which.</p>
 
-        <ul>
-          <li>A cluster = one or more <span class="term">control plane</span> nodes (the brain) + <span class="term">worker nodes</span> (run your <span class="term">pods</span>; a pod = one or more containers sharing an IP).</li>
-          <li>Production: 3 control-plane nodes for high availability. Managed K8s (EKS, AKS, GKE) runs the control plane for you. minikube/kind: one node does both jobs.</li>
-        </ul>
+        <h3>The idea</h3>
+        <p>A cluster has two halves. The <span class="term">control plane</span> is the brain: it stores the desired state, decides, and runs the reconcile loops. <span class="term">Worker nodes</span> are the muscle: they run your pods. Every component on both halves talks to one place only, the API server.</p>
 <pre>                      ┌──────────────────── CONTROL PLANE ────────────────────┐
 kubectl / CI / UI ───▶│  kube-apiserver ◀────▶ etcd (cluster state)           │
                       │     ▲      ▲                                          │
@@ -151,23 +187,29 @@ kubectl / CI / UI ───▶│  kube-apiserver ◀────▶ etcd (clust
 │ [pod] [pod] [pod] │  │ [pod] [pod]       │  │ [pod] [pod] [pod] │
 └───────────────────┘  └───────────────────┘  └───────────────────┘</pre>
 
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The <strong>control plane is the manager's office</strong> and each <strong>worker node is a kitchen</strong>. The office never cooks and the kitchens never decide. The last column below is the full staff list. You'll meet each member in the next four sections.</p>
+        </div>
+
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Component</th><th>Where</th><th>Runs as</th><th>Job in one line</th></tr></thead>
+            <thead><tr><th>Component</th><th>Where</th><th>Runs as</th><th>Job in one line</th><th>In the restaurant</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">kube-apiserver</code></td><td>Control plane</td><td>Static pod</td><td>Front door; validates and stores every object; the only component that talks to etcd.</td></tr>
-              <tr><td><code class="inl">etcd</code></td><td>Control plane (or external)</td><td>Static pod</td><td>Key-value database holding the whole cluster state.</td></tr>
-              <tr><td><code class="inl">kube-scheduler</code></td><td>Control plane</td><td>Static pod</td><td>Chooses a node for each new pod.</td></tr>
-              <tr><td><code class="inl">kube-controller-manager</code></td><td>Control plane</td><td>Static pod</td><td>Runs the built-in controllers (reconcile loops).</td></tr>
-              <tr><td><code class="inl">cloud-controller-manager</code></td><td>Control plane, cloud only</td><td>Pod</td><td>Talks to AWS/Azure/GCP: load balancers, node lifecycle, routes.</td></tr>
-              <tr><td><code class="inl">kubelet</code></td><td>Every node</td><td>systemd service</td><td>Starts and monitors the pods assigned to its node.</td></tr>
-              <tr><td><code class="inl">kube-proxy</code></td><td>Every node</td><td>DaemonSet pod</td><td>Programs iptables/IPVS rules so Service IPs reach pods.</td></tr>
-              <tr><td>Container runtime</td><td>Every node</td><td>systemd service</td><td>containerd / CRI-O — actually pulls images and runs containers.</td></tr>
-              <tr><td>Add-ons: CoreDNS, CNI</td><td>Cluster-wide</td><td>Deployment / DaemonSet</td><td>Cluster DNS; pod networking (Calico, Flannel, Cilium).</td></tr>
+              <tr><td><code class="inl">kube-apiserver</code></td><td>Control plane</td><td>Static pod</td><td>Front door: validates and stores every object; the only one that talks to etcd</td><td>The order desk</td></tr>
+              <tr><td><code class="inl">etcd</code></td><td>Control plane</td><td>Static pod</td><td>Key-value database holding all cluster state</td><td>The ticket book</td></tr>
+              <tr><td><code class="inl">kube-scheduler</code></td><td>Control plane</td><td>Static pod</td><td>Chooses a node for each new pod</td><td>Floor manager who picks a kitchen</td></tr>
+              <tr><td><code class="inl">kube-controller-manager</code></td><td>Control plane</td><td>Static pod</td><td>Runs the built-in controllers (reconcile loops)</td><td>Shift managers</td></tr>
+              <tr><td><code class="inl">cloud-controller-manager</code></td><td>Control plane, cloud only</td><td>Pod</td><td>Talks to AWS/Azure/GCP: load balancers, nodes, routes</td><td>The landlord's contact</td></tr>
+              <tr><td><code class="inl">kubelet</code></td><td>Every node</td><td>systemd service</td><td>Starts and monitors the pods assigned to its node</td><td>Head chef of a kitchen</td></tr>
+              <tr><td>Container runtime</td><td>Every node</td><td>systemd service</td><td>containerd / CRI-O: pulls images, runs containers</td><td>The stoves</td></tr>
+              <tr><td><code class="inl">kube-proxy</code></td><td>Every node</td><td>DaemonSet pod</td><td>Writes iptables/nftables rules so Service IPs reach pods</td><td>The kitchen intercom</td></tr>
+              <tr><td>Add-ons: CoreDNS, CNI</td><td>Cluster-wide</td><td>Deployment / DaemonSet</td><td>Cluster DNS; pod networking (Calico, Flannel, Cilium)</td><td>Staff directory; phone lines</td></tr>
             </tbody>
           </table>
         </div>
-        <p>To follow along, start a local cluster now with <code class="inl">minikube start</code> (details in §6). The control plane shows up as pods:</p>
+
+        <h3>See it: the control plane runs as pods</h3>
 <pre><span class="pr">$</span> kubectl get pods -n kube-system -o wide
 <span class="out">NAME                               READY   STATUS    RESTARTS      AGE   IP             NODE
 coredns-66bc5c9577-x7k2p           1/1     Running   0             12m   10.244.0.2     minikube
@@ -178,14 +220,32 @@ kube-proxy-9vq4d                   1/1     Running   0             12m   192.168
 kube-scheduler-minikube            1/1     Running   0             12m   192.168.49.2   minikube
 storage-provisioner                1/1     Running   1 (11m ago)   12m   192.168.49.2   minikube</span></pre>
         <ul>
-          <li><code class="inl">&lt;component&gt;-minikube</code> = <span class="term">static pods</span> the kubelet starts from files on the node (§5). They use the node's IP (host network).</li>
-          <li><code class="inl">kube-proxy-9vq4d</code> has a random suffix → it's from a DaemonSet. CoreDNS gets a pod IP from the pod network (<code class="inl">10.244.0.0/16</code>).</li>
-          <li>No kubelet pod in the list — it's a normal process on the node, not a pod.</li>
+          <li><code class="inl">-n kube-system</code> is the <span class="term">namespace</span> where Kubernetes keeps its own components. <code class="inl">-o wide</code> adds the IP and NODE columns.</li>
+          <li>Names ending in <code class="inl">-minikube</code> are <span class="term">static pods</span>, started by the kubelet from files on the node (section 5). They use the node's own IP.</li>
+          <li><code class="inl">kube-proxy-9vq4d</code> has a random suffix, so a controller made it (a DaemonSet: one per node). CoreDNS got an IP from the pod network, <code class="inl">10.244.0.0/16</code>.</li>
         </ul>
+        <p><strong>What it does <em>not</em> show:</strong> the kubelet and the container runtime. They're systemd services on the node. The kubelet is what starts pods, so it can't be one.</p>
+        <p>Production clusters run <strong>3 control-plane nodes</strong> for high availability (etcd needs a majority, section 3) and keep app pods on the workers. Managed Kubernetes (EKS, AKS, GKE) runs the control plane for you, so you only see worker nodes. minikube and kind squeeze both halves onto one node.</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Control plane = apiserver, etcd, scheduler, controller-manager (+ cloud-controller-manager). Every node = kubelet, kube-proxy, container runtime. Everything talks through the API server.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"kubelet and kube-proxy are control-plane components." <strong>✗</strong> They run on <em>every</em> node. The control plane is apiserver, etcd, scheduler, controller-manager and cloud-controller-manager.</p>
+          <p>"Every node runs its own etcd." <strong>✗</strong> etcd belongs to the control plane, usually as a 3- or 5-member cluster. Worker nodes never touch it.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Control plane decides &amp; remembers: apiserver · etcd · scheduler · controller-manager.</strong><br /><strong>Every node does: kubelet · kube-proxy · container runtime. Everyone talks only to the API server.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Sort into "control plane" or "every node": kubelet, etcd, kube-proxy, kube-scheduler, containerd, kube-controller-manager.</summary>
+            <p class="ans">Control plane: etcd, kube-scheduler, kube-controller-manager (plus kube-apiserver). Every node: kubelet, kube-proxy, containerd.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">kube-proxy-9vq4d</code> has a random suffix; <code class="inl">etcd-minikube</code> ends in the node's name. What does that tell you?</summary>
+            <p class="ans">A random suffix means a controller stamped it from a template (kube-proxy's DaemonSet). A node-name suffix marks a static pod that the kubelet on <code class="inl">minikube</code> started from a file. The API server only shows a mirror of it.</p></details>
+          <details class="quiz"><summary>Q3. On EKS, <code class="inl">kubectl get pods -n kube-system</code> shows CoreDNS and kube-proxy but no apiserver or etcd. Why?</summary>
+            <p class="ans">EKS is managed. AWS runs the control plane in its own account and gives you only the API endpoint, so you see worker nodes and their add-ons.</p></details>
         </div>
       </section>
 
@@ -194,74 +254,56 @@ storage-provisioner                1/1     Running   1 (11m ago)   12m   192.168
         <h2><span class="sec-num">3</span> API server &amp; etcd</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The API server is the only receptionist allowed to write in the company's record book (etcd). Everyone — you, the scheduler, every node — has to ask the receptionist.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Count the writers in section 1's demo: you, a controller, the scheduler, the kubelet. A real cluster adds 50 kubelets, CI pipelines and five teammates. If they all wrote straight into the database, who would check that a pod spec is valid, that you may delete production, or that two writers don't overwrite each other?</p>
 
-        <h3>kube-apiserver</h3>
-        <ul>
-          <li>A REST API over HTTPS (port 6443 on kubeadm clusters, 8443 on minikube). kubectl, kubelets, the scheduler and controllers are all just API clients.</li>
-          <li>Every request passes the same pipeline before anything is stored:</li>
-        </ul>
+        <h3>The idea</h3>
+        <p>The cluster has <strong>one front door</strong>. The <span class="term">kube-apiserver</span> is a REST API over HTTPS, and it's the <strong>only</strong> component that reads or writes <span class="term">etcd</span>, the database holding all cluster state. kubectl, the scheduler, the controllers and every kubelet are just API clients, and every request passes the same checks before anything is stored:</p>
 <pre>kubectl apply ──HTTPS──▶ kube-apiserver
-                           │ 1. Authentication     who are you?        (client cert, token, OIDC)
-                           │ 2. Authorization      are you allowed?    (RBAC, S16)
-                           │ 3. Mutating admission  fill defaults, inject sidecars
+                           │ 1. Authentication      who are you?        (client cert, token, OIDC)
+                           │ 2. Authorization       are you allowed?    (RBAC, S16)
+                           │ 3. Mutating admission  fill in defaults, inject sidecars
                            │ 4. Schema validation   is this a valid Deployment?
                            │ 5. Validating admission policies, ResourceQuota
                            ▼
-                         etcd (object persisted) ──▶ watchers notified (controllers, scheduler, kubelets)</pre>
-        <ul>
-          <li><strong>Watch</strong>: components keep a long-lived connection and get pushed every change to the objects they care about — that's how work gets triggered without polling etcd.</li>
-          <li>URL layout: core group <code class="inl">/api/v1/namespaces/taskflow/pods</code>; named groups <code class="inl">/apis/apps/v1/namespaces/taskflow/deployments</code>.</li>
-        </ul>
-<pre><span class="cm"># see the REST call kubectl makes</span>
-<span class="pr">$</span> kubectl get pods -n kube-system -v=6 2&gt;&amp;1 | grep GET
-<span class="out">I1009 10:21:04.534118   48211 round_trippers.go:553] GET https://192.168.49.2:8443/api/v1/namespaces/kube-system/pods?limit=500 200 OK in 12 milliseconds</span>
+                         etcd (object stored) ──▶ watchers notified (controllers, scheduler, kubelets)</pre>
 
-<span class="cm"># API server health, check by check</span>
-<span class="pr">$</span> kubectl get --raw='/readyz?verbose'
-<span class="out">[+]ping ok
-[+]log ok
-[+]etcd ok
-[+]etcd-readiness ok
-[+]informer-sync ok
-…
-readyz check passed</span></pre>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The API server is the <strong>order desk</strong>, and etcd is the <strong>ticket book</strong> behind it. Customers, managers and head chefs all queue at the same desk. It checks who you are and whether you may order that, fills in the blanks, rejects nonsense, and only then writes the ticket in the book. Nobody else touches the book.</p>
+        </div>
 
-        <h3>etcd</h3>
-        <ul>
-          <li>A distributed, strongly consistent key-value store. Every object (pods, deployments, secrets…) lives under keys like <code class="inl">/registry/pods/&lt;namespace&gt;/&lt;name&gt;</code>.</li>
-          <li>Uses the <span class="term">Raft</span> consensus algorithm: a write succeeds only when a majority (<span class="term">quorum</span>) of members agree.</li>
-          <li>Lose etcd without a backup = lose the cluster's memory. Running containers keep running, but nothing can be changed or recovered.</li>
-        </ul>
+        <h3>See it: kubectl is just an HTTPS client</h3>
+<pre><span class="pr">$</span> kubectl get pods -n kube-system -v=6 2&gt;&amp;1 | grep GET
+<span class="out">I1009 10:21:04.534118   48211 round_trippers.go:632] "Response" verb="GET" url="https://192.168.49.2:8443/api/v1/namespaces/kube-system/pods?limit=500" status="200 OK" milliseconds=12</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-v=6</code></td><td>Verbosity 6: log every HTTP request kubectl sends (8 adds the bodies)</td></tr>
+              <tr><td><code class="inl">2&gt;&amp;1 | grep GET</code></td><td>The log goes to stderr, so merge it into the pipe and keep the request line</td></tr>
+              <tr><td><code class="inl">https://192.168.49.2:8443</code></td><td>The API server: port 8443 on minikube, 6443 on kubeadm clusters</td></tr>
+              <tr><td><code class="inl">/api/v1/namespaces/kube-system/pods</code></td><td>The resource as a URL. The core group lives under <code class="inl">/api/v1/…</code>, named groups under <code class="inl">/apis/&lt;group&gt;/&lt;version&gt;/…</code> (e.g. <code class="inl">/apis/apps/v1/namespaces/taskflow/deployments</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> kubectl never touches etcd and doesn't even know where it is. It's Session 6 again, where the docker CLI only spoke to dockerd's API. You can also ask the API server about its own health, check by check, with <code class="inl">kubectl get --raw='/readyz?verbose'</code> (<code class="inl">[+]etcd ok … readyz check passed</code>).</p>
+
+        <h3>Build it up: watches and etcd</h3>
+        <p><strong>Watch, don't poll.</strong> Components hold a long-lived connection open, and the API server pushes them every change to the objects they care about. That's how the scheduler hears about a new pod within milliseconds.</p>
+        <p><strong>etcd</strong> is a distributed, strongly consistent key-value store. Objects live under keys like <code class="inl">/registry/pods/&lt;namespace&gt;/&lt;name&gt;</code>. It uses the <span class="term">Raft</span> consensus algorithm: a write succeeds only when a majority of members (a <span class="term">quorum</span>) agree.</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>etcd members</th><th>Quorum (⌊n/2⌋ + 1)</th><th>Failures tolerated</th></tr></thead>
             <tbody>
               <tr><td>1</td><td>1</td><td>0</td></tr>
               <tr><td>3</td><td>2</td><td><strong>1</strong> (typical production)</td></tr>
-              <tr><td>4</td><td>3</td><td>1 — no better than 3, so use odd numbers</td></tr>
+              <tr><td>4</td><td>3</td><td>1, no better than 3, so use odd numbers</td></tr>
               <tr><td>5</td><td>3</td><td>2</td></tr>
             </tbody>
           </table>
         </div>
-<pre><span class="cm"># peek at the keys (minikube; etcdctl ships inside the etcd image)</span>
-<span class="pr">$</span> kubectl -n kube-system exec etcd-minikube -- etcdctl \
-    --endpoints=https://127.0.0.1:2379 \
-    --cacert=/var/lib/minikube/certs/etcd/ca.crt \
-    --cert=/var/lib/minikube/certs/etcd/server.crt \
-    --key=/var/lib/minikube/certs/etcd/server.key \
-    get /registry/pods/kube-system --prefix --keys-only
-<span class="out">/registry/pods/kube-system/coredns-66bc5c9577-x7k2p
-
-/registry/pods/kube-system/etcd-minikube
-
-/registry/pods/kube-system/kube-apiserver-minikube
-…</span>
-
-<span class="cm"># backup on a kubeadm control-plane node (cert paths: /etc/kubernetes/pki/etcd)</span>
+<pre><span class="cm"># back up etcd on a kubeadm control-plane node (cert paths: /etc/kubernetes/pki/etcd)</span>
 <span class="pr">$</span> sudo ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-2026-10-09.db \
     --endpoints=https://127.0.0.1:2379 \
     --cacert=/etc/kubernetes/pki/etcd/ca.crt \
@@ -275,20 +317,29 @@ Snapshot saved at /backup/etcd-2026-10-09.db</span>
 +----------+----------+------------+------------+---------+
 | 7ef8a2c1 |    48213 |       1204 |     5.1 MB |   3.6.0 |
 +----------+----------+------------+------------+---------+</span></pre>
-        <p>Restore with <code class="inl">etcdutl snapshot restore</code> into a new data dir and point etcd at it. (<code class="inl">ETCDCTL_API=3</code> is the default since etcd 3.4; you'll still see it in docs.)</p>
+        <p>etcd only talks to clients with trusted certificates, hence the flags. The same flags plus <code class="inl">get /registry/pods/kube-system --prefix --keys-only</code> list the stored keys (<code class="inl">/registry/pods/kube-system/etcd-minikube</code>, …). Restore with <code class="inl">etcdutl snapshot restore</code> into a new data directory. (<code class="inl">ETCDCTL_API=3</code> is the default since etcd 3.4.)</p>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Thinking kubectl or the scheduler writes to etcd directly. Only the API server does.</li>
-            <li>Running 2 etcd members "for HA" — quorum is 2, so losing either one stops writes. Worse than 1.</li>
-            <li>Secrets are stored in etcd base64-encoded, not encrypted, unless encryption at rest is configured (S12).</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Two etcd members are safer than one." <strong>✗</strong> The quorum of 2 is 2, so losing <em>either</em> member stops all writes, which is worse than one member. Use 3 or 5.</p>
+          <p>"Secrets are encrypted in etcd." <strong>✗</strong> Not by default. They're stored base64-encoded unless encryption at rest is configured (Session 12).</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          API server: authn → authz → admission → validate → etcd, then notifies watchers. etcd: Raft-replicated KV store of all state; odd member counts; back it up with <code class="inl">etcdctl snapshot save</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Everyone talks to the API server. Only the API server talks to etcd.</strong><br /><strong>authn → authz → admission → validation → etcd → watchers · quorum = ⌊n/2⌋ + 1</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Spot the misconception: "The scheduler writes its decision straight into etcd."</summary>
+            <p class="ans">Only the API server talks to etcd. The scheduler sends an API request (a "binding") like any other client, and it passes the same checks.</p></details>
+          <details class="quiz"><summary>Q2. Predict the URL kubectl calls for <code class="inl">kubectl get deployments -n taskflow</code>.</summary>
+            <p class="ans"><code class="inl">GET https://&lt;apiserver&gt;/apis/apps/v1/namespaces/taskflow/deployments</code>. Deployments are in the named group <code class="inl">apps/v1</code>, so the path starts with <code class="inl">/apis/</code>.</p></details>
+          <details class="quiz"><summary>Q3. A 5-member etcd cluster loses two members. Can you still deploy? What if it loses a third?</summary>
+            <p class="ans">With 3 of 5 left the quorum (3) is met, so yes. A third loss leaves 2 &lt; 3, so there's no quorum: no writes, which means no deploys, no scaling and no self-healing.</p></details>
+          <details class="quiz"><summary>Q4. etcd's disk is wiped and there's no snapshot. Do the running TaskFlow containers stop at once?</summary>
+            <p class="ans">No. The kubelets keep the existing containers running. But the cluster has lost its memory of what should exist, so nothing can be viewed, changed or healed. You rebuild from the YAML in Git.</p></details>
         </div>
       </section>
 
@@ -297,114 +348,106 @@ Snapshot saved at /backup/etcd-2026-10-09.db</span>
         <h2><span class="sec-num">4</span> Scheduler &amp; controller manager</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>A newly stored pod has a spec but no machine: its <code class="inl">spec.nodeName</code> is empty. Usually that's fixed within milliseconds. Sometimes it isn't:</p>
+<pre><span class="pr">$</span> kubectl get pod taskflow-api-7c9d8b6f4-2xkqz -n taskflow
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE
+taskflow-api-7c9d8b6f4-2xkqz   0/1     Pending   0          2m</span></pre>
+        <p>Who picks the machine, and why would it refuse? And who noticed the missing nginx pod in section 1?</p>
+
+        <h3>The idea</h3>
+        <p>The <span class="term">kube-scheduler</span> has one job: for every pod without a node, pick a node. It <strong>filters</strong> out nodes that can't run the pod, <strong>scores</strong> the rest, and <strong>binds</strong> the pod to the winner by writing <code class="inl">spec.nodeName</code>. It never starts anything. The <span class="term">kube-controller-manager</span> is one binary running dozens of controllers, each one the section 1 loop for one kind of object.</p>
+<pre> new taskflow-api pod   nodeName: ""   requests: cpu 500m, memory 512Mi
+        │
+   FILTER   node-1 ✗ only 300m CPU free      node-2 ✗ taint dedicated=db, not tolerated
+        │   node-3 ✓ 1500m / 1Gi free        node-4 ✓ 3 CPU / 5Gi free
+        │
+   SCORE    node-3 → 48 (memory would be tight)   node-4 → 86 (room to spare, image cached)
+        │
+   BIND     spec.nodeName = node-4   ──▶  the kubelet on node-4 takes over (section 5)</pre>
+        <p>Other filter reasons: a nodeSelector/affinity mismatch, a host port in use, a volume in another zone. Other score plugins: spread the load, honour affinity preferences, spread replicas apart.</p>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The scheduler is the seating host who picks a table for each new guest. The controllers are managers who keep counting heads and fix anything that doesn't match the plan.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The scheduler is the <strong>floor manager</strong> choosing a kitchen for each new order. Not kitchen 1, its burners are booked. Not kitchen 2, it only does desserts. Kitchen 4 has the most room. He writes "kitchen 4" on the ticket and walks away without cooking. The controllers are the <strong>shift managers</strong>, each watching one kind of ticket and fixing any gap.</p>
         </div>
 
-        <h3>kube-scheduler: filter → score → bind</h3>
-        <ol>
-          <li>Watches for pods whose <code class="inl">spec.nodeName</code> is empty.</li>
-          <li><strong>Filter</strong>: drop nodes that can't run it — not enough free CPU/memory (by <em>requests</em>), untolerated taints, nodeSelector/affinity mismatch, host port in use, volume in another zone.</li>
-          <li><strong>Score</strong>: rank survivors 0–100 per plugin — spread resource usage, image already on the node, affinity preferences, spreading replicas.</li>
-          <li><strong>Bind</strong>: write the winning node into the pod (<code class="inl">spec.nodeName</code>). The scheduler never starts containers — the kubelet does.</li>
-        </ol>
-
-        <div class="callout example">
-          <span class="c-title">Example: placing a taskflow-api pod (requests 500m CPU, 512Mi memory)</span>
-          <div class="tbl-wrap">
-            <table>
-              <thead><tr><th>Node</th><th>Free CPU / memory</th><th>Other</th><th>Filter</th><th>Score (illustrative)</th></tr></thead>
-              <tbody>
-                <tr><td>node-1</td><td>300m / 3Gi</td><td>—</td><td>❌ Insufficient cpu</td><td>—</td></tr>
-                <tr><td>node-2</td><td>2 / 6Gi</td><td>taint <code class="inl">dedicated=db:NoSchedule</code></td><td>❌ untolerated taint</td><td>—</td></tr>
-                <tr><td>node-3</td><td>1500m / 1Gi</td><td>—</td><td>✅</td><td>48 (memory would be tight)</td></tr>
-                <tr><td>node-4</td><td>3 / 5Gi</td><td>image already cached</td><td>✅</td><td><strong>86 → chosen</strong></td></tr>
-              </tbody>
-            </table>
-          </div>
-<pre><span class="out">Events:
+        <h3>See it: the scheduler signs its work</h3>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-7c9d8b6f4-2xkqz -n taskflow | tail -4
+<span class="out">Events:
   Type    Reason     Age   From               Message
   ----    ------     ----  ----               -------
   Normal  Scheduled  3s    default-scheduler  Successfully assigned taskflow/taskflow-api-7c9d8b6f4-2xkqz to node-4</span></pre>
-          <p>If no node passes the filter, the pod stays <code class="inl">Pending</code> and the reason is in <code class="inl">kubectl describe pod</code>:</p>
+        <p><code class="inl">From: default-scheduler</code> names the component. When no node passes the filter, the same place explains the Pending puzzle:</p>
 <pre><span class="out">  Warning  FailedScheduling  12s  default-scheduler  0/4 nodes are available: 1 node(s) had untolerated taint {dedicated: db}, 3 Insufficient memory. preemption: …</span></pre>
-        </div>
+        <p><strong>What it does <em>not</em> do:</strong> look at live usage. The filter counts <strong>requests</strong> (what pods have reserved), so a node idling at 5% CPU but fully reserved still fails. And it places each pod once; it never moves running pods to rebalance.</p>
 
-        <h3>kube-controller-manager</h3>
-        <ul>
-          <li>One binary running dozens of <span class="term">controllers</span>. Each watches certain objects via the API server and acts to make actual = desired.</li>
-        </ul>
+        <h3>Build it up: the controllers</h3>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Controller</th><th>Keeps this true</th></tr></thead>
             <tbody>
-              <tr><td>Deployment</td><td>The right ReplicaSet exists for the current pod template; rolls out new versions (S10).</td></tr>
-              <tr><td>ReplicaSet</td><td>Exactly <code class="inl">replicas</code> pods matching its selector exist.</td></tr>
-              <tr><td>Node</td><td>Nodes without heartbeats are marked <code class="inl">NotReady</code>; their pods get evicted.</td></tr>
-              <tr><td>EndpointSlice</td><td>Each Service's list of ready pod IPs is current (S11).</td></tr>
-              <tr><td>Job / CronJob</td><td>Pods run to completion / on schedule (S15).</td></tr>
-              <tr><td>StatefulSet / DaemonSet</td><td>Ordered, named pods / one pod per node (S15).</td></tr>
-              <tr><td>Namespace</td><td>Deleting a namespace deletes everything in it.</td></tr>
-              <tr><td>ServiceAccount</td><td>Every namespace has a <code class="inl">default</code> ServiceAccount (S16).</td></tr>
+              <tr><td>Deployment</td><td>The right ReplicaSet exists for the current pod template; rolls out new versions (S10)</td></tr>
+              <tr><td>ReplicaSet</td><td>Exactly <code class="inl">replicas</code> matching pods exist (the one you watched in section 1)</td></tr>
+              <tr><td>Node</td><td>Nodes without heartbeats are marked <code class="inl">NotReady</code> and their pods evicted</td></tr>
+              <tr><td>EndpointSlice</td><td>Each Service's list of ready pod IPs is current (S11)</td></tr>
+              <tr><td>Job / CronJob · StatefulSet / DaemonSet</td><td>Run to completion / on a schedule · ordered, named pods / one pod per node (S15)</td></tr>
+              <tr><td>Namespace · ServiceAccount</td><td>Deleting a namespace deletes its contents · every namespace gets a <code class="inl">default</code> ServiceAccount (S16)</td></tr>
             </tbody>
           </table>
         </div>
+        <p>The <strong>cloud-controller-manager</strong> runs only on cloud clusters and holds the cloud-specific loops. Its service controller creates a real AWS/Azure/GCP load balancer for a <code class="inl">type: LoadBalancer</code> Service (S11). Its node controller labels nodes with zone and instance type and removes deleted VMs, and its route controller sets up pod-network routes. minikube has none, which is why a LoadBalancer's <code class="inl">EXTERNAL-IP</code> stays <code class="inl">&lt;pending&gt;</code> there.</p>
 
-<pre><span class="cm"># watch the ReplicaSet controller heal a deleted pod</span>
-<span class="pr">$</span> kubectl create deployment hello --image=nginx:1.28-alpine --replicas=2
-<span class="out">deployment.apps/hello created</span>
-<span class="pr">$</span> kubectl get pods
-<span class="out">NAME                     READY   STATUS    RESTARTS   AGE
-hello-6d9f7c8b5d-4kq2x   1/1     Running   0          20s
-hello-6d9f7c8b5d-p8wzn   1/1     Running   0          20s</span>
-<span class="pr">$</span> kubectl delete pod hello-6d9f7c8b5d-4kq2x
-<span class="out">pod "hello-6d9f7c8b5d-4kq2x" deleted</span>
-<span class="pr">$</span> kubectl get pods
-<span class="out">NAME                     READY   STATUS    RESTARTS   AGE
-hello-6d9f7c8b5d-p8wzn   1/1     Running   0          48s
-hello-6d9f7c8b5d-zr7tm   1/1     Running   0          4s</span>     <span class="cm">← brand-new pod: desired 2, actual was 1</span>
-<span class="pr">$</span> kubectl delete deployment hello</pre>
-
-        <h3>cloud-controller-manager</h3>
-        <p>Only on cloud clusters. Splits cloud-specific logic out of core K8s: the <strong>service controller</strong> creates a real AWS/Azure/GCP load balancer for <code class="inl">type: LoadBalancer</code> (S11), the <strong>node controller</strong> labels nodes with zone/instance type and removes deleted VMs, the <strong>route controller</strong> sets up pod-network routes. That's why <code class="inl">EXTERNAL-IP</code> stays <code class="inl">&lt;pending&gt;</code> on minikube.</p>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p>Deleting pods of a Deployment to "stop the app" — the controller just recreates them. Scale to 0 (<code class="inl">kubectl scale deploy/taskflow-api --replicas=0</code>) or delete the Deployment.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"The scheduler starts the containers." <strong>✗</strong> It only writes <code class="inl">nodeName</code>. That node's kubelet starts them.</p>
+          <p>"The scheduler moves pods off a node that gets busy." <strong>✗</strong> Each pod is scheduled once. Running pods aren't rebalanced (that takes an add-on such as the descheduler).</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Scheduler: filter → score → bind (writes <code class="inl">nodeName</code>). Controller manager: many reconcile loops (Deployment, ReplicaSet, Node, EndpointSlice, Job…). Cloud controller manager: the cloud-API bits.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Scheduler: filter → score → bind. It writes nodeName and nothing else.</strong><br /><strong>Controller manager = one reconcile loop per kind of object.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A pod is <code class="inl">Pending</code> with <code class="inl">0/3 nodes are available: 3 Insufficient cpu</code>. Who wrote that, what does it mean, and give two fixes.</summary>
+            <p class="ans">kube-scheduler. The pod's CPU <em>request</em> is larger than every node's unreserved CPU. Lower the request, free capacity, or add a node.</p></details>
+          <details class="quiz"><summary>Q2. Predict: 2-CPU nodes idle at 10% real CPU, but existing requests reserve 95% of each. A new pod requests 500m. Scheduled?</summary>
+            <p class="ans">No. Only 100m is unreserved per node, which is less than 500m. The scheduler counts requests, not live usage.</p></details>
+          <details class="quiz"><summary>Q3. Which controller handles: (a) a node stops heartbeating, (b) a Service's ready-pod list, (c) a ReplicaSet with 2 of 3 pods, (d) a Deployment whose image changed?</summary>
+            <p class="ans">(a) Node · (b) EndpointSlice · (c) ReplicaSet · (d) Deployment, which creates a new ReplicaSet.</p></details>
+          <details class="quiz"><summary>Q4. The same LoadBalancer Service gets an AWS hostname on EKS but stays <code class="inl">&lt;pending&gt;</code> on minikube. Why?</summary>
+            <p class="ans">The cloud-controller-manager's service controller creates the load balancer through the cloud API. minikube has no cloud and no cloud-controller-manager (Session 11 uses <code class="inl">minikube tunnel</code>).</p></details>
         </div>
       </section>
 
       <!-- ===================== 5. WORKER NODE ===================== -->
       <section id="worker-node">
-        <h2><span class="sec-num">5</span> kubelet, kube-proxy &amp; the <code class="inl">kubectl apply</code> flow</h2>
+        <h2><span class="sec-num">5</span> kubelet, kube-proxy &amp; the runtime</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>After binding, the pod says <code class="inl">nodeName: node-4</code>. That's only a string in etcd. Something on node-4 has to notice, pull the image and start the container, and restart it after a 3 a.m. crash without asking a control plane that might be in another building.</p>
+
+        <h3>The idea</h3>
+        <p>Every node runs three things. The <span class="term">kubelet</span> is the node agent: it watches the API server for pods bound to its node, tells the runtime to start them, runs their health checks, and reports status and heartbeats. The <span class="term">container runtime</span> pulls images and runs the containers through runc, exactly as in Session 6. <span class="term">kube-proxy</span> turns Services into network rules so Service traffic reaches the right pods (Session 11).</p>
+<pre>                     watch "pods for node-4"
+ kube-apiserver ◀────────────────────────────▶ kubelet  (systemd service)
+                report status + heartbeats       │ CRI: gRPC over a local socket
+                                                 ▼
+                                   container runtime (containerd / CRI-O) ──▶ runc ──▶ containers
+                                                 │  a tiny "pause" container holds each pod's network namespace
+                                                 └─ CNI plugin gives the pod its IP
+
+ kube-apiserver ◀── watch Services + EndpointSlices ── kube-proxy (DaemonSet pod) ──▶ iptables / nftables rules</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The kubelet is the factory foreman: it reads orders from head office, tells the machines (container runtime) what to build, and phones back progress. kube-proxy is the factory's switchboard.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The kubelet is the <strong>head chef</strong> of one kitchen. He checks the order desk for tickets marked with his kitchen, gets the <strong>stoves</strong> going (the runtime does the cooking), tastes the food (health checks) and phones the desk every few seconds: "kitchen 4, all fine". kube-proxy is the kitchen's <strong>intercom wiring</strong>, which knows who answers calls for "the API counter".</p>
         </div>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th></th><th>kubelet</th><th>kube-proxy</th><th>Container runtime</th></tr></thead>
-            <tbody>
-              <tr><td>Job</td><td>Runs pods bound to its node: pull image, start containers, mount volumes, run probes, report status &amp; node heartbeats</td><td>Turns Services into iptables / IPVS / nftables rules so a Service IP reaches pod IPs</td><td>Pulls images, creates containers (via runc)</td></tr>
-              <tr><td>Talks to</td><td>API server (watch + status), runtime via <span class="term">CRI</span> (gRPC socket)</td><td>API server (watch Services, EndpointSlices)</td><td>kubelet</td></tr>
-              <tr><td>Runs as</td><td>systemd service (not a pod)</td><td>DaemonSet pod</td><td>systemd service: containerd or CRI-O</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <ul>
-          <li><strong>CRI</strong> (Container Runtime Interface) is the plug: any compliant runtime works. Docker Engine support via "dockershim" was removed in v1.24 — images built with <code class="inl">docker build</code> still run fine (they're OCI images).</li>
-          <li>Each pod gets a tiny <code class="inl">pause</code> container that holds the pod's network namespace; your containers join it.</li>
-          <li>The kubelet also runs <span class="term">static pods</span> from <code class="inl">/etc/kubernetes/manifests/</code> — that's how the control plane itself starts.</li>
-        </ul>
+        <h3>See it: inside the node</h3>
 <pre><span class="pr">$</span> minikube ssh
 <span class="pr">docker@minikube:~$</span> systemctl status kubelet --no-pager | head -5
 <span class="out">● kubelet.service - kubelet: The Kubernetes Node Agent
@@ -419,14 +462,70 @@ hello-6d9f7c8b5d-zr7tm   1/1     Running   0          4s</span>     <span class=
 3a9f1c2e7b4d5   90550c43ad2bc   25 minutes ago   Running   kube-proxy                0         7c1e9d2f3a4b6   kube-proxy-9vq4d
 b2d8e6f1a9c3e   a0af72f2ec6d6   25 minutes ago   Running   kube-scheduler            0         5d4c3b2a1f0e9   kube-scheduler-minikube
 c7a1d9e3f5b2c   3d2a8c1f6e4b7   25 minutes ago   Running   kube-apiserver            0         1a2b3c4d5e6f7   kube-apiserver-minikube</span>
-<span class="pr">docker@minikube:~$</span> exit
+<span class="pr">docker@minikube:~$</span> exit</pre>
+        <ul>
+          <li><code class="inl">minikube ssh</code> opens a shell on the node; <code class="inl">systemctl status</code> proves the kubelet is a systemd service (Session 2).</li>
+          <li><code class="inl">/etc/kubernetes/manifests/</code> holds the <strong>static pod</strong> files. The kubelet runs any pod file it finds there without asking the API server, which is how the control plane boots.</li>
+          <li><code class="inl">crictl ps</code> is <code class="inl">docker ps</code> for nodes, speaking CRI to the runtime.</li>
+        </ul>
+        <p><strong>What it does <em>not</em> do:</strong> the kubelet doesn't choose its pods (the scheduler did), and it doesn't recreate deleted pods (the ReplicaSet controller does). It runs what it's told and restarts crashed containers in place.</p>
 
-<span class="pr">$</span> kubectl get daemonset -n kube-system
+        <h3>Build it up: kube-proxy and the CRI</h3>
+<pre><span class="pr">$</span> kubectl get daemonset -n kube-system
 <span class="out">NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
 kube-proxy   1         1         1       1            1           kubernetes.io/os=linux   25m</span></pre>
+        <p>A DaemonSet runs one pod per node (Session 15): DESIRED is 1 here, and would be 3 on a 3-node cluster. kube-proxy watches Services and EndpointSlices and rewrites the kernel's iptables or nftables rules. Packets never pass through the kube-proxy process.</p>
+        <p>The kubelet talks to the runtime through the <span class="term">CRI</span> (Container Runtime Interface), so any CRI runtime plugs in. EKS, GKE and kind use containerd. minikube defaults to Docker Engine through the cri-dockerd adapter (<code class="inl">docker://28.4.0</code> in section 7). Kubernetes dropped its built-in Docker support (dockershim) in v1.24, and Docker-built images still run because they're OCI images.</p>
 
-        <h3>What happens when you run <code class="inl">kubectl apply -f deployment.yaml</code></h3>
-        <div class="fname">k8s/deployment.yaml (minimal — explained fully in S10)</div>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"kube-proxy forwards every request through itself." <strong>✗</strong> In iptables/nftables mode it only writes kernel rules, and the kernel rewrites the packets.</p>
+          <p>"If the API server goes down, every container stops." <strong>✗</strong> The kubelets keep running and restarting what they have. They just can't get new work or report status until it returns.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>kubelet = head chef: runs the pods bound to its node, reports back.</strong><br /><strong>runtime = stoves (via CRI) · kube-proxy = writes Service rules, carries no traffic.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A container crashes. Which component restarts it, and must the control plane be reachable?</summary>
+            <p class="ans">The kubelet on that node, following <code class="inl">restartPolicy</code>. It's local, so no. The pod keeps its name and IP and RESTARTS goes up by 1.</p></details>
+          <details class="quiz"><summary>Q2. You copy a pod YAML into <code class="inl">/etc/kubernetes/manifests/</code>, then <code class="inl">kubectl delete</code> the pod that appears. What happens?</summary>
+            <p class="ans">It's a static pod. You deleted only its mirror, and the kubelet recreates it because the file is still there. Remove the file to remove the pod.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: the kubelet talks to the runtime through the ________; a pod gets its IP from a ________ plugin; the ________ container holds the pod's network namespace.</summary>
+            <p class="ans">CRI · CNI · pause.</p></details>
+          <details class="quiz"><summary>Q4. kube-proxy crashes on node-2. Can node-2's pods still reach existing Services?</summary>
+            <p class="ans">Yes, for now, because the rules it already wrote stay in the kernel. New Services and endpoint changes won't reach node-2 until it's back, so node-2 slowly goes stale.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 6. APPLY FLOW ===================== -->
+      <section id="apply-flow">
+        <h2><span class="sec-num">6</span> What happens on <code class="inl">kubectl apply</code></h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>The favourite exam question here is "Describe what happens when you run <code class="inl">kubectl apply -f deployment.yaml</code>." Most answers stop at "Kubernetes creates the pods". The real answer passes through six components, and kubectl has already printed its reply before most of them start.</p>
+
+        <h3>The idea</h3>
+        <p>No component calls another. Each one <strong>watches</strong> the API server for the objects it cares about, does its one job, and writes the result back. The work moves through the cluster like a ticket moving down the rail:</p>
+<pre>kubectl ──①──▶ kube-apiserver ──②──▶ etcd
+                    │
+                    ├─③ Deployment controller sees new Deployment → creates ReplicaSet
+                    ├─④ ReplicaSet controller sees 0/3 pods       → creates 3 Pods (no node yet)
+                    ├─⑤ Scheduler sees unscheduled Pods           → binds each to a node
+                    ├─⑥ kubelet on that node sees its Pod          → CRI: pull image, start containers
+                    └─⑦ kubelet reports Running/Ready              → API server → etcd</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>One ticket, many hands. The desk files it in the book. A shift manager splits "3 × taskflow-api" into three tickets, the floor manager writes a kitchen on each, and each head chef cooks his and calls back "ready". Nobody phoned anybody. They all kept checking the same rail.</p>
+        </div>
+
+        <h3>See it: apply TaskFlow</h3>
+        <div class="fname">k8s/deployment.yaml (minimal; Session 10 adds the rest)</div>
 <pre><span class="kw">apiVersion:</span> apps/v1                <span class="cm"># API group "apps", version v1</span>
 <span class="kw">kind:</span> Deployment
 <span class="kw">metadata:</span>
@@ -446,40 +545,38 @@ kube-proxy   1         1         1       1            1           kubernetes.io/
     spec:
       containers:
       - name: api
-        image: shauryav/taskflow-api:1.0
+        image: shauryav/taskflow-api:1.0.0
         ports:
         - containerPort: <span class="nm">3000</span>
         resources:
           requests:                  <span class="cm"># what the scheduler reserves on a node</span>
             cpu: 100m                <span class="cm"># 0.1 CPU core</span>
             memory: 128Mi</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">apiVersion</code> · <code class="inl">kind</code> · <code class="inl">metadata</code></td><td>The <code class="inl">/apis/apps/v1</code> API (section 3) · a Deployment · named <code class="inl">taskflow-api</code> in namespace <code class="inl">taskflow</code></td></tr>
+              <tr><td><code class="inl">spec.replicas</code> · <code class="inl">selector</code></td><td>Desired count · "pods labelled <code class="inl">app: taskflow-api</code> are mine"</td></tr>
+              <tr><td><code class="inl">spec.template</code></td><td>The pod to stamp out: labels matching the selector, plus containers (<code class="inl">image</code>, <code class="inl">containerPort</code>)</td></tr>
+              <tr><td><code class="inl">resources.requests</code></td><td>100m CPU and 128 MiB reserved: the numbers the scheduler filters on (section 4)</td></tr>
+            </tbody>
+          </table>
+        </div>
 <pre><span class="pr">$</span> kubectl create namespace taskflow
 <span class="out">namespace/taskflow created</span>
 <span class="pr">$</span> kubectl apply -f k8s/deployment.yaml
 <span class="out">deployment.apps/taskflow-api created</span></pre>
-<pre>kubectl ──①──▶ kube-apiserver ──②──▶ etcd
-                    │
-                    ├─③ Deployment controller sees new Deployment → creates ReplicaSet
-                    ├─④ ReplicaSet controller sees 0/3 pods       → creates 3 Pods (no node yet)
-                    ├─⑤ Scheduler sees unscheduled Pods           → binds each to a node
-                    ├─⑥ kubelet on that node sees its Pod          → CRI: pull image, start containers
-                    └─⑦ kubelet reports Running/Ready              → API server → etcd</pre>
-        <ol>
-          <li><strong>kubectl</strong> reads <code class="inl">~/.kube/config</code>, converts YAML → JSON, sends an HTTPS request to <code class="inl">/apis/apps/v1/namespaces/taskflow/deployments</code>.</li>
-          <li><strong>API server</strong> authenticates, authorizes, runs admission + validation, stores the Deployment in <strong>etcd</strong>, replies <code class="inl">created</code>. Your command returns here — everything below is asynchronous.</li>
-          <li><strong>Deployment controller</strong> (watching Deployments) creates a ReplicaSet <code class="inl">taskflow-api-7c9d8b6f4</code>.</li>
-          <li><strong>ReplicaSet controller</strong> sees 0 of 3 pods → creates 3 Pod objects with empty <code class="inl">nodeName</code>.</li>
-          <li><strong>Scheduler</strong> filters + scores nodes, writes <code class="inl">nodeName</code> into each pod.</li>
-          <li><strong>kubelet</strong> on that node sees a pod assigned to it → asks containerd (CRI) to create the pod sandbox; the CNI plugin gives it an IP; image pulled; container started.</li>
-          <li><strong>kubelet</strong> reports status → API server → etcd. <code class="inl">kubectl get pods</code> now shows <code class="inl">Running</code>. (Then the EndpointSlice controller and kube-proxy wire up any matching Service.)</li>
-        </ol>
+        <p><code class="inl">create namespace</code> makes the folder the Deployment lives in (Session 15). <code class="inl">apply -f</code> sends the file's desired state. <strong>What it does <em>not</em> do:</strong> wait. <code class="inl">created</code> means "validated and stored" (steps ① and ②), not "running". Steps ③ to ⑦ happen after your prompt returns.</p>
+
+        <h3>Build it up: read the steps in the events</h3>
 <pre><span class="pr">$</span> kubectl get events -n taskflow --sort-by=.lastTimestamp
 <span class="out">LAST SEEN   TYPE     REASON              OBJECT                              MESSAGE
 14s         Normal   ScalingReplicaSet   deployment/taskflow-api             Scaled up replica set taskflow-api-7c9d8b6f4 from 0 to 3
 14s         Normal   SuccessfulCreate    replicaset/taskflow-api-7c9d8b6f4   Created pod: taskflow-api-7c9d8b6f4-2xkqz
 14s         Normal   Scheduled           pod/taskflow-api-7c9d8b6f4-2xkqz    Successfully assigned taskflow/taskflow-api-7c9d8b6f4-2xkqz to minikube
-13s         Normal   Pulling             pod/taskflow-api-7c9d8b6f4-2xkqz    Pulling image "shauryav/taskflow-api:1.0"
-6s          Normal   Pulled              pod/taskflow-api-7c9d8b6f4-2xkqz    Successfully pulled image "shauryav/taskflow-api:1.0" in 6.8s
+13s         Normal   Pulling             pod/taskflow-api-7c9d8b6f4-2xkqz    Pulling image "shauryav/taskflow-api:1.0.0"
+6s          Normal   Pulled              pod/taskflow-api-7c9d8b6f4-2xkqz    Successfully pulled image "shauryav/taskflow-api:1.0.0" in 6.8s
 6s          Normal   Created             pod/taskflow-api-7c9d8b6f4-2xkqz    Created container api
 6s          Normal   Started             pod/taskflow-api-7c9d8b6f4-2xkqz    Started container api</span>
 
@@ -494,63 +591,75 @@ NAME                                READY   STATUS    RESTARTS   AGE
 pod/taskflow-api-7c9d8b6f4-2xkqz    1/1     Running   0          20s
 pod/taskflow-api-7c9d8b6f4-9hdmv    1/1     Running   0          20s
 pod/taskflow-api-7c9d8b6f4-tq5wl    1/1     Running   0          20s</span></pre>
-        <p>Read the events top-down and you can see each component's fingerprint: controller-manager (<code class="inl">ScalingReplicaSet</code>, <code class="inl">SuccessfulCreate</code>), scheduler (<code class="inl">Scheduled</code>), kubelet (<code class="inl">Pulling</code> → <code class="inl">Started</code>).</p>
+        <p>Each component leaves a fingerprint: <code class="inl">ScalingReplicaSet</code> is step ③ (Deployment controller), <code class="inl">SuccessfulCreate</code> is ④ (ReplicaSet controller), <code class="inl">Scheduled</code> is ⑤ (scheduler), and <code class="inl">Pulling</code> → <code class="inl">Started</code> is ⑥ (kubelet). The Deployment → ReplicaSet → Pod chain is Session 10's topic, and wiring a Service to these pods is Session 11's. Because the state lives in etcd and every component is a stateless watcher, any of them can crash and restart without losing work.</p>
 
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>Components never call each other directly. They all <strong>watch the API server</strong> and react to object changes. That's why each piece can crash and restart without losing work — the state is in etcd.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">kubectl apply</code> printed <code class="inl">created</code>, so the app is running." <strong>✗</strong> It means the object was stored. Check <code class="inl">kubectl get pods</code> or <code class="inl">kubectl rollout status</code> (Session 10).</p>
+          <p>"The Deployment controller creates the pods." <strong>✗</strong> It creates a ReplicaSet, and the ReplicaSet controller creates the pods.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          kubelet = node agent (pods, CRI, status); kube-proxy = Service rules; runtime = containerd/CRI-O. Apply flow: kubectl → API server → etcd → Deployment ctrl → ReplicaSet ctrl → scheduler → kubelet → status.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>kubectl → API server → etcd → Deployment ctrl → ReplicaSet ctrl → scheduler → kubelet → runtime → status back.</strong><br /><strong>Nobody calls anybody. Everybody watches the API server.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Put in order: scheduler binds · ReplicaSet created · kubelet pulls the image · Deployment stored in etcd · Pods created with no node · kubectl prints <code class="inl">created</code>.</summary>
+            <p class="ans">Deployment stored in etcd → kubectl prints <code class="inl">created</code> → ReplicaSet created → Pods created with no node → scheduler binds → kubelet pulls the image.</p></details>
+          <details class="quiz"><summary>Q2. Spot the misconception: "The scheduler was down for 5 minutes, so the 3 running TaskFlow pods crashed."</summary>
+            <p class="ans">Running pods don't need the scheduler, because their kubelets keep them going. Only <em>new</em> pods would sit in Pending until the scheduler returns.</p></details>
+          <details class="quiz"><summary>Q3. Events show <code class="inl">Scheduled</code>, <code class="inl">Pulling</code>, then <code class="inl">Failed … ErrImagePull</code>. Which steps worked, and which component failed?</summary>
+            <p class="ans">Steps ① to ⑤ worked. Step ⑥ failed: the kubelet (via the runtime) couldn't pull the image, usually because of a wrong tag or a private registry (Session 14).</p></details>
+          <details class="quiz"><summary>Q4. You apply a 3-replica Deployment. <code class="inl">get deploy</code> shows <code class="inl">0/3</code> and no ReplicaSet exists at all. Which component do you suspect?</summary>
+            <p class="ans">The kube-controller-manager: step ③ never happened. Check its pod in <code class="inl">kube-system</code> and read its logs.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 6. SETUP AND KUBECTL ===================== -->
+      <!-- ===================== 7. SETUP AND KUBECTL ===================== -->
       <section id="kubectl">
-        <h2><span class="sec-num">6</span> Cluster setup &amp; kubectl</h2>
+        <h2><span class="sec-num">7</span> Cluster setup, kubectl &amp; kubeconfig</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+<pre><span class="pr">$</span> kubectl get pods
+<span class="out">The connection to the server localhost:8080 was refused - did you specify the right host or port?</span></pre>
+        <p>kubectl has no idea which cluster to talk to. The opposite failure is worse: three clusters configured, you think you're on minikube, and you run <code class="inl">kubectl delete deployment taskflow-api</code> on production.</p>
+
+        <h3>The idea</h3>
+        <p>kubectl is an HTTPS client (section 3). Before every command it reads the <span class="term">kubeconfig</span> file, <code class="inl">~/.kube/config</code>, to learn <strong>where</strong> the API server is, <strong>who</strong> you are, and <strong>which</strong> namespace to use by default. A named set of those three is a <span class="term">context</span>, and <code class="inl">current-context</code> is the one in use.</p>
+<pre> clusters:  minikube → https://192.168.49.2:8443        kind-taskflow → https://127.0.0.1:41263
+ users:     minikube → client cert                     kind-taskflow → client cert
+                 └────────────┬────────────┘                   └────────────┬────────────┘
+ contexts:   minikube = cluster + user + ns taskflow      kind-taskflow = cluster + user
+                       ▲
+ current-context ──────┘   every kubectl command goes here unless you pass --context</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>kubectl is the remote control; the kubeconfig file is the list of TVs it can point at, plus the PIN for each.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The kubeconfig is your <strong>wallet of staff badges</strong>. Each badge (context) names a restaurant (cluster), who you are there (user) and your usual section (namespace). <code class="inl">current-context</code> is the badge you're wearing. The wrong badge can still cancel real orders, so check it first.</p>
         </div>
 
-        <h3>Local cluster: minikube (or kind)</h3>
-<pre><span class="pr">$</span> minikube start --driver=docker --cpus=2 --memory=4096
-<span class="out">😄  minikube v1.37.0 on Ubuntu 24.04
-✨  Using the docker driver based on user configuration
-👍  Starting "minikube" primary control-plane node in "minikube" cluster
-🔥  Creating docker container (CPUs=2, Memory=4096MB) ...
-🐳  Preparing Kubernetes v1.34.0 on Docker 28.4.0 ...
-🔗  Configuring bridge CNI (Container Networking Interface) ...
-🔎  Verifying Kubernetes components...
-🌟  Enabled addons: storage-provisioner, default-storageclass
-🏄  Done! kubectl is now configured to use "minikube" cluster and "default" namespace by default</span>
+        <h3>See it: switch badges</h3>
+<pre><span class="pr">$</span> kubectl config get-contexts
+<span class="out">CURRENT   NAME            CLUSTER         AUTHINFO        NAMESPACE
+*         minikube        minikube        minikube        taskflow
+          kind-taskflow   kind-taskflow   kind-taskflow</span>
+<span class="pr">$</span> kubectl config use-context kind-taskflow
+<span class="out">Switched to context "kind-taskflow".</span>
+<span class="pr">$</span> kubectl config current-context
+<span class="out">kind-taskflow</span>
+<span class="pr">$</span> kubectl config use-context minikube
+<span class="pr">$</span> kubectl config set-context --current --namespace=taskflow
+<span class="out">Context "minikube" modified.</span></pre>
+        <p><code class="inl">*</code> marks the current context, AUTHINFO is the user, and NAMESPACE is the default when you omit <code class="inl">-n</code>. <strong>What these commands do <em>not</em> do:</strong> touch any cluster. They only edit the file on your laptop.</p>
 
-<span class="pr">$</span> minikube status
-<span class="out">minikube
-type: Control Plane
-host: Running
-kubelet: Running
-apiserver: Running
-kubeconfig: Configured</span>
+        <h3>Build it up</h3>
+        <h4>Where contexts come from: minikube and kind</h4>
+        <p><code class="inl">minikube start</code> wrote <code class="inl">minikube</code> (section 1). <code class="inl">kind create cluster --name taskflow</code> wrote <code class="inl">kind-taskflow</code>. <span class="term">kind</span> (Kubernetes IN Docker) runs every node as a Docker container, which makes it fast and popular in CI. minikube, used in this course, adds add-ons (<code class="inl">ingress</code>, <code class="inl">metrics-server</code>), <code class="inl">minikube service</code>/<code class="inl">tunnel</code> and multi-node clusters (<code class="inl">--nodes 3</code>; workers show ROLES <code class="inl">&lt;none&gt;</code>). Clean up with <code class="inl">minikube delete</code> or <code class="inl">kind delete cluster --name taskflow</code>.</p>
 
-<span class="cm"># alternative: kind = Kubernetes IN Docker (each node is a container)</span>
-<span class="pr">$</span> kind create cluster --name taskflow
-<span class="out">Creating cluster "taskflow" ...
- ✓ Ensuring node image (kindest/node:v1.34.0) 🖼
- ✓ Preparing nodes 📦
- ✓ Writing configuration 📜
- ✓ Starting control-plane 🕹️
- ✓ Installing CNI 🔌
- ✓ Installing StorageClass 💾
-Set kubectl context to "kind-taskflow"</span></pre>
-        <p><strong>minikube</strong> (used in this course): node = Docker container or VM, handy add-ons (<code class="inl">ingress</code>, <code class="inl">metrics-server</code>), <code class="inl">minikube service</code> / <code class="inl">tunnel</code>, multi-node with <code class="inl">--nodes 3</code>. <strong>kind</strong>: nodes are Docker containers, very fast, multi-node via a config file, popular in CI.</p>
-        <p>Stop / delete: <code class="inl">minikube stop</code>, <code class="inl">minikube delete</code>, <code class="inl">kind delete cluster --name taskflow</code>.</p>
-
-        <h3>kubeconfig: <code class="inl">~/.kube/config</code></h3>
+        <h4>The file itself</h4>
         <div class="fname">~/.kube/config</div>
 <pre><span class="kw">apiVersion:</span> v1
 <span class="kw">kind:</span> Config
@@ -588,114 +697,85 @@ Set kubectl context to "kind-taskflow"</span></pre>
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">clusters[].cluster.server</code></td><td>API server URL (minikube: <code class="inl">:8443</code>; kubeadm: <code class="inl">:6443</code>; EKS: <code class="inl">https://XXXX.gr7.ap-south-1.eks.amazonaws.com</code>).</td></tr>
-              <tr><td><code class="inl">certificate-authority</code> / <code class="inl">-data</code></td><td>CA that signed the API server's cert — file path, or the file inlined as base64.</td></tr>
-              <tr><td><code class="inl">users[].user</code></td><td>Client cert + key, a bearer <code class="inl">token</code>, or an <code class="inl">exec</code> plugin (EKS: <code class="inl">aws eks get-token</code>).</td></tr>
-              <tr><td><code class="inl">contexts[]</code></td><td>A named triple: cluster + user + optional namespace.</td></tr>
-              <tr><td><code class="inl">current-context</code></td><td>The active one. Changed by <code class="inl">kubectl config use-context</code>.</td></tr>
+              <tr><td><code class="inl">clusters[].cluster.server</code></td><td>API server URL (minikube <code class="inl">:8443</code>; kubeadm <code class="inl">:6443</code>; EKS <code class="inl">https://XXXX.gr7.ap-south-1.eks.amazonaws.com</code>)</td></tr>
+              <tr><td><code class="inl">certificate-authority</code> / <code class="inl">-data</code></td><td>The CA that signed the API server's certificate, as a path or inlined base64</td></tr>
+              <tr><td><code class="inl">users[].user</code></td><td>Client cert + key, a bearer <code class="inl">token</code>, or an <code class="inl">exec</code> plugin (EKS runs <code class="inl">aws eks get-token</code>)</td></tr>
+              <tr><td><code class="inl">contexts[]</code> · <code class="inl">current-context</code></td><td>Named triples of cluster + user + optional namespace · the one in use</td></tr>
             </tbody>
           </table>
         </div>
-<pre><span class="pr">$</span> kubectl config get-contexts
-<span class="out">CURRENT   NAME            CLUSTER         AUTHINFO        NAMESPACE
-*         minikube        minikube        minikube        taskflow
-          kind-taskflow   kind-taskflow   kind-taskflow</span>
-<span class="pr">$</span> kubectl config use-context kind-taskflow
-<span class="out">Switched to context "kind-taskflow".</span>
-<span class="pr">$</span> kubectl config current-context
-<span class="out">kind-taskflow</span>
-<span class="pr">$</span> kubectl config use-context minikube
-<span class="pr">$</span> kubectl config set-context --current --namespace=taskflow
-<span class="out">Context "minikube" modified.</span>
-<span class="pr">$</span> kubectl config view --minify          <span class="cm"># only the current context; cert data shown as DATA+OMITTED</span>
-<span class="pr">$</span> KUBECONFIG=~/.kube/config:~/eks.yaml kubectl config get-contexts   <span class="cm"># merge several files</span></pre>
+        <p>That explains the opening error: with no usable kubeconfig (cluster never started, or <code class="inl">KUBECONFIG</code> pointing nowhere), kubectl falls back to <code class="inl">localhost:8080</code>. Run <code class="inl">minikube start</code>, then check <code class="inl">kubectl config current-context</code>. <code class="inl">kubectl config view --minify</code> shows only the current context; <code class="inl">KUBECONFIG=~/.kube/config:~/eks.yaml</code> merges files.</p>
 
-        <h3>kubectl basics</h3>
-        <p>Syntax: <code class="inl">kubectl &lt;verb&gt; &lt;type&gt; [name] [flags]</code> — e.g. <code class="inl">kubectl get pods -n kube-system -o wide</code>. Useful flags: <code class="inl">-n NS</code>, <code class="inl">-A</code> (all namespaces), <code class="inl">-o wide|yaml|json|name</code>, <code class="inl">-w</code> (watch), <code class="inl">-l app=taskflow-api</code>, <code class="inl">--context</code>.</p>
+        <h4>Finding your way around</h4>
+        <p>Syntax: <code class="inl">kubectl &lt;verb&gt; &lt;type&gt; [name] [flags]</code>. Daily flags: <code class="inl">-n NS</code>, <code class="inl">-A</code> (all namespaces), <code class="inl">-o wide|yaml|json|name</code>, <code class="inl">-w</code> (watch), <code class="inl">-l app=taskflow-api</code>, <code class="inl">--context</code>.</p>
 <pre><span class="pr">$</span> kubectl version
 <span class="out">Client Version: v1.34.1
 Kustomize Version: v5.7.1
-Server Version: v1.34.0</span>        <span class="cm">← kubectl may be at most ±1 minor version from the server</span>
-
+Server Version: v1.34.0</span>        <span class="cm"># kubectl may be at most ±1 minor version from the server</span>
 <span class="pr">$</span> kubectl cluster-info
 <span class="out">Kubernetes control plane is running at https://192.168.49.2:8443
-CoreDNS is running at https://192.168.49.2:8443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
-
-To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.</span>
-
+CoreDNS is running at https://192.168.49.2:8443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy</span>
 <span class="pr">$</span> kubectl get nodes -o wide
 <span class="out">NAME       STATUS   ROLES           AGE   VERSION   INTERNAL-IP    EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION     CONTAINER-RUNTIME
 minikube   Ready    control-plane   12m   v1.34.0   192.168.49.2   &lt;none&gt;        Ubuntu 22.04.5 LTS   6.8.0-45-generic   docker://28.4.0</span>
-
-<span class="cm"># a 3-node minikube profile: workers show ROLES &lt;none&gt;</span>
-<span class="pr">$</span> minikube start --nodes 3 -p multi &amp;&amp; kubectl get nodes
-<span class="out">NAME        STATUS   ROLES           AGE   VERSION
-multi       Ready    control-plane   3m    v1.34.0
-multi-m02   Ready    &lt;none&gt;          2m    v1.34.0
-multi-m03   Ready    &lt;none&gt;          2m    v1.34.0</span>
-
-<span class="pr">$</span> kubectl api-resources
+<span class="pr">$</span> kubectl api-resources                       <span class="cm"># trimmed</span>
 <span class="out">NAME                       SHORTNAMES   APIVERSION             NAMESPACED   KIND
-configmaps                 cm           v1                     true         ConfigMap
-namespaces                 ns           v1                     false        Namespace
 nodes                      no           v1                     false        Node
 pods                       po           v1                     true         Pod
-secrets                                 v1                     true         Secret
 services                   svc          v1                     true         Service
 deployments                deploy       apps/v1                true         Deployment
-replicasets                rs           apps/v1                true         ReplicaSet
 horizontalpodautoscalers   hpa          autoscaling/v2         true         HorizontalPodAutoscaler
-ingresses                  ing          networking.k8s.io/v1   true         Ingress
-…</span>
+ingresses                  ing          networking.k8s.io/v1   true         Ingress</span></pre>
+        <p><code class="inl">api-resources</code> answers the questions you have while writing YAML: short name, apiVersion, namespaced or not. <code class="inl">kubectl explain pod.spec</code> is built-in field documentation (add <code class="inl">--recursive</code> for the whole tree). Save typing with <code class="inl">alias k=kubectl</code> and <code class="inl">source &lt;(kubectl completion bash)</code>.</p>
 
-<span class="pr">$</span> kubectl explain pod.spec
-<span class="out">KIND:       Pod
-VERSION:    v1
-
-FIELD: spec &lt;PodSpec&gt;
-
-DESCRIPTION:
-    Specification of the desired behavior of the pod. …
-
-FIELDS:
-  containers	&lt;[]Container&gt; -required-
-    List of containers belonging to the pod. …
-  nodeName	&lt;string&gt;
-    NodeName indicates in which node this pod is scheduled. …
-  restartPolicy	&lt;string&gt;
-  enum: Always, Never, OnFailure
-…</span></pre>
-        <ul>
-          <li><code class="inl">api-resources</code> answers "what's the short name / apiVersion / is it namespaced?" — exactly what you need when writing YAML.</li>
-          <li><code class="inl">explain</code> is offline-friendly docs for any field: <code class="inl">kubectl explain deployment.spec.strategy</code>, add <code class="inl">--recursive</code> for the whole tree.</li>
-          <li>Speed-ups: <code class="inl">alias k=kubectl</code> and <code class="inl">source &lt;(kubectl completion bash)</code> (or <code class="inl">zsh</code>).</li>
-        </ul>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><code class="inl">The connection to the server localhost:8080 was refused - did you specify the right host or port?</code> → kubectl has no kubeconfig/context (cluster not started, or <code class="inl">KUBECONFIG</code> points nowhere). Run <code class="inl">minikube start</code> / check <code class="inl">kubectl config current-context</code>.</li>
-            <li>Running a command against the wrong cluster. Check the context before <code class="inl">delete</code>; put it in your shell prompt.</li>
-            <li>"No resources found in default namespace." — your pods are in <code class="inl">taskflow</code>. Add <code class="inl">-n taskflow</code>, <code class="inl">-A</code>, or set the context namespace.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"The namespace in my context limits what I'm allowed to touch." <strong>✗</strong> It's only the default for <code class="inl">-n</code>. Permissions come from RBAC (Session 16).</p>
+          <p>"Any kubectl works with any cluster." <strong>✗</strong> kubectl is supported within one minor version of the API server (v1.34 kubectl for v1.33–v1.35 clusters).</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">minikube start</code> writes a context into <code class="inl">~/.kube/config</code>. Context = cluster + user + namespace. Discover with <code class="inl">get nodes</code>, <code class="inl">cluster-info</code>, <code class="inl">api-resources</code>, <code class="inl">explain</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>context = cluster + user + namespace · current-context = where every command goes.</strong><br /><strong>Check <code class="inl">kubectl config current-context</code> before anything destructive.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Which line of <code class="inl">~/.kube/config</code> changes after <code class="inl">kubectl config use-context kind-taskflow</code>? After <code class="inl">set-context --current --namespace=taskflow</code>?</summary>
+            <p class="ans">First: <code class="inl">current-context: kind-taskflow</code>. Second: a <code class="inl">namespace: taskflow</code> line under that context. Neither touches a cluster.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">apply</code> printed <code class="inl">deployment.apps/taskflow-api created</code>, but <code class="inl">get pods</code> says "No resources found in default namespace." Give three fixes.</summary>
+            <p class="ans"><code class="inl">kubectl get pods -n taskflow</code>, <code class="inl">kubectl get pods -A</code>, or <code class="inl">kubectl config set-context --current --namespace=taskflow</code> once.</p></details>
+          <details class="quiz"><summary>Q3. You need HorizontalPodAutoscaler's apiVersion and short name, then the fields under <code class="inl">deployment.spec.strategy</code>. Which two commands?</summary>
+            <p class="ans"><code class="inl">kubectl api-resources</code> (<code class="inl">hpa</code>, <code class="inl">autoscaling/v2</code>) and <code class="inl">kubectl explain deployment.spec.strategy</code>.</p></details>
+          <details class="quiz"><summary>Q4. <code class="inl">get nodes -o wide</code> shows <code class="inl">CONTAINER-RUNTIME docker://28.4.0</code>. What does that tell you, and what would EKS show?</summary>
+            <p class="ans">minikube's kubelet drives Docker Engine 28.4.0 through the CRI (via cri-dockerd). EKS shows <code class="inl">containerd://…</code>. Both speak CRI, so the kubelet doesn't care.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 7. FIRST POD ===================== -->
+      <!-- ===================== 8. YAML ANATOMY ===================== -->
       <section id="first-pod">
-        <h2><span class="sec-num">7</span> YAML anatomy &amp; imperative vs declarative</h2>
+        <h2><span class="sec-num">8</span> YAML anatomy &amp; imperative vs declarative</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>A teammate hot-fixed production with <code class="inl">kubectl run</code>, <code class="inl">scale</code> and <code class="inl">set image</code>. Today the cluster is rebuilt and nobody knows what was typed. Meanwhile your file-based approach fails the second time you run it:</p>
+<pre><span class="pr">$</span> kubectl create -f k8s/pod.yaml
+<span class="out">Error from server (AlreadyExists): error when creating "k8s/pod.yaml": pods "taskflow-api" already exists</span></pre>
+
+        <h3>The idea</h3>
+        <p>Every Kubernetes object has the same shape, and you can send one in two ways: <strong>imperatively</strong> ("do this now") or <strong>declaratively</strong> ("make the cluster look like this file"). Files in Git plus <code class="inl">kubectl apply</code> is how real projects work.</p>
+<pre> apiVersion: v1      ← which API (group/version) understands this kind
+ kind: Pod           ← what type of object
+ metadata: …         ← identity: name, namespace, labels      (you write)
+ spec: …             ← desired state: what you want           (you write)
+ status: …           ← actual state: what is really happening (Kubernetes writes)</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Every Kubernetes YAML is a form with the same four boxes: what kind of thing, which version of the form, its name tag, and what you want it to be.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Every <strong>order ticket</strong> is printed on the same form: which form (apiVersion), what kind of order (kind), the name on it (metadata), what you want (spec). The kitchen fills in the bottom box (status). You never write in that box.</p>
         </div>
 
+        <h3>See it: TaskFlow's first pod</h3>
         <div class="fname">k8s/pod.yaml</div>
 <pre><span class="kw">apiVersion:</span> v1                     <span class="cm"># group/version — Pods live in the core group "v1"</span>
 <span class="kw">kind:</span> Pod                          <span class="cm"># object type</span>
@@ -708,7 +788,7 @@ FIELDS:
 <span class="kw">spec:</span>                              <span class="cm"># DESIRED state — you write this</span>
   containers:
   - name: api                       <span class="cm"># container name inside the pod</span>
-    image: shauryav/taskflow-api:1.0
+    image: shauryav/taskflow-api:1.0.0
     ports:
     - containerPort: <span class="nm">3000</span>           <span class="cm"># informational, like EXPOSE</span>
     env:
@@ -718,11 +798,10 @@ FIELDS:
           <table>
             <thead><tr><th>Field</th><th>Who writes it</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">apiVersion</code></td><td>You</td><td><code class="inl">v1</code> (Pod, Service, ConfigMap, Secret), <code class="inl">apps/v1</code> (Deployment), <code class="inl">networking.k8s.io/v1</code> (Ingress), <code class="inl">autoscaling/v2</code> (HPA). Check with <code class="inl">kubectl api-resources</code>.</td></tr>
-              <tr><td><code class="inl">kind</code></td><td>You</td><td>Object type, CamelCase.</td></tr>
-              <tr><td><code class="inl">metadata</code></td><td>You (+ K8s adds <code class="inl">uid</code>, <code class="inl">creationTimestamp</code>, <code class="inl">resourceVersion</code>)</td><td><code class="inl">name</code>, <code class="inl">namespace</code>, <code class="inl">labels</code> (for selecting), <code class="inl">annotations</code> (free-form notes for tools).</td></tr>
-              <tr><td><code class="inl">spec</code></td><td>You</td><td>Desired state. Its shape depends on <code class="inl">kind</code>.</td></tr>
-              <tr><td><code class="inl">status</code></td><td><strong>Kubernetes only</strong></td><td>Actual state (phase, IPs, conditions). Never put it in your files.</td></tr>
+              <tr><td><code class="inl">apiVersion</code> · <code class="inl">kind</code></td><td>You</td><td><code class="inl">v1</code> for core kinds like Pod and Service · object type in CamelCase</td></tr>
+              <tr><td><code class="inl">metadata</code></td><td>You (Kubernetes adds <code class="inl">uid</code>, <code class="inl">resourceVersion</code>…)</td><td><code class="inl">name</code>, <code class="inl">namespace</code>, <code class="inl">labels</code> (for selecting), <code class="inl">annotations</code> (notes for tools)</td></tr>
+              <tr><td><code class="inl">spec</code></td><td>You</td><td>Desired state, shaped by <code class="inl">kind</code>: here one container with image, port and env</td></tr>
+              <tr><td><code class="inl">status</code></td><td><strong>Kubernetes only</strong></td><td>Actual state (phase, IPs, conditions). Never in your files.</td></tr>
             </tbody>
           </table>
         </div>
@@ -732,108 +811,72 @@ FIELDS:
 <span class="out">NAME           READY   STATUS    RESTARTS   AGE   IP           NODE       NOMINATED NODE   READINESS GATES
 taskflow-api   1/1     Running   0          14s   10.244.0.7   minikube   &lt;none&gt;           &lt;none&gt;</span>
 <span class="pr">$</span> kubectl port-forward -n taskflow pod/taskflow-api 3000:3000
-<span class="out">Forwarding from 127.0.0.1:3000 -&gt; 3000
-Forwarding from [::1]:3000 -&gt; 3000</span>
+<span class="out">Forwarding from 127.0.0.1:3000 -&gt; 3000</span>
 <span class="cm"># in another terminal</span>
 <span class="pr">$</span> curl -s localhost:3000/health
 <span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> kubectl get pod taskflow-api -n taskflow -o jsonpath='{.status.phase} {.status.podIP}'
+<span class="out">Running 10.244.0.7</span></pre>
+        <p><code class="inl">port-forward</code> tunnels laptop port 3000 to the pod through the API server (testing only). The last command reads the <code class="inl">status</code> box Kubernetes filled in. <strong>What it does <em>not</em> do:</strong> protect the pod. A bare pod has no controller, so if you delete it or lose its node it's gone for good. Session 10 wraps pods in Deployments for that reason.</p>
 
-<span class="pr">$</span> kubectl get pod taskflow-api -n taskflow -o yaml | sed -n '/^status:/,$p'
-<span class="out">status:
-  conditions:
-  - status: "True"
-    type: Ready
-  containerStatuses:
-  - image: shauryav/taskflow-api:1.0
-    name: api
-    ready: true
-    restartCount: 0
-    state:
-      running:
-        startedAt: "2026-10-09T10:30:12Z"
-  hostIP: 192.168.49.2
-  phase: Running
-  podIP: 10.244.0.7
-  …</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><code class="inl">value: 3000</code> (unquoted) → <code class="inl">Error from server (BadRequest): … json: cannot unmarshal number into Go struct field EnvVar.spec.containers.env.value of type string</code>.</li>
-            <li>Tabs in YAML → <code class="inl">error converting YAML to JSON: yaml: line 7: found character that cannot start any token</code>. Spaces only, 2 per level.</li>
-            <li>Editing <code class="inl">env</code> of a running pod and re-applying → <code class="inl">The Pod "taskflow-api" is invalid: spec: Forbidden: pod updates may not change fields other than `spec.containers[*].image`, …</code>. Pods are nearly immutable — that's why we use Deployments (S10).</li>
-          </ul>
-        </div>
-
-        <h3>Imperative vs declarative</h3>
+        <h3>Build it up: create vs apply, and generating YAML</h3>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Technique</th><th>Examples</th><th>Good</th><th>Bad</th></tr></thead>
             <tbody>
               <tr><td>Imperative commands</td><td><code class="inl">kubectl run</code>, <code class="inl">create deployment</code>, <code class="inl">scale</code>, <code class="inl">expose</code>, <code class="inl">set image</code></td><td>Fast; great for labs and debugging</td><td>No file, no review, no history</td></tr>
               <tr><td>Imperative object config</td><td><code class="inl">kubectl create -f</code>, <code class="inl">replace -f</code>, <code class="inl">delete -f</code></td><td>Files in Git</td><td><code class="inl">create</code> fails if it exists; <code class="inl">replace</code> drops live changes</td></tr>
-              <tr><td><strong>Declarative</strong> object config</td><td><code class="inl">kubectl apply -f k8s/</code>, <code class="inl">kubectl diff -f k8s/</code></td><td>Idempotent, whole directories, Git = source of truth (GitOps, S22)</td><td>Merge behaviour can surprise</td></tr>
+              <tr><td><strong>Declarative</strong> object config</td><td><code class="inl">kubectl apply -f k8s/</code>, <code class="inl">kubectl diff -f k8s/</code></td><td>Idempotent, whole directories, Git as source of truth (GitOps, S22)</td><td>Merge behaviour can surprise</td></tr>
             </tbody>
           </table>
         </div>
-<pre><span class="pr">$</span> kubectl create -f k8s/pod.yaml
-<span class="out">Error from server (AlreadyExists): error when creating "k8s/pod.yaml": pods "taskflow-api" already exists</span>
-<span class="pr">$</span> kubectl apply -f k8s/pod.yaml
+<pre><span class="pr">$</span> kubectl apply -f k8s/pod.yaml
 <span class="out">pod/taskflow-api unchanged</span>
-<span class="cm"># change image to :1.1 in the file</span>
+<span class="cm"># change image to :1.1.0 in the file</span>
 <span class="pr">$</span> kubectl diff -f k8s/pod.yaml | grep image:
-<span class="out">-  - image: shauryav/taskflow-api:1.0
-+  - image: shauryav/taskflow-api:1.1</span>
+<span class="out">-  - image: shauryav/taskflow-api:1.0.0
++  - image: shauryav/taskflow-api:1.1.0</span>
 <span class="pr">$</span> kubectl apply -f k8s/pod.yaml
 <span class="out">pod/taskflow-api configured</span>
 <span class="pr">$</span> kubectl delete -f k8s/pod.yaml
 <span class="out">pod "taskflow-api" deleted</span></pre>
-
-        <h3>Generate YAML instead of typing it: <code class="inl">--dry-run=client -o yaml</code></h3>
-<pre><span class="pr">$</span> kubectl create deployment taskflow-api --image=shauryav/taskflow-api:1.0 \
+        <p>That solves the opening puzzle. <code class="inl">create</code> means "make a new one", so it fails if the object exists. <code class="inl">apply</code> means "make it look like this file" and answers <code class="inl">created</code>, <code class="inl">unchanged</code> or <code class="inl">configured</code> however often you run it. You rarely type YAML from scratch, either. kubectl will write it for you without sending anything:</p>
+<pre><span class="pr">$</span> kubectl create deployment taskflow-api --image=shauryav/taskflow-api:1.0.0 \
     --replicas=3 --port=3000 -n taskflow --dry-run=client -o yaml &gt; k8s/deployment.yaml
-<span class="pr">$</span> cat k8s/deployment.yaml
-<span class="out">apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    app: taskflow-api
-  name: taskflow-api
-  namespace: taskflow
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: taskflow-api
-  strategy: {}
-  template:
-    metadata:
-      labels:
-        app: taskflow-api
-    spec:
-      containers:
-      - image: shauryav/taskflow-api:1.0
-        name: taskflow-api
-        ports:
-        - containerPort: 3000
-        resources: {}
-status: {}</span>
-
-<span class="pr">$</span> kubectl run tmp --image=busybox:1.36 --restart=Never --dry-run=client -o yaml -- sleep 3600
+<span class="pr">$</span> grep -n '{}' k8s/deployment.yaml          <span class="cm"># the rest is section 6's file, minus resources</span>
+<span class="out">13:  strategy: {}
+24:        resources: {}
+25:status: {}</span>
 <span class="pr">$</span> kubectl apply -f k8s/deployment.yaml --dry-run=server     <span class="cm"># full server-side validation, nothing saved</span></pre>
-        <ul>
-          <li><code class="inl">--dry-run=client</code>: build the object locally, send nothing. <code class="inl">--dry-run=server</code>: API server validates + runs admission, but doesn't persist.</li>
-          <li>Clean up the generated file: delete <code class="inl">status: {}</code>, empty <code class="inl">strategy: {}</code> / <code class="inl">resources: {}</code> (and <code class="inl">creationTimestamp: null</code> if your kubectl adds it), then fill in real values.</li>
-        </ul>
+        <p><code class="inl">--dry-run=client -o yaml</code> builds the object locally and prints it (it works with <code class="inl">kubectl run</code> too). The generated file has the same apiVersion, metadata, selector and template as section 6's, plus three empty placeholders: delete <code class="inl">status: {}</code>, and fill in or delete <code class="inl">strategy: {}</code> and <code class="inl">resources: {}</code>. <code class="inl">--dry-run=server</code> runs validation and admission without storing anything.</p>
 
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>Use imperative commands to <em>explore</em> and to <em>generate</em> YAML; use <code class="inl">kubectl apply -f</code> on files in Git to <em>run</em> things. Every TaskFlow manifest in <code class="inl">k8s/</code> follows this.</p>
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>Tabs in YAML → <code class="inl">error converting YAML to JSON: yaml: line 7: found character that cannot start any token</code>. Spaces only, 2 per level.</li>
+            <li>Changing <code class="inl">env</code> of a running pod and re-applying → <code class="inl">The Pod "taskflow-api" is invalid: spec: Forbidden: pod updates may not change fields other than `spec.containers[*].image`, …</code>. Pods are nearly immutable, which is one more reason to use Deployments.</li>
+          </ul>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          apiVersion / kind / metadata / spec (you) + status (K8s). <code class="inl">create</code> = "make new", <code class="inl">apply</code> = "make it look like this file". <code class="inl">--dry-run=client -o yaml</code> generates starter YAML.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Put <code class="inl">status: phase: Running</code> in the YAML so Kubernetes knows the pod should run." <strong>✗</strong> Kubernetes writes <code class="inl">status</code>. What you want goes in <code class="inl">spec</code>.</p>
+          <p>"<code class="inl">kubectl apply -f</code> and <code class="inl">kubectl create -f</code> are the same." <strong>✗</strong> <code class="inl">create</code> fails if the object exists. <code class="inl">apply</code> creates or updates, so it's safe to repeat.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>apiVersion · kind · metadata · spec (you) + status (Kubernetes).</strong><br /><strong>create = make new · apply = make it look like this file. Imperative to explore and generate, declarative to run.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Predict: <code class="inl">kubectl create -f pod.yaml</code> twice; <code class="inl">kubectl apply -f pod.yaml</code> twice; then <code class="inl">apply</code> after changing the image tag.</summary>
+            <p class="ans">create: <code class="inl">created</code>, then <code class="inl">AlreadyExists</code>. apply: <code class="inl">unchanged</code> twice (the pod exists), then <code class="inl">configured</code>. The image is one of the few fields a live pod lets you change.</p></details>
+          <details class="quiz"><summary>Q2. Spot the bug: <code class="inl">env: [ { name: PORT, value: 3000 } ]</code></summary>
+            <p class="ans">Env values must be strings. YAML reads <code class="inl">3000</code> as a number, and the API server rejects it ("cannot unmarshal number … of type string"). Write <code class="inl">value: "3000"</code>.</p></details>
+          <details class="quiz"><summary>Q3. Which dry run catches the typo <code class="inl">replica: 3</code> in a Deployment, and why?</summary>
+            <p class="ans"><code class="inl">--dry-run=server</code>. It goes through the API server's schema validation, which reports <code class="inl">unknown field "spec.replica"</code>. A client dry run never reaches the server.</p></details>
         </div>
       </section>
 
@@ -845,23 +888,27 @@ status: {}</span>
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">minikube start [--nodes 3 -p multi]</code> / <code class="inl">status</code> / <code class="inl">stop</code> / <code class="inl">delete</code></td><td>Manage a local cluster.</td></tr>
-              <tr><td><code class="inl">minikube ssh</code></td><td>Shell on the minikube node (kubelet, manifests, crictl).</td></tr>
-              <tr><td><code class="inl">kind create cluster --name taskflow</code></td><td>Local cluster in Docker containers.</td></tr>
-              <tr><td><code class="inl">kubectl version</code> / <code class="inl">cluster-info</code></td><td>Client/server versions; API server + CoreDNS URLs.</td></tr>
-              <tr><td><code class="inl">kubectl config get-contexts</code> / <code class="inl">use-context X</code> / <code class="inl">current-context</code></td><td>List / switch / show contexts.</td></tr>
-              <tr><td><code class="inl">kubectl config set-context --current --namespace=taskflow</code></td><td>Default namespace for the current context.</td></tr>
-              <tr><td><code class="inl">kubectl get nodes -o wide</code></td><td>Nodes with IPs, OS, kernel, runtime.</td></tr>
-              <tr><td><code class="inl">kubectl get pods -n kube-system</code></td><td>See control-plane and add-on pods.</td></tr>
-              <tr><td><code class="inl">kubectl api-resources</code> / <code class="inl">explain pod.spec</code></td><td>Resource types + apiVersions / field docs.</td></tr>
-              <tr><td><code class="inl">kubectl apply -f file.yaml|dir/</code></td><td>Declaratively create/update.</td></tr>
-              <tr><td><code class="inl">kubectl diff -f file.yaml</code></td><td>Show what apply would change.</td></tr>
-              <tr><td><code class="inl">kubectl create deployment X --image=Y --dry-run=client -o yaml</code></td><td>Generate YAML without creating anything.</td></tr>
-              <tr><td><code class="inl">kubectl get deploy,rs,pods -n taskflow</code></td><td>Several resource types at once.</td></tr>
-              <tr><td><code class="inl">kubectl get events -n taskflow --sort-by=.lastTimestamp</code></td><td>What each component did, in order.</td></tr>
-              <tr><td><code class="inl">kubectl port-forward pod/X 3000:3000</code></td><td>Reach a pod from your laptop.</td></tr>
-              <tr><td><code class="inl">kubectl get --raw='/readyz?verbose'</code></td><td>API server health checks.</td></tr>
-              <tr><td><code class="inl">etcdctl snapshot save FILE …</code></td><td>Back up etcd (on the control plane).</td></tr>
+              <tr><td><code class="inl">minikube start [--nodes 3 -p multi]</code> / <code class="inl">status</code> / <code class="inl">stop</code> / <code class="inl">delete</code></td><td>Manage a local cluster</td></tr>
+              <tr><td><code class="inl">minikube ssh</code> → <code class="inl">systemctl status kubelet</code>, <code class="inl">sudo crictl ps</code></td><td>Shell on the node: kubelet service, static-pod manifests, containers via CRI</td></tr>
+              <tr><td><code class="inl">kind create cluster --name taskflow</code></td><td>Local cluster in Docker containers</td></tr>
+              <tr><td><code class="inl">kubectl version</code> / <code class="inl">cluster-info</code></td><td>Client/server versions; API server + CoreDNS URLs</td></tr>
+              <tr><td><code class="inl">kubectl config get-contexts</code> / <code class="inl">use-context X</code> / <code class="inl">current-context</code></td><td>List / switch / show contexts</td></tr>
+              <tr><td><code class="inl">kubectl config set-context --current --namespace=taskflow</code></td><td>Default namespace for the current context</td></tr>
+              <tr><td><code class="inl">kubectl get nodes -o wide</code></td><td>Nodes with IPs, OS, kernel, runtime</td></tr>
+              <tr><td><code class="inl">kubectl get pods -n kube-system -o wide</code></td><td>Control-plane and add-on pods</td></tr>
+              <tr><td><code class="inl">kubectl api-resources</code> / <code class="inl">explain pod.spec</code></td><td>Resource types + apiVersions / field docs</td></tr>
+              <tr><td><code class="inl">kubectl create deployment hello --image=… --replicas=2</code></td><td>Imperative Deployment (labs, demos)</td></tr>
+              <tr><td><code class="inl">kubectl delete pod NAME</code> / <code class="inl">scale deploy NAME --replicas=0</code></td><td>Delete a pod (it comes back) / change the desired state</td></tr>
+              <tr><td><code class="inl">kubectl apply -f file.yaml|dir/</code> / <code class="inl">kubectl create -f</code></td><td>Create or update declaratively / create only (fails if it exists)</td></tr>
+              <tr><td><code class="inl">kubectl diff -f file.yaml</code></td><td>Show what apply would change</td></tr>
+              <tr><td><code class="inl">kubectl create deployment X --image=Y --dry-run=client -o yaml</code></td><td>Generate YAML without creating anything</td></tr>
+              <tr><td><code class="inl">kubectl apply -f X --dry-run=server</code></td><td>Full validation, nothing stored</td></tr>
+              <tr><td><code class="inl">kubectl get deploy,rs,pods -n taskflow</code></td><td>Several resource types at once</td></tr>
+              <tr><td><code class="inl">kubectl get events -n taskflow --sort-by=.lastTimestamp</code></td><td>What each component did, in order</td></tr>
+              <tr><td><code class="inl">kubectl describe pod NAME</code></td><td>Details + Events (who scheduled it, why it's Pending)</td></tr>
+              <tr><td><code class="inl">kubectl port-forward pod/X 3000:3000</code></td><td>Reach a pod from your laptop</td></tr>
+              <tr><td><code class="inl">kubectl get … -v=6</code> / <code class="inl">kubectl get --raw='/readyz?verbose'</code></td><td>See kubectl's HTTP calls / API server health checks</td></tr>
+              <tr><td><code class="inl">etcdctl snapshot save FILE …</code> / <code class="inl">etcdutl snapshot status FILE</code></td><td>Back up etcd / check a snapshot (on the control plane)</td></tr>
             </tbody>
           </table>
         </div>
@@ -873,38 +920,24 @@ status: {}</span>
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>Kubernetes is a desired-state machine. You <code class="inl">kubectl apply</code> TaskFlow's YAML; the API server checks it and stores it in etcd; the controller manager turns a Deployment into a ReplicaSet and Pods; the scheduler picks a node for each pod; the kubelet on that node has containerd run the containers and reports back; kube-proxy wires Services to them. Every piece only watches the API server, so if a pod, a component or a whole node fails, the loops notice the gap and close it. kubectl + kubeconfig is your remote control for all of it.</p>
+          <p>Kubernetes is a desired-state machine. You <code class="inl">kubectl apply</code> TaskFlow's YAML to the cluster your kubeconfig points at. The API server checks it and stores it in etcd. Controllers turn the Deployment into a ReplicaSet and Pods, the scheduler picks a node for each pod, and that node's kubelet has the runtime start the containers and reports back. Every component only watches the API server, so when a pod, a component or a node fails, the loops see the gap between desired and actual and close it.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>Which control-plane component is the only one that reads and writes etcd?</summary>
-          <p class="ans">kube-apiserver. Scheduler, controllers, kubelets and kubectl all go through it.</p>
-        </details>
-        <details class="quiz">
-          <summary>A pod is <code class="inl">Pending</code> with <code class="inl">0/3 nodes are available: 3 Insufficient cpu</code>. Which component wrote that and what does it mean?</summary>
-          <p class="ans">kube-scheduler (event source <code class="inl">default-scheduler</code>). No node passed the filter step: the pod's CPU <em>requests</em> exceed every node's unreserved CPU. Lower requests, free capacity, or add nodes.</p>
-        </details>
-        <details class="quiz">
-          <summary>You delete one pod of a 3-replica Deployment and a new pod appears seconds later. Which components made that happen, in order?</summary>
-          <p class="ans">ReplicaSet controller (in kube-controller-manager) sees 2/3 and creates a Pod object → scheduler binds it to a node → kubelet on that node starts it via the container runtime.</p>
-        </details>
-        <details class="quiz">
-          <summary>How many failures does a 5-member etcd cluster tolerate, and why use odd numbers?</summary>
-          <p class="ans">2 (quorum = 3). An even count adds a member without adding fault tolerance (4 members still tolerate only 1).</p>
-        </details>
-        <details class="quiz">
-          <summary>kubelet vs kube-proxy — one line each.</summary>
-          <p class="ans">kubelet: node agent that runs/monitors the pods assigned to its node via CRI and reports status. kube-proxy: programs iptables/IPVS rules on each node so Service virtual IPs reach the right pods.</p>
-        </details>
-        <details class="quiz">
-          <summary>What happens if you run <code class="inl">kubectl create -f pod.yaml</code> twice? <code class="inl">kubectl apply -f pod.yaml</code> twice?</summary>
-          <p class="ans"><code class="inl">create</code> fails the second time with <code class="inl">AlreadyExists</code>. <code class="inl">apply</code> is idempotent: <code class="inl">unchanged</code> (or <code class="inl">configured</code> if the file changed).</p>
-        </details>
-        <details class="quiz">
-          <summary>What three things does a kubeconfig context bind together?</summary>
-          <p class="ans">A cluster (API server URL + CA), a user (credentials) and optionally a default namespace.</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — combine everything</span>
+          <details class="quiz"><summary>Q1. 3 nodes: node-2 is tainted <code class="inl">dedicated=db:NoSchedule</code>, node-3 has 200m CPU free, node-1 has plenty. You apply a 3-replica Deployment whose pods request 500m. Narrate it component by component and give the final state.</summary>
+            <p class="ans">API server checks and stores it in etcd, and kubectl prints <code class="inl">created</code>. Deployment controller → ReplicaSet; ReplicaSet controller → 3 node-less pods. The scheduler filters out node-2 (taint) and node-3 (requests) and binds all three to node-1, whose kubelet pulls the image via the CRI and reports Running. If node-1 only fits two, the third stays <code class="inl">Pending</code> with a <code class="inl">FailedScheduling</code> event naming both reasons.</p></details>
+          <details class="quiz"><summary>Q2. At 02:13 node-3 loses power. Which components notice and act, in order, and what does <code class="inl">kubectl get pods</code> show along the way?</summary>
+            <p class="ans">Heartbeats stop. After ~40–50 s the node controller marks node-3 <code class="inl">NotReady</code> (its pods still look Running). After the 5-minute toleration they're evicted, the ReplicaSet controller creates replacements, the scheduler binds them to healthy nodes, and those kubelets start them. New names and IPs appear and the count returns to 3/3.</p></details>
+          <details class="quiz"><summary>Q3. You built a 2-member etcd cluster "for HA" and one member dies. Can you scale TaskFlow? Do its running pods stop?</summary>
+            <p class="ans">No scaling: 1 of 2 members is no quorum, so etcd refuses writes. The running pods carry on, because kubelets don't need etcd to keep existing containers alive. Use 3 members.</p></details>
+          <details class="quiz"><summary>Q4. Correct every error: "kubectl writes the Deployment into etcd, the scheduler starts the containers, and kube-proxy restarts crashed pods."</summary>
+            <p class="ans">(1) kubectl sends it to the <strong>API server</strong>, the only writer to etcd. (2) The scheduler only <strong>binds</strong>; the <strong>kubelet</strong> starts containers through the runtime. (3) The <strong>kubelet</strong> restarts crashed containers and the <strong>ReplicaSet controller</strong> replaces deleted pods. kube-proxy only writes Service rules.</p></details>
+          <details class="quiz"><summary>Q5. You <code class="inl">kubectl delete pod</code> both <code class="inl">etcd-minikube</code> and one pod of Deployment <code class="inl">hello</code>. Both come back. Who brought back each, and how would you really remove each?</summary>
+            <p class="ans"><code class="inl">etcd-minikube</code> is a static pod: the kubelet recreates it from <code class="inl">/etc/kubernetes/manifests/etcd.yaml</code>, and only removing that file removes it (don't!). The hello pod came back because the ReplicaSet controller reconciles to desired 2. Scale to 0 or delete the Deployment.</p></details>
+          <details class="quiz"><summary>Q6. A teammate has contexts for minikube and the college EKS cluster. They <code class="inl">kubectl apply -f k8s/</code>, see <code class="inl">created</code>, but find nothing in minikube. Give two likely causes and the command that checks each.</summary>
+            <p class="ans">(1) The current context was EKS: check <code class="inl">kubectl config current-context</code>. (2) It went into <code class="inl">taskflow</code> while they're viewing <code class="inl">default</code>: check <code class="inl">kubectl get pods -A</code>. And since <code class="inl">created</code> only means "stored", look for Pending pods or pull errors too.</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -926,6 +959,7 @@ status: {}</span>
         </ul>
       </section>
 
+      <!-- PAGER -->
       <nav class="pager">
         <a href="session-8.html"><div class="dir">← Previous</div><div class="ttl">Session 8: Docker Networking, Volumes &amp; Compose</div></a>
         <a class="next" href="session-10.html"><div class="dir">Next →</div><div class="ttl">Session 10: Pods, ReplicaSets &amp; Deployments</div></a>
@@ -937,6 +971,6 @@ status: {}</span>
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 9 — Kubernetes Fundamentals &amp; Architecture</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

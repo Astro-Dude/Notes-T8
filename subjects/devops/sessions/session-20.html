@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 20 — Terraform &amp; Infrastructure as Code</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,11 @@
       <span class="kicker">Term 9 · DevOps · Session 20</span>
       <h1>Terraform &amp; Infrastructure as Code</h1>
       <p class="lead">
-        Write Terraform for real infrastructure, read a <code class="inl">terraform plan</code> line by line, and keep state safe in S3.
-        The hands-on project uses the Docker provider, so it runs on your laptop with no cloud account.
+        Explain why declarative code beats clicking in a console, read a <code class="inl">terraform plan</code> symbol by symbol before it touches anything,
+        and say exactly what the state file remembers. You'll build, change, break and destroy TaskFlow's nginx container with the Docker provider
+        (no cloud account needed), then move its state to S3 with locking.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 27 min read</span><span class="badge-rt">📖 7 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 41 min read</span><span class="badge-rt">📖 8 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -37,11 +38,12 @@
         <ol>
           <li><a href="#iac">What is Infrastructure as Code?</a></li>
           <li><a href="#architecture">Terraform architecture &amp; HCL</a></li>
-          <li><a href="#providers">Providers</a></li>
+          <li><a href="#providers">Providers &amp; terraform init</a></li>
           <li><a href="#resources">Resources &amp; data sources</a></li>
           <li><a href="#variables">Variables, locals &amp; outputs</a></li>
-          <li><a href="#workflow">init → plan → apply → destroy</a></li>
+          <li><a href="#workflow">plan → apply → destroy</a></li>
           <li><a href="#state">Terraform state</a></li>
+          <li><a href="#remote-state">Remote state, locking &amp; drift</a></li>
           <li><a href="#commands">Commands you must know</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
           <li><a href="#refs">References</a></li>
@@ -55,79 +57,102 @@
         <h2><span class="sec-num">1</span> What is Infrastructure as Code?</h2>
         <hr class="section-rule" />
 
+        <h3>The problem: ClickOps</h3>
+        <p>You build TaskFlow's dev environment in the AWS console: a VPC, two subnets, a security group and an EC2 instance. That's about 40 clicks, and none of them is written down. Then the requests start:</p>
+<pre>Week 1    dev built by hand in the console             no record of what was clicked
+Week 3    "make staging identical to dev"              which boxes did you tick?
+Week 5    port 22 is open to 0.0.0.0/0                 who changed it, and when?
+Week 8    the region has an outage                     rebuild everything from memory
+Month 6   a forgotten test server is still billing     nobody knew it existed</pre>
+        <p>All five are the same bug. The infrastructure exists only as the result of clicks, and you can't diff, review or replay clicks.</p>
+
+        <h3>The idea</h3>
+        <p><span class="term">Infrastructure as Code (IaC)</span> means describing servers, networks, databases and DNS in text files, keeping the files in Git, and letting a tool create the real thing from them. The files become the source of truth. Changing the infrastructure means changing a file, so it goes through a pull request like any other code.</p>
+<pre> ClickOps                                     Infrastructure as Code
+ you ──clicks──▶ console ──▶ dev              you ──edit──▶ main.tf ──git push──▶ PR + review
+     ──clicks──▶ console ──▶ staging ≠ dev                                          │
+     (no history, can't be repeated)                         terraform plan   (preview the diff)
+                                                                                    │
+                                                             terraform apply ───────┼──▶ dev
+                                                                                    ├──▶ staging   same files
+                                                                                    └──▶ prod      = same infra</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Instead of building a Lego house from memory every time, you write the instruction booklet once. Anyone can rebuild the exact same house from it.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>ClickOps is building a house by standing on site shouting "wall here, window there". IaC is handing the builder an <strong>architect's blueprint</strong>: anyone can build the identical house from it, two versions can be compared line by line, and it still shows what the house <em>should</em> look like after someone knocks a hole in a wall. This page keeps the picture: your <code class="inl">.tf</code> files are the blueprint, Terraform is the <strong>contractor</strong>.</p>
         </div>
 
-        <p><span class="term">Infrastructure as Code (IaC)</span> = servers, networks, databases and DNS described in text files, kept in Git, and created by a tool instead of by clicking in a web console.</p>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>ClickOps (console clicking) problem</th><th>How IaC fixes it</th></tr></thead>
-            <tbody>
-              <tr><td>Dev and prod drift apart; nobody remembers which boxes were ticked</td><td><strong>Repeatable</strong>: same files → same infra, every environment</td></tr>
-              <tr><td>Someone opens port 22 to the world; nobody notices</td><td><strong>Reviewable</strong>: infra changes go through PRs and <code class="inl">terraform plan</code></td></tr>
-              <tr><td>"Who changed the security group last Tuesday?"</td><td><strong>Versioned</strong>: <code class="inl">git log</code> / <code class="inl">git revert</code></td></tr>
-              <tr><td>Running a setup script twice creates two VPCs</td><td><strong>Idempotent</strong>: apply twice → second run changes nothing</td></tr>
-              <tr><td>Rebuilding after a region outage takes days</td><td><strong>Automatable</strong>: one <code class="inl">terraform apply</code> in CI</td></tr>
-              <tr><td>Forgotten test servers keep billing</td><td><code class="inl">terraform destroy</code> removes everything it created</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Declarative vs imperative</h3>
-        <p>Imperative (AWS CLI script) — <em>how</em>, step by step. Run it twice, get two VPCs:</p>
+        <h3>See it: imperative vs declarative</h3>
+        <p>There are two ways to write infrastructure down. The <strong>imperative</strong> way is a list of steps, for example AWS CLI commands. Run the same "create a VPC" line twice:</p>
 <pre><span class="pr">$</span> aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query Vpc.VpcId --output text
 <span class="out">vpc-0a1b2c3d4e5f67890</span>
 <span class="pr">$</span> aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query Vpc.VpcId --output text
-<span class="out">vpc-0f9e8d7c6b5a43210</span>      <span class="cm"># oops — a second, duplicate VPC</span></pre>
-        <p>Declarative (Terraform) — <em>what</em> the end state is. The tool works out the steps and does nothing if it already matches:</p>
+<span class="out">vpc-0f9e8d7c6b5a43210</span>      <span class="cm"># a second, duplicate VPC</span></pre>
+        <p><code class="inl">aws ec2</code> is the CLI's EC2 API (VPCs live there), <code class="inl">create-vpc</code> <em>always</em> creates a new VPC, <code class="inl">--cidr-block</code> is the range (Session 4), and <code class="inl">--query … --output text</code> prints just the ID. The script says <em>how</em> and has no idea a VPC already exists. The <strong>declarative</strong> way says <em>what</em> should exist:</p>
 <pre>resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
 }</pre>
+        <p>Terraform compares this with what it built before. The first run creates the VPC. The second run finds that reality already matches and prints <code class="inl">No changes.</code> (you'll see it happen in section 6). That property is called <span class="term">idempotency</span>: running again without edits changes nothing.</p>
+        <p><strong>What it does <em>not</em> do:</strong> a <code class="inl">.tf</code> file on its own does nothing. It's only a description. Nothing happens until Terraform reads it and you approve the plan.</p>
 
+        <h3>Build it up: what IaC buys you</h3>
+        <p>Each pain maps to a property: <strong>repeatable</strong> (staging = dev, same files), <strong>reviewable</strong> (port 22 caught in a PR and a plan), <strong>versioned</strong> (<code class="inl">git log</code> answers who and when), <strong>idempotent</strong> (safe to run twice), <strong>automatable</strong> (the outage rebuild and the forgotten server are one <code class="inl">apply</code> or <code class="inl">destroy</code> away).</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>Declarative</th><th>Imperative</th></tr></thead>
             <tbody>
-              <tr><td>You describe</td><td>Desired end state</td><td>Sequence of commands</td></tr>
-              <tr><td>Run twice</td><td>No changes</td><td>Duplicates / errors</td></tr>
-              <tr><td>Change</td><td>Edit the file; tool computes the diff</td><td>Write a new script for the change</td></tr>
-              <tr><td>Examples</td><td>Terraform, CloudFormation, K8s YAML</td><td>Bash + AWS CLI, Python boto3 scripts</td></tr>
+              <tr><td>You describe</td><td>The desired end state</td><td>A sequence of commands</td></tr>
+              <tr><td>Run twice</td><td>No changes</td><td>Duplicates or errors</td></tr>
+              <tr><td>To change something</td><td>Edit the file; the tool computes the diff</td><td>Write a new script for the change</td></tr>
+              <tr><td>Examples</td><td>Terraform, CloudFormation, Kubernetes YAML</td><td>Bash + AWS CLI, Python boto3 scripts</td></tr>
             </tbody>
           </table>
         </div>
-
+        <h4>The tools, and the two different jobs they do</h4>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Tool</th><th>Category</th><th>Language</th><th>Clouds</th></tr></thead>
+            <thead><tr><th>Tool</th><th>Job (language)</th><th>Targets</th></tr></thead>
             <tbody>
-              <tr><td><strong>Terraform</strong> (HashiCorp) / <strong>OpenTofu</strong> (open-source fork, <code class="inl">tofu</code> CLI)</td><td>Provisioning, declarative</td><td>HCL</td><td>Any (thousands of providers)</td></tr>
-              <tr><td>Pulumi</td><td>Provisioning</td><td>TypeScript, Python, Go, C#</td><td>Any</td></tr>
-              <tr><td>AWS CloudFormation / CDK</td><td>Provisioning</td><td>YAML/JSON (CDK: TS/Python)</td><td>AWS only</td></tr>
-              <tr><td>Azure ARM / Bicep</td><td>Provisioning</td><td>JSON / Bicep</td><td>Azure only</td></tr>
-              <tr><td>Ansible</td><td>Configuration management (agentless, SSH)</td><td>YAML playbooks</td><td>Configures existing servers</td></tr>
-              <tr><td>Chef / Puppet</td><td>Configuration management (agent-based)</td><td>Ruby DSL / Puppet DSL</td><td>Configures existing servers</td></tr>
+              <tr><td><strong>Terraform</strong> (HashiCorp) / <strong>OpenTofu</strong> (open-source fork, <code class="inl">tofu</code> CLI)</td><td>Provisioning, declarative (HCL)</td><td>Any platform with a provider (thousands)</td></tr>
+              <tr><td>Pulumi</td><td>Provisioning (TypeScript, Python, Go, C#)</td><td>Any</td></tr>
+              <tr><td>AWS CloudFormation / CDK</td><td>Provisioning (YAML/JSON; CDK: TS/Python)</td><td>AWS only</td></tr>
+              <tr><td>Azure ARM / Bicep</td><td>Provisioning (JSON / Bicep)</td><td>Azure only</td></tr>
+              <tr><td>Ansible</td><td>Config management, agentless over SSH (YAML playbooks)</td><td>Existing servers</td></tr>
+              <tr><td>Chef / Puppet</td><td>Config management, agent-based (Ruby / Puppet DSL)</td><td>Existing servers</td></tr>
             </tbody>
           </table>
         </div>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>Provisioning</th><th>Configuration management</th></tr></thead>
             <tbody>
-              <tr><td>Question</td><td>"Which machines/networks exist?"</td><td>"What's installed and configured <em>on</em> them?"</td></tr>
-              <tr><td>TaskFlow example</td><td>Create VPC, subnet, security group, EC2 (Terraform)</td><td>Install Docker, write <code class="inl">/etc/taskflow.env</code>, start the service (Ansible)</td></tr>
-              <tr><td>Typical tools</td><td>Terraform, CloudFormation, Pulumi</td><td>Ansible, Chef, Puppet</td></tr>
+              <tr><td>Question it answers</td><td>"Which machines and networks exist?"</td><td>"What's installed and configured <em>on</em> them?"</td></tr>
+              <tr><td>TaskFlow example</td><td>Create the VPC, subnet, security group and EC2 instance (Terraform)</td><td>Install Docker, write <code class="inl">/etc/taskflow.env</code>, start the service (Ansible)</td></tr>
             </tbody>
           </table>
         </div>
-        <p>They're combined: Terraform creates the EC2 instance, then Ansible (or a <code class="inl">user_data</code> script, Session 21) configures it.</p>
+        <p>Teams combine them: Terraform creates the EC2 instance, then Ansible, or a <code class="inl">user_data</code> boot script (Session 21), configures it.</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          IaC = infra in versioned files. Terraform is declarative and idempotent: you describe the end state, it computes and applies the difference.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Terraform and Ansible do the same job." <strong>✗</strong> Terraform <em>provisions</em> (the VPC, the instance); Ansible <em>configures</em> machines that exist. Teams use both.</p>
+          <p>"A Bash script of AWS CLI commands is declarative IaC." <strong>✗</strong> It's code, but imperative: a second run creates duplicates.</p>
+          <p>"Idempotent means the tool refuses to run twice." <strong>✗</strong> It runs every time and changes nothing when reality already matches.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Imperative = HOW (a list of steps) · Declarative = WHAT (the end state)</strong><br /><strong>Provisioning = which machines exist · Config management = what's on them</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A script creates a VPC, a subnet and an EC2 instance with AWS CLI commands. You run it twice, then apply the equivalent Terraform config twice. How many VPCs exist in each case?</summary>
+            <p class="ans">Script: two of everything, because every <code class="inl">create-*</code> call makes a new object. Terraform: one of each, because the second apply finds nothing to change.</p></details>
+          <details class="quiz"><summary>Q2. Provisioning or configuration management? (a) Terraform for an S3 bucket, (b) Ansible installing Docker on three servers, (c) a CloudFormation VPC, (d) a boot script running <code class="inl">docker run</code>.</summary>
+            <p class="ans">(a) and (c) provision. (b) and (d) configure software on machines that already exist.</p></details>
+          <details class="quiz"><summary>Q3. True or false: "Kubernetes YAML isn't IaC, because kubectl applies it step by step."</summary>
+            <p class="ans">False. A manifest is declarative desired state (Session 9): you write "3 replicas" and controllers keep making it true. Same idea as Terraform, for objects inside a cluster.</p></details>
         </div>
       </section>
 
@@ -136,134 +161,153 @@
         <h2><span class="sec-num">2</span> Terraform architecture &amp; HCL</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Terraform Core is the project manager, providers are translators who speak "AWS" or "Docker", and the state file is the manager's notebook of what's already built.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>AWS alone has hundreds of services, each with its own API. Add Azure, GCP, Docker, Kubernetes and GitHub. How can one <code class="inl">terraform</code> binary speak all of those APIs? And when you run it again next week, how does it know what it already built?</p>
 
+        <h3>The idea</h3>
+        <p>Terraform splits the work three ways. <strong>Terraform Core</strong> (the <code class="inl">terraform</code> binary) reads your <code class="inl">.tf</code> files, builds a dependency graph and works out what must change, but it knows nothing about AWS. <strong>Providers</strong> are separate plugins, one per platform, that turn "create an <code class="inl">aws_vpc</code>" into real API calls. The <strong>state</strong> records what was built, so next week Core has something to compare against.</p>
 <pre>   *.tf files ─────┐
    (desired state)  ▼
-             ┌─────────────────┐   reads/writes   ┌──────────────────────────┐
+             ┌─────────────────┐   reads/writes   ┌───────────────────────────┐
   you ─────▶ │ Terraform Core  │◀───────────────▶ │ State (terraform.tfstate) │
   terraform  │ (the CLI binary)│                  │ local file or S3 backend  │
-  plan/apply │ graph + diff    │                  └──────────────────────────┘
+  plan/apply │ graph + diff    │                  └───────────────────────────┘
              └───────┬─────────┘
                      │ gRPC plugin protocol
-        ┌────────────┼──────────────┬───────────────┐
-        ▼            ▼              ▼               ▼
-  hashicorp/aws  kreuzwerker/docker  hashicorp/kubernetes  …   (providers, downloaded by init)
-        │            │              │
-        ▼            ▼              ▼
-    AWS APIs    Docker daemon   K8s API server                 (real infrastructure)</pre>
+        ┌────────────┼──────────────────┬──────────────────────┐
+        ▼            ▼                  ▼                      ▼
+  hashicorp/aws  kreuzwerker/docker  hashicorp/kubernetes     …   (providers, downloaded by init)
+        │            │                  │
+        ▼            ▼                  ▼
+    AWS APIs    Docker daemon      K8s API server                  (real infrastructure)</pre>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Component</th><th>Job</th></tr></thead>
-            <tbody>
-              <tr><td><strong>Core</strong> (<code class="inl">terraform</code> binary)</td><td>Parses <code class="inl">.tf</code>, builds a dependency graph, compares config vs state vs reality, produces the plan, calls providers in the right order (parallel where possible).</td></tr>
-              <tr><td><strong>Providers</strong></td><td>Plugins that turn "create <code class="inl">aws_vpc</code>" into real API calls. Separate binaries, versioned independently, from the Terraform Registry.</td></tr>
-              <tr><td><strong>State</strong></td><td>JSON record mapping each resource in your config to the real object ID (<code class="inl">aws_vpc.main</code> → <code class="inl">vpc-0a1b…</code>).</td></tr>
-              <tr><td><strong>Backend</strong></td><td>Where state is stored and locked: local disk (default), S3, HCP Terraform, GCS, azurerm…</td></tr>
-            </tbody>
-          </table>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The <code class="inl">.tf</code> files are the <strong>blueprint</strong>. Core is the <strong>general contractor</strong>: it reads the blueprint and writes the work order but lays no bricks. Providers are <strong>specialist crews</strong>, each speaking one site's language (AWS, Docker). State is the contractor's <strong>logbook</strong>: "blueprint item <code class="inl">web</code> = container <code class="inl">7d3e…</code>".</p>
         </div>
 
-        <div class="flow">
-          <div class="step"><div class="s-ico">✍️</div><div class="s-t">Write</div><div class="s-d">*.tf files</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">📦</div><div class="s-t">init</div><div class="s-d">download providers, set up backend</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🔍</div><div class="s-t">plan</div><div class="s-d">preview the diff</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🚀</div><div class="s-t">apply</div><div class="s-d">make it real, update state</div></div>
-          <div class="arrow">→</div>
-          <div class="step"><div class="s-ico">🧹</div><div class="s-t">destroy</div><div class="s-d">delete everything it manages</div></div>
-        </div>
+        <p>Where state is kept and locked is the <strong>backend</strong>'s job: local disk by default, S3 in section 8.</p>
 
-        <h3>HCL syntax in one block</h3>
-<pre><span class="cm"># block type  label 1 (resource type)  label 2 (local name)</span>
+        <h3>See it: HCL, the language</h3>
+        <p>You write Terraform in <span class="term">HCL</span> (HashiCorp Configuration Language). Everything is a <strong>block</strong>: a type, some labels, then a body in braces.</p>
+<pre><span class="cm"># block type  label 1 (resource type)  label 2 (your local name)</span>
 resource      "aws_s3_bucket"          "logs" {
-  bucket        = "taskflow-logs-${var.environment}"   <span class="cm"># argument = expression; "${…}" interpolates</span>
-  force_destroy = var.environment != "prod"            <span class="cm"># bool expression</span>
+  bucket        = "taskflow-logs-${var.environment}"   <span class="cm"># argument = expression; "${…}" inserts a value</span>
+  force_destroy = var.environment != "prod"            <span class="cm"># a bool expression</span>
 
-  tags = {                                             <span class="cm"># map</span>
+  tags = {                                             <span class="cm"># a map argument: it HAS an "="</span>
     Project = "taskflow"
   }
 
-  lifecycle {                                          <span class="cm"># nested block: no "=" sign</span>
+  lifecycle {                                          <span class="cm"># a nested block: NO "=" sign</span>
     prevent_destroy = false
   }
 }
 <span class="cm">// comments: #, // or /* … */</span></pre>
+        <p>You can try expressions without any cloud at all. <code class="inl">terraform console</code> is an interactive calculator for HCL. This folder only contains <code class="inl">variable "environment" { default = "dev" }</code>:</p>
+<pre><span class="pr">$</span> terraform console
+<span class="pr">&gt;</span> "taskflow-${var.environment}"
+<span class="out">"taskflow-dev"</span>
+<span class="pr">&gt;</span> var.environment == "prod" ? 3 : 1
+<span class="out">1</span>
+<span class="pr">&gt;</span> length(["ap-south-1a", "ap-south-1b"])
+<span class="out">2</span>
+<span class="pr">&gt;</span> cidrsubnet("10.0.0.0/16", 8, 1)
+<span class="out">"10.0.1.0/24"</span>
+<span class="pr">&gt;</span> exit</pre>
+        <p>That's interpolation, a conditional, a function on a list, and a networking function you'll need in Session 21. <strong>What it does <em>not</em> do:</strong> <code class="inl">console</code> never creates or changes anything. It only evaluates expressions.</p>
 
+        <h3>Build it up: the block types you'll meet</h3>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Expression</th><th>Example</th></tr></thead>
+            <thead><tr><th>Block</th><th>Purpose</th><th>Section</th></tr></thead>
             <tbody>
-              <tr><td>String / number / bool</td><td><code class="inl">"t3.micro"</code>, <code class="inl">8080</code>, <code class="inl">true</code></td></tr>
-              <tr><td>List / map</td><td><code class="inl">["ap-south-1a", "ap-south-1b"]</code>, <code class="inl">{ Name = "web" }</code></td></tr>
-              <tr><td>Reference</td><td><code class="inl">var.region</code>, <code class="inl">local.name</code>, <code class="inl">aws_vpc.main.id</code>, <code class="inl">data.aws_ami.ubuntu.id</code></td></tr>
-              <tr><td>Interpolation</td><td><code class="inl">"http://${aws_instance.app.public_ip}:3000"</code></td></tr>
-              <tr><td>Conditional</td><td><code class="inl">var.environment == "prod" ? 3 : 1</code></td></tr>
-              <tr><td>Functions</td><td><code class="inl">length(var.azs)</code>, <code class="inl">toset([...])</code>, <code class="inl">file("~/.ssh/id.pub")</code>, <code class="inl">cidrsubnet("10.0.0.0/16", 8, 1)</code> → <code class="inl">"10.0.1.0/24"</code></td></tr>
+              <tr><td><code class="inl">terraform { }</code></td><td>Required Terraform and provider versions, the backend</td><td>3, 8</td></tr>
+              <tr><td><code class="inl">provider "aws" { }</code></td><td>Configure a provider (region, profile)</td><td>3</td></tr>
+              <tr><td><code class="inl">resource "type" "name" { }</code></td><td>Something Terraform creates and manages</td><td>4</td></tr>
+              <tr><td><code class="inl">data "type" "name" { }</code></td><td>Read something that already exists</td><td>4</td></tr>
+              <tr><td><code class="inl">variable</code> / <code class="inl">locals</code> / <code class="inl">output</code></td><td>Inputs / internal named values / results printed after apply</td><td>5</td></tr>
+              <tr><td><code class="inl">import</code> / <code class="inl">moved</code> / <code class="inl">module</code></td><td>Adopt existing infra / rename without destroying / reuse a folder of <code class="inl">.tf</code></td><td>7</td></tr>
             </tbody>
           </table>
         </div>
+        <p>Terraform loads <strong>every <code class="inl">*.tf</code> file in the folder</strong> as one configuration. Names like <code class="inl">main.tf</code> are only a convention, and block order doesn't matter. The workflow for the rest of the page is <strong>init</strong> (§3) → <strong>plan</strong> → <strong>apply</strong> → <strong>destroy</strong> (§6).</p>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Block</th><th>Purpose</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">terraform { }</code></td><td>Required Terraform/provider versions, backend.</td></tr>
-              <tr><td><code class="inl">provider "aws" { }</code></td><td>Configure a provider (region, credentials profile).</td></tr>
-              <tr><td><code class="inl">resource "type" "name" { }</code></td><td>Something Terraform creates and manages.</td></tr>
-              <tr><td><code class="inl">data "type" "name" { }</code></td><td>Read something that already exists (read-only).</td></tr>
-              <tr><td><code class="inl">variable</code> / <code class="inl">locals</code> / <code class="inl">output</code></td><td>Inputs / internal named values / values printed after apply.</td></tr>
-              <tr><td><code class="inl">module</code>, <code class="inl">import</code>, <code class="inl">moved</code></td><td>Reuse a folder of .tf / adopt existing infra / rename without destroying.</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Terraform runs <code class="inl">main.tf</code> top to bottom, so the VPC must come first." <strong>✗</strong> It reads all the <code class="inl">.tf</code> files at once and orders the work by the dependency graph (section 4).</p>
+          <p>"Terraform Core calls the AWS API." <strong>✗</strong> Core never talks to a cloud. The provider plugin makes every API call.</p>
         </div>
-        <p>Terraform loads <strong>every <code class="inl">*.tf</code> file in the folder</strong> as one configuration. File names (<code class="inl">main.tf</code>, <code class="inl">variables.tf</code>…) are convention only; order inside and across files doesn't matter.</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Core builds a graph and a diff; providers talk to APIs; state remembers real IDs. HCL = blocks with labels, <code class="inl">argument = expression</code>, nested blocks.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Core = plans · Providers = talk to APIs · State = remembers</strong><br /><strong>All *.tf files in one folder = one configuration; order doesn't matter.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. AWS launches a new service. To manage it with Terraform, do you upgrade Core or the AWS provider?</summary>
+            <p class="ans">The AWS provider. Core is generic; each resource type lives in the provider plugin, which is released separately.</p></details>
+          <details class="quiz"><summary>Q2. Spot both bugs: <code class="inl">resource "aws_s3_bucket" "logs" { tags { Project = "taskflow" } lifecycle = { prevent_destroy = true } }</code></summary>
+            <p class="ans"><code class="inl">tags</code> is a map <em>argument</em>: write <code class="inl">tags = { … }</code> (Terraform says <code class="inl">Unsupported block type … use the equals sign</code>). <code class="inl">lifecycle</code> is a nested <em>block</em>: no <code class="inl">=</code> (otherwise <code class="inl">Unsupported argument</code>).</p></details>
+          <details class="quiz"><summary>Q3. Fill in: in <code class="inl">resource "aws_vpc" "main"</code>, <code class="inl">aws_vpc</code> is the ________ (from the ________ provider), <code class="inl">main</code> is the ________, and other blocks refer to it as ________.</summary>
+            <p class="ans">Resource type · <code class="inl">aws</code> · local name · <code class="inl">aws_vpc.main</code> (for example <code class="inl">aws_vpc.main.id</code>).</p></details>
         </div>
       </section>
 
       <!-- ===================== 3. PROVIDERS ===================== -->
       <section id="providers">
-        <h2><span class="sec-num">3</span> Providers</h2>
+        <h2><span class="sec-num">3</span> Providers &amp; terraform init</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Your teammate clones the repo, opens the Terraform folder and runs a plan straight away:</p>
+<pre><span class="pr">$</span> terraform plan
+<span class="out">╷
+│ Error: Required plugins are not installed
+│
+│ The installed provider plugins are not consistent with the packages
+│ selected in the dependency lock file:
+│   - registry.terraform.io/kreuzwerker/docker: there is no package for registry.terraform.io/kreuzwerker/docker 4.6.0 cached in .terraform/providers
+│ …
+│   terraform init
+╵</span></pre>
+        <p>Every <code class="inl">.tf</code> file is there. So what's missing, and how does the error already know the exact version, 4.6.0?</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">provider</span> is a separate program (a plugin binary) that Core starts and talks to. Your config only <em>names</em> the providers it needs and which versions are acceptable, in a <code class="inl">required_providers</code> block. <code class="inl">terraform init</code> downloads them from the Terraform Registry into a hidden <code class="inl">.terraform/</code> folder, and records the exact version it picked, with checksums, in <code class="inl">.terraform.lock.hcl</code>.</p>
+<pre> providers.tf                              registry.terraform.io
+ required_providers {                     ┌───────────────────────────────┐
+   docker = {                             │ kreuzwerker/docker            │
+     source  = "kreuzwerker/docker" ─────▶│   3.x … 4.5.0  4.6.0 ✔ newest │
+     version = "~&gt; 4.0"                   │ hashicorp/aws   5.x  6.x      │
+   }                                      └───────────────┬───────────────┘
+ }                                   terraform init:      │ download + verify checksum
+                                                          ▼
+   .terraform/providers/…/docker/4.6.0/darwin_arm64/   the binary          → git-ignored
+   .terraform.lock.hcl   version = "4.6.0" + hashes    the exact choice    → COMMITTED</pre>
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A provider is a travel adapter: Terraform has one plug shape, and each provider converts it to the socket of one platform.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><code class="inl">init</code> <strong>hires the crews</strong> named in the contract from an agency, the Terraform Registry. The version constraint is the job ad: "any 4.x Docker crew". The lock file records exactly <strong>whom you hired</strong> (4.6.0, plus an ID check), so your teammate and CI get the same crew instead of whoever is newest that day.</p>
         </div>
 
-        <ul>
-          <li>A <span class="term">provider</span> is a plugin that knows one API: <code class="inl">hashicorp/aws</code>, <code class="inl">hashicorp/azurerm</code>, <code class="inl">hashicorp/google</code>, <code class="inl">hashicorp/kubernetes</code>, <code class="inl">kreuzwerker/docker</code>, <code class="inl">integrations/github</code>…</li>
-          <li>Address = <code class="inl">registry.terraform.io/NAMESPACE/TYPE</code>, written short as <code class="inl">NAMESPACE/TYPE</code>. Tiers: official (HashiCorp), partner, community.</li>
-          <li>The provider's <em>type</em> is the prefix of its resources: provider <code class="inl">aws</code> → <code class="inl">aws_instance</code>, <code class="inl">aws_vpc</code>; provider <code class="inl">docker</code> → <code class="inl">docker_container</code>.</li>
-        </ul>
-
-        <p>The hands-on project for this page — an nginx container managed by Terraform (needs only Docker running locally):</p>
+        <h3>See it: one provider, one init</h3>
+        <p>This page's project is an nginx container managed by Terraform. It only needs Docker running on your laptop:</p>
 <pre><span class="out">tf-docker-demo/
-├── providers.tf        terraform {} block + provider "docker"
-├── variables.tf        inputs (§5)
-├── main.tf             resources (§4)
-├── outputs.tf          values printed after apply (§5)
-├── terraform.tfvars    values for the inputs (§5)
-├── .terraform.lock.hcl created by init — COMMIT it
-└── .terraform/         created by init — provider binaries, DON'T commit</span></pre>
-
+├── providers.tf          terraform {} block + provider "docker"   (this section)
+├── main.tf               resources                                (§4)
+├── variables.tf          inputs                                   (§5)
+├── terraform.tfvars      values for the inputs                    (§5)
+├── outputs.tf            values printed after apply               (§5)
+├── .terraform.lock.hcl   written by init: COMMIT it
+└── .terraform/           written by init: provider binaries, DON'T commit</span></pre>
         <div class="fname">tf-docker-demo/providers.tf</div>
 <pre>terraform {
   required_version = "&gt;= 1.10.0"          <span class="cm"># refuse to run on an older Terraform CLI</span>
 
   required_providers {
     docker = {                            <span class="cm"># local name used in this config</span>
-      source  = "kreuzwerker/docker"      <span class="cm"># registry.terraform.io/kreuzwerker/docker</span>
+      source  = "kreuzwerker/docker"      <span class="cm"># = registry.terraform.io/kreuzwerker/docker</span>
       version = "~&gt; 4.0"                  <span class="cm"># any 4.x, never 5.0</span>
     }
   }
@@ -273,45 +317,85 @@ provider "docker" {
   <span class="cm"># host defaults to $DOCKER_HOST, else unix:///var/run/docker.sock (Docker Desktop / Linux)</span>
   <span class="cm"># Colima users: host = "unix:///Users/shaurya/.colima/default/docker.sock"</span>
 }</pre>
+        <p><code class="inl">source</code> is <code class="inl">NAMESPACE/TYPE</code> on the Registry, whose providers come in tiers: official (<code class="inl">hashicorp/aws</code>), partner, community (<code class="inl">kreuzwerker/docker</code>). The type is the prefix of its resources: <code class="inl">docker_image</code>, <code class="inl">aws_vpc</code>.</p>
+<pre><span class="pr">$</span> cd tf-docker-demo &amp;&amp; terraform init
+<span class="out">Initializing the backend...
+Initializing provider plugins...
+- Finding kreuzwerker/docker versions matching "~&gt; 4.0"...
+- Installing kreuzwerker/docker v4.6.0...
+- Installed kreuzwerker/docker v4.6.0 (self-signed, key ID BD080C4571C6104C)
+Terraform has created a lock file .terraform.lock.hcl to record the provider
+selections it made above. Include this file in your version control repository …
 
+Terraform has been successfully initialized!</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Initializing the backend...</code></td><td>Where state lives: a local file by default (section 8 moves it to S3)</td></tr>
+              <tr><td><code class="inl">Installing … v4.6.0</code></td><td>The newest version matching <code class="inl">~&gt; 4.0</code>, saved under <code class="inl">.terraform/providers/registry.terraform.io/kreuzwerker/docker/4.6.0/darwin_arm64/</code></td></tr>
+              <tr><td><code class="inl">(self-signed, key ID …)</code></td><td>Signature checked: community providers are signed by their authors, official ones <code class="inl">(signed by HashiCorp)</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>That solves the puzzle: the clone had the committed lock file but not the git-ignored <code class="inl">.terraform/</code>, so plan knew the version and couldn't find it. <code class="inl">terraform init</code> installs exactly 4.6.0. <strong>What it does <em>not</em> do:</strong> init creates no container and never contacts Docker. It only prepares the folder (providers, modules, backend), so it's always safe to re-run, and needed again after adding a provider or module or changing the backend.</p>
+
+        <h3>Build it up</h3>
+        <h4>Version constraints</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Constraint</th><th>Allows</th><th>Typical use</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">= 4.6.0</code> (or <code class="inl">"4.6.0"</code>)</td><td>Exactly 4.6.0</td><td>Rarely — blocks patches</td></tr>
+              <tr><td><code class="inl">= 4.6.0</code> (or <code class="inl">"4.6.0"</code>)</td><td>Exactly 4.6.0</td><td>Rarely: it blocks patches</td></tr>
               <tr><td><code class="inl">&gt;= 1.10.0</code></td><td>1.10.0 and anything newer</td><td><code class="inl">required_version</code></td></tr>
-              <tr><td><code class="inl">~&gt; 4.0</code></td><td>≥ 4.0, &lt; 5.0 (rightmost number may grow)</td><td><strong>Providers</strong> — new features, no breaking major</td></tr>
-              <tr><td><code class="inl">~&gt; 4.6.0</code></td><td>≥ 4.6.0, &lt; 4.7.0 (patches only)</td><td>Very cautious pinning</td></tr>
-              <tr><td><code class="inl">&gt;= 5.0, &lt; 7.0</code></td><td>A range</td><td>Modules supporting two majors</td></tr>
+              <tr><td><code class="inl">~&gt; 4.0</code></td><td>≥ 4.0 and &lt; 5.0 (only the rightmost number may grow)</td><td><strong>Providers</strong>: new features, no breaking major version</td></tr>
+              <tr><td><code class="inl">~&gt; 4.6.0</code></td><td>≥ 4.6.0 and &lt; 4.7.0 (patches only)</td><td>Very cautious pinning</td></tr>
             </tbody>
           </table>
         </div>
-        <p>The constraint says what's <em>allowed</em>; <code class="inl">.terraform.lock.hcl</code> records what was actually <em>chosen</em> (exact version + checksums), so your teammate and CI get the same 4.6.0. <code class="inl">terraform init -upgrade</code> moves to the newest allowed version and rewrites the lock file.</p>
+        <h4>The lock file</h4>
+        <div class="fname">tf-docker-demo/.terraform.lock.hcl</div>
+<pre><span class="cm"># This file is maintained automatically by "terraform init".
+# Manual edits may be lost in future updates.</span>
 
-        <h3>The AWS provider (used from Session 21)</h3>
-<pre>terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~&gt; 5.0"
-    }
-  }
-}
+provider "registry.terraform.io/kreuzwerker/docker" {
+  version     = "4.6.0"                 <span class="cm"># exact version chosen</span>
+  constraints = "~&gt; 4.0"                <span class="cm"># copied from required_providers</span>
+  hashes = [                            <span class="cm"># checksums: a tampered binary fails init</span>
+    "h1:Qm7tZ0vXc4yP2kR9mJ1sL8wN3bF6hD5aE0uT7iY2oGk=",
+    "zh:0a3c5e9f2b7d1c8e4a6f0b2d9c7e5a3f1b8d6c4e2a0f9b7d5c3e1a8f6b4d2c0e",
+    <span class="cm"># … one zh: hash per OS/architecture …</span>
+  ]
+}</pre>
+        <p>The constraint says what's <em>allowed</em>. The lock file says what was <em>chosen</em>. To move to a newer allowed version on purpose, run <code class="inl">terraform init -upgrade</code>, which rewrites the lock file, then commit it.</p>
 
-provider "aws" {
-  region = "ap-south-1"            <span class="cm"># Mumbai — every resource below is created here</span>
+        <h4>The AWS provider (used in Session 21)</h4>
+        <p>Declared the same way, <code class="inl">aws = { source = "hashicorp/aws", version = "~&gt; 5.0" }</code>, and configured with a region:</p>
+<pre>provider "aws" {
+  region = "ap-south-1"            <span class="cm"># Mumbai: every resource below is created here</span>
   <span class="cm"># profile = "taskflow"           # optional named profile from ~/.aws/credentials</span>
 }</pre>
-        <p>Where the AWS provider finds credentials (first match wins): provider arguments → env vars <code class="inl">AWS_ACCESS_KEY_ID</code> / <code class="inl">AWS_SECRET_ACCESS_KEY</code> / <code class="inl">AWS_SESSION_TOKEN</code> → <code class="inl">~/.aws/credentials</code> + <code class="inl">~/.aws/config</code> (written by <code class="inl">aws configure</code> or <code class="inl">aws sso login</code>) → EC2/ECS role. In CI use OIDC (Session 19).</p>
+        <p>Credentials, first match wins: provider arguments → env vars <code class="inl">AWS_ACCESS_KEY_ID</code> / <code class="inl">AWS_SECRET_ACCESS_KEY</code> / <code class="inl">AWS_SESSION_TOKEN</code> → <code class="inl">~/.aws/credentials</code> + <code class="inl">~/.aws/config</code> (from <code class="inl">aws configure</code> or <code class="inl">aws sso login</code>) → the machine's IAM role (EC2/ECS). In CI, use OIDC (Session 19).</p>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p>Writing <code class="inl">access_key = "AKIA…"</code> and <code class="inl">secret_key = "…"</code> inside <code class="inl">provider "aws"</code>. The keys end up in Git history (see secret scanning, Session 19). Keep credentials in env vars or <code class="inl">~/.aws/</code>, never in <code class="inl">.tf</code> files.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Add <code class="inl">.terraform.lock.hcl</code> to <code class="inl">.gitignore</code>." <strong>✗</strong> Commit the lock file. Ignore <code class="inl">.terraform/</code>, which holds the downloaded binaries.</p>
+          <p>"Put <code class="inl">access_key = "AKIA…"</code> in the provider block so it just works." <strong>✗</strong> The key ends up in Git history, where secret scanners and attackers find it (Session 19). Use environment variables, <code class="inl">~/.aws/</code> or OIDC.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Declare providers in <code class="inl">required_providers</code> with <code class="inl">source</code> + <code class="inl">~&gt;</code> constraint, configure them in <code class="inl">provider</code> blocks, commit the lock file, keep credentials out of code.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>required_providers = what you need · init = download it · lock file = exactly what you got (commit it)</strong><br /><strong>~&gt; 4.0 = any 4.x, never 5.0</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Which versions does <code class="inl">version = "~&gt; 5.0"</code> allow? And <code class="inl">"~&gt; 5.31.0"</code>?</summary>
+            <p class="ans"><code class="inl">~&gt; 5.0</code>: ≥ 5.0 and &lt; 6.0. <code class="inl">~&gt; 5.31.0</code>: ≥ 5.31.0 and &lt; 5.32.0 (patches only). Only the <em>rightmost</em> number you wrote may grow.</p></details>
+          <details class="quiz"><summary>Q2. Your laptop uses docker provider 4.6.0, the CI runner installed 4.7.1, and the plans differ. What wasn't committed, and what's the fix?</summary>
+            <p class="ans">The lock file. Commit <code class="inl">.terraform.lock.hcl</code> and CI's <code class="inl">init</code> installs exactly 4.6.0. Upgrade on purpose with <code class="inl">terraform init -upgrade</code> in a PR.</p></details>
+          <details class="quiz"><summary>Q3. You add <code class="inl">hashicorp/aws</code> to <code class="inl">required_providers</code> and run <code class="inl">terraform plan</code>. Predict the result.</summary>
+            <p class="ans"><code class="inl">Error: Inconsistent dependency lock file … hashicorp/aws: required by this configuration but no version is selected</code>. Run <code class="inl">terraform init</code>: it downloads the provider and adds it to the lock file.</p></details>
         </div>
       </section>
 
@@ -320,17 +404,46 @@ provider "aws" {
         <h2><span class="sec-num">4</span> Resources &amp; data sources</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Here's TaskFlow's web server the way you started it by hand in Session 6:</p>
+<pre><span class="pr">$</span> docker pull nginx:1.27-alpine
+<span class="pr">$</span> docker run -d --name taskflow-web --restart unless-stopped -p 8080:80 nginx:1.27-alpine</pre>
+        <p>That's two imperative steps. For Terraform to create it, change it, and one day delete it, you describe the <em>end state</em> instead: "an image <code class="inl">nginx:1.27-alpine</code> exists, and a container named <code class="inl">taskflow-web</code> runs it on port 8080".</p>
+
+        <h3>The idea</h3>
+        <p>A <code class="inl">resource</code> block says "this object should exist". In <code class="inl">resource "TYPE" "NAME"</code> the type comes from a provider and the name is your label; together they form the <span class="term">address</span> <code class="inl">docker_container.web</code>, unique in the folder. <strong>Arguments</strong> are what you set. <strong>Attributes</strong> are what the provider reports back once the object exists (<code class="inl">id</code>, <code class="inl">image_id</code>). Using another resource's attribute is also a dependency, and Terraform orders the work by it.</p>
+<pre>                         you set (arguments)               provider reports back (attributes)
+ docker_image.nginx      name = "nginx:1.27-alpine"   ──▶   image_id = "sha256:4c1c…"
+          │                                                          │
+          │  reference: image = docker_image.nginx.image_id  ◀───────┘
+          ▼  (this is also a dependency edge)
+ docker_container.web    image, name, restart, ports  ──▶   id = "7d3e5f…"
+
+ apply order:   image, then container        destroy order:   container, then image</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A resource is "please build this". A data source is "please look this up for me" — Terraform only reads it, never builds or deletes it.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>A <strong>resource</strong> is a line in the blueprint: "build a container like this". A <strong>data source</strong> is "look up where the city's water main is and tell me": the contractor reads it but never builds or demolishes it.</p>
         </div>
 
-        <ul>
-          <li>Syntax: <code class="inl">resource "&lt;TYPE&gt;" "&lt;NAME&gt;" { … }</code>. The <span class="term">address</span> is <code class="inl">TYPE.NAME</code> (e.g. <code class="inl">docker_container.web</code>) and must be unique in the folder.</li>
-          <li><strong>Arguments</strong> = what you set (<code class="inl">name</code>, <code class="inl">ports</code>). <strong>Attributes</strong> = what the provider reports back, often only after creation (<code class="inl">id</code>, <code class="inl">image_id</code>) — shown as <code class="inl">(known after apply)</code> in a plan.</li>
-          <li>Reference an attribute with <code class="inl">TYPE.NAME.ATTRIBUTE</code>.</li>
-        </ul>
+        <h3>See it: the smallest resource</h3>
+<pre>resource "docker_image" "nginx" {
+  name = "nginx:1.27-alpine"
+}</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">resource</code></td><td>Block type: something Terraform creates and manages</td></tr>
+              <tr><td><code class="inl">"docker_image"</code></td><td>Resource type from the docker provider. Creating one pulls an image.</td></tr>
+              <tr><td><code class="inl">"nginx"</code></td><td>Your local name, used only inside Terraform: <code class="inl">docker_image.nginx</code></td></tr>
+              <tr><td><code class="inl">name = "nginx:1.27-alpine"</code></td><td>Argument: which image to pull</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Applying this block does what <code class="inl">docker pull</code> does. <strong>What it does <em>not</em> do:</strong> the label <code class="inl">nginx</code> isn't a Docker name. Call it <code class="inl">"base"</code> and nothing in Docker changes. And writing the block creates nothing until you apply.</p>
 
+        <h3>Build it up: TaskFlow's web container</h3>
         <div class="fname">tf-docker-demo/main.tf</div>
 <pre><span class="cm"># = docker pull nginx:1.27-alpine</span>
 resource "docker_image" "nginx" {
@@ -349,33 +462,21 @@ resource "docker_container" "web" {
     external = var.external_port              <span class="cm"># host port (8080)</span>
   }
 }</pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">resource "docker_image" "nginx"</code></td><td>Type from the docker provider; <code class="inl">nginx</code> is our local name (not the Docker name).</td></tr>
-              <tr><td><code class="inl">image = docker_image.nginx.image_id</code></td><td>Uses the image's ID attribute (<code class="inl">sha256:…</code>). Because of this reference, Terraform pulls the image first and replaces the container if the image changes.</td></tr>
-              <tr><td><code class="inl">ports { }</code></td><td>Nested block, repeatable (one block per published port). Same as <code class="inl">-p 8080:80</code>.</td></tr>
-              <tr><td><code class="inl">restart</code></td><td>Docker restart policy (Session 6).</td></tr>
+              <tr><td><code class="inl">keep_locally = false</code></td><td>Destroying this resource also deletes the image from Docker</td></tr>
+              <tr><td><code class="inl">image = docker_image.nginx.image_id</code></td><td>The image's ID attribute (<code class="inl">sha256:…</code>). Because of this reference, Terraform pulls first, and replaces the container whenever the image changes.</td></tr>
+              <tr><td><code class="inl">ports { internal … external … }</code></td><td>A nested block, repeatable (one per published port): <code class="inl">-p 8080:80</code></td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Dependencies</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th></th><th>Implicit</th><th>Explicit (<code class="inl">depends_on</code>)</th></tr></thead>
-            <tbody>
-              <tr><td>How</td><td>One resource references another's attribute</td><td><code class="inl">depends_on = [aws_route_table_association.public]</code></td></tr>
-              <tr><td>When</td><td>Almost always (preferred)</td><td>Hidden dependency Terraform can't see in the arguments</td></tr>
-              <tr><td>Example</td><td>container → <code class="inl">docker_image.nginx.image_id</code></td><td>EC2 whose <code class="inl">user_data</code> runs <code class="inl">apt-get</code> needs the internet route to exist first, but never references it (Session 21)</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Terraform builds a graph from these edges, creates independent resources <strong>in parallel</strong> (default 10 at a time), and destroys in reverse order. See it with <code class="inl">terraform graph</code>.</p>
+        <h4>Dependencies: implicit vs explicit</h4>
+        <p>That reference is an <strong>implicit</strong> dependency, which is what you want almost always. An <strong>explicit</strong> <code class="inl">depends_on = [aws_route_table_association.public]</code> is only for a hidden dependency no argument shows, like an EC2 boot script that needs the internet route but never references it (Session 21). Independent resources are created <strong>in parallel</strong> (10 at a time by default); <code class="inl">terraform graph</code> prints the graph.</p>
 
-        <h3><code class="inl">count</code> and <code class="inl">for_each</code> (many copies from one block)</h3>
+        <h4>Many copies from one block: <code class="inl">count</code> and <code class="inl">for_each</code></h4>
 <pre>resource "docker_container" "worker" {
   count = 3                                     <span class="cm"># docker_container.worker[0], [1], [2]</span>
   name  = "taskflow-worker-${count.index}"      <span class="cm"># taskflow-worker-0, -1, -2</span>
@@ -395,16 +496,15 @@ resource "docker_container" "env" {
           <table>
             <thead><tr><th></th><th><code class="inl">count</code></th><th><code class="inl">for_each</code></th></tr></thead>
             <tbody>
-              <tr><td>Input</td><td>A number</td><td>A map or <code class="inl">set(string)</code> (<code class="inl">toset(list)</code>)</td></tr>
-              <tr><td>Instances identified by</td><td>Index <code class="inl">[0]</code>, <code class="inl">[1]</code></td><td>Key <code class="inl">["blue"]</code></td></tr>
-              <tr><td>Remove a middle item</td><td>Later items shift index → get destroyed and recreated</td><td>Only that one is destroyed</td></tr>
-              <tr><td>Best for</td><td>N identical copies; on/off switch <code class="inl">count = var.enabled ? 1 : 0</code></td><td>Copies that differ by name/config</td></tr>
+              <tr><td>Input · instances named by</td><td>A number · index <code class="inl">[0]</code>, <code class="inl">[1]</code></td><td>A map or <code class="inl">toset(list)</code> · key <code class="inl">["blue"]</code></td></tr>
+              <tr><td>Remove an item from the middle</td><td>Later items shift index, so they're changed or recreated</td><td>Only that one is destroyed</td></tr>
+              <tr><td>Best for</td><td>N identical copies, or an on/off switch: <code class="inl">count = var.enabled ? 1 : 0</code></td><td>Copies that differ by name or config</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Data sources</h3>
-        <p>A taste of AWS (Session 21 builds on it): look up the account ID, then use it in a globally unique bucket name.</p>
+        <h4>Data sources: read, don't create</h4>
+        <p>A first taste of AWS (Session 21 builds on it). Look up your account ID, then use it to make a globally unique bucket name:</p>
         <div class="fname">aws-demo/main.tf</div>
 <pre>data "aws_caller_identity" "current" {}        <span class="cm"># read-only: who am I? (account_id, arn)</span>
 
@@ -418,22 +518,26 @@ resource "aws_s3_bucket_versioning" "logs" {
     status = "Enabled"
   }
 }</pre>
-        <p>Other common data sources: <code class="inl">data "aws_ami"</code> (latest Ubuntu image ID), <code class="inl">data "aws_availability_zones"</code>, <code class="inl">data "aws_vpc"</code> (an existing VPC). In a plan they show as <code class="inl">&lt;= read (data resources)</code> or just <code class="inl">Reading… Read complete</code>.</p>
+        <p>Data sources are addressed as <code class="inl">data.TYPE.NAME</code>. Other common ones: <code class="inl">data "aws_ami"</code> (the newest Ubuntu image ID), <code class="inl">data "aws_availability_zones"</code>, <code class="inl">data "aws_vpc"</code>. Plans show them as <code class="inl">Reading... Read complete</code>, or <code class="inl">&lt;= read</code> if they can only be read during apply.</p>
+        <p>One more nested block works on any resource. <code class="inl">lifecycle { prevent_destroy = true }</code> makes any plan that would destroy it fail (state bucket, prod database). <code class="inl">create_before_destroy = true</code> builds the replacement first (<code class="inl">+/-</code>) for less downtime. <code class="inl">ignore_changes = [tags]</code> stops Terraform fighting changes made outside it.</p>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th><code class="inl">lifecycle { }</code> argument</th><th>Effect</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">prevent_destroy = true</code></td><td>Any plan that would destroy it errors out (state bucket, prod DB).</td></tr>
-              <tr><td><code class="inl">create_before_destroy = true</code></td><td>On replacement, create the new one first (<code class="inl">+/-</code>) → less downtime.</td></tr>
-              <tr><td><code class="inl">ignore_changes = [tags]</code></td><td>Don't fight changes made outside Terraform to these arguments.</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Add <code class="inl">depends_on</code> everywhere to be safe." <strong>✗</strong> A reference already creates the dependency. Use <code class="inl">depends_on</code> only for hidden ones. Extra edges slow plans down and hide the real intent.</p>
+          <p>"A data source creates the object if it's missing." <strong>✗</strong> It only reads. If nothing matches, the plan fails.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">resource "TYPE" "NAME"</code> creates; <code class="inl">data</code> reads. References create the dependency graph; <code class="inl">depends_on</code> only for hidden dependencies; prefer <code class="inl">for_each</code> over <code class="inl">count</code> for named items.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>resource = create &amp; manage · data = read only</strong><br /><strong>A reference (TYPE.NAME.ATTRIBUTE) is also a dependency.</strong><br /><strong>count for N identical copies · for_each for named ones</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Spot the bug: <code class="inl">image = "docker_image.nginx.image_id"</code></summary>
+            <p class="ans">The quotes make it a literal string: Docker is asked for an image literally named <code class="inl">docker_image.nginx.image_id</code>, and Terraform sees no dependency. Drop the quotes.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">count = length(var.names)</code> with <code class="inl">names = ["api", "worker", "cron"]</code>. You delete <code class="inl">"api"</code>. Predict the plan.</summary>
+            <p class="ans">Indexes shift: <code class="inl">[0]</code> becomes worker and <code class="inl">[1]</code> becomes cron, so both are replaced (their names change), and <code class="inl">[2]</code> is destroyed: <code class="inl">Plan: 2 to add, 0 to change, 3 to destroy</code>. With <code class="inl">for_each = toset(var.names)</code> only <code class="inl">["api"]</code> goes.</p></details>
         </div>
       </section>
 
@@ -442,11 +546,38 @@ resource "aws_s3_bucket_versioning" "logs" {
         <h2><span class="sec-num">5</span> Variables, locals &amp; outputs</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p><code class="inl">main.tf</code> needs a container name and a port; staging wants port 9090 and another name; the DB password must never sit in a committed file. Copying the folder to <code class="inl">staging/</code> works for a week, until the copies drift apart.</p>
+
+        <h3>The idea</h3>
+        <p>Treat the configuration like a function. <strong>Variables</strong> are its parameters (type, default, validation). <strong>Locals</strong> are values computed inside. <strong>Outputs</strong> are its return values, printed after apply and read by scripts. The code stays the same for every environment; only the inputs change.</p>
+<pre> inputs                                  the configuration                 results
+ terraform.tfvars ──┐                   ┌──────────────────────────┐
+ TF_VAR_* env vars ─┼─▶ variables.tf ─▶ │ locals { … }             │ ─▶ outputs.tf ─▶ terraform output
+ -var / -var-file ──┘   (type, default, │ main.tf uses var.x and   │    url,             → your shell,
+                         validation)    │ local.y                  │    container_id       scripts, CI
+                                        └──────────────────────────┘</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Variables are the blanks on a form, <code class="inl">.tfvars</code> is the filled-in form, outputs are the receipt Terraform hands back.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>You already know this shape: <code class="inl">def taskflow_web(container_name="taskflow-web", external_port: int = 8080): …</code>. Parameters with defaults are <strong>variables</strong>, an <code class="inl">assert</code> on the first line is <strong>validation</strong>, local variables in the body are <strong>locals</strong>, and the <code class="inl">return {"url": …}</code> is an <strong>output</strong>. Calling it with other arguments is a <strong>tfvars</strong> file.</p>
         </div>
 
+        <h3>See it: one variable, four ways to set it</h3>
+        <p>Declare <code class="inl">variable "external_port" { type = number, default = 8080 }</code>, use it as <code class="inl">external = var.external_port</code>, and watch the planned output change (only that line shown):</p>
+<pre><span class="pr">$</span> terraform plan                                              <span class="cm"># nothing set: the default</span>
+<span class="out">  + url = "http://localhost:8080"</span>
+<span class="pr">$</span> TF_VAR_external_port=9000 terraform plan                    <span class="cm"># environment variable</span>
+<span class="out">  + url = "http://localhost:9000"</span>
+<span class="pr">$</span> echo 'external_port = 8081' &gt; terraform.tfvars
+<span class="pr">$</span> TF_VAR_external_port=9000 terraform plan                    <span class="cm"># the tfvars file beats the env var</span>
+<span class="out">  + url = "http://localhost:8081"</span>
+<span class="pr">$</span> TF_VAR_external_port=9000 terraform plan -var external_port=9090   <span class="cm"># the CLI flag beats everything</span>
+<span class="out">  + url = "http://localhost:9090"</span></pre>
+        <p>The full precedence order, later wins: <strong>(1)</strong> <code class="inl">default</code> → <strong>(2)</strong> <code class="inl">TF_VAR_external_port</code> → <strong>(3)</strong> <code class="inl">terraform.tfvars</code>, then <code class="inl">terraform.tfvars.json</code> (both loaded automatically) → <strong>(4)</strong> <code class="inl">*.auto.tfvars</code>, alphabetically → <strong>(5)</strong> <code class="inl">-var 'external_port=9090'</code> and <code class="inl">-var-file=prod.tfvars</code>, in the order given.</p>
+        <p><strong>What it does <em>not</em> do:</strong> a variable can't be computed from a resource (<code class="inl">default = aws_vpc.main.id</code> is an error). Values arrive from outside, before planning starts. Use a local for anything computed.</p>
+
+        <h3>Build it up: TaskFlow's inputs</h3>
         <div class="fname">tf-docker-demo/variables.tf</div>
 <pre>variable "container_name" {
   description = "Name of the nginx container"   <span class="cm"># shown in prompts and docs</span>
@@ -471,47 +602,33 @@ variable "nginx_tag" {
   default     = "1.27-alpine"
 }
 
-variable "db_password" {                        <span class="cm"># not used by nginx — shows a secret input</span>
+variable "db_password" {                        <span class="cm"># not used by nginx; shows a secret input</span>
   description = "Example secret; set via TF_VAR_db_password"
   type        = string
   sensitive   = true                            <span class="cm"># hidden in plan/apply output</span>
   default     = null
 }</pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">type</code></td><td><code class="inl">string</code>, <code class="inl">number</code>, <code class="inl">bool</code>, <code class="inl">list(string)</code>, <code class="inl">set(string)</code>, <code class="inl">map(string)</code>, <code class="inl">object({ name = string, port = number })</code>, <code class="inl">any</code>. Wrong type → error before anything runs.</td></tr>
-              <tr><td><code class="inl">default</code></td><td>Used when no value is given. Without one, Terraform prompts (<code class="inl">var.x  Enter a value:</code>) or fails in CI.</td></tr>
-              <tr><td><code class="inl">validation</code></td><td><code class="inl">condition</code> must be true, else <code class="inl">error_message</code> is shown. Several blocks allowed.</td></tr>
-              <tr><td><code class="inl">sensitive = true</code></td><td>Prints <code class="inl">(sensitive value)</code> in plans. <strong>Still stored in plain text in state.</strong></td></tr>
+              <tr><td><code class="inl">type</code></td><td><code class="inl">string</code>, <code class="inl">number</code>, <code class="inl">bool</code>, <code class="inl">list(string)</code>, <code class="inl">set(string)</code>, <code class="inl">map(string)</code>, <code class="inl">object({ name = string, port = number })</code>, <code class="inl">any</code>. <code class="inl">-var external_port=abc</code> fails: <code class="inl">a number is required</code>.</td></tr>
+              <tr><td><code class="inl">default</code></td><td>Used when no value is given. With none, Terraform prompts (<code class="inl">var.x  Enter a value:</code>), or with <code class="inl">-input=false</code> fails: <code class="inl">No value for required variable</code>.</td></tr>
+              <tr><td><code class="inl">validation</code></td><td><code class="inl">condition</code> must be true, otherwise <code class="inl">error_message</code> is shown. Several blocks are allowed.</td></tr>
+              <tr><td><code class="inl">sensitive = true</code></td><td>Shows <code class="inl">(sensitive value)</code> in plans. <strong>It's still stored in plain text in state.</strong></td></tr>
             </tbody>
           </table>
         </div>
-
         <div class="fname">tf-docker-demo/terraform.tfvars</div>
-<pre><span class="cm"># Loaded automatically. Non-secret values only — this file is committed.</span>
+<pre><span class="cm"># Loaded automatically. Non-secret values only: this file is committed.</span>
 container_name = "taskflow-web"
 external_port  = 8080
 nginx_tag      = "1.27-alpine"</pre>
-
-        <h3>Ways to set a variable — precedence (later wins)</h3>
-        <ol>
-          <li><code class="inl">default</code> in the <code class="inl">variable</code> block</li>
-          <li>Environment variable <code class="inl">TF_VAR_external_port=9000</code></li>
-          <li><code class="inl">terraform.tfvars</code>, then <code class="inl">terraform.tfvars.json</code></li>
-          <li><code class="inl">*.auto.tfvars</code> / <code class="inl">*.auto.tfvars.json</code> (alphabetical)</li>
-          <li><code class="inl">-var 'external_port=9090'</code> and <code class="inl">-var-file=prod.tfvars</code> on the command line, in the order given</li>
-        </ol>
-        <div class="callout example">
-          <span class="c-title">Example: which port wins?</span>
-          <p>default <code class="inl">8080</code>, <code class="inl">export TF_VAR_external_port=9000</code>, <code class="inl">terraform.tfvars</code> says <code class="inl">8081</code>, and you run <code class="inl">terraform apply -var external_port=9090</code> → <strong>9090</strong>. Drop the <code class="inl">-var</code> → <strong>8081</strong> (tfvars beats env vars).</p>
-        </div>
-
-<pre><span class="pr">$</span> export TF_VAR_db_password='Dev-Only-9xKq2'      <span class="cm"># secrets via env var, never in a committed file</span>
+        <p>The secret goes in through the environment instead, and the validation rule catches a bad port before any API call:</p>
+<pre><span class="pr">$</span> export TF_VAR_db_password='Dev-Only-9xKq2'      <span class="cm"># never in a committed file</span>
 <span class="pr">$</span> terraform plan -var external_port=80
-<span class="out">╷
+<span class="out">Planning failed. Terraform encountered an error while generating this plan.
+╷
 │ Error: Invalid value for variable
 │
 │   on variables.tf line 7:
@@ -520,20 +637,16 @@ nginx_tag      = "1.27-alpine"</pre>
 │     │ var.external_port is 80
 │
 │ external_port must be between 1024 and 65535.
-│
-│ This was checked by the validation rule at variables.tf:12,3-13.
 ╵</span></pre>
 
-        <h3>Locals</h3>
+        <h4>Locals</h4>
 <pre>locals {
-  name_prefix = "taskflow-${terraform.workspace}"      <span class="cm"># "taskflow-default" unless you use workspaces</span>
-  common_tags = {
-    Project   = "taskflow"
-    ManagedBy = "terraform"
-  }
+  name_prefix = "taskflow-${terraform.workspace}"                  <span class="cm"># "taskflow-default" unless you use workspaces</span>
+  common_tags = { Project = "taskflow", ManagedBy = "terraform" }  <span class="cm"># then tags = local.common_tags</span>
 }</pre>
-        <p><code class="inl">variable</code> = input from outside (can be overridden). <code class="inl">local</code> = internal named expression (can't be overridden). Use locals to avoid repeating the same string or map.</p>
+        <p>A variable comes from outside and can be overridden; a local (<code class="inl">local.name_prefix</code>) is computed inside and can't be. Use locals to avoid repeating a string or map.</p>
 
+        <h4>Outputs</h4>
         <div class="fname">tf-docker-demo/outputs.tf</div>
 <pre>output "url" {
   description = "Open this in a browser"
@@ -549,6 +662,7 @@ output "db_password" {
   value     = var.db_password
   sensitive = true      <span class="cm"># required: an output built from a sensitive value must say so</span>
 }</pre>
+        <p>Leave out that <code class="inl">sensitive = true</code> and the plan stops with <code class="inl">Error: Output refers to sensitive values</code>. After apply, read outputs like this:</p>
 <pre><span class="pr">$</span> terraform output
 <span class="out">container_id = "7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f"
 db_password = &lt;sensitive&gt;
@@ -556,188 +670,131 @@ url = "http://localhost:8080"</span>
 <span class="pr">$</span> terraform output -raw url             <span class="cm"># no quotes → usable in scripts</span>
 <span class="out">http://localhost:8080</span>
 <span class="pr">$</span> curl -s -o /dev/null -w "%{http_code}\n" "$(terraform output -raw url)"
-<span class="out">200</span>
-<span class="pr">$</span> terraform output -json | jq -r .container_id.value
-<span class="out">7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f</span></pre>
+<span class="out">200</span>                                  <span class="cm"># -json gives every output as JSON, for jq</span></pre>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <p>Leaving out <code class="inl">sensitive = true</code> on that output → <code class="inl">Error: Output refers to sensitive values</code>.<br>
-          Thinking <code class="inl">sensitive</code> means encrypted: it only hides console output. <code class="inl">terraform output -raw db_password</code> and the state file both show it in plain text.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">sensitive = true</code> encrypts the value." <strong>✗</strong> It only hides it in plan/apply output. State holds it in plain text, and <code class="inl">output -raw</code> prints it.</p>
+          <p>"Environment variables override <code class="inl">terraform.tfvars</code>." <strong>✗</strong> The reverse: only the default is weaker than <code class="inl">TF_VAR_</code>.</p>
+          <p>"<code class="inl">terraform.tfvars</code> is where the DB password goes." <strong>✗</strong> It's committed. Use <code class="inl">TF_VAR_db_password</code> or a git-ignored <code class="inl">*.secret.tfvars</code>.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">variables.tf</code> declares inputs (type, default, validation, sensitive); <code class="inl">terraform.tfvars</code> fills them; CLI <code class="inl">-var</code> wins. Locals de-duplicate; outputs expose results (<code class="inl">-raw</code> for scripts).
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>variables = parameters · locals = local variables · outputs = return values</strong><br /><strong>default &lt; TF_VAR_ &lt; terraform.tfvars &lt; *.auto.tfvars &lt; -var / -var-file</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. <code class="inl">terraform.tfvars</code> says <code class="inl">external_port = 8081</code> and <code class="inl">staging.auto.tfvars</code> says <code class="inl">9000</code>. You run <code class="inl">terraform plan</code> with no flags. Which port?</summary>
+            <p class="ans">9000. <code class="inl">*.auto.tfvars</code> files load after <code class="inl">terraform.tfvars</code>, and the later value wins.</p></details>
+          <details class="quiz"><summary>Q2. Your teammate changes the default of <code class="inl">external_port</code> to 80, passes nothing, and gets <code class="inl">Invalid value for variable</code>. They didn't set anything, so why?</summary>
+            <p class="ans">Validation checks the final value, and that includes the default. 80 fails <code class="inl">&gt;= 1024</code>, so even the default is rejected.</p></details>
+          <details class="quiz"><summary>Q3. A script runs <code class="inl">curl "$(terraform output url)/health"</code> and gets <code class="inl">curl: (3) URL rejected: Port number was not a decimal number between 0 and 65535</code>. Why?</summary>
+            <p class="ans">Without <code class="inl">-raw</code> the output keeps its quotes, so curl receives <code class="inl">"http://localhost:8080"/health</code> and the quote after the port breaks the URL. Use <code class="inl">terraform output -raw url</code>.</p></details>
         </div>
       </section>
 
       <!-- ===================== 6. WORKFLOW ===================== -->
       <section id="workflow">
-        <h2><span class="sec-num">6</span> init → plan → apply → destroy</h2>
+        <h2><span class="sec-num">6</span> plan → apply → destroy</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>One day you'll run Terraform in a folder that also manages TaskFlow's production database. Before anything happens you want to know what will be created, what will change, and above all what will be <strong>destroyed</strong>.</p>
+
+        <h3>The idea</h3>
+        <p><code class="inl">terraform plan</code> is a dry run over three inputs: your config (what you want), the state (what was built last time) and the real objects, refreshed through the provider (what's there now). It prints the difference as actions. <code class="inl">apply</code> carries them out and records the new IDs in state. <code class="inl">destroy</code> is a plan to delete everything in state, then an apply.</p>
+<pre>  config (*.tf)               state (last apply)            real world (refreshed now)
+  "web should exist,          "web = container 7d3e…,       "container 7d3e… is running,
+   port 8080"                  port 8080"                     port 8080"
+            └──────────────────────────┼─────────────────────────────┘
+                                       ▼
+                 terraform plan   →  + create   ~ update   -/+ replace   - destroy
+                                       ▼   you read: "Plan: 2 to add, 0 to change, 0 to destroy."
+                 terraform apply  →  provider API calls  →  state updated with real IDs</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>init = unpack the toolbox, plan = "here's what I'm about to do", apply = do it, destroy = put everything back in the box.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><code class="inl">plan</code> is the contractor's <strong>itemised quote</strong>: "build one container, replace one image, demolish nothing". You read it, sign it, and only then does work start. Saving the plan with <code class="inl">-out</code> gives you the <strong>signed copy</strong>: the crew does exactly what's on it and nothing else.</p>
         </div>
 
-        <h3><code class="inl">terraform init</code></h3>
-<pre><span class="pr">$</span> cd tf-docker-demo &amp;&amp; terraform init
-<span class="out">Initializing the backend...
-Initializing provider plugins...
-- Finding kreuzwerker/docker versions matching "~&gt; 4.0"...
-- Installing kreuzwerker/docker v4.6.0...
-- Installed kreuzwerker/docker v4.6.0 (self-signed, key ID BD080C4571C6104C)
-Partner and community providers are signed by their developers.
-If you'd like to know more about provider signing, you can read about it here:
-https://developer.hashicorp.com/terraform/cli/plugins/signing
-Terraform has created a lock file .terraform.lock.hcl to record the provider
-selections it made above. Include this file in your version control repository
-so that Terraform can guarantee to make the same selections by default when
-you run "terraform init" in the future.
-
-Terraform has been successfully initialized!</span></pre>
-        <p>What it did: set up the backend (local), downloaded the provider binary into <code class="inl">.terraform/providers/registry.terraform.io/kreuzwerker/docker/4.6.0/darwin_arm64/</code>, wrote the lock file. Safe to re-run any time; required again after adding a provider, module or backend.</p>
-        <div class="fname">tf-docker-demo/.terraform.lock.hcl</div>
-<pre><span class="cm"># This file is maintained automatically by "terraform init".
-# Manual edits may be lost in future updates.</span>
-
-provider "registry.terraform.io/kreuzwerker/docker" {
-  version     = "4.6.0"                 <span class="cm"># exact version chosen</span>
-  constraints = "~&gt; 4.0"                <span class="cm"># copied from required_providers</span>
-  hashes = [                            <span class="cm"># checksums: a tampered binary fails init</span>
-    "h1:Qm7tZ0vXc4yP2kR9mJ1sL8wN3bF6hD5aE0uT7iY2oGk=",
-    "zh:0a3c5e9f2b7d1c8e4a6f0b2d9c7e5a3f1b8d6c4e2a0f9b7d5c3e1a8f6b4d2c0e",
-    <span class="cm"># … one zh: hash per OS/arch …</span>
-  ]
-}</pre>
-
-        <h3><code class="inl">fmt</code> and <code class="inl">validate</code></h3>
-<pre><span class="pr">$</span> terraform fmt -recursive                 <span class="cm"># rewrites files to canonical style, prints changed files</span>
-<span class="out">main.tf</span>
-<span class="pr">$</span> terraform fmt -check -recursive          <span class="cm"># CI: non-zero exit if anything is unformatted</span>
-<span class="pr">$</span> terraform validate
-<span class="out">Success! The configuration is valid.</span>
-<span class="pr">$</span> terraform validate                       <span class="cm"># after a typo: var.containr_name</span>
-<span class="out">╷
-│ Error: Reference to undeclared input variable
-│
-│   on main.tf line 9, in resource "docker_container" "web":
-│    9:   name    = var.containr_name
-│
-│ An input variable with the name "containr_name" has not been declared. Did
-│ you mean "container_name"?
-╵</span></pre>
-
-        <h3><code class="inl">terraform plan</code></h3>
+        <h3>See it: check, then plan</h3>
+<pre><span class="pr">$</span> terraform fmt -recursive &amp;&amp; terraform validate   <span class="cm"># canonical style (prints changed files), then syntax + references</span>
+<span class="out">main.tf
+Success! The configuration is valid.</span></pre>
+        <p>Neither makes API calls. In CI, <code class="inl">fmt -check</code> exits non-zero on unformatted files. Had you typed <code class="inl">var.containr_name</code>, validate would stop with <code class="inl">Reference to undeclared input variable … Did you mean "container_name"?</code>. Now the plan:</p>
 <pre><span class="pr">$</span> terraform plan -out=tfplan
-<span class="out">Terraform used the selected providers to generate the following execution
-plan. Resource actions are indicated with the following symbols:
+<span class="out">… Resource actions are indicated with the following symbols:
   + create
-
-Terraform will perform the following actions:
 
   # docker_container.web will be created
   + resource "docker_container" "web" {
-      + attach       = false
-      + exit_code    = (known after apply)
-      + hostname     = (known after apply)
-      + id           = (known after apply)
-      + image        = (known after apply)
-      + must_run     = true
-      + name         = "taskflow-web"
-      + network_data = (known after apply)
-      + restart      = "unless-stopped"
-      + start        = true</span>
+      + id      = (known after apply)
+      + image   = (known after apply)
+      + name    = "taskflow-web"
+      + restart = "unless-stopped"</span>
         <span class="cm">… ~25 more attributes trimmed, mostly (known after apply) …</span>
-<span class="out">
-      + ports {
+<span class="out">      + ports {
           + external = 8080
           + internal = 80
-          + ip       = "0.0.0.0"
-          + protocol = "tcp"
         }
     }
 
   # docker_image.nginx will be created
   + resource "docker_image" "nginx" {
-      + id           = (known after apply)
       + image_id     = (known after apply)
       + keep_locally = false
       + name         = "nginx:1.27-alpine"
-      + repo_digest  = (known after apply)
     }
 
 Plan: 2 to add, 0 to change, 0 to destroy.
 
 Changes to Outputs:
-  + container_id = (known after apply)
   + db_password  = (sensitive value)
   + url          = "http://localhost:8080"
-
-─────────────────────────────────────────────────────────────────────────────
-
-Saved the plan to: tfplan
-
-To perform exactly these actions, run the following command to apply:
-    terraform apply "tfplan"</span></pre>
-
+Saved the plan to: tfplan</span></pre>
+        <p>Read the <strong>summary line first</strong>: any "to destroy" you didn't expect is your cue to stop. <code class="inl">-out=tfplan</code> saved this exact plan to a file. <strong>What it does <em>not</em> do:</strong> plan changes nothing; it only reads, so it's safe any time. But reality can change between plan and apply, which is why the saved file exists.</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Symbol</th><th>Meaning</th><th>When</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">+</code></td><td>create</td><td>New resource in config</td></tr>
-              <tr><td><code class="inl">-</code></td><td>destroy</td><td>Removed from config, or <code class="inl">terraform destroy</code></td></tr>
-              <tr><td><code class="inl">~</code></td><td>update in-place</td><td>Argument the API can change live (tags, instance type)</td></tr>
-              <tr><td><code class="inl">-/+</code></td><td>destroy, then create replacement</td><td>Argument marked <code class="inl"># forces replacement</code> changed (image, AMI, name)</td></tr>
-              <tr><td><code class="inl">+/-</code></td><td>create replacement, then destroy</td><td>Same, with <code class="inl">create_before_destroy</code></td></tr>
-              <tr><td><code class="inl">&lt;=</code></td><td>read</td><td>Data source that can only be read during apply</td></tr>
+              <tr><td><code class="inl">+</code></td><td>create</td><td>A new resource in the config</td></tr>
+              <tr><td><code class="inl">-</code></td><td>destroy</td><td>Removed from the config, or <code class="inl">terraform destroy</code></td></tr>
+              <tr><td><code class="inl">~</code></td><td>update in place</td><td>An argument the API can change live (tags, instance type)</td></tr>
+              <tr><td><code class="inl">-/+</code></td><td>destroy, then create a replacement</td><td>An argument marked <code class="inl"># forces replacement</code> changed (image, AMI, name)</td></tr>
+              <tr><td><code class="inl">+/-</code></td><td>create the replacement, then destroy</td><td>The same, with <code class="inl">create_before_destroy</code></td></tr>
             </tbody>
           </table>
         </div>
-        <p>Read the last line first: <code class="inl">Plan: 2 to add, 0 to change, 0 to destroy.</code> Any unexpected "to destroy" is your cue to stop. <code class="inl">(known after apply)</code> = the provider learns the value only after creating it.</p>
 
-        <h3><code class="inl">terraform apply</code></h3>
+        <h3>Build it up: apply, re-run, change, destroy</h3>
 <pre><span class="pr">$</span> terraform apply tfplan                   <span class="cm"># saved plan: no prompt, runs exactly what you reviewed</span>
 <span class="out">docker_image.nginx: Creating...
-docker_image.nginx: Still creating... [00m10s elapsed]
 docker_image.nginx: Creation complete after 12s [id=sha256:4c1c2b9e0d8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2bnginx:1.27-alpine]
 docker_container.web: Creating...
 docker_container.web: Creation complete after 1s [id=7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f]
 
 Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
 
-Outputs:
-
-container_id = "7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f"
-db_password = &lt;sensitive&gt;
-url = "http://localhost:8080"</span>
-<span class="pr">$</span> docker ps --filter name=taskflow-web
-<span class="out">CONTAINER ID   IMAGE          COMMAND                  CREATED          STATUS          PORTS                  NAMES
-7d3e5f1a9b2c   4c1c2b9e0d8f   "/docker-entrypoint.…"   20 seconds ago   Up 19 seconds   0.0.0.0:8080-&gt;80/tcp   taskflow-web</span>
+Outputs: …                              </span><span class="cm"># the three outputs from §5</span>
 <span class="pr">$</span> curl -sI localhost:8080 | head -2
 <span class="out">HTTP/1.1 200 OK
 Server: nginx/1.27.5</span></pre>
-        <p>Plain <code class="inl">terraform apply</code> (no plan file) makes a fresh plan, shows it, and waits for you to type <code class="inl">yes</code>. The IMAGE column shows an ID because we passed <code class="inl">image_id</code>.</p>
+        <p>Image first, container second: the dependency from section 4. Plain <code class="inl">terraform apply</code> (no plan file) makes a fresh plan, shows it, and waits for you to type <code class="inl">yes</code>. <code class="inl">-auto-approve</code> skips that prompt, the only human check, so keep it for CI applying a plan someone already reviewed.</p>
 
-        <div class="callout example">
-          <span class="c-title">Example: idempotency, then a replacement</span>
-          <p>Run <code class="inl">terraform plan</code> again without changes → nothing to do. Then bump the tag:</p>
-        </div>
+        <h4>Run it again: idempotency</h4>
 <pre><span class="pr">$</span> terraform plan
 <span class="out">docker_image.nginx: Refreshing state... [id=sha256:4c1c…nginx:1.27-alpine]
 docker_container.web: Refreshing state... [id=7d3e5f1a9b2c…]
 
-No changes. Your infrastructure matches the configuration.</span>
-<span class="pr">$</span> terraform plan -var nginx_tag=1.28-alpine
-<span class="out">Terraform used the selected providers to generate the following execution
-plan. Resource actions are indicated with the following symbols:
--/+ destroy and then create replacement
+No changes. Your infrastructure matches the configuration.
+…</span></pre>
+        <p>Section 1's promise, kept: the CLI script made a second VPC; Terraform does nothing because nothing differs.</p>
 
-Terraform will perform the following actions:
-
-  # docker_container.web must be replaced
+        <h4>Change something: replace vs update in place</h4>
+<pre><span class="pr">$</span> terraform plan -var nginx_tag=1.28-alpine
+<span class="out">  # docker_container.web must be replaced
 -/+ resource "docker_container" "web" {
       ~ id      = "7d3e5f1a9b2c…" -&gt; (known after apply)
       ~ image   = "sha256:4c1c2b9e0d8f…" -&gt; (known after apply) # forces replacement
@@ -747,61 +804,49 @@ Terraform will perform the following actions:
 
   # docker_image.nginx must be replaced
 -/+ resource "docker_image" "nginx" {
-      ~ id          = "sha256:4c1c…nginx:1.27-alpine" -&gt; (known after apply)
       ~ image_id    = "sha256:4c1c2b9e0d8f…" -&gt; (known after apply)
       ~ name        = "nginx:1.27-alpine" -&gt; "nginx:1.28-alpine" # forces replacement
-      ~ repo_digest = "nginx@sha256:65645c7b…" -&gt; (known after apply)
-        # (1 unchanged attribute hidden)
+        # (3 unchanged attributes hidden)
     }
 
 Plan: 2 to add, 0 to change, 2 to destroy.</span></pre>
-        <p>An in-place update (<code class="inl">~</code>) looks like this — e.g. changing a tag on the S3 bucket from §4:</p>
-<pre><span class="out">  # aws_s3_bucket.logs will be updated in-place
-  ~ resource "aws_s3_bucket" "logs" {
-        id       = "taskflow-logs-123456789012"
-      ~ tags     = {
-          ~ "Environment" = "dev" -&gt; "staging"
-        }
-        # (10 unchanged attributes hidden)
-    }
+        <p>An image can't be renamed in place, so it's replaced, and the container, whose <code class="inl">image</code> is that ID, is replaced too. An <strong>in-place</strong> update instead looks like <code class="inl">~ tags = { ~ "Environment" = "dev" -&gt; "staging" }</code> on section 4's bucket, with <code class="inl">Plan: 0 to add, 1 to change, 0 to destroy.</code>: same ID, no downtime.</p>
 
-Plan: 0 to add, 1 to change, 0 to destroy.</span></pre>
-
-        <h3><code class="inl">terraform destroy</code></h3>
+        <h4>Destroy</h4>
 <pre><span class="pr">$</span> terraform destroy
-<span class="out">  # docker_container.web will be destroyed
-  - resource "docker_container" "web" {
-      - name    = "taskflow-web" -&gt; null
-        … }
-  # docker_image.nginx will be destroyed
+<span class="out">  - resource "docker_container" "web" { … }
   - resource "docker_image" "nginx" { … }
-
 Plan: 0 to add, 0 to change, 2 to destroy.
 
-Do you really want to destroy all resources?
-  Terraform will destroy all your managed infrastructure, as shown above.
-  There is no undo. Only 'yes' will be accepted to confirm.
-
+Do you really want to destroy all resources? …
   Enter a value: yes
 
-docker_container.web: Destroying... [id=7d3e5f1a9b2c…]
 docker_container.web: Destruction complete after 1s
-docker_image.nginx: Destroying... [id=sha256:4c1c…nginx:1.27-alpine]
 docker_image.nginx: Destruction complete after 0s
 
 Destroy complete! Resources: 2 destroyed.</span></pre>
-        <p>Order is the reverse of creation: the container goes before the image it depends on. <code class="inl">terraform plan -destroy</code> previews this without doing it.</p>
+        <p>Reverse order of creation. <code class="inl">terraform plan -destroy</code> previews this. <code class="inl">terraform apply -replace=docker_container.web</code> forces one resource to be recreated (it replaced the old <code class="inl">taint</code>).</p>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <p><code class="inl">-auto-approve</code> on your laptop skips the only human check — fine in CI <em>after</em> a reviewed plan, risky otherwise.<br>
-          <code class="inl">-target=docker_container.web</code> applies a slice of the config and can leave state inconsistent; use only to recover from errors.<br>
-          Running <code class="inl">plan</code> before <code class="inl">init</code> → <code class="inl">Error: Inconsistent dependency lock file</code> / <code class="inl">Required plugins are not installed</code>. Run <code class="inl">terraform init</code>.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">terraform apply</code> applies the plan I reviewed earlier." <strong>✗</strong> Without a file it makes a <em>new</em> plan. <code class="inl">apply tfplan</code> runs the saved one, or refuses (<code class="inl">Saved plan is stale</code>) if state changed since.</p>
+          <p>"<code class="inl">-/+</code> is an in-place update." <strong>✗</strong> It destroys and recreates: new ID, maybe a new IP, and whatever was inside is gone.</p>
+          <p>"<code class="inl">terraform destroy</code> deletes everything in the AWS account." <strong>✗</strong> Only what's recorded in this folder's state.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          init (providers + backend) → fmt/validate → <code class="inl">plan -out=tfplan</code> (read the summary line and symbols) → <code class="inl">apply tfplan</code> → destroy. Re-running with no changes is a no-op.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>plan = preview (read-only) · apply = do it + record it in state · destroy = delete what state knows</strong><br /><strong>+ create · ~ in place · -/+ replace · - destroy. Read the summary line first.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A plan for a one-tag change ends with <code class="inl">Plan: 0 to add, 1 to change, 14 to destroy.</code> What do you do?</summary>
+            <p class="ans">Stop. A tag change is one <code class="inl">~</code>. Fourteen destroys mean something else is wrong: wrong folder or backend, a deleted <code class="inl">.tf</code> file, or a variable that set a <code class="inl">count</code> to 0. Read the <code class="inl">-</code> lines first.</p></details>
+          <details class="quiz"><summary>Q2. Plan shows <code class="inl">-/+ aws_instance.app</code> with <code class="inl"># forces replacement</code> next to <code class="inl">ami</code>. What happens to the server if you apply?</summary>
+            <p class="ans">It's terminated and a new one is created: new instance ID, new public IP, local disk gone. Session 21 prevents this with <code class="inl">lifecycle { ignore_changes = [ami] }</code>.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: plan compares the ________ with the ________ and with the ________; apply then updates the ________.</summary>
+            <p class="ans">Configuration · state · real infrastructure (refreshed through the provider) · state.</p></details>
         </div>
       </section>
 
@@ -810,36 +855,75 @@ Destroy complete! Resources: 2 destroyed.</span></pre>
         <h2><span class="sec-num">7</span> Terraform state</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>The nginx container is running. Then your copy of the folder loses <code class="inl">terraform.tfstate</code>: a <code class="inl">git clean</code>, a new laptop, or a fresh clone. Nothing touched Docker. You plan and apply:</p>
+<pre><span class="pr">$</span> docker ps --format '{{.Names}}'
+<span class="out">taskflow-web</span>                                 <span class="cm"># still running</span>
+<span class="pr">$</span> terraform plan | tail -1
+<span class="out">Plan: 2 to add, 0 to change, 0 to destroy.</span>    <span class="cm"># it wants to create everything again</span>
+<span class="pr">$</span> terraform apply -auto-approve
+<span class="out">docker_image.nginx: Creating...
+docker_image.nginx: Creation complete after 1s [id=sha256:4c1c…nginx:1.27-alpine]
+docker_container.web: Creating...
+╷
+│ Error: Unable to create container: Error response from daemon: Conflict. The container name "/taskflow-web" is already in use by container "7d3e5f1a9b2c…". You have to remove (or rename) that container to be able to reuse that name.
+│
+│   with docker_container.web,
+│   on main.tf line 8, in resource "docker_container" "web":
+│    8: resource "docker_container" "web" {
+╵</span></pre>
+        <p>Terraform could read the code and could talk to Docker, yet it didn't recognise its own container. What did it lose?</p>
+
+        <h3>The idea</h3>
+        <p>The <span class="term">state</span> file maps every address in your config to the real object behind it, plus that object's attributes and dependencies. Plan needs all three columns below. Delete the middle one and Terraform has no way to know that <code class="inl">docker_container.web</code> <em>is</em> container <code class="inl">7d3e…</code>, so it assumes nothing exists.</p>
+<pre> config (main.tf)              state (terraform.tfstate)                 real world (Docker)
+ docker_image.nginx     ◀──▶  docker_image.nginx   = sha256:4c1c…  ◀──▶  image nginx:1.27-alpine
+ docker_container.web   ◀──▶  docker_container.web = 7d3e5f1a9b2c… ◀──▶  container taskflow-web
+                               + every attribute, + dependencies
+
+ state deleted → middle column empty → "nothing exists" → Plan: 2 to add → name Conflict</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The state file is Terraform's memory: "the thing I call <code class="inl">web</code> is container 7d3e…". Lose it and Terraform forgets it built anything.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Lose the contractor's <strong>logbook</strong> and the crew turns up with the blueprint, sees an empty page, and starts building a second house on the same plot, straight into the first.</p>
         </div>
 
+        <h3>See it: what Terraform remembers</h3>
+<pre><span class="pr">$</span> terraform state list
+<span class="out">docker_container.web
+docker_image.nginx</span>
+<span class="pr">$</span> terraform state show docker_container.web
+<span class="out"># docker_container.web:
+resource "docker_container" "web" {
+    id       = "7d3e5f1a9b2c4e6f…"
+    name     = "taskflow-web"
+    …
+}</span></pre>
+        <p><code class="inl">state list</code> prints every managed address; <code class="inl">state show ADDR</code> prints one's recorded attributes. <strong>What it does <em>not</em> do:</strong> neither asks Docker anything. They read the file, so a container deleted by hand still shows up until the next plan refreshes.</p>
+
+        <h3>Build it up</h3>
+        <h4>Inside the file</h4>
         <div class="fname">tf-docker-demo/terraform.tfstate (trimmed)</div>
 <pre>{
   "version": 4,
-  "terraform_version": "1.16.5",
+  "terraform_version": "1.16.4",
   "serial": 3,
   "lineage": "6f1c2b9e-8d47-4a1e-b0c3-9e2d7a5f4b10",
-  "outputs": {
-    "url": { "value": "http://localhost:8080", "type": "string" }
-  },
+  "outputs": { "url": { "value": "http://localhost:8080", "type": "string" } },
   "resources": [
     {
       "mode": "managed",
       "type": "docker_container",
       "name": "web",
       "provider": "provider[\"registry.terraform.io/kreuzwerker/docker\"]",
-      "instances": [
-        {
-          "attributes": {
-            "id": "7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
-            "name": "taskflow-web",
-            "ports": [{ "external": 8080, "internal": 80, "ip": "0.0.0.0", "protocol": "tcp" }]
-          },
-          "dependencies": ["docker_image.nginx"]
-        }
-      ]
+      "instances": [{
+        "attributes": {
+          "id": "7d3e5f1a9b2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
+          "name": "taskflow-web",
+          "ports": [{ "external": 8080, "internal": 80, "ip": "0.0.0.0", "protocol": "tcp" }]
+        },
+        "dependencies": ["docker_image.nginx"]
+      }]
     }
   ]
 }</pre>
@@ -847,53 +931,100 @@ Destroy complete! Resources: 2 destroyed.</span></pre>
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">version</code> / <code class="inl">terraform_version</code></td><td>State file format (4) and the CLI that last wrote it.</td></tr>
-              <tr><td><code class="inl">serial</code></td><td>Incremented on every write; a stale copy with a lower serial is refused.</td></tr>
-              <tr><td><code class="inl">lineage</code></td><td>Unique ID of this state's history, so states of different projects can't be mixed up.</td></tr>
-              <tr><td><code class="inl">mode</code> + <code class="inl">type</code> + <code class="inl">name</code></td><td><code class="inl">managed</code> (resource) or <code class="inl">data</code>; together they form the address <code class="inl">docker_container.web</code>.</td></tr>
-              <tr><td><code class="inl">attributes.id</code></td><td>The real object's ID: the link between your code and the running container.</td></tr>
-              <tr><td><code class="inl">dependencies</code></td><td>Graph edges recorded at apply time (see "Metadata" below).</td></tr>
+              <tr><td><code class="inl">serial</code> · <code class="inl">lineage</code></td><td>Goes up on every write (a stale copy with a lower serial is refused) · a unique ID for this state's history, so two projects' states can't be mixed up</td></tr>
+              <tr><td><code class="inl">type</code> + <code class="inl">name</code> → <code class="inl">attributes.id</code></td><td>The address <code class="inl">docker_container.web</code> and the real object's ID: the link between your code and the running container (<code class="inl">mode</code> is <code class="inl">managed</code>, or <code class="inl">data</code> for data sources)</td></tr>
+              <tr><td><code class="inl">dependencies</code></td><td>Graph edges recorded at apply time, so destroy works in the right order even after you delete the code</td></tr>
             </tbody>
           </table>
         </div>
+        <p>So state exists for four reasons. <strong>Mapping</strong>: address ↔ real ID, without which Terraform can't tell "my container" from any other. <strong>Metadata</strong>: dependencies for ordering. <strong>Performance</strong>: cached attributes let big setups skip slow API reads (<code class="inl">-refresh=false</code>). <strong>Collaboration</strong>: one shared, locked copy for the whole team (section 8).</p>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Why state exists</th><th>Detail</th></tr></thead>
-            <tbody>
-              <tr><td>Mapping</td><td>Config address ↔ real ID. Without it Terraform can't tell "my container" from any other.</td></tr>
-              <tr><td>Metadata</td><td>Dependencies, so it can destroy in the right order even after you delete the code.</td></tr>
-              <tr><td>Performance</td><td>Cached attributes; large setups can skip slow API reads.</td></tr>
-              <tr><td>Collaboration</td><td>With a shared, locked backend, the whole team works on one source of truth.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="callout warn">
-          <span class="c-title">Never commit state to Git</span>
-          <p>It contains every attribute in <strong>plain text</strong>, including DB passwords and private keys. Two people applying from their own copies overwrite each other. Use a remote backend instead.</p>
-        </div>
-
+        <h4>Never commit it</h4>
+        <p>State holds every attribute in <strong>plain text</strong>, including database passwords and private keys, and two people applying from their own copies overwrite each other. Keep it out of Git:</p>
         <div class="fname">.gitignore (Terraform part)</div>
-<pre><span class="cm"># provider binaries and modules — re-created by terraform init</span>
+<pre><span class="cm"># provider binaries and modules, re-created by terraform init</span>
 .terraform/
-<span class="cm"># state and its backups — may contain secrets</span>
+<span class="cm"># state and its backups (terraform.tfstate.backup), may contain secrets</span>
 *.tfstate
 *.tfstate.*
-<span class="cm"># saved plans — also contain values</span>
+<span class="cm"># saved plans, which also contain values</span>
 tfplan
 *.tfplan
 <span class="cm"># crash logs</span>
 crash.log
 crash.*.log
-<span class="cm"># local secrets / overrides</span>
+<span class="cm"># local secrets and overrides</span>
 *.secret.tfvars
 override.tf
 *_override.tf
 <span class="cm"># DO commit: *.tf, terraform.tfvars (no secrets), .terraform.lock.hcl</span></pre>
 
-        <h3>Remote backend: S3 with locking</h3>
-        <p>Create the bucket once, by hand (chicken-and-egg: the backend must exist before Terraform can use it):</p>
+        <h4>Adopting and editing: import, state mv, state rm</h4>
+        <p>When something exists but isn't in state (built in the console, or "forgotten" like the problem above), <span class="term">import</span> links it to an address without recreating it:</p>
+<pre><span class="cm"># import.tf (Terraform ≥ 1.5): reviewed in a plan like any other change</span>
+import {
+  to = aws_s3_bucket.assets
+  id = "taskflow-assets-shauryav"     <span class="cm"># the real bucket name created in the console</span>
+}</pre>
+<pre><span class="pr">$</span> terraform plan -generate-config-out=generated.tf     <span class="cm"># also writes the resource block for you</span>
+<span class="out">Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.</span>
+<span class="pr">$</span> terraform import aws_s3_bucket.assets taskflow-assets-shauryav   <span class="cm"># older CLI way: write the block first</span>
+<span class="out">… Import successful!</span>
+<span class="pr">$</span> terraform state mv docker_container.web docker_container.frontend   <span class="cm"># rename in state (or a moved {} block)</span>
+<span class="pr">$</span> terraform state rm docker_container.frontend                        <span class="cm"># forget it; the container keeps running</span></pre>
+        <p>For the lost-state problem, the real fix is to get the state back (section 8 keeps every version in S3). For a stateless nginx you could also <code class="inl">docker rm -f taskflow-web</code> and apply; a database you'd import or restore.</p>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Deleting <code class="inl">terraform.tfstate</code> deletes the infrastructure." <strong>✗</strong> It deletes Terraform's memory; the objects keep running (and billing), unmanaged.</p>
+          <p>"<code class="inl">terraform state rm</code> deletes the resource." <strong>✗</strong> It only makes Terraform forget it.</p>
+          <p>"State is just a cache Terraform can rebuild from the cloud." <strong>✗</strong> The cloud doesn't record which object is which address; only import, one object at a time, re-links them.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>State = Terraform's memory: address ↔ real ID.</strong><br /><strong>Lose it and Terraform forgets; it doesn't delete.</strong><br /><strong>Never commit it: it holds secrets in plain text.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You rename <code class="inl">resource "docker_container" "web"</code> to <code class="inl">"frontend"</code> and change nothing else. What does plan propose, and how do you avoid it?</summary>
+            <p class="ans">Destroy <code class="inl">docker_container.web</code>, create <code class="inl">docker_container.frontend</code>: one address vanished, a new one appeared. Add <code class="inl">moved { from = docker_container.web  to = docker_container.frontend }</code> (or <code class="inl">terraform state mv</code>) and the plan shows a move, 0 to destroy.</p></details>
+          <details class="quiz"><summary>Q2. Which go into Git: <code class="inl">main.tf</code>, <code class="inl">.terraform/</code>, <code class="inl">.terraform.lock.hcl</code>, <code class="inl">terraform.tfstate</code>, <code class="inl">terraform.tfstate.backup</code>, <code class="inl">tfplan</code>?</summary>
+            <p class="ans">Commit <code class="inl">main.tf</code> and <code class="inl">.terraform.lock.hcl</code>. Ignore <code class="inl">.terraform/</code> (binaries), both state files (secrets, conflicting copies) and <code class="inl">tfplan</code> (it contains values too).</p></details>
+          <details class="quiz"><summary>Q3. Predict: <code class="inl">terraform state rm docker_container.web</code>, then <code class="inl">terraform apply</code>.</summary>
+            <p class="ans">Terraform no longer knows the container, so it tries to create it and fails with the same <code class="inl">Conflict … already in use</code> error as the problem above. The real container never stopped.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 8. REMOTE STATE ===================== -->
+      <section id="remote-state">
+        <h2><span class="sec-num">8</span> Remote state, locking &amp; drift</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+<pre>10:00   Shaurya: terraform apply     laptop A, its own terraform.tfstate
+10:00   Priya:   terraform apply     laptop B, her own, older terraform.tfstate
+10:01   both write state: laptop B's copy never learns about the security-group rule
+        Shaurya just added, so Priya's next plan deletes it</pre>
+        <p>A state file on one laptop works for one person. A team needs one shared copy, and a rule that only one apply at a time may write it.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">backend</span> decides where state lives. The S3 backend keeps it as one object in a versioned, encrypted bucket that everyone reads and writes. Before writing, Terraform takes a <strong>lock</strong>: with <code class="inl">use_lockfile = true</code> it creates a <code class="inl">.tflock</code> object by a conditional write that fails if one exists, so a second apply errors instead of corrupting state.</p>
+<pre> laptop A: terraform apply                 s3://shauryav-taskflow-tfstate/taskflow/dev/
+   1. create terraform.tfstate.tflock ──▶    terraform.tfstate          (versioned, encrypted)
+   2. read  terraform.tfstate         ◀──    terraform.tfstate.tflock   (exists = locked)
+   3. apply, then write new state     ──▶
+   4. delete the .tflock              ──▶
+ laptop B, during steps 1–4: create .tflock → 412 PreconditionFailed → "Error acquiring the state lock"</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>Instead of a copy of the logbook in every crew's van, there's <strong>one logbook in the site office</strong> and <strong>one key</strong> to the office. Whoever holds the key writes; everyone else waits. Bucket versioning keeps every old page.</p>
+        </div>
+
+        <h3>See it: the backend block</h3>
+        <p>Create the bucket once, by hand. It's a chicken-and-egg problem: the backend must exist before Terraform can store state in it.</p>
 <pre><span class="pr">$</span> aws s3api create-bucket --bucket shauryav-taskflow-tfstate --region ap-south-1 \
     --create-bucket-configuration LocationConstraint=ap-south-1
 <span class="out">{
@@ -901,7 +1032,6 @@ override.tf
 }</span>
 <span class="pr">$</span> aws s3api put-bucket-versioning --bucket shauryav-taskflow-tfstate \
     --versioning-configuration Status=Enabled      <span class="cm"># every state write kept → recover from mistakes</span></pre>
-
         <div class="fname">infra/backend.tf</div>
 <pre>terraform {
   backend "s3" {
@@ -909,35 +1039,34 @@ override.tf
     key          = "taskflow/dev/terraform.tfstate"   <span class="cm"># object path; one key per environment</span>
     region       = "ap-south-1"
     encrypt      = true                               <span class="cm"># server-side encryption of the state object</span>
-    use_lockfile = true                               <span class="cm"># lock via an S3 .tflock object (Terraform ≥ 1.10)</span>
-    <span class="cm"># dynamodb_table = "terraform-locks"              # OLD way: DynamoDB table with key "LockID" — deprecated</span>
+    use_lockfile = true                               <span class="cm"># lock with an S3 .tflock object (Terraform ≥ 1.10)</span>
+    <span class="cm"># dynamodb_table = "terraform-locks"              # OLD way: DynamoDB table with key "LockID", deprecated</span>
   }
 }</pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Argument</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">bucket</code> / <code class="inl">key</code></td><td>Where the state object lives: <code class="inl">s3://shauryav-taskflow-tfstate/taskflow/dev/terraform.tfstate</code>.</td></tr>
-              <tr><td><code class="inl">use_lockfile</code></td><td>Before writing, Terraform creates <code class="inl">…/terraform.tfstate.tflock</code> with a conditional write; a second <code class="inl">apply</code> fails instead of corrupting state. Needs <code class="inl">s3:GetObject/PutObject/DeleteObject</code> on that key.</td></tr>
-              <tr><td><code class="inl">dynamodb_table</code></td><td>Pre-1.10 locking. Still works, deprecated; new projects use <code class="inl">use_lockfile</code>.</td></tr>
+              <tr><td><code class="inl">bucket</code> / <code class="inl">key</code></td><td>Where the state object lives: <code class="inl">s3://shauryav-taskflow-tfstate/taskflow/dev/terraform.tfstate</code></td></tr>
+              <tr><td><code class="inl">encrypt</code></td><td>Encrypt the object at rest. Add a tight bucket policy too: state holds secrets.</td></tr>
+              <tr><td><code class="inl">use_lockfile</code></td><td>Creates <code class="inl">…/terraform.tfstate.tflock</code> before writing. Needs <code class="inl">s3:GetObject</code>, <code class="inl">s3:PutObject</code>, <code class="inl">s3:DeleteObject</code> on that key. (<code class="inl">dynamodb_table</code> is the deprecated pre-1.10 method.)</td></tr>
             </tbody>
           </table>
         </div>
-
+        <p>A new backend means a new <code class="inl">init</code>, which offers to copy your local state across:</p>
 <pre><span class="pr">$</span> terraform init -migrate-state
 <span class="out">Initializing the backend...
 Do you want to copy existing state to the new backend?
-  Pre-existing state was found while migrating the previous "local" backend to the
-  newly configured "s3" backend. No existing state was found in the newly
-  configured "s3" backend. Do you want to copy this state to the new "s3"
-  backend? Enter "yes" to copy and "no" to start with an empty state.
-
+  …
   Enter a value: yes
 
 Successfully configured the backend "s3"! Terraform will automatically
 use this backend unless the backend configuration changes.</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> the backend block doesn't create the bucket, and it can't read variables (Q3 below). Versioning on the bucket is what lets you restore an older state after a bad apply or an accidental <code class="inl">state rm</code>, which turns section 7's lost-state problem into a one-minute fix.</p>
 
-        <p>A teammate runs <code class="inl">apply</code> while yours is in progress:</p>
+        <h3>Build it up</h3>
+        <h4>Two applies at once</h4>
+        <p>Priya runs <code class="inl">apply</code> while Shaurya's is still running:</p>
 <pre><span class="out">╷
 │ Error: Error acquiring the state lock
 │
@@ -945,85 +1074,52 @@ use this backend unless the backend configuration changes.</span></pre>
 │ api error PreconditionFailed: At least one of the pre-conditions you specified did not hold
 │ Lock Info:
 │   ID:        9d2f6c1e-3b7a-4f0e-8a51-2c4d6e8f0a1b
-│   Path:      shauryav-taskflow-tfstate/taskflow/dev/terraform.tfstate
-│   Operation: OperationTypeApply
 │   Who:       shaurya@MacBook-Pro.local
-│   Version:   1.16.5
 │   Created:   2026-10-09 05:12:44.123456 +0000 UTC
-│
-│ Terraform acquires a state lock to protect the state from being written
-│ by multiple users at the same time. Please resolve the issue above and try
-│ again.
+│ …
 ╵</span>
 <span class="pr">$</span> terraform force-unlock 9d2f6c1e-3b7a-4f0e-8a51-2c4d6e8f0a1b   <span class="cm"># ONLY if that apply really crashed</span></pre>
+        <p>The lock did its job: Priya's run stopped before touching anything. <code class="inl">Who</code> and <code class="inl">Created</code> tell her whom to ask.</p>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p><code class="inl">bucket = var.state_bucket</code> in a backend block → <code class="inl">Error: Variables not allowed</code>. Backends load before variables; use literals or <code class="inl">terraform init -backend-config=backend.hcl</code>.</p>
-        </div>
-
-        <h3>Drift: someone changed things outside Terraform</h3>
+        <h4>Drift: someone changed things outside Terraform</h4>
 <pre><span class="pr">$</span> docker rm -f taskflow-web          <span class="cm"># a "quick fix" by hand</span>
 <span class="pr">$</span> terraform plan
 <span class="out">docker_container.web: Refreshing state... [id=7d3e5f1a9b2c…]
 
 Note: Objects have changed outside of Terraform
 
-Terraform detected the following changes made outside of Terraform since the
-last "terraform apply" which may have affected this plan:
-
   # docker_container.web has been deleted
   - resource "docker_container" "web" {
       - id   = "7d3e5f1a9b2c…" -&gt; null
         name = "taskflow-web"
-        # (14 unchanged attributes hidden)
     }
 
   # docker_container.web will be created
   + resource "docker_container" "web" { … }
 
 Plan: 1 to add, 0 to change, 0 to destroy.</span></pre>
-        <ul>
-          <li><code class="inl">terraform apply</code> puts reality back to what the code says (drift corrected).</li>
-          <li><code class="inl">terraform plan -refresh-only</code> / <code class="inl">apply -refresh-only</code> = update <em>state</em> to match reality without changing infrastructure (accept the drift, then fix the code).</li>
-        </ul>
+        <p><span class="term">Drift</span> is any difference between reality and state, and the refresh step found it. Two ways to resolve it: <code class="inl">terraform apply</code> puts reality back to what the code says (the code wins), while <code class="inl">plan -refresh-only</code> / <code class="inl">apply -refresh-only</code> updates the <em>state</em> to match reality without touching infrastructure. Use the second to accept a change, then edit the code to match.</p>
 
-        <h3>Import: adopt something created by hand</h3>
-<pre><span class="cm"># import.tf — Terraform ≥ 1.5, reviewed in a plan like any change</span>
-import {
-  to = aws_s3_bucket.assets
-  id = "taskflow-assets-shauryav"     <span class="cm"># the real bucket name created in the console</span>
-}</pre>
-<pre><span class="pr">$</span> terraform plan -generate-config-out=generated.tf     <span class="cm"># writes the resource block for you</span>
-<span class="out">Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.</span>
-<span class="pr">$</span> terraform import aws_s3_bucket.assets taskflow-assets-shauryav   <span class="cm"># older CLI way (you write the block first)</span>
-<span class="out">aws_s3_bucket.assets: Importing from ID "taskflow-assets-shauryav"...
-aws_s3_bucket.assets: Import prepared!
-  Prepared aws_s3_bucket for import
-aws_s3_bucket.assets: Refreshing state... [id=taskflow-assets-shauryav]
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"See a lock error? Run <code class="inl">force-unlock</code>." <strong>✗</strong> Only if the holder really crashed (check <code class="inl">Who</code>, <code class="inl">Created</code>). Unlocking a live apply lets two writers corrupt state.</p>
+          <p>"S3 state locking needs a DynamoDB table." <strong>✗</strong> That's the deprecated method; <code class="inl">use_lockfile = true</code> (Terraform ≥ 1.10) locks with an S3 object.</p>
+          <p>"<code class="inl">-refresh-only</code> fixes drift." <strong>✗</strong> It only records reality in state; the next normal plan still undoes the change unless you edit the code.</p>
+        </div>
 
-Import successful!</span></pre>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Remote backend = one shared state + a lock + versions.</strong><br /><strong>Drift: apply → reality back to the code · -refresh-only → state back to reality.</strong></p>
+        </div>
 
-<pre><span class="pr">$</span> terraform state list
-<span class="out">docker_container.web
-docker_image.nginx</span>
-<span class="pr">$</span> terraform state show docker_container.web
-<span class="out"># docker_container.web:
-resource "docker_container" "web" {
-    attach   = false
-    …
-    id       = "7d3e5f1a9b2c4e6f…"
-    image    = "sha256:4c1c2b9e0d8f…"
-    name     = "taskflow-web"
-    restart  = "unless-stopped"
-    …
-}</span>
-<span class="pr">$</span> terraform state mv docker_container.web docker_container.frontend   <span class="cm"># rename without destroy (or a moved {} block)</span>
-<span class="pr">$</span> terraform state rm docker_container.frontend   <span class="cm"># forget it; the container keeps running</span></pre>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          State maps code to real IDs and holds secrets in plain text: gitignore it and store it in versioned, encrypted S3 with <code class="inl">use_lockfile = true</code>. Fix drift with <code class="inl">apply</code> or accept it with <code class="inl">-refresh-only</code>; adopt existing infra with <code class="inl">import</code> blocks.
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You get <code class="inl">Error acquiring the state lock</code>, with <code class="inl">Who: runner@fv-az123</code> and <code class="inl">Created</code> 40 seconds ago. What do you do?</summary>
+            <p class="ans">Wait: a CI apply is running right now. Only if the lock is hours old and that job crashed do you run <code class="inl">terraform force-unlock &lt;ID&gt;</code>.</p></details>
+          <details class="quiz"><summary>Q2. Someone added a security-group rule in the console, and plan shows <code class="inl">~</code> to remove it. When do you apply, and what if the rule was right?</summary>
+            <p class="ans">If the click was a mistake, apply: the code wins and the rule goes. If the rule is wanted, add it to the code; the next plan shows no changes. <code class="inl">-refresh-only</code> alone would record it in state, and the next plan would still remove it.</p></details>
+          <details class="quiz"><summary>Q3. Spot the bug: <code class="inl">backend "s3" { bucket = var.state_bucket  key = "taskflow/${var.env}/terraform.tfstate" }</code></summary>
+            <p class="ans">Backends can't use variables (<code class="inl">Error: Variables not allowed</code>); they're read before variables exist. Write literals, or keep a <code class="inl">backend-dev.hcl</code> per environment and run <code class="inl">terraform init -backend-config=backend-dev.hcl</code>.</p></details>
         </div>
       </section>
 
@@ -1035,23 +1131,19 @@ resource "docker_container" "web" {
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">terraform version</code></td><td>CLI + provider versions.</td></tr>
-              <tr><td><code class="inl">terraform init</code> · <code class="inl">-upgrade</code> · <code class="inl">-migrate-state</code> · <code class="inl">-reconfigure</code></td><td>Download providers / set up backend; upgrade within constraints; move state to a new backend; ignore old backend.</td></tr>
-              <tr><td><code class="inl">terraform fmt -recursive</code> · <code class="inl">fmt -check</code></td><td>Format files; CI check.</td></tr>
-              <tr><td><code class="inl">terraform validate</code></td><td>Syntax + references, no API calls.</td></tr>
-              <tr><td><code class="inl">terraform plan -out=tfplan</code></td><td>Preview and save the plan.</td></tr>
-              <tr><td><code class="inl">terraform plan -var 'k=v' -var-file=prod.tfvars</code></td><td>Override inputs.</td></tr>
-              <tr><td><code class="inl">terraform apply tfplan</code> · <code class="inl">apply -auto-approve</code></td><td>Apply the reviewed plan; apply without prompt (CI).</td></tr>
-              <tr><td><code class="inl">terraform apply -replace=docker_container.web</code></td><td>Force recreate one resource (replaces old <code class="inl">taint</code>).</td></tr>
-              <tr><td><code class="inl">terraform destroy</code> · <code class="inl">plan -destroy</code></td><td>Delete everything managed; preview that.</td></tr>
-              <tr><td><code class="inl">terraform plan -refresh-only</code></td><td>Show drift without proposing changes.</td></tr>
-              <tr><td><code class="inl">terraform output</code> · <code class="inl">-raw NAME</code> · <code class="inl">-json</code></td><td>Read outputs.</td></tr>
-              <tr><td><code class="inl">terraform show</code> · <code class="inl">show tfplan</code></td><td>Human-readable state / saved plan.</td></tr>
-              <tr><td><code class="inl">terraform state list</code> · <code class="inl">state show ADDR</code></td><td>What Terraform manages; details of one.</td></tr>
-              <tr><td><code class="inl">terraform state mv A B</code> · <code class="inl">state rm ADDR</code></td><td>Rename in state; stop managing.</td></tr>
-              <tr><td><code class="inl">terraform import ADDR ID</code> · <code class="inl">plan -generate-config-out=f.tf</code></td><td>Adopt existing infra.</td></tr>
-              <tr><td><code class="inl">terraform force-unlock LOCK_ID</code></td><td>Remove a stale lock.</td></tr>
-              <tr><td><code class="inl">terraform console</code> · <code class="inl">terraform graph</code></td><td>Try expressions (<code class="inl">cidrsubnet(…)</code>); dependency graph in DOT.</td></tr>
+              <tr><td><code class="inl">terraform init</code> · <code class="inl">-upgrade</code> · <code class="inl">-migrate-state</code> · <code class="inl">-reconfigure</code> · <code class="inl">-backend-config=f.hcl</code></td><td>Download providers, set up the backend · upgrade within constraints · move state to a new backend · ignore the old backend · pass backend settings</td></tr>
+              <tr><td><code class="inl">terraform fmt -recursive</code> · <code class="inl">fmt -check</code> · <code class="inl">validate</code> · <code class="inl">console</code></td><td>Format · CI format check · syntax and references (no API calls) · try expressions</td></tr>
+              <tr><td><code class="inl">terraform plan -out=tfplan</code></td><td>Preview and save the plan</td></tr>
+              <tr><td><code class="inl">terraform plan -var 'k=v' -var-file=prod.tfvars</code> · <code class="inl">TF_VAR_k=v</code></td><td>Set inputs (CLI flags win)</td></tr>
+              <tr><td><code class="inl">terraform apply tfplan</code> · <code class="inl">apply -auto-approve</code></td><td>Apply the reviewed plan · apply without a prompt (CI only)</td></tr>
+              <tr><td><code class="inl">terraform apply -replace=docker_container.web</code></td><td>Force one resource to be recreated (replaces <code class="inl">taint</code>)</td></tr>
+              <tr><td><code class="inl">terraform destroy</code> · <code class="inl">plan -destroy</code></td><td>Delete everything in state · preview that</td></tr>
+              <tr><td><code class="inl">terraform plan -refresh-only</code> · <code class="inl">apply -refresh-only</code></td><td>Show drift · write reality into state without changing infra</td></tr>
+              <tr><td><code class="inl">terraform output</code> · <code class="inl">-raw NAME</code> · <code class="inl">-json</code></td><td>Read outputs (raw for scripts)</td></tr>
+              <tr><td><code class="inl">terraform show</code> · <code class="inl">show tfplan</code></td><td>Human-readable state · saved plan</td></tr>
+              <tr><td><code class="inl">terraform state list</code> · <code class="inl">show ADDR</code> · <code class="inl">mv A B</code> · <code class="inl">rm ADDR</code></td><td>What's managed · one resource's details · rename in state · stop managing (object keeps running)</td></tr>
+              <tr><td><code class="inl">terraform import ADDR ID</code> · <code class="inl">plan -generate-config-out=f.tf</code></td><td>Adopt existing infrastructure (CLI · import blocks)</td></tr>
+              <tr><td><code class="inl">terraform force-unlock LOCK_ID</code> · <code class="inl">terraform graph</code></td><td>Remove a stale lock (only if its holder crashed) · dependency graph (DOT)</td></tr>
             </tbody>
           </table>
         </div>
@@ -1063,38 +1155,22 @@ resource "docker_container" "web" {
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>Terraform turns infrastructure into reviewed, versioned code. You declare providers and resources in HCL, feed them variables, and read results from outputs. <code class="inl">init</code> fetches the provider plugins, <code class="inl">plan</code> diffs config against state and reality, <code class="inl">apply</code> makes the change and records real IDs in state. Because state is Terraform's memory (and full of secrets), it lives in a locked, versioned S3 bucket, never in Git. Session 21 uses exactly this workflow to build a VPC and an EC2 instance running TaskFlow.</p>
+          <p>Terraform turns infrastructure into reviewed, versioned code. You declare providers and resources in HCL, feed in variables, read results from outputs. <code class="inl">init</code> fetches the provider plugins (pinned by the lock file) that make the real API calls. <code class="inl">plan</code> compares config, state and reality and shows every action first; <code class="inl">apply</code> makes it so and records real IDs in state. State is Terraform's memory and full of secrets, so it lives in a locked, versioned S3 bucket, never in Git. Session 21 uses this workflow to build a VPC and an EC2 instance running TaskFlow.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>Which versions does <code class="inl">version = "~&gt; 5.0"</code> allow? And <code class="inl">"~&gt; 5.31.0"</code>?</summary>
-          <p class="ans"><code class="inl">~&gt; 5.0</code>: ≥ 5.0 and &lt; 6.0. <code class="inl">~&gt; 5.31.0</code>: ≥ 5.31.0 and &lt; 5.32.0 (patches only).</p>
-        </details>
-        <details class="quiz">
-          <summary>What does <code class="inl">-/+</code> mean in a plan, and what causes it?</summary>
-          <p class="ans">Destroy then create a replacement. An argument the API can't change in place was modified (marked <code class="inl"># forces replacement</code>), e.g. the container image or an EC2 AMI.</p>
-        </details>
-        <details class="quiz">
-          <summary>Which of these go into Git: <code class="inl">main.tf</code>, <code class="inl">.terraform/</code>, <code class="inl">.terraform.lock.hcl</code>, <code class="inl">terraform.tfstate</code>, <code class="inl">tfplan</code>?</summary>
-          <p class="ans">Commit <code class="inl">main.tf</code> and <code class="inl">.terraform.lock.hcl</code>. Ignore <code class="inl">.terraform/</code> (binaries), <code class="inl">terraform.tfstate</code> (secrets, conflicts) and <code class="inl">tfplan</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>default = 8080, <code class="inl">TF_VAR_external_port=9000</code>, <code class="inl">terraform.tfvars</code> = 8081, CLI <code class="inl">-var external_port=9090</code>. Which value is used?</summary>
-          <p class="ans">9090. CLI flags have the highest precedence; without it, 8081 (tfvars beats env vars, which beat the default).</p>
-        </details>
-        <details class="quiz">
-          <summary>Implicit vs explicit dependency — when do you need <code class="inl">depends_on</code>?</summary>
-          <p class="ans">Implicit comes from referencing another resource's attribute (preferred). Use <code class="inl">depends_on</code> only when a resource needs another one to exist but doesn't reference it, e.g. an EC2 whose boot script needs the internet route.</p>
-        </details>
-        <details class="quiz">
-          <summary>Someone deleted the container with <code class="inl">docker rm -f</code>. What does the next <code class="inl">terraform plan</code> show?</summary>
-          <p class="ans">"Objects have changed outside of Terraform … has been deleted", then a plan to create it again (<code class="inl">1 to add</code>). <code class="inl">apply</code> restores it; <code class="inl">-refresh-only</code> would just update state.</p>
-        </details>
-        <details class="quiz">
-          <summary>Why lock state, and how does the S3 backend do it on Terraform ≥ 1.10?</summary>
-          <p class="ans">Two concurrent applies would overwrite each other's state. <code class="inl">use_lockfile = true</code> creates a <code class="inl">.tflock</code> object with a conditional write; a second run gets "Error acquiring the state lock".</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check: combine everything</span>
+          <details class="quiz"><summary>Q1. New laptop, fresh clone, state in S3. List the commands, in order, to safely bump <code class="inl">nginx_tag</code>, and say what each one touches.</summary>
+            <p class="ans"><code class="inl">init</code>: installs the locked provider version and connects the S3 backend. Edit <code class="inl">terraform.tfvars</code>; <code class="inl">fmt</code> + <code class="inl">validate</code> (local only). <code class="inl">plan -out=tfplan</code>: takes the lock, reads state from S3, refreshes the real image and container, shows <code class="inl">-/+</code> for both. <code class="inl">apply tfplan</code>: locks, replaces both, writes the new state to S3, unlocks. Check with <code class="inl">curl "$(terraform output -raw url)"</code>.</p></details>
+          <details class="quiz"><summary>Q2. A professor says: "Terraform is declarative, so it doesn't need state. It just compares the code with the cloud." Correct this.</summary>
+            <p class="ans">To compare, Terraform must know <em>which</em> real object each address is, and the cloud doesn't record that. State holds that mapping, plus attributes and dependencies. Without it Terraform plans to create everything again and hits conflicts (section 7).</p></details>
+          <details class="quiz"><summary>Q3. A teammate commits <code class="inl">terraform.tfstate</code> and a <code class="inl">terraform.tfvars</code> containing <code class="inl">db_password</code>. Two problems, two fixes?</summary>
+            <p class="ans">(1) The secret is in Git twice, since <code class="inl">sensitive</code> doesn't encrypt state: rotate it, purge history, move it to <code class="inl">TF_VAR_db_password</code>, ignore <code class="inl">*.tfstate*</code>. (2) A committed state goes stale and gets overwritten: move it to S3 with <code class="inl">use_lockfile = true</code> and versioning.</p></details>
+          <details class="quiz"><summary>Q4. CI runs <code class="inl">terraform apply -auto-approve -var external_port=9090</code>; tfvars says 8081. Which port, and what's wrong with the step?</summary>
+            <p class="ans">9090: the CLI flag beats tfvars and passes validation. But it applies a fresh plan nobody reviewed. Split it: <code class="inl">plan -out=tfplan</code> → review/approval → <code class="inl">apply tfplan</code>.</p></details>
+          <details class="quiz"><summary>Q5. Someone ran <code class="inl">docker rm -f taskflow-web</code>. You then run <code class="inl">terraform destroy</code>. Predict the plan.</summary>
+            <p class="ans">Destroy refreshes first, notes the container was deleted outside Terraform, and drops it. Only the image is left: <code class="inl">Plan: 0 to add, 0 to change, 1 to destroy.</code></p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -1126,6 +1202,6 @@ resource "docker_container" "web" {
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 20 — Terraform &amp; Infrastructure as Code</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

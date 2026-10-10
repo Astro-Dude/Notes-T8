@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 14 — Kubernetes Troubleshooting</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,10 @@
       <span class="kicker">Term 9 · DevOps · Session 14</span>
       <h1>Kubernetes Troubleshooting</h1>
       <p class="lead">
-        A debugging handbook: read pod status, drive <code class="inl">get</code> / <code class="inl">describe</code> / <code class="inl">logs</code> / <code class="inl">exec</code> / events,
-        and fix the failures you'll actually hit — CrashLoopBackOff, ImagePullBackOff, Pending pods and Services that don't route.
+        Diagnose a broken TaskFlow pod from its symptoms. Read STATUS with <code class="inl">get</code>, the reason with <code class="inl">describe</code> and Events, and the app's last words with <code class="inl">logs</code>, then test from inside with <code class="inl">exec</code>.
+        Then fix the failures you'll actually hit: CrashLoopBackOff, ImagePullBackOff, Pending pods, and Services that don't route.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 30 min read</span><span class="badge-rt">📖 7 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 38 min read</span><span class="badge-rt">📖 7 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -55,11 +55,20 @@
         <h2><span class="sec-num">1</span> The workflow &amp; kubectl get</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Like a doctor: look at the patient (<code class="inl">get</code>), read the chart (<code class="inl">describe</code> + events), listen (<code class="inl">logs</code>), then examine up close (<code class="inl">exec</code>).</p>
-        </div>
+        <h3>The problem</h3>
+        <p>It's the morning after the 1.2.1 release, and two things are wrong:</p>
+<pre><span class="pr">$</span> curl -sk -o /dev/null -w '%{http_code}\n' https://taskflow.local/api/tasks
+<span class="out">503</span>                                                     <span class="cm"># puzzle 1: the API is "down"…</span>
+<span class="pr">$</span> kubectl get pods -n taskflow
+<span class="out">NAME                            READY   STATUS             RESTARTS      AGE
+taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running            0             2d</span>      <span class="cm"># …yet these look fine</span>
+<span class="out">taskflow-api-7c9d8f6b5d-9wd7t   1/1     Running            0             2d
+taskflow-api-6d8f7c9b4-2xkqp    0/1     CrashLoopBackOff   5 (41s ago)   4m10s</span>   <span class="cm"># puzzle 2: 1.2.1 won't start</span>
+<span class="out">taskflow-db-6b8d9f7c5-k7m2p     1/1     Running            0             2d</span></pre>
+        <p>The namespace holds Deployments, ReplicaSets, pods, Services, an Ingress, ConfigMaps, Secrets and a PVC. The tempting move is to start poking: delete the pod, redeploy, restart minikube. Each one destroys evidence, and the bug comes back. You need a fixed order of questions instead.</p>
 
+        <h3>The idea</h3>
+        <p>Every failure leaves a trail, and four commands read it in order. <code class="inl">get</code> says <strong>where</strong> it broke. <code class="inl">describe</code> + Events say <strong>why</strong>, from Kubernetes's side. <code class="inl">logs</code> says why from the app's side. <code class="inl">exec</code> / <code class="inl">debug</code> / <code class="inl">port-forward</code> let you <strong>test</strong> a theory. The STATUS column picks the branch:</p>
 <pre>kubectl get pods -n taskflow            ← read STATUS, READY, RESTARTS
    │
    ├─ Pending ─────────────────────▶ describe pod → Events: FailedScheduling        (§6)
@@ -72,130 +81,133 @@
 
 Still stuck? → kubectl get events --sort-by=.lastTimestamp → exec / debug / port-forward</pre>
 
-        <h3>The known-good baseline (every case below breaks one line)</h3>
-        <div class="fname">k8s/deployment.yaml</div>
-<pre>apiVersion: apps/v1
-kind: Deployment
-metadata:
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>An emergency-room doctor. <strong>get</strong> is triage: a glance at every patient's vital signs on the board. <strong>describe</strong> is the patient's chart, and its <strong>Events</strong> are the nurses' notes from the last hour. <strong>logs</strong> is what the patient says, and <code class="inl">--previous</code> is what they said just before they collapsed. <strong>exec</strong> is examining them up close. A good doctor never starts with surgery. This ER comes back in every section.</p>
+        </div>
+
+        <h3>See it: read one line of <code class="inl">get</code></h3>
+        <p>In the command, <code class="inl">get</code> lists objects, <code class="inl">pods</code> is the resource type (<code class="inl">po</code> for short), and <code class="inl">-n taskflow</code> picks the namespace. The information is in the columns:</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Column (for <code class="inl">taskflow-api-6d8f7c9b4-2xkqp</code>)</th><th>Value</th><th>What it tells you</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">READY</code></td><td><code class="inl">0/1</code></td><td>Ready containers / total. 0 means it gets no Service traffic.</td></tr>
+              <tr><td><code class="inl">STATUS</code></td><td><code class="inl">CrashLoopBackOff</code></td><td>The headline, and it picks your branch of the flowchart (here §4).</td></tr>
+              <tr><td><code class="inl">RESTARTS</code></td><td><code class="inl">5 (41s ago)</code></td><td>The container has died 5 times; the last restart was 41 s ago.</td></tr>
+              <tr><td><code class="inl">AGE</code></td><td><code class="inl">4m10s</code></td><td>A new pod: it came with the release, so suspect the change.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The two old pods are fine, which is exactly why users still have a working API… or should have (puzzle 1 waits for §7).</p>
+        <p><strong>What it does <em>not</em> do:</strong> say <em>why</em>. <code class="inl">get</code> is a one-word symptom. The reason is always one command further.</p>
+
+        <h3>Build it up</h3>
+        <h4>The flags you'll use daily</h4>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -o wide                  <span class="cm"># + IP, NODE (trimmed to 2 pods)</span>
+<span class="out">NAME                            READY   STATUS             RESTARTS      AGE     IP            NODE       NOMINATED NODE   READINESS GATES
+taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running            0             2d      10.244.0.14   minikube   &lt;none&gt;           &lt;none&gt;
+taskflow-api-6d8f7c9b4-2xkqp    0/1     CrashLoopBackOff   5 (41s ago)   4m10s   10.244.0.31   minikube   &lt;none&gt;           &lt;none&gt;</span>
+<span class="pr">$</span> kubectl get pods -A                                   <span class="cm"># every namespace (is kube-system healthy?)</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -w                       <span class="cm"># watch status changes live</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api --show-labels
+<span class="out">NAME                            READY   STATUS    RESTARTS   AGE   LABELS
+taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running   0          2d    app=taskflow-api,pod-template-hash=7c9d8f6b5d</span>
+<span class="cm"># quote anything with [ ]: zsh treats brackets as globs</span>
+<span class="pr">$</span> kubectl get pods -n taskflow --sort-by='.status.containerStatuses[0].restartCount'
+<span class="pr">$</span> kubectl get pods -n taskflow -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image'
+<span class="out">NAME                            IMAGE
+taskflow-api-7c9d8f6b5d-4kq2x   shauryav/taskflow-api:1.2.0
+taskflow-api-6d8f7c9b4-2xkqp    shauryav/taskflow-api:1.2.1</span>
+<span class="pr">$</span> kubectl get pod taskflow-api-6d8f7c9b4-2xkqp -n taskflow \
+    -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}'
+<span class="out">Error</span>
+<span class="pr">$</span> kubectl get pods -A --field-selector=status.phase=Pending   <span class="cm"># all unscheduled pods</span></pre>
+
+        <h4>The known-good baseline (every case on this page breaks one line)</h4>
+        <div class="fname">k8s/deployment.yaml + k8s/service.yaml (trimmed to what breaks)</div>
+<pre><span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
   name: taskflow-api
   namespace: taskflow
-spec:
-  replicas: 2
+<span class="kw">spec:</span>
+  replicas: <span class="nm">2</span>
   selector:
-    matchLabels:
-      app: taskflow-api
+    matchLabels: { app: taskflow-api }
   template:
     metadata:
-      labels:
-        app: taskflow-api                    <span class="cm"># (7) Service selector must match this</span>
+      labels: { app: taskflow-api }          <span class="cm"># (7) the Service selector must match this</span>
     spec:
       containers:
         - name: api
           image: shauryav/taskflow-api:1.2.0 <span class="cm"># (3) typo / private repo → ImagePullBackOff</span>
           ports:
-            - name: http
-              containerPort: 3000            <span class="cm"># (7) Service targetPort must point here</span>
+            - { name: http, containerPort: 3000 }   <span class="cm"># (7) the Service's targetPort must point here</span>
           env:
             - name: LOG_LEVEL
               valueFrom:
-                configMapKeyRef:
-                  name: taskflow-config
-                  key: LOG_LEVEL
+                configMapKeyRef: { name: taskflow-config, key: LOG_LEVEL }
             - name: DATABASE_URL             <span class="cm"># (1) deleted → app exits → CrashLoopBackOff</span>
               valueFrom:
                 secretKeyRef:
                   name: taskflow-db-secret
                   key: DATABASE_URL          <span class="cm"># (4) wrong key → CreateContainerConfigError</span>
           resources:
-            requests:
-              cpu: 100m                      <span class="cm"># (5) bigger than any node → Pending</span>
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi                  <span class="cm"># (2) too small → OOMKilled</span>
+            requests: { cpu: 100m, memory: 128Mi }   <span class="cm"># (5) bigger than any node → Pending</span>
+            limits:   { cpu: 500m, memory: 256Mi }   <span class="cm"># (2) memory too small → OOMKilled</span>
           readinessProbe:
-            httpGet:
-              path: /health                  <span class="cm"># (6) wrong path → READY 0/1, no endpoints</span>
-              port: http
-            periodSeconds: 5
+            httpGet: { path: /health, port: http }   <span class="cm"># (6) wrong path → READY 0/1, no endpoints</span>
+            periodSeconds: <span class="nm">5</span>
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 10
+            httpGet: { path: /health, port: http }
+            periodSeconds: <span class="nm">10</span>
 ---
-apiVersion: v1
-kind: Service
-metadata:
+<span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
   name: taskflow-api
   namespace: taskflow
-spec:
-  selector:
-    app: taskflow-api                        <span class="cm"># (7) typo → Service has no endpoints</span>
+<span class="kw">spec:</span>
+  selector: { app: taskflow-api }            <span class="cm"># (7) typo → Service has no endpoints</span>
   ports:
-    - name: http
-      port: 80
-      targetPort: http                       <span class="cm"># (7) wrong port → connection refused</span></pre>
+    - { name: http, port: 80, targetPort: http }   <span class="cm"># (7) wrong targetPort → connection refused</span></pre>
+        <p>The numbers say which break produces which symptom and where it's solved: (1)(2) → §4, (3)(4) → §5, (5) → §6, (6)(7) → §7.</p>
 
-        <h3>Pod STATUS cheat sheet</h3>
+        <h4>Other statuses you'll meet</h4>
+        <p>The flowchart covers the common ones. These are the rest:</p>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>STATUS / READY</th><th>Meaning</th><th>First command</th></tr></thead>
+            <thead><tr><th>STATUS</th><th>Meaning</th><th>First command</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">Pending</code></td><td>Not scheduled to a node yet.</td><td><code class="inl">describe pod</code> → FailedScheduling</td></tr>
-              <tr><td><code class="inl">ContainerCreating</code></td><td>Scheduled; pulling image / mounting volumes / setting up network.</td><td><code class="inl">describe pod</code> → FailedMount</td></tr>
-              <tr><td><code class="inl">Init:0/1</code>, <code class="inl">Init:CrashLoopBackOff</code></td><td>An init container is running / failing.</td><td><code class="inl">logs POD -c INIT_NAME</code></td></tr>
-              <tr><td><code class="inl">ErrImagePull</code> → <code class="inl">ImagePullBackOff</code></td><td>Image can't be pulled; kubelet retries with back-off.</td><td><code class="inl">describe pod</code></td></tr>
-              <tr><td><code class="inl">CreateContainerConfigError</code></td><td>Referenced ConfigMap/Secret/key doesn't exist.</td><td><code class="inl">describe pod</code></td></tr>
-              <tr><td><code class="inl">RunContainerError</code></td><td>Runtime couldn't start the process (bad command, missing binary).</td><td><code class="inl">describe pod</code> → Last State message</td></tr>
-              <tr><td><code class="inl">CrashLoopBackOff</code></td><td>Container keeps exiting; kubelet waits longer between restarts.</td><td><code class="inl">logs POD --previous</code></td></tr>
-              <tr><td><code class="inl">Error</code> / <code class="inl">OOMKilled</code></td><td>Just exited non-zero / killed for exceeding memory limit.</td><td><code class="inl">describe pod</code> → Exit Code</td></tr>
+              <tr><td><code class="inl">Init:0/1</code>, <code class="inl">Init:CrashLoopBackOff</code></td><td>An init container is running / failing</td><td><code class="inl">logs POD -c INIT_NAME</code></td></tr>
+              <tr><td><code class="inl">RunContainerError</code></td><td>The runtime couldn't start the process</td><td><code class="inl">describe pod</code> → Last State message</td></tr>
               <tr><td><code class="inl">Completed</code></td><td>Exited 0. Normal for Jobs, a bug for Deployments.</td><td>check <code class="inl">command</code>/<code class="inl">CMD</code></td></tr>
-              <tr><td><code class="inl">Running</code> + <code class="inl">0/1</code></td><td>Process up, readiness probe failing → no traffic.</td><td><code class="inl">describe pod</code> → Unhealthy</td></tr>
-              <tr><td><code class="inl">Terminating</code> (stuck)</td><td>Finalizer or unreachable node.</td><td><code class="inl">get pod -o yaml</code> → finalizers</td></tr>
-              <tr><td><code class="inl">Evicted</code> / <code class="inl">Unknown</code></td><td>Node under disk/memory pressure / node unreachable.</td><td><code class="inl">describe node</code></td></tr>
+              <tr><td><code class="inl">Terminating</code> (stuck)</td><td>A finalizer, or an unreachable node</td><td><code class="inl">get pod -o yaml</code> → finalizers</td></tr>
+              <tr><td><code class="inl">Evicted</code> / <code class="inl">Unknown</code></td><td>Node under disk/memory pressure / node unreachable</td><td><code class="inl">describe node</code></td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3><code class="inl">kubectl get</code> power flags</h3>
-<pre><span class="pr">$</span> kubectl get pods -n taskflow -o wide
-<span class="out">NAME                            READY   STATUS             RESTARTS      AGE     IP            NODE       NOMINATED NODE   READINESS GATES
-taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running            0             2d      10.244.0.14   minikube   &lt;none&gt;           &lt;none&gt;
-taskflow-api-7c9d8f6b5d-9wd7t   1/1     Running            0             2d      10.244.0.15   minikube   &lt;none&gt;           &lt;none&gt;
-taskflow-api-6d8f7c9b4-2xkqp    0/1     CrashLoopBackOff   5 (41s ago)   4m10s   10.244.0.31   minikube   &lt;none&gt;           &lt;none&gt;
-taskflow-db-6b8d9f7c5-k7m2p     1/1     Running            0             2d      10.244.0.12   minikube   &lt;none&gt;           &lt;none&gt;</span>
-
-<span class="pr">$</span> kubectl get pods -A                                   <span class="cm"># every namespace (is kube-system healthy?)</span>
-<span class="pr">$</span> kubectl get pods -n taskflow -w                       <span class="cm"># watch status changes live</span>
-<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api --show-labels
-<span class="out">NAME                            READY   STATUS    RESTARTS   AGE   LABELS
-taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running   0          2d    app=taskflow-api,pod-template-hash=7c9d8f6b5d</span>
-
-<span class="cm"># quote anything with [ ] — zsh treats brackets as globs</span>
-<span class="pr">$</span> kubectl get pods -n taskflow --sort-by='.status.containerStatuses[0].restartCount'
-<span class="pr">$</span> kubectl get pods -n taskflow -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,NODE:.spec.nodeName'
-<span class="out">NAME                            IMAGE                         NODE
-taskflow-api-7c9d8f6b5d-4kq2x   shauryav/taskflow-api:1.2.0   minikube
-taskflow-api-6d8f7c9b4-2xkqp    shauryav/taskflow-api:1.2.1   minikube</span>
-<span class="pr">$</span> kubectl get pod taskflow-api-6d8f7c9b4-2xkqp -n taskflow \
-    -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}{"\n"}'
-<span class="out">Error</span>
-<span class="pr">$</span> kubectl get pods -A --field-selector=status.phase=Pending   <span class="cm"># all unscheduled pods</span>
-<span class="pr">$</span> kubectl get deploy taskflow-api -n taskflow -o yaml     <span class="cm"># full object incl. status.conditions</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>A <code class="inl">CrashLoopBackOff</code> pod's <em>phase</em> is still <code class="inl">Running</code> — <code class="inl">--field-selector=status.phase!=Running</code> won't find it. Read the STATUS column.</li>
-            <li><code class="inl">kubectl get all</code> does <strong>not</strong> list ConfigMaps, Secrets, Ingresses, PVCs. Ask for them: <code class="inl">kubectl get cm,secret,ing,pvc -n taskflow</code>.</li>
-            <li>Forgetting <code class="inl">-n taskflow</code> → <code class="inl">No resources found in default namespace.</code> — the pods exist, you're looking in the wrong place.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Find crashing pods with <code class="inl">--field-selector=status.phase!=Running</code>." <strong>✗</strong> A CrashLoopBackOff pod's <em>phase</em> is still <code class="inl">Running</code>. Read the STATUS column.</p>
+          <p>"<code class="inl">kubectl get all</code> shows everything." <strong>✗</strong> It skips ConfigMaps, Secrets, Ingresses and PVCs. Ask for them: <code class="inl">kubectl get cm,secret,ing,pvc -n taskflow</code>.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          STATUS tells you which tool to reach for. <code class="inl">-o wide</code>, <code class="inl">-w</code>, <code class="inl">-l</code>, <code class="inl">-A</code>, <code class="inl">-o jsonpath</code>, <code class="inl">--sort-by</code> are the flags you'll use daily.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>get (where) → describe + events (why, K8s) → logs (why, app) → exec (test).</strong><br /><strong>STATUS picks the branch. Never delete the evidence first.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Output: <code class="inl">No resources found in default namespace.</code> Your teammate says "the pods are gone!" Diagnose.</summary>
+            <p class="ans">They're looking in <code class="inl">default</code>. Add <code class="inl">-n taskflow</code> (or <code class="inl">-A</code>), or set the context's namespace with <code class="inl">kubectl config set-context --current --namespace=taskflow</code>.</p></details>
+          <details class="quiz"><summary>Q2. Output: <code class="inl">taskflow-api-7c9d8f6b5d-4kq2x 1/1 Running 14 (3h ago) 2d</code>. Healthy?</summary>
+            <p class="ans">Not really. It's up right now, but it has died 14 times in 2 days. Something kills it periodically, typically OOM or a liveness failure. Check <code class="inl">describe pod</code> → <code class="inl">Last State</code> (Reason, Exit Code) and <code class="inl">logs --previous</code>.</p></details>
+          <details class="quiz"><summary>Q3. A Deployment's pod shows <code class="inl">0/1 Completed</code> and then <code class="inl">CrashLoopBackOff</code>. What's the likely bug?</summary>
+            <p class="ans">The container's command finishes and exits 0, for example a script instead of a long-running server. Deployments expect a process that never ends, so the kubelet keeps restarting it. Fix the <code class="inl">command</code>/<code class="inl">CMD</code>.</p></details>
         </div>
       </section>
 
@@ -204,18 +216,29 @@ taskflow-api-6d8f7c9b4-2xkqp    shauryav/taskflow-api:1.2.1   minikube</span>
         <h2><span class="sec-num">2</span> kubectl describe &amp; Events</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p><code class="inl">get</code> gives you one word, like <code class="inl">Pending</code> or <code class="inl">CrashLoopBackOff</code>. Pending <em>why</em>? Which component gave up, and what did it say? And when a pod crashed an hour ago and has since recovered, where is the record of what happened?</p>
+
+        <h3>The idea</h3>
+        <p><code class="inl">kubectl describe</code> prints one object's spec, status and its recent <strong>Events</strong> in human-readable form. Events are API objects (<code class="inl">kind: Event</code>) that the components write as they work. <code class="inl">Normal</code> means information, <code class="inl">Warning</code> means something failed. They're kept for <strong>1 hour</strong> by default (kube-apiserver <code class="inl">--event-ttl</code>).</p>
+<pre> scheduler    ──▶ Scheduled · FailedScheduling                     ┐
+ kubelet      ──▶ Pulling · Pulled · Failed · BackOff ·            ├──▶ Event objects (kept ~1 h)
+                  Created · Started · Unhealthy · Killing          │      ├─▶ bottom of kubectl describe …
+ controllers  ──▶ ScalingReplicaSet · SuccessfulCreate ·           │      └─▶ kubectl get events / kubectl events
+                  FailedCreate · SuccessfulRescale                 ┘</pre>
+        <p>The <em>Reason</em> tells you which component is complaining, which tells you which kind of problem you have.</p>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p><code class="inl">describe</code> is the patient's chart; the Events at the bottom are the nurse's notes of everything that happened in the last hour.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The chart at the foot of the bed. The top half is the patient's details and current state. The bottom half is the nurses' notes, timestamped, saying who did what ("scheduler: assigned bed 4", "kubelet: patient collapsed, 5th time"). The notes are shredded after an hour.</p>
         </div>
 
-        <p>Know what <strong>healthy</strong> looks like first:</p>
-<pre><span class="pr">$</span> kubectl describe pod taskflow-api-7c9d8f6b5d-4kq2x -n taskflow
+        <h3>See it: what healthy looks like</h3>
+        <p>Know the normal chart first, so the abnormal one jumps out:</p>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-7c9d8f6b5d-4kq2x -n taskflow      <span class="cm"># trimmed</span>
 <span class="out">Name:             taskflow-api-7c9d8f6b5d-4kq2x
 Namespace:        taskflow
-Service Account:  default
 Node:             minikube/192.168.49.2
-Start Time:       Wed, 07 Oct 2026 10:02:11 +0530
 Labels:           app=taskflow-api
                   pod-template-hash=7c9d8f6b5d
 Status:           Running
@@ -240,8 +263,6 @@ Containers:
     Environment:
       LOG_LEVEL:     &lt;set to the key 'LOG_LEVEL' of config map 'taskflow-config'&gt;    Optional: false
       DATABASE_URL:  &lt;set to the key 'DATABASE_URL' in secret 'taskflow-db-secret'&gt;  Optional: false
-    Mounts:
-      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-x8k2d (ro)
 Conditions:
   Type                        Status
   PodReadyToStartContainers   True
@@ -250,9 +271,6 @@ Conditions:
   ContainersReady             True
   PodScheduled                True
 QoS Class:                   Burstable
-Node-Selectors:              &lt;none&gt;
-Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
-                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
 Events:
   Type    Reason     Age   From               Message
   ----    ------     ----  ----               -------
@@ -261,31 +279,25 @@ Events:
   Normal  Pulled     2d    kubelet            Successfully pulled image "shauryav/taskflow-api:1.2.0" in 2.1s (2.1s including waiting). Image size: 61234567 bytes.
   Normal  Created    2d    kubelet            Created container: api
   Normal  Started    2d    kubelet            Started container api</span></pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Part</th><th>What to check</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">Node</code></td><td>Empty → never scheduled (Pending).</td></tr>
-              <tr><td><code class="inl">Controlled By</code></td><td>Which ReplicaSet/Job owns it — tells you which revision it belongs to.</td></tr>
-              <tr><td><code class="inl">Image</code></td><td>Exact tag running. Typos show up here.</td></tr>
-              <tr><td><code class="inl">State</code> / <code class="inl">Last State</code></td><td><code class="inl">Waiting</code> + Reason (CrashLoopBackOff, ImagePullBackOff…). <code class="inl">Last State: Terminated</code> + <strong>Reason + Exit Code</strong> = why the previous run died.</td></tr>
+              <tr><td><code class="inl">Node</code></td><td>Empty → never scheduled (Pending, §6).</td></tr>
+              <tr><td><code class="inl">Controlled By</code> / <code class="inl">Image</code></td><td>Which ReplicaSet (so which revision) owns it, and the exact tag running. Typos show up here.</td></tr>
+              <tr><td><code class="inl">State</code> / <code class="inl">Last State</code></td><td><code class="inl">Waiting</code> + Reason (CrashLoopBackOff, ImagePullBackOff…). <code class="inl">Last State: Terminated</code> + <strong>Reason + Exit Code</strong> = why the previous run died (§4).</td></tr>
               <tr><td><code class="inl">Restart Count</code></td><td>&gt; 0 means crashes or liveness kills.</td></tr>
-              <tr><td><code class="inl">Limits</code> / <code class="inl">Requests</code></td><td>OOMKilled? Pending? Compare to <code class="inl">kubectl top</code> and node capacity.</td></tr>
-              <tr><td><code class="inl">Liveness</code> / <code class="inl">Readiness</code></td><td>Path, port and timings the kubelet actually uses.</td></tr>
-              <tr><td><code class="inl">Environment</code></td><td>Which ConfigMap/Secret keys are referenced (values of secrets aren't shown).</td></tr>
-              <tr><td><code class="inl">Conditions</code></td><td><code class="inl">PodScheduled False</code> → scheduling; <code class="inl">Ready False</code> → readiness/crash.</td></tr>
-              <tr><td><code class="inl">Events</code></td><td>The story. <code class="inl">(x5 over 2m40s)</code> = same event repeated 5 times in 2m40s.</td></tr>
+              <tr><td><code class="inl">Limits</code> / <code class="inl">Requests</code></td><td>OOMKilled? Pending? Compare with <code class="inl">kubectl top</code> and node capacity.</td></tr>
+              <tr><td><code class="inl">Liveness</code> / <code class="inl">Readiness</code></td><td>The path, port and timings the kubelet actually uses.</td></tr>
+              <tr><td><code class="inl">Environment</code></td><td>Which ConfigMap/Secret keys are referenced. Secret values aren't shown.</td></tr>
+              <tr><td><code class="inl">Conditions</code></td><td><code class="inl">PodScheduled False</code> → scheduling. <code class="inl">Ready False</code> → readiness or crash.</td></tr>
+              <tr><td><code class="inl">Events</code></td><td>The story. <code class="inl">(x5 over 2m40s)</code> = the same event repeated 5 times in 2m40s.</td></tr>
             </tbody>
           </table>
         </div>
+        <p><strong>What it does <em>not</em> do:</strong> show the app's own output. Events are Kubernetes talking. When the kubelet says "Back-off restarting failed container", <em>why</em> it failed is in the logs (§3).</p>
 
-        <h3>Events</h3>
-        <ul>
-          <li>Events are API objects (<code class="inl">kind: Event</code>) written by the scheduler, kubelet and controllers. <code class="inl">Normal</code> = info, <code class="inl">Warning</code> = something failed.</li>
-          <li>They're kept for <strong>1 hour</strong> by default (kube-apiserver <code class="inl">--event-ttl</code>). Old crash? Events are gone — check logs/monitoring.</li>
-          <li>Unsorted by default — always add <code class="inl">--sort-by</code>.</li>
-        </ul>
+        <h3>Build it up: the namespace's timeline</h3>
 <pre><span class="pr">$</span> kubectl get events -n taskflow --sort-by=.lastTimestamp
 <span class="out">LAST SEEN   TYPE      REASON              OBJECT                              MESSAGE
 5m          Normal    ScalingReplicaSet   deployment/taskflow-api             Scaled up replica set taskflow-api-6d8f7c9b4 from 0 to 1
@@ -293,12 +305,11 @@ Events:
 5m          Normal    Scheduled           pod/taskflow-api-6d8f7c9b4-2xkqp    Successfully assigned taskflow/taskflow-api-6d8f7c9b4-2xkqp to minikube
 4m          Normal    Pulled              pod/taskflow-api-6d8f7c9b4-2xkqp    Container image "shauryav/taskflow-api:1.2.1" already present on machine
 12s         Warning   BackOff             pod/taskflow-api-6d8f7c9b4-2xkqp    Back-off restarting failed container api in pod taskflow-api-6d8f7c9b4-2xkqp_taskflow(5c1e2a7d-0b9f-4e6a-8d21-7f3c9e0a4b12)</span>
-
 <span class="pr">$</span> kubectl get events -n taskflow --field-selector type=Warning                       <span class="cm"># only problems</span>
 <span class="pr">$</span> kubectl get events -n taskflow --field-selector involvedObject.name=taskflow-api-6d8f7c9b4-2xkqp
 <span class="pr">$</span> kubectl get events -A --field-selector type=Warning -w                            <span class="cm"># live, whole cluster</span>
 <span class="pr">$</span> kubectl events -n taskflow --for pod/taskflow-api-6d8f7c9b4-2xkqp --types=Warning  <span class="cm"># newer subcommand, sorted by time</span></pre>
-
+        <p>Read the release top to bottom: the Deployment created a new ReplicaSet, the ReplicaSet created a pod, the scheduler placed it, the kubelet found the image… and then <code class="inl">BackOff</code>. Scheduling and pulling were fine, so the failure is in the container itself. That narrows puzzle 2 down to §4.</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Describe this…</th><th>…when</th><th>Typical event</th></tr></thead>
@@ -312,9 +323,25 @@ Events:
           </table>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Read State / Last State / Exit Code / Events in <code class="inl">describe</code>. Events live 1 h — sort them by <code class="inl">.lastTimestamp</code> and filter <code class="inl">type=Warning</code>.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"No events, so nothing happened." <strong>✗</strong> Events expire after about an hour. For older incidents, use logs, <code class="inl">Last State</code> and monitoring (Session 22).</p>
+          <p>"<code class="inl">kubectl get events</code> lists events in time order." <strong>✗</strong> The order isn't guaranteed. Always add <code class="inl">--sort-by=.lastTimestamp</code> (or use <code class="inl">kubectl events</code>).</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>describe = State, Last State + Exit Code, Events. Read the Warning's Reason first.</strong><br /><strong>Events live ~1 h · sort by .lastTimestamp · filter type=Warning.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: <code class="inl">Warning BackOff 7s (x11 over 2m35s) kubelet Back-off restarting failed container api</code>. Who wrote it, what does <code class="inl">x11 over 2m35s</code> mean, and what's your next command?</summary>
+            <p class="ans">The kubelet. The same event happened 11 times in the last 2m35s, meaning the container keeps dying. Next: <code class="inl">kubectl logs POD --previous</code> and the <code class="inl">Last State</code> exit code in <code class="inl">describe</code> (§4).</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">kubectl get deploy taskflow-api</code> shows <code class="inl">0/2</code>, and <code class="inl">kubectl get pods -l app=taskflow-api</code> returns nothing. Which object do you describe, and what will you probably see?</summary>
+            <p class="ans">The ReplicaSet (<code class="inl">kubectl describe rs -n taskflow</code>). The pods were never created, so admission rejected them, and the RS shows <code class="inl">FailedCreate</code>, e.g. <code class="inl">exceeded quota</code> (Session 15) or a Pod Security violation (Session 16).</p></details>
+          <details class="quiz"><summary>Q3. In <code class="inl">describe pod</code>, <code class="inl">Node:</code> is <code class="inl">&lt;none&gt;</code> and Conditions show <code class="inl">PodScheduled False</code>. Which component is the problem, and which event Reason do you look for?</summary>
+            <p class="ans">The scheduler couldn't place the pod. Look for <code class="inl">FailedScheduling</code>, whose message names the reason (resources, selector, taint, PVC). That's §6.</p></details>
         </div>
       </section>
 
@@ -323,44 +350,53 @@ Events:
         <h2><span class="sec-num">3</span> logs, exec, debug &amp; port-forward</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>A pod is <code class="inl">1/1 Running</code> with zero restarts, and <code class="inl">describe</code> shows nothing but Normal events, yet <code class="inl">/tasks</code> returns 500. Kubernetes thinks everything is fine, and from its point of view it is. The answer is inside the app: its output, its environment, its network view.</p>
+
+        <h3>The idea</h3>
+        <p>Four tools, each reaching one layer deeper:</p>
+<pre> kubectl logs          → what the app wrote to stdout/stderr (current container, or --previous)
+ kubectl exec          → run a command INSIDE the running container (env, files, localhost, DNS)
+ kubectl debug         → add a container with tools (image has no shell / container won't stay up)
+ kubectl port-forward  → your laptop ──▶ one pod directly, skipping the Service and the Ingress</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Logs = what the app said. Exec = stepping inside its room. Debug = bringing your own toolbox when the room is empty.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><strong>logs</strong> is listening to what the patient tells you. <strong>exec</strong> is examining them with what's already in the room. <strong>debug</strong> is bringing your own instruments when the room is empty. <strong>port-forward</strong> is walking straight to the patient's bed instead of going through reception.</p>
         </div>
 
-        <h3>kubectl logs</h3>
+        <h3>See it: <code class="inl">kubectl logs</code></h3>
 <pre><span class="pr">$</span> kubectl logs taskflow-api-7c9d8f6b5d-4kq2x -n taskflow --tail=3 --timestamps
 <span class="out">2026-10-09T04:32:10.118263512Z {"level":"info","msg":"GET /health 200 1ms"}
-2026-10-09T04:32:12.402118033Z {"level":"info","msg":"GET /tasks 200 14ms"}
-2026-10-09T04:32:15.118904127Z {"level":"info","msg":"GET /health 200 1ms"}</span>
-
-<span class="pr">$</span> kubectl logs deploy/taskflow-api -n taskflow -f            <span class="cm"># follow; picks ONE pod</span>
-<span class="out">Found 2 pods, using pod/taskflow-api-7c9d8f6b5d-4kq2x</span>
-
-<span class="pr">$</span> kubectl logs -l app=taskflow-api -n taskflow --prefix --since=10m
-<span class="out">[pod/taskflow-api-7c9d8f6b5d-4kq2x/api] {"level":"info","msg":"TaskFlow API listening on :3000"}
-[pod/taskflow-api-7c9d8f6b5d-9wd7t/api] {"level":"info","msg":"TaskFlow API listening on :3000"}</span>
-
-<span class="pr">$</span> kubectl logs taskflow-api-6d8f7c9b4-2xkqp -n taskflow --previous   <span class="cm"># the run that CRASHED</span>
-<span class="pr">$</span> kubectl logs taskflow-web-58d9c7b6f-p4m8x -n taskflow             <span class="cm"># multi-container pod</span>
-<span class="out">Defaulted container "nginx" out of: nginx, log-shipper</span>
-<span class="pr">$</span> kubectl logs taskflow-web-58d9c7b6f-p4m8x -n taskflow -c log-shipper</pre>
-
+2026-10-09T04:32:12.402118033Z {"level":"error","msg":"GET /tasks 500 14ms","err":"permission denied for table tasks"}
+2026-10-09T04:32:15.118904127Z {"level":"info","msg":"GET /health 200 1ms"}</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Flag</th><th>Use</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">-f</code></td><td>Stream new lines.</td></tr>
-              <tr><td><code class="inl">--previous</code> / <code class="inl">-p</code></td><td>Logs of the <strong>previous</strong> container instance — the one that crashed. #1 flag for CrashLoopBackOff.</td></tr>
-              <tr><td><code class="inl">-c NAME</code> / <code class="inl">--all-containers</code></td><td>Pick a container (sidecar, init container) / all of them.</td></tr>
-              <tr><td><code class="inl">--tail=N</code>, <code class="inl">--since=10m</code>, <code class="inl">--timestamps</code></td><td>Limit output, add RFC3339 timestamps.</td></tr>
-              <tr><td><code class="inl">-l app=…</code> + <code class="inl">--prefix</code></td><td>All pods matching a label, each line tagged with its pod. Defaults to last 10 lines per pod.</td></tr>
-              <tr><td><code class="inl">deploy/NAME</code>, <code class="inl">job/NAME</code></td><td>Let kubectl pick a pod of that workload.</td></tr>
+              <tr><td><code class="inl">logs POD</code></td><td>The container's stdout/stderr, as captured by the runtime on the node</td></tr>
+              <tr><td><code class="inl">--tail=3</code></td><td>Only the last 3 lines (<code class="inl">--since=10m</code> works too)</td></tr>
+              <tr><td><code class="inl">--timestamps</code></td><td>Prefix each line with its RFC3339 time</td></tr>
             </tbody>
           </table>
         </div>
+        <p>The 500 now has a reason: <code class="inl">permission denied for table tasks</code>. That's a database grant, not a Kubernetes problem, and no amount of <code class="inl">describe</code> would have shown it.</p>
+        <p><strong>What it does <em>not</em> do:</strong> show logs the app writes to files inside the container (only stdout/stderr), or anything from a pod that's already been deleted. And by default it shows the <em>current</em> container, so after a crash you need <code class="inl">--previous</code>.</p>
 
-        <h3>kubectl exec</h3>
+        <h3>Build it up</h3>
+        <h4>More ways to read logs</h4>
+<pre><span class="pr">$</span> kubectl logs deploy/taskflow-api -n taskflow -f            <span class="cm"># follow; kubectl picks ONE pod</span>
+<span class="out">Found 2 pods, using pod/taskflow-api-7c9d8f6b5d-4kq2x</span>
+<span class="pr">$</span> kubectl logs -l app=taskflow-api -n taskflow --prefix --since=10m
+<span class="out">[pod/taskflow-api-7c9d8f6b5d-4kq2x/api] {"level":"info","msg":"TaskFlow API listening on :3000"}
+[pod/taskflow-api-7c9d8f6b5d-9wd7t/api] {"level":"info","msg":"TaskFlow API listening on :3000"}</span>
+<span class="pr">$</span> kubectl logs taskflow-api-6d8f7c9b4-2xkqp -n taskflow --previous   <span class="cm"># the run that CRASHED (§4)</span>
+<span class="pr">$</span> kubectl logs taskflow-web-58d9c7b6f-p4m8x -n taskflow             <span class="cm"># multi-container pod</span>
+<span class="out">Defaulted container "nginx" out of: nginx, log-shipper</span>
+<span class="pr">$</span> kubectl logs taskflow-web-58d9c7b6f-p4m8x -n taskflow -c log-shipper</pre>
+        <p><code class="inl">--previous</code> (<code class="inl">-p</code>) is the number-one flag for CrashLoopBackOff. <code class="inl">-c NAME</code> picks a container (or use <code class="inl">--all-containers</code>). <code class="inl">-l</code> with <code class="inl">--prefix</code> reads every matching pod, tagging each line, and shows the last 10 lines per pod by default.</p>
+
+        <h4>Go inside: <code class="inl">exec</code></h4>
 <pre><span class="pr">$</span> kubectl exec -it deploy/taskflow-api -n taskflow -- sh
 <span class="pr">/app $</span> env | grep -E 'PORT|DATABASE'
 <span class="out">PORT=3000
@@ -373,51 +409,54 @@ DATABASE_URL=postgres://taskflow:tf-pass-2026@taskflow-db:5432/taskflow</span>
 <span class="out">search taskflow.svc.cluster.local svc.cluster.local cluster.local
 nameserver 10.96.0.10
 options ndots:5</span>
-<span class="pr">/app $</span> exit
+<span class="pr">/app $</span> exit</pre>
+        <p>Everything after <code class="inl">--</code> runs inside the container. <code class="inl">node:20-alpine</code> includes BusyBox <code class="inl">wget</code> and <code class="inl">nc</code>. A one-off needs no shell: <code class="inl">kubectl exec POD -n taskflow -- ls -la /app</code>, plus <code class="inl">-c</code> to pick a container.</p>
 
-<span class="pr">$</span> kubectl exec taskflow-api-7c9d8f6b5d-4kq2x -n taskflow -- ls -la /app   <span class="cm"># one-off, no shell</span>
-<span class="pr">$</span> kubectl exec -it taskflow-web-58d9c7b6f-p4m8x -n taskflow -c nginx -- sh  <span class="cm"># choose container</span></pre>
-        <ul>
-          <li>Everything after <code class="inl">--</code> is the command run inside the container.</li>
-          <li><code class="inl">node:20-alpine</code> has BusyBox <code class="inl">wget</code>/<code class="inl">nc</code>. Distroless/scratch images have no shell: <code class="inl">exec: "sh": executable file not found in $PATH</code> → use <code class="inl">kubectl debug</code>.</li>
-          <li>You can't exec into a container that isn't running (CrashLoopBackOff) — use <code class="inl">debug --copy-to</code>.</li>
-        </ul>
-
-        <h3>kubectl debug</h3>
-<pre><span class="cm"># 1. ephemeral container with tools, sharing the target's process namespace</span>
+        <h4>Bring tools: <code class="inl">debug</code></h4>
+<pre><span class="cm"># 1. an ephemeral container with tools, sharing the target's process namespace</span>
 <span class="pr">$</span> kubectl debug -it taskflow-api-7c9d8f6b5d-4kq2x -n taskflow --image=busybox:1.36 --target=api
 <span class="out">Targeting container "api". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
-Defaulting debug container name to debugger-w7k2x.
-If you don't see a command prompt, try pressing enter.</span>
+Defaulting debug container name to debugger-w7k2x.</span>
 <span class="pr">/ #</span> ps
 <span class="out">PID   USER     TIME  COMMAND
     1 1000      0:02 node server.js
    23 root      0:00 sh</span>
-
-<span class="cm"># 2. copy of a crashing pod with the command replaced by a shell</span>
+<span class="cm"># 2. a copy of a crashing pod with the command replaced by a shell (delete api-debug afterwards)</span>
 <span class="pr">$</span> kubectl debug taskflow-api-6d8f7c9b4-2xkqp -n taskflow -it --copy-to=api-debug --container=api -- sh
-<span class="pr">$</span> kubectl delete pod api-debug -n taskflow             <span class="cm"># clean up afterwards</span>
-
-<span class="cm"># 3. shell on the node (host filesystem mounted at /host)</span>
+<span class="cm"># 3. a shell on the node itself (host filesystem mounted at /host)</span>
 <span class="pr">$</span> kubectl debug node/minikube -it --image=busybox:1.36
 <span class="out">Creating debugging pod node-debugger-minikube-8kz2q with container debugger on node minikube.</span></pre>
 
-        <h3>port-forward &amp; top</h3>
-<pre><span class="pr">$</span> kubectl port-forward pod/taskflow-api-7c9d8f6b5d-4kq2x 8080:3000 -n taskflow   <span class="cm"># bypasses Service &amp; Ingress</span>
+        <h4>Skip the Service: <code class="inl">port-forward</code> and <code class="inl">top</code></h4>
+<pre><span class="pr">$</span> kubectl port-forward pod/taskflow-api-7c9d8f6b5d-4kq2x 8080:3000 -n taskflow
 <span class="out">Forwarding from 127.0.0.1:8080 -&gt; 3000
-Forwarding from [::1]:8080 -&gt; 3000
-Handling connection for 8080</span>
+Forwarding from [::1]:8080 -&gt; 3000</span>
 <span class="pr">$</span> curl localhost:8080/health        <span class="cm"># (second terminal)</span>
 <span class="out">{"status":"ok"}</span>
-
 <span class="pr">$</span> kubectl top pods -n taskflow --sort-by=memory      <span class="cm"># needs metrics-server (Session 13)</span>
 <span class="out">NAME                            CPU(cores)   MEMORY(bytes)
 taskflow-api-7c9d8f6b5d-4kq2x   4m           58Mi
 taskflow-db-6b8d9f7c5-k7m2p     6m           38Mi</span></pre>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">logs --previous</code> for crashes, <code class="inl">exec</code> to test env/ports/DNS from inside, <code class="inl">debug</code> when there's no shell or the container won't stay up, <code class="inl">port-forward</code> to skip the Service.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Just <code class="inl">exec</code> into the crash-looping pod and look around." <strong>✗</strong> You can't exec into a container that isn't running. Use <code class="inl">logs --previous</code>, or <code class="inl">kubectl debug --copy-to</code> with a shell as the command.</p>
+          <p>"<code class="inl">kubectl port-forward svc/taskflow-api 8080:80</code> tests the Service's load balancing." <strong>✗</strong> kubectl picks <em>one</em> pod behind the Service and tunnels to it. It bypasses kube-proxy entirely.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>logs = what it said (<code class="inl">--previous</code> after a crash) · exec = test from inside · debug = no shell or won't stay up · port-forward = skip Service + Ingress.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: <code class="inl">kubectl exec -it POD -- sh</code> prints <code class="inl">exec: "sh": executable file not found in $PATH</code>. The pod is Running.</summary>
+            <p class="ans">The image has no shell (distroless or scratch). Attach an ephemeral container instead: <code class="inl">kubectl debug -it POD --image=busybox:1.36 --target=api</code>.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">curl localhost:8080/health</code> through <code class="inl">port-forward pod/…</code> works, but the in-cluster <code class="inl">wget taskflow-api/health</code> fails. Which layer is broken?</summary>
+            <p class="ans">Not the app: the pod answers directly. The problem is between the Service and the pod (selector, targetPort, readiness, endpoints) or in DNS. That's §7.</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl logs -l app=taskflow-api</code> shows only a few lines per pod, and the error you're hunting isn't there. Why, and what do you add?</summary>
+            <p class="ans">With a label selector, kubectl defaults to the last 10 lines per pod. Add <code class="inl">--tail=-1</code> (all lines) or <code class="inl">--since=30m</code>, and <code class="inl">--prefix</code> to see which pod said what.</p></details>
         </div>
       </section>
 
@@ -426,43 +465,14 @@ taskflow-db-6b8d9f7c5-k7m2p     6m           38Mi</span></pre>
         <h2><span class="sec-num">4</span> CrashLoopBackOff &amp; OOMKilled</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The app keeps falling over the moment it stands up. Kubernetes keeps picking it up, but waits a bit longer each time.</p>
-        </div>
-
-        <ul>
-          <li><span class="term">CrashLoopBackOff</span> is not an error itself — it means "the container exited, and I'm waiting before restarting it again".</li>
-          <li>Back-off delay: <strong>10 s → 20 s → 40 s → 80 s → 160 s → 300 s (cap)</strong>. Resets after the container runs 10 minutes without crashing.</li>
-          <li>The cause is always in <strong>the previous run</strong>: <code class="inl">logs --previous</code> + <code class="inl">Last State</code> exit code.</li>
-        </ul>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Exit code</th><th>Meaning</th><th>Typical cause</th></tr></thead>
-            <tbody>
-              <tr><td>0 (<code class="inl">Completed</code>)</td><td>Process finished successfully</td><td>CMD runs a script that ends; Deployments need a long-running process</td></tr>
-              <tr><td>1</td><td>Application error</td><td>Uncaught exception, missing env var, bad config → read logs</td></tr>
-              <tr><td>126 / 127</td><td>Not executable / command not found</td><td>Typo in <code class="inl">command:</code>, missing binary, CRLF in a shell script</td></tr>
-              <tr><td>128 (<code class="inl">StartError</code>)</td><td>Runtime couldn't start the process</td><td><code class="inl">exec: "nodee": executable file not found in $PATH</code></td></tr>
-              <tr><td>137 = 128 + 9</td><td>SIGKILL</td><td><strong>OOMKilled</strong>, or killed after the grace period (failed liveness, ignoring SIGTERM)</td></tr>
-              <tr><td>143 = 128 + 15</td><td>SIGTERM</td><td>Normal stop / liveness restart handled gracefully</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Case 1 — missing environment variable</h3>
+        <h3>The problem: puzzle 2, the 1.2.1 release</h3>
         <div class="fname">k8s/deployment.yaml — broken (v1.2.1, env section)</div>
 <pre>          image: shauryav/taskflow-api:1.2.1
           env:
             - name: LOG_LEVEL
               valueFrom:
-                configMapKeyRef:
-                  name: taskflow-config
-                  key: LOG_LEVEL
+                configMapKeyRef: { name: taskflow-config, key: LOG_LEVEL }
             <span class="cm"># the DATABASE_URL block was deleted in a refactor  ← the bug</span></pre>
-
-        <p><strong>Symptom</strong> — the rollout stalls. Old pods keep serving (rolling update never removes them until a new pod is ready):</p>
 <pre><span class="pr">$</span> kubectl apply -f k8s/deployment.yaml &amp;&amp; kubectl rollout status deploy/taskflow-api -n taskflow
 <span class="out">deployment.apps/taskflow-api configured
 Waiting for deployment "taskflow-api" rollout to finish: 1 out of 2 new replicas have been updated...</span>
@@ -471,29 +481,32 @@ Waiting for deployment "taskflow-api" rollout to finish: 1 out of 2 new replicas
 taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running            0             2d
 taskflow-api-7c9d8f6b5d-9wd7t   1/1     Running            0             2d
 taskflow-api-6d8f7c9b4-2xkqp    0/1     CrashLoopBackOff   4 (32s ago)   2m41s</span></pre>
+        <p>The rollout stalls, and the old pods keep serving, because a rolling update doesn't remove old pods until a new one is ready.</p>
+        <details class="quiz"><summary>Predict before reading on: §2's events showed the pod scheduled and the image present. Is the cause in the scheduler, the registry, or the app?</summary>
+          <p class="ans">The app. Scheduling and pulling succeeded, so the container itself starts and then exits. The evidence is in the previous run's exit code and logs.</p></details>
 
-        <p><strong>Diagnose</strong>:</p>
-<pre><span class="pr">$</span> kubectl describe pod taskflow-api-6d8f7c9b4-2xkqp -n taskflow
-<span class="out">...
-    State:          Waiting
+        <h3>The idea</h3>
+        <p><span class="term">CrashLoopBackOff</span> isn't an error in itself. It means "the container exited, and I'm waiting before restarting it again". The kubelet doubles the wait after every crash and caps it at 5 minutes. The wait resets once the container runs for 10 minutes without crashing. The cause is always in the <strong>previous</strong> run.</p>
+<pre> start ─▶ exit 1 ─▶ wait 10s ─▶ start ─▶ exit 1 ─▶ wait 20s ─▶ … 40s ─▶ 80s ─▶ 160s ─▶ 300s (cap) ─▶ …
+ STATUS:  Error      CrashLoopBackOff      Error     CrashLoopBackOff           RESTARTS keeps climbing
+          └ evidence: describe → Last State (Reason, Exit Code) · logs --previous</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The patient faints every time they stand up. The nurse helps them up again, but waits a little longer each time: 10 seconds, then 20, then 40. Watching them lie there tells you nothing. You need to know what happened the moment before they fell.</p>
+        </div>
+
+        <h3>See it: diagnose and fix puzzle 2</h3>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-6d8f7c9b4-2xkqp -n taskflow | sed -n '/State:/,/Restart Count/p'
+<span class="out">    State:          Waiting
       Reason:       CrashLoopBackOff
     Last State:     Terminated
       Reason:       Error
       Exit Code:    1
       Started:      Fri, 09 Oct 2026 10:14:02 +0530
-      Finished:     Fri, 09 Oct 2026 10:14:03 +0530      <span class="cm">← dies 1 s after start</span>
-    Ready:          False
-    Restart Count:  4
-...
-Events:
-  Type     Reason     Age                  From               Message
-  ----     ------     ----                 ----               -------
-  Normal   Scheduled  2m41s                default-scheduler  Successfully assigned taskflow/taskflow-api-6d8f7c9b4-2xkqp to minikube
-  Normal   Pulled     61s (x5 over 2m40s)  kubelet            Container image "shauryav/taskflow-api:1.2.1" already present on machine
-  Normal   Created    61s (x5 over 2m40s)  kubelet            Created container: api
-  Normal   Started    60s (x5 over 2m40s)  kubelet            Started container api
-  Warning  BackOff    7s (x11 over 2m35s)  kubelet            Back-off restarting failed container api in pod taskflow-api-6d8f7c9b4-2xkqp_taskflow(5c1e2a7d-0b9f-4e6a-8d21-7f3c9e0a4b12)</span>
-
+      Finished:     Fri, 09 Oct 2026 10:14:03 +0530</span>      <span class="cm">← dies 1 s after start</span>
+<span class="out">    Ready:          False
+    Restart Count:  4</span>
 <span class="pr">$</span> kubectl logs taskflow-api-6d8f7c9b4-2xkqp -n taskflow --previous
 <span class="out">/app/server.js:9
   throw new Error('DATABASE_URL is not set');
@@ -504,72 +517,78 @@ Error: DATABASE_URL is not set
     at Module._compile (node:internal/modules/cjs/loader:1469:14)
 
 Node.js v20.17.0</span>
-
 <span class="pr">$</span> kubectl get deploy taskflow-api -n taskflow -o jsonpath='{.spec.template.spec.containers[0].env[*].name}{"\n"}'
 <span class="out">LOG_LEVEL</span></pre>
-
-        <p><strong>Fix</strong> — roll back now, then fix the manifest:</p>
+        <p>Exit code 1 is the app's own error, the log names it, and the jsonpath proves the variable isn't in the spec. Fix it in two moves: roll back now, then repair the manifest.</p>
 <pre><span class="pr">$</span> kubectl rollout undo deploy/taskflow-api -n taskflow      <span class="cm"># instant relief: back to 1.2.0's ReplicaSet</span>
 <span class="out">deployment.apps/taskflow-api rolled back</span>
-<span class="cm"># restore the DATABASE_URL env block in k8s/deployment.yaml, then:</span>
-<span class="pr">$</span> kubectl apply -f k8s/deployment.yaml
-<span class="out">deployment.apps/taskflow-api configured</span>
-<span class="pr">$</span> kubectl rollout status deploy/taskflow-api -n taskflow
-<span class="out">Waiting for deployment "taskflow-api" rollout to finish: 1 out of 2 new replicas have been updated...
+<span class="cm"># restore the DATABASE_URL env block in k8s/deployment.yaml (in Git), then:</span>
+<span class="pr">$</span> kubectl apply -f k8s/deployment.yaml &amp;&amp; kubectl rollout status deploy/taskflow-api -n taskflow
+<span class="out">deployment.apps/taskflow-api configured
 Waiting for deployment "taskflow-api" rollout to finish: 1 old replicas are pending termination...
 deployment "taskflow-api" successfully rolled out</span></pre>
+        <p>That solves puzzle 2. <strong>What <code class="inl">rollout undo</code> does <em>not</em> do:</strong> fix your YAML. The next <code class="inl">kubectl apply</code> of the broken file breaks it again.</p>
 
-        <h3>Case 2 — OOMKilled</h3>
-        <div class="fname">k8s/deployment.yaml — broken (resources)</div>
+        <h3>Build it up: two more crash causes</h3>
+        <h4>OOMKilled</h4>
 <pre>          resources:
-            requests:
-              cpu: 100m
-              memory: 64Mi
-            limits:
-              memory: 64Mi       <span class="cm"># ← Node 20 idles at ~50Mi; any load pushes it over</span></pre>
-
+            requests: { cpu: 100m, memory: 64Mi }
+            limits:   { memory: 64Mi }       <span class="cm"># ← Node 20 idles at ~50Mi; any load pushes it over</span></pre>
 <pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -w
 <span class="out">NAME                           READY   STATUS      RESTARTS     AGE
 taskflow-api-5f8b7d6c9-qm4tz   1/1     Running     0            3m
 taskflow-api-5f8b7d6c9-qm4tz   0/1     OOMKilled   0            3m40s
-taskflow-api-5f8b7d6c9-qm4tz   0/1     Running     1 (2s ago)   3m42s
-taskflow-api-5f8b7d6c9-qm4tz   1/1     Running     1 (7s ago)   3m47s</span>
-
-<span class="pr">$</span> kubectl describe pod taskflow-api-5f8b7d6c9-qm4tz -n taskflow
-<span class="out">...
-    Last State:     Terminated
+taskflow-api-5f8b7d6c9-qm4tz   0/1     Running     1 (2s ago)   3m42s</span>
+<span class="pr">$</span> kubectl describe pod taskflow-api-5f8b7d6c9-qm4tz -n taskflow | grep -A2 'Last State'
+<span class="out">    Last State:     Terminated
       Reason:       OOMKilled
-      Exit Code:    137
-    Restart Count:  1
-    Limits:
-      memory:  64Mi
-...</span>
+      Exit Code:    137</span>
 <span class="pr">$</span> kubectl logs taskflow-api-5f8b7d6c9-qm4tz -n taskflow --previous --tail=2
 <span class="out">{"level":"info","msg":"GET /tasks 200 31ms"}
-{"level":"info","msg":"GET /tasks 200 29ms"}</span>      <span class="cm">← no stack trace: the kernel killed it, the app never saw it coming</span></pre>
-
-        <p><strong>Fix</strong>: measure with <code class="inl">kubectl top pod</code> under load, set the limit ~1.5–2× the observed peak (e.g. <code class="inl">256Mi</code>), and cap V8's heap below it with <code class="inl">NODE_OPTIONS=--max-old-space-size=192</code>. If memory keeps climbing over hours, it's a leak — a bigger limit only delays it.</p>
-
-        <h3>Case 3 — bad command (one-liner)</h3>
+{"level":"info","msg":"GET /tasks 200 29ms"}</span>      <span class="cm">← no stack trace: the kernel killed it mid-request</span></pre>
+        <p>137 = 128 + 9 (SIGKILL): the cgroup memory limit from Session 6, enforced by the kernel. <strong>Fix:</strong> measure with <code class="inl">kubectl top pod</code> under load, set the limit to about 1.5–2× the observed peak (e.g. <code class="inl">256Mi</code>), and cap V8's heap below it with <code class="inl">NODE_OPTIONS=--max-old-space-size=192</code>. If memory climbs for hours, it's a leak, and a bigger limit only delays it.</p>
+        <h4>A bad command</h4>
 <pre><span class="cm"># command: ["nodee", "server.js"]   ← typo</span>
 <span class="pr">$</span> kubectl describe pod taskflow-api-84c6b9d7f-zt5vn -n taskflow | grep -A 4 "Last State"
 <span class="out">    Last State:     Terminated
       Reason:       StartError
       Message:      failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: "nodee": executable file not found in $PATH: unknown
       Exit Code:    128</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Running plain <code class="inl">kubectl logs</code> after the restart and seeing nothing — the new instance hasn't logged yet. Use <code class="inl">--previous</code>.</li>
-            <li>A liveness probe on the wrong port/path also produces CrashLoopBackOff (Exit 137/143, events say <code class="inl">failed liveness probe, will be restarted</code>). Fix the probe, not the app.</li>
-            <li>Deleting the pod "to fix it" — the ReplicaSet recreates it with the same broken spec.</li>
-          </ul>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Exit code</th><th>Meaning</th><th>Typical cause</th></tr></thead>
+            <tbody>
+              <tr><td>0 (<code class="inl">Completed</code>)</td><td>Process finished successfully</td><td>CMD runs a script that ends; Deployments need a long-running process</td></tr>
+              <tr><td>1</td><td>Application error</td><td>Uncaught exception, missing env var, bad config → read the logs</td></tr>
+              <tr><td>126 / 127</td><td>Not executable / command not found</td><td>Typo in <code class="inl">command:</code>, missing binary, CRLF in a shell script</td></tr>
+              <tr><td>128 (<code class="inl">StartError</code>)</td><td>The runtime couldn't start the process</td><td><code class="inl">exec: "nodee": executable file not found in $PATH</code></td></tr>
+              <tr><td>137 = 128 + 9</td><td>SIGKILL</td><td><strong>OOMKilled</strong>, or killed after the grace period (failed liveness, ignoring SIGTERM)</td></tr>
+              <tr><td>143 = 128 + 15</td><td>SIGTERM</td><td>A stop or liveness restart where SIGTERM itself ended the process (e.g. tini as PID 1, no handler in the app)</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          CrashLoopBackOff = repeated exits with growing back-off (10 s → 5 min). Read <code class="inl">Last State</code> exit code + <code class="inl">logs --previous</code>. 137 + OOMKilled = raise the memory limit or fix the leak. <code class="inl">rollout undo</code> buys time.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Delete the crashing pod to fix it." <strong>✗</strong> The ReplicaSet recreates it from the same broken template. Fix the spec (or <code class="inl">rollout undo</code>).</p>
+          <p>"CrashLoopBackOff always means the app has a bug." <strong>✗</strong> A liveness probe on the wrong port or path causes it too (exit 137/143, with the event <code class="inl">failed liveness probe, will be restarted</code>). Then you fix the probe, not the app (Session 13).</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>CrashLoopBackOff = repeated exits, 10 s → 5 min back-off. Evidence = Last State exit code + <code class="inl">logs --previous</code>.</strong><br /><strong>1 = app error · 137 + OOMKilled = memory limit · 128 = bad command · <code class="inl">rollout undo</code> buys time.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: <code class="inl">Last State: Terminated, Reason: Error, Exit Code: 1</code>, and plain <code class="inl">kubectl logs POD</code> prints nothing. Next command, and why was the output empty?</summary>
+            <p class="ans"><code class="inl">kubectl logs POD --previous</code>. Plain <code class="inl">logs</code> shows the <em>current</em> container, which has just been restarted and hasn't logged anything yet. The crash's stack trace belongs to the previous instance.</p></details>
+          <details class="quiz"><summary>Q2. Diagnose: <code class="inl">Reason: OOMKilled, Exit Code: 137</code>, <code class="inl">Limits: memory: 128Mi</code>, and <code class="inl">kubectl top pod</code> shows 120Mi a minute after each restart. Explain 137 and give two fixes.</summary>
+            <p class="ans">137 = 128 + 9: the kernel sent SIGKILL because the container crossed <code class="inl">limits.memory</code>. Fixes: raise the limit based on measured peak usage (e.g. 256Mi), and cap the Node heap below it with <code class="inl">--max-old-space-size</code>. If usage keeps climbing over time, find the leak.</p></details>
+          <details class="quiz"><summary>Q3. Diagnose: <code class="inl">CrashLoopBackOff</code>, exit 137, no OOMKilled, and events show <code class="inl">Liveness probe failed: HTTP probe failed with statuscode: 404</code>. Is the app broken?</summary>
+            <p class="ans">Probably not. The liveness probe hits a path the app doesn't serve (say <code class="inl">/healthz</code> instead of <code class="inl">/health</code>), so the kubelet kills a healthy container every time. Fix the probe's path or port.</p></details>
+          <details class="quiz"><summary>Q4. A release crash-loops, but users see no outage. Why, and what's the fastest recovery?</summary>
+            <p class="ans">RollingUpdate keeps the old ReplicaSet's pods until new ones are Ready, so the rollout just stalls. <code class="inl">kubectl rollout undo deploy/taskflow-api</code> returns to the previous revision immediately. Then fix the manifest.</p></details>
         </div>
       </section>
 
@@ -578,25 +597,34 @@ taskflow-api-5f8b7d6c9-qm4tz   1/1     Running     1 (7s ago)   3m47s</span>
         <h2><span class="sec-num">5</span> ImagePullBackOff &amp; CreateContainerConfigError</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The kubelet went to the shop for your image and came back empty-handed — wrong name, shop was locked, or it already shopped too often today.</p>
-        </div>
-
-        <ul>
-          <li><code class="inl">ErrImagePull</code> = the pull just failed. <code class="inl">ImagePullBackOff</code> = waiting before retrying (same 10 s → 5 min back-off).</li>
-          <li>The container never started → <code class="inl">kubectl logs</code> has nothing. Everything is in <code class="inl">describe pod</code> Events.</li>
-        </ul>
-
-        <h3>Case 1 — tag doesn't exist</h3>
+        <h3>The problem</h3>
         <div class="fname">k8s/deployment.yaml — broken (image)</div>
 <pre>          image: shauryav/taskflow-api:1.2      <span class="cm"># ← CI pushed "1.2.0", not "1.2"</span></pre>
 <pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
 <span class="out">NAME                           READY   STATUS             RESTARTS   AGE
 taskflow-api-5b7d9c8f6-q8wzn   0/1     ImagePullBackOff   0          73s</span>
-<span class="pr">$</span> kubectl describe pod taskflow-api-5b7d9c8f6-q8wzn -n taskflow
-<span class="out">...
-Events:
+<span class="pr">$</span> kubectl logs taskflow-api-5b7d9c8f6-q8wzn -n taskflow
+<span class="out">Error from server (BadRequest): container "api" in pod "taskflow-api-5b7d9c8f6-q8wzn" is waiting to start: trying and failing to pull image</span></pre>
+        <p><code class="inl">RESTARTS 0</code>, and there are no logs at all.</p>
+        <details class="quiz"><summary>Predict: why can't <code class="inl">logs</code> help here, and where is the evidence?</summary>
+          <p class="ans">The container never started, because there's no image to start it from, so it has written nothing. The kubelet's pull attempts are recorded as Events in <code class="inl">describe pod</code>.</p></details>
+
+        <h3>The idea</h3>
+        <p>Before a container can start, the kubelet must pull its image from the registry. <code class="inl">ErrImagePull</code> means a pull just failed. <code class="inl">ImagePullBackOff</code> means the kubelet is waiting before retrying, with the same 10 s → 5 min back-off as §4. The registry's answer, quoted in the event, tells you which of four causes it is:</p>
+<pre> kubelet ── pull shauryav/taskflow-api:1.2 ──▶ registry
+              ◀── "not found / manifest unknown" → typo in name or tag            (case 1)
+              ◀── "401 Unauthorized / access denied" → private repo, no creds     (case 2)
+              ◀── "429 Too Many Requests"           → Docker Hub rate limit       (case 3)
+              ◀── "pull access denied, repository does not exist" for a local-only image (case 4)</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The doctor prescribed a medicine, and the pharmacy can't hand it over. The name is misspelled, it's in a locked cabinet you have no key for, or you've hit today's limit. Until it arrives, the patient can't even start treatment, so there's nothing to listen to (no logs).</p>
+        </div>
+
+        <h3>See it: case 1, a tag that doesn't exist</h3>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-5b7d9c8f6-q8wzn -n taskflow | sed -n '/Events:/,$p'
+<span class="out">Events:
   Type     Reason     Age                From               Message
   ----     ------     ----               ----               -------
   Normal   Scheduled  85s                default-scheduler  Successfully assigned taskflow/taskflow-api-5b7d9c8f6-q8wzn to minikube
@@ -605,50 +633,43 @@ Events:
   Warning  Failed     39s (x3 over 84s)  kubelet            Error: ErrImagePull
   Normal   BackOff    12s (x4 over 83s)  kubelet            Back-off pulling image "shauryav/taskflow-api:1.2"
   Warning  Failed     12s (x4 over 83s)  kubelet            Error: ImagePullBackOff</span>
-<span class="cm"># (containerd wording — kind/EKS. minikube's Docker runtime says "manifest for … not found: manifest unknown")</span>
-
+<span class="cm"># (containerd wording, as on kind/EKS. minikube's Docker runtime says "manifest for … not found: manifest unknown")</span>
 <span class="pr">$</span> docker manifest inspect shauryav/taskflow-api:1.2 &gt; /dev/null     <span class="cm"># confirm from your laptop</span>
 <span class="out">no such manifest: docker.io/shauryav/taskflow-api:1.2</span>
 <span class="pr">$</span> kubectl set image deploy/taskflow-api api=shauryav/taskflow-api:1.2.0 -n taskflow   <span class="cm"># fix (and fix the YAML in Git)</span>
 <span class="out">deployment.apps/taskflow-api image updated</span></pre>
+        <p>Notice how the full name was expanded to <code class="inl">docker.io/shauryav/taskflow-api:1.2</code> (Session 6's naming rules). <strong>What <code class="inl">ImagePullBackOff</code> does <em>not</em> tell you:</strong> which cause it is. Only the <code class="inl">Failed</code> event's message does, so always read it.</p>
 
-        <h3>Case 2 — private registry, no credentials</h3>
-<pre><span class="out">  Warning  Failed  10s (x2 over 25s)  kubelet  Failed to pull image "ghcr.io/shauryav/taskflow-api:1.2.0": failed to pull and unpack image "ghcr.io/shauryav/taskflow-api:1.2.0": failed to resolve reference "ghcr.io/shauryav/taskflow-api:1.2.0": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Ashauryav%2Ftaskflow-api%3Apull&amp;service=ghcr.io: 401 Unauthorized</span>
-
+        <h3>Build it up: the other causes</h3>
+        <h4>Case 2: private registry, no credentials</h4>
+<pre><span class="out">  Warning  Failed  10s (x2 over 25s)  kubelet  Failed to pull image "ghcr.io/shauryav/taskflow-api:1.2.0": … failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Ashauryav%2Ftaskflow-api%3Apull&amp;service=ghcr.io: 401 Unauthorized</span>
 <span class="pr">$</span> kubectl create secret docker-registry ghcr-cred -n taskflow \
     --docker-server=ghcr.io --docker-username=shauryav --docker-password="$GHCR_PAT"   <span class="cm"># PAT with read:packages</span>
-<span class="out">secret/ghcr-cred created</span></pre>
-        <div class="fname">k8s/deployment.yaml — fixed (pod template spec)</div>
-<pre>    spec:
-      imagePullSecrets:
-        - name: ghcr-cred                     <span class="cm"># same namespace as the pod</span>
-      containers:
-        - name: api
-          image: ghcr.io/shauryav/taskflow-api:1.2.0</pre>
-        <p>Or attach it once to the namespace's default ServiceAccount: <code class="inl">kubectl patch serviceaccount default -n taskflow -p '{"imagePullSecrets":[{"name":"ghcr-cred"}]}'</code>.</p>
-
-        <h3>Case 3 — Docker Hub rate limit &amp; Case 4 — local image on minikube</h3>
+<span class="out">secret/ghcr-cred created</span>
+<span class="cm"># then in the pod template:  spec.imagePullSecrets: [{ name: ghcr-cred }]   (Session 12)</span>
+<span class="cm"># or once per namespace:</span>
+<span class="pr">$</span> kubectl patch serviceaccount default -n taskflow -p '{"imagePullSecrets":[{"name":"ghcr-cred"}]}'</pre>
+        <h4>Case 3: Docker Hub rate limit · Case 4: a local image on minikube</h4>
 <pre><span class="out">  Warning  Failed  5s  kubelet  Failed to pull image "postgres:16": … 429 Too Many Requests - Server message: toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit</span>
-<span class="cm"># fix: imagePullSecret with Docker Hub creds, imagePullPolicy: IfNotPresent, or mirror the image to GHCR/ECR</span>
+<span class="cm"># fix: an imagePullSecret with Docker Hub creds, imagePullPolicy: IfNotPresent, or mirror the image to GHCR/ECR</span>
 
-<span class="cm"># Built on your laptop with "docker build -t taskflow-api:dev ." — the cluster's runtime doesn't have it:</span>
+<span class="cm"># built on your laptop with "docker build -t taskflow-api:dev ." — the cluster's runtime doesn't have it:</span>
 <span class="out">  Warning  Failed  4s  kubelet  Failed to pull image "taskflow-api:dev": … pull access denied, repository does not exist or may require authorization</span>
 <span class="pr">$</span> minikube image load taskflow-api:dev          <span class="cm"># kind: kind load docker-image taskflow-api:dev</span>
 <span class="cm"># and set imagePullPolicy: IfNotPresent (or Never) so the kubelet doesn't try Docker Hub</span></pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th><code class="inl">imagePullPolicy</code></th><th>Behaviour</th><th>Default when</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">Always</code></td><td>Check the registry on every container start</td><td>tag is <code class="inl">:latest</code> or no tag</td></tr>
-              <tr><td><code class="inl">IfNotPresent</code></td><td>Pull only if not cached on the node</td><td>any other tag</td></tr>
-              <tr><td><code class="inl">Never</code></td><td>Never pull; fail if missing</td><td>—</td></tr>
+              <tr><td><code class="inl">Always</code></td><td>Check the registry on every container start</td><td>The tag is <code class="inl">:latest</code> or missing</td></tr>
+              <tr><td><code class="inl">IfNotPresent</code></td><td>Pull only if the image isn't cached on the node</td><td>Any other tag</td></tr>
+              <tr><td><code class="inl">Never</code></td><td>Never pull; fail if it's missing</td><td>—</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>CreateContainerConfigError — missing ConfigMap / Secret / key</h3>
-        <div class="fname">k8s/deployment.yaml — broken (env)</div>
+        <h4>The sibling: CreateContainerConfigError</h4>
+        <p>Here the image is fine, but the container spec references something that doesn't exist:</p>
 <pre>            - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -657,27 +678,34 @@ Events:
 <pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
 <span class="out">NAME                           READY   STATUS                       RESTARTS   AGE
 taskflow-api-7f9c6d5b8-m2xvd   0/1     CreateContainerConfigError   0          22s</span>
-<span class="pr">$</span> kubectl describe pod taskflow-api-7f9c6d5b8-m2xvd -n taskflow | tail -2
-<span class="out">  Normal   Pulled   5s (x3 over 22s)  kubelet  Container image "shauryav/taskflow-api:1.2.0" already present on machine
-  Warning  Failed   5s (x3 over 22s)  kubelet  Error: couldn't find key DB_URL in Secret taskflow/taskflow-db-secret</span>
-<span class="pr">$</span> kubectl describe secret taskflow-db-secret -n taskflow     <span class="cm"># lists keys + sizes, never values</span>
-<span class="out">Name:         taskflow-db-secret
-Namespace:    taskflow
-Type:  Opaque
-
-Data
+<span class="pr">$</span> kubectl describe pod taskflow-api-7f9c6d5b8-m2xvd -n taskflow | tail -1
+<span class="out">  Warning  Failed   5s (x3 over 22s)  kubelet  Error: couldn't find key DB_URL in Secret taskflow/taskflow-db-secret</span>
+<span class="pr">$</span> kubectl describe secret taskflow-db-secret -n taskflow | sed -n '/Data/,$p'     <span class="cm"># keys + sizes, never values</span>
+<span class="out">Data
 ====
 DATABASE_URL:       58 bytes
 POSTGRES_PASSWORD:  12 bytes</span></pre>
-        <ul>
-          <li>Other messages you'll see: <code class="inl">Error: secret "taskflow-db-secret" not found</code> (often: created in <code class="inl">default</code> — forgot <code class="inl">-n taskflow</code>), <code class="inl">Error: configmap "taskflow-config" not found</code>, <code class="inl">couldn't find key LOG_LEVEL in ConfigMap taskflow/taskflow-config</code>.</li>
-          <li><strong>Fix</strong>: correct the key name (or add the key). The kubelet keeps retrying, so once the object/key exists the container starts — no restart needed.</li>
-          <li>A missing ConfigMap mounted as a <em>volume</em> shows differently: stuck in <code class="inl">ContainerCreating</code> with <code class="inl">FailedMount … configmap "taskflow-config" not found</code>.</li>
-        </ul>
+        <p><strong>Fix:</strong> correct the key name (or add the key). The kubelet keeps retrying, so the container starts as soon as the key exists, with no restart needed. Other messages you'll see: <code class="inl">secret "taskflow-db-secret" not found</code> (often created in <code class="inl">default</code>), <code class="inl">configmap "taskflow-config" not found</code>. A missing ConfigMap mounted as a <em>volume</em> shows differently: stuck in <code class="inl">ContainerCreating</code> with <code class="inl">FailedMount … configmap "taskflow-config" not found</code>.</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Image errors: check the exact name/tag, registry auth (<code class="inl">imagePullSecrets</code>), rate limits, and on minikube <code class="inl">minikube image load</code>. Config errors: the Event names the missing Secret/ConfigMap/key — fix it and the kubelet retries.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"ImagePullBackOff means the registry is down." <strong>✗</strong> Usually it's your typo, your missing credentials or your rate limit. The event message says which.</p>
+          <p>"I created the pull secret, so all namespaces can pull." <strong>✗</strong> Secrets are namespaced. <code class="inl">ghcr-cred</code> must exist in each pod's namespace and be referenced via <code class="inl">imagePullSecrets</code> or the ServiceAccount.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Image or config errors → no logs exist → read <code class="inl">describe pod</code> Events.</strong><br /><strong>not found = typo · 401 = credentials · 429 = rate limit · local image = <code class="inl">minikube image load</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: <code class="inl">Failed to pull image "ghcr.io/shauryav/taskflow-api:1.2.0": … 401 Unauthorized</code>. The tag definitely exists. Fix?</summary>
+            <p class="ans">It's a private package and the kubelet has no credentials. <code class="inl">kubectl create secret docker-registry ghcr-cred -n taskflow --docker-server=ghcr.io …</code> with a PAT that has <code class="inl">read:packages</code>, then add <code class="inl">imagePullSecrets: [{name: ghcr-cred}]</code> to the pod template (or patch the default ServiceAccount).</p></details>
+          <details class="quiz"><summary>Q2. You built <code class="inl">taskflow-api:dev</code> locally and minikube says <code class="inl">pull access denied, repository does not exist</code>. What two things do you change?</summary>
+            <p class="ans">Load the image into the cluster's runtime (<code class="inl">minikube image load taskflow-api:dev</code>), and set <code class="inl">imagePullPolicy: IfNotPresent</code> (or <code class="inl">Never</code>) so the kubelet uses the local copy instead of asking Docker Hub for <code class="inl">library/taskflow-api</code>.</p></details>
+          <details class="quiz"><summary>Q3. Diagnose: one pod is <code class="inl">CreateContainerConfigError</code> with <code class="inl">configmap "taskflow-config" not found</code>; another is stuck in <code class="inl">ContainerCreating</code> with <code class="inl">FailedMount … configmap "taskflow-config" not found</code>. Same root cause?</summary>
+            <p class="ans">Yes: the ConfigMap is missing in this namespace. The first pod references it as an env source, so the container can't be configured. The second mounts it as a volume, so the mount fails before the container is created. Create the ConfigMap, and both start without a restart.</p></details>
         </div>
       </section>
 
@@ -686,42 +714,33 @@ POSTGRES_PASSWORD:  12 bytes</span></pre>
         <h2><span class="sec-num">6</span> Pending pods</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The pod is waiting in the lobby because no room (node) fits its booking: too big, wrong kind of room, or its luggage (PVC) hasn't arrived.</p>
-        </div>
-
-        <ul>
-          <li><code class="inl">Pending</code> with an empty <code class="inl">Node:</code> = the scheduler couldn't place it. The scheduler writes exactly why into a <code class="inl">FailedScheduling</code> event.</li>
-          <li>Read it as: <code class="inl">0/N nodes are available: &lt;count&gt; &lt;reason&gt;, …</code> — one reason per group of nodes. The <code class="inl">preemption:</code> part says whether evicting lower-priority pods would help (usually not).</li>
-        </ul>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Reason in the event</th><th>Cause</th><th>Fix</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">Insufficient cpu</code> / <code class="inl">Insufficient memory</code></td><td>Sum of <strong>requests</strong> doesn't fit on any node</td><td>Lower requests, add nodes / bigger nodes</td></tr>
-              <tr><td><code class="inl">pod has unbound immediate PersistentVolumeClaims</code></td><td>PVC is <code class="inl">Pending</code></td><td><code class="inl">describe pvc</code> (class typo, no matching PV)</td></tr>
-              <tr><td><code class="inl">didn't match Pod's node affinity/selector</code></td><td><code class="inl">nodeSelector</code>/affinity matches no node labels</td><td>Label a node or fix the selector</td></tr>
-              <tr><td><code class="inl">had untolerated taint {key: value}</code></td><td>Node tainted, pod has no toleration</td><td>Add toleration or remove the taint (Session 16)</td></tr>
-              <tr><td><code class="inl">node(s) didn't have free ports</code></td><td><code class="inl">hostPort</code> already used</td><td>Drop <code class="inl">hostPort</code>; use a Service</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Case 1 — requests too big</h3>
+        <h3>The problem</h3>
         <div class="fname">k8s/deployment.yaml — broken (resources)</div>
 <pre>          resources:
             requests:
-              cpu: "2"            <span class="cm"># ← copied from a prod values file; minikube has 2 CPUs total</span>
+              cpu: <span class="st">"2"</span>            <span class="cm"># ← copied from a prod values file; minikube has 2 CPUs total</span>
               memory: 512Mi</pre>
-<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
-<span class="out">NAME                           READY   STATUS    RESTARTS   AGE
-taskflow-api-8d6f5c7b9-tq2lx   0/1     Pending   0          2m</span>
-<span class="pr">$</span> kubectl describe pod taskflow-api-8d6f5c7b9-tq2lx -n taskflow | tail -3
-<span class="out">  Type     Reason            Age   From               Message
-  ----     ------            ----  ----               -------
-  Warning  FailedScheduling  2m    default-scheduler  0/1 nodes are available: 1 Insufficient cpu. preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod.</span>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -o wide
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE   IP       NODE     NOMINATED NODE   READINESS GATES
+taskflow-api-8d6f5c7b9-tq2lx   0/1     Pending   0          2m    &lt;none&gt;   &lt;none&gt;   &lt;none&gt;           &lt;none&gt;</span></pre>
+        <p>No IP, no node, after two minutes. Meanwhile <code class="inl">kubectl top nodes</code> says the node is only 15% busy.</p>
+        <details class="quiz"><summary>Predict: the node is 85% idle. Why won't the scheduler place a pod that asks for 2 CPUs?</summary>
+          <p class="ans">The scheduler doesn't look at usage. It adds up the <strong>requests</strong> of the pods already on the node. 2 CPUs allocatable − 1050m already requested = 950m free, which is less than 2, so it never fits.</p></details>
+
+        <h3>The idea</h3>
+        <p><code class="inl">Pending</code> with an empty <code class="inl">Node:</code> means the scheduler couldn't place the pod. For each pod it filters out nodes that can't take it, then scores the survivors. If zero nodes survive, it writes a <code class="inl">FailedScheduling</code> event that says exactly why, as <code class="inl">0/N nodes are available: &lt;count&gt; &lt;reason&gt;, …</code>. The <code class="inl">preemption:</code> part says whether evicting lower-priority pods would help (usually not).</p>
+<pre> all nodes ─▶ enough unrequested cpu/memory? ─▶ matches nodeSelector/affinity? ─▶ tolerates taints?
+          ─▶ its PVCs bound / bindable here? ─▶ free hostPort? ─▶ 0 left → Pending + FailedScheduling
+                                                                  ≥1 left → score → bind → kubelet starts it</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The patient is waiting in the lobby for a bed. Every bed is <em>reserved</em> (requests), even if the people in them are asleep (low usage). Or the patient asked for the cardiac ward and this hospital has none (nodeSelector). Or the ward has a "staff only" sign (taint). Or their equipment hasn't arrived (an unbound PVC). The admissions desk writes down which one it was.</p>
+        </div>
+
+        <h3>See it: read the scheduler's reason</h3>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-8d6f5c7b9-tq2lx -n taskflow | tail -1
+<span class="out">  Warning  FailedScheduling  2m    default-scheduler  0/1 nodes are available: 1 Insufficient cpu. preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod.</span>
 <span class="pr">$</span> kubectl describe node minikube | grep -A 6 "Allocated resources"
 <span class="out">Allocated resources:
   (Total limits may be over 100 percent, i.e., overcommitted.)
@@ -729,22 +748,14 @@ taskflow-api-8d6f5c7b9-tq2lx   0/1     Pending   0          2m</span>
   --------           --------     ------
   cpu                1050m (52%)  1 (50%)
   memory             668Mi (8%)   1194Mi (15%)
-  ephemeral-storage  0 (0%)       0 (0%)</span>
-<span class="cm"># 2 CPUs allocatable − 1050m already requested = 950m free &lt; 2 requested → never fits</span></pre>
-        <p><strong>Fix</strong>: set requests from real usage (<code class="inl">kubectl top</code>) — <code class="inl">cpu: 100m</code> here. Or add capacity: <code class="inl">minikube node add</code>, or the cluster autoscaler on EKS.</p>
+  ephemeral-storage  0 (0%)       0 (0%)</span></pre>
+        <p>"0/1 nodes are available: 1 Insufficient cpu" reads as: of 1 node, 0 fit, and 1 was ruled out for CPU. Allocated resources confirms it: 1050m is already requested out of 2 cores. <strong>Fix:</strong> set requests from real usage (<code class="inl">kubectl top</code>), here <code class="inl">cpu: 100m</code>. Or add capacity: <code class="inl">minikube node add</code>, or the Cluster Autoscaler on EKS.</p>
+        <p><strong>What Pending does <em>not</em> mean:</strong> "still downloading". Pulling happens after scheduling, under <code class="inl">ContainerCreating</code>.</p>
 
-        <h3>Case 2 — PVC never binds</h3>
-        <div class="fname">k8s/postgres.yaml — broken (PVC)</div>
-<pre>spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: fast-ssd          <span class="cm"># ← no such StorageClass on this cluster</span>
-  resources:
-    requests:
-      storage: 5Gi</pre>
-<pre><span class="out">  Warning  FailedScheduling  30s  default-scheduler  0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims. preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.</span>
-<span class="pr">$</span> kubectl get pvc -n taskflow
-<span class="out">NAME               STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
-taskflow-db-data   Pending                                      fast-ssd       &lt;unset&gt;                 3m</span>
+        <h3>Build it up: the other reasons</h3>
+        <h4>Case 2: the PVC never binds</h4>
+<pre><span class="cm"># k8s/postgres.yaml PVC:  storageClassName: fast-ssd   ← no such StorageClass on this cluster</span>
+<span class="out">  Warning  FailedScheduling  30s  default-scheduler  0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims. preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.</span>
 <span class="pr">$</span> kubectl describe pvc taskflow-db-data -n taskflow | tail -1
 <span class="out">  Warning  ProvisioningFailed  12s (x14 over 3m)  persistentvolume-controller  storageclass.storage.k8s.io "fast-ssd" not found</span>
 <span class="pr">$</span> kubectl get storageclass
@@ -752,10 +763,9 @@ taskflow-db-data   Pending                                      fast-ssd       &
 standard (default)   k8s.io/minikube-hostpath   Delete          Immediate           false                  3d</span>
 <span class="cm"># storageClassName is immutable on a PVC → fix the YAML, delete and recreate the claim</span>
 <span class="pr">$</span> kubectl delete pvc taskflow-db-data -n taskflow &amp;&amp; kubectl apply -f k8s/postgres.yaml</pre>
-
-        <h3>Case 3 — nodeSelector &amp; Case 4 — taint</h3>
+        <h4>Case 3: nodeSelector · Case 4: taint</h4>
 <pre><span class="cm"># nodeSelector: { disktype: ssd }  ← no node has that label</span>
-<span class="out">  Warning  FailedScheduling  15s  default-scheduler  0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector. preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.</span>
+<span class="out">  Warning  FailedScheduling  15s  default-scheduler  0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector. preemption: …</span>
 <span class="pr">$</span> kubectl get nodes -L disktype
 <span class="out">NAME       STATUS   ROLES           AGE   VERSION   DISKTYPE
 minikube   Ready    control-plane   3d    v1.34.0</span>
@@ -763,20 +773,43 @@ minikube   Ready    control-plane   3d    v1.34.0</span>
 <span class="out">node/minikube labeled</span>
 
 <span class="cm"># someone ran: kubectl taint nodes minikube dedicated=db:NoSchedule</span>
-<span class="out">  Warning  FailedScheduling  8s  default-scheduler  0/1 nodes are available: 1 node(s) had untolerated taint {dedicated: db}. preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.</span>
+<span class="out">  Warning  FailedScheduling  8s  default-scheduler  0/1 nodes are available: 1 node(s) had untolerated taint {dedicated: db}. preemption: …</span>
 <span class="pr">$</span> kubectl describe node minikube | grep Taints
 <span class="out">Taints:             dedicated=db:NoSchedule</span>
-<span class="pr">$</span> kubectl taint nodes minikube dedicated=db:NoSchedule-       <span class="cm"># trailing "-" removes it</span>
+<span class="pr">$</span> kubectl taint nodes minikube dedicated=db:NoSchedule-       <span class="cm"># the trailing "-" removes it</span>
 <span class="out">node/minikube untainted</span></pre>
-
-        <div class="callout note">
-          <span class="c-title">No pods at all?</span>
-          <p>If <code class="inl">kubectl get deploy</code> shows <code class="inl">0/2</code> but <code class="inl">kubectl get pods</code> shows nothing, the pods were never <em>created</em> — admission rejected them. Check <code class="inl">kubectl describe rs -n taskflow</code> for <code class="inl">FailedCreate</code> (ResourceQuota / LimitRange — Session 15; Pod Security — Session 16).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Reason in the event</th><th>Cause</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Insufficient cpu</code> / <code class="inl">Insufficient memory</code></td><td>The sum of <strong>requests</strong> doesn't fit on any node</td><td>Lower requests; add nodes or bigger nodes</td></tr>
+              <tr><td><code class="inl">pod has unbound immediate PersistentVolumeClaims</code></td><td>The PVC is <code class="inl">Pending</code></td><td><code class="inl">describe pvc</code> (class typo, no matching PV)</td></tr>
+              <tr><td><code class="inl">didn't match Pod's node affinity/selector</code></td><td><code class="inl">nodeSelector</code>/affinity matches no node's labels</td><td>Label a node or fix the selector</td></tr>
+              <tr><td><code class="inl">had untolerated taint {key: value}</code></td><td>The node is tainted and the pod has no toleration</td><td>Add a toleration or remove the taint (Session 16)</td></tr>
+              <tr><td><code class="inl">node(s) didn't have free ports</code></td><td>The <code class="inl">hostPort</code> is already used</td><td>Drop <code class="inl">hostPort</code>; use a Service</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Pending = scheduler problem. The <code class="inl">FailedScheduling</code> event names it: resources (requests), unbound PVC, selector/affinity, taints. Compare with <code class="inl">describe node</code>.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"The node shows 30% usage in <code class="inl">kubectl top</code>, so the pod must fit." <strong>✗</strong> Scheduling uses <strong>requests</strong>, not usage. Check <code class="inl">describe node</code> → Allocated resources.</p>
+          <p>"Pending is the kubelet's fault." <strong>✗</strong> No kubelet has the pod yet. The <em>scheduler</em> (<code class="inl">default-scheduler</code> in the event's From column) is the one refusing.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Pending = scheduler problem. <code class="inl">FailedScheduling</code> names it: requests, PVC, selector/affinity, taint.</strong><br /><strong>Scheduler counts requests, not usage.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: <code class="inl">0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 Insufficient memory.</code> Which nodes were ruled out for what, and what are your options?</summary>
+            <p class="ans">The control-plane node was excluded by its taint. The two workers are excluded because their unrequested memory is less than the pod's request. Options: lower the pod's memory request, add or enlarge worker nodes, or free requests by scaling something down. Tolerating the control-plane taint is not the answer.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">kubectl get deploy</code> shows <code class="inl">0/2</code>, yet there are no Pending pods, or any pods. Is this a scheduling problem?</summary>
+            <p class="ans">No. Unschedulable pods would exist and be Pending. Here the pods were never created, because admission rejected them. <code class="inl">kubectl describe rs -n taskflow</code> shows <code class="inl">FailedCreate</code> (ResourceQuota/LimitRange, Session 15; Pod Security, Session 16).</p></details>
+          <details class="quiz"><summary>Q3. The Postgres pod is Pending with <code class="inl">pod has unbound immediate PersistentVolumeClaims</code>. Which object do you describe next, and why can't you just edit its class?</summary>
+            <p class="ans">The PVC (<code class="inl">kubectl describe pvc taskflow-db-data</code>), whose <code class="inl">ProvisioningFailed</code> event names the bad class. <code class="inl">storageClassName</code> is immutable on an existing PVC, so you fix the YAML, delete the claim and recreate it.</p></details>
         </div>
       </section>
 
@@ -785,40 +818,32 @@ minikube   Ready    control-plane   3d    v1.34.0</span>
         <h2><span class="sec-num">7</span> Service &amp; DNS troubleshooting</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The pods are fine but nobody can find them: the phone book entry (DNS) is wrong, or the receptionist (Service) is forwarding calls to the wrong desk.</p>
-        </div>
+        <h3>The problem: puzzle 1, the 503</h3>
+        <p>Back to the morning's first symptom. Every API pod is <code class="inl">1/1 Running</code>, <code class="inl">port-forward</code> to a pod works (§3), and yet:</p>
+<pre><span class="pr">$</span> curl -sk -o /dev/null -w '%{http_code}\n' https://taskflow.local/api/tasks
+<span class="out">503</span>
+<span class="pr">$</span> kubectl run tmp -n taskflow --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- -T 3 taskflow-api/health
+<span class="out">wget: can't connect to remote host (10.96.45.12): Connection refused
+pod "tmp" deleted
+pod taskflow/tmp terminated (Error)</span></pre>
+        <p>The name resolved (we got an IP), but nothing answered behind it. The app is fine and the pods are fine, so the break is in the wiring between them.</p>
+        <details class="quiz"><summary>Predict: DNS works and the pods are healthy. Which object is most likely wrong, and which one command checks it?</summary>
+          <p class="ans">The Service. Its selector probably matches no ready pods, so it has no endpoints. <code class="inl">kubectl get endpoints taskflow-api -n taskflow</code> (or the EndpointSlices) will show <code class="inl">&lt;none&gt;</code>.</p></details>
 
+        <h3>The idea</h3>
+        <p>A request to a Service passes four checkpoints, and each has its own test. Walk them in order, and the first one that fails is your bug:</p>
 <pre>client pod ──DNS──▶ Service IP:80 ──selector──▶ EndpointSlice ──targetPort──▶ READY pod :3000
  (1) name resolves?   (2) Service exists,       (3) endpoints          (4) app listening on
-                          right port?               non-empty?             that port?</pre>
+                          right port?               non-empty?             that port?
+ nslookup FQDN        get svc                   get endpointslices     exec … wget localhost:3000</pre>
 
-        <p>Test from inside the cluster with a throwaway pod:</p>
-<pre><span class="pr">$</span> kubectl run tmp -n taskflow --rm -it --image=busybox:1.36 --restart=Never -- sh
-<span class="pr">/ #</span> wget -qO- -T 3 taskflow-api/health
-<span class="out">{"status":"ok"}</span>             <span class="cm">← healthy result; anything else → follow the cases below</span></pre>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The hospital switchboard. The patient is fine and their bedside phone works (port-forward). But the directory might have no entry for the ward you're calling from (DNS, wrong namespace), or the switchboard routes the ward's number to an empty room (selector matches nothing), or to the right room but the wrong extension (targetPort).</p>
+        </div>
 
-        <h3>Case 1 — selector doesn't match (no endpoints)</h3>
-        <div class="fname">k8s/service.yaml — broken</div>
-<pre>apiVersion: v1
-kind: Service
-metadata:
-  name: taskflow-api
-  namespace: taskflow
-spec:
-  selector:
-    app: taskflow           <span class="cm"># ← pods are labelled app=taskflow-api</span>
-  ports:
-    - name: http
-      port: 80
-      targetPort: http</pre>
-<pre><span class="pr">/ #</span> wget -qO- -T 3 taskflow-api/health
-<span class="out">wget: can't connect to remote host (10.96.45.12): Connection refused</span>
-<span class="pr">$</span> curl -i http://taskflow.local/api/health           <span class="cm"># through the Ingress</span>
-<span class="out">HTTP/1.1 503 Service Temporarily Unavailable</span>
-
-<span class="pr">$</span> kubectl get endpoints taskflow-api -n taskflow
+        <h3>See it: checkpoint 3, no endpoints</h3>
+<pre><span class="pr">$</span> kubectl get endpoints taskflow-api -n taskflow
 <span class="out">Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
 NAME           ENDPOINTS   AGE
 taskflow-api   &lt;none&gt;      6m</span>
@@ -828,37 +853,39 @@ Endpoints:</span>
 <span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow        <span class="cm"># test the Service's selector directly</span>
 <span class="out">No resources found in taskflow namespace.</span>
 <span class="pr">$</span> kubectl get pods -n taskflow --show-labels | grep api
-<span class="out">taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running   0          2d    app=taskflow-api,pod-template-hash=7c9d8f6b5d</span>
-
-<span class="cm"># fix selector to app: taskflow-api, apply, re-check (EndpointSlice view)</span>
+<span class="out">taskflow-api-7c9d8f6b5d-4kq2x   1/1     Running   0          2d    app=taskflow-api,pod-template-hash=7c9d8f6b5d</span></pre>
+        <div class="fname">k8s/service.yaml — broken (someone "tidied" the selector during the incident)</div>
+<pre><span class="kw">spec:</span>
+  selector:
+    app: taskflow           <span class="cm"># ← the pods are labelled app=taskflow-api</span>
+  ports:
+    - { name: http, port: 80, targetPort: http }</pre>
+<pre><span class="cm"># fix the selector to app: taskflow-api, apply, re-check</span>
 <span class="pr">$</span> kubectl get endpointslices -n taskflow -l kubernetes.io/service-name=taskflow-api
 <span class="out">NAME                 ADDRESSTYPE   PORTS   ENDPOINTS                 AGE
-taskflow-api-7xk2p   IPv4          3000    10.244.0.14,10.244.0.15   6m</span></pre>
+taskflow-api-7xk2p   IPv4          3000    10.244.0.14,10.244.0.15   6m</span>
+<span class="pr">$</span> curl -sk -o /dev/null -w '%{http_code}\n' https://taskflow.local/api/tasks
+<span class="out">200</span></pre>
+        <p>That solves puzzle 1. A Service with no endpoints refuses in-cluster connections, and ingress-nginx turns "no endpoints" into <code class="inl">503</code>. <strong>What the Service does <em>not</em> do:</strong> warn you. A selector that matches nothing is perfectly valid YAML.</p>
 
-        <h3>Case 2 — wrong targetPort</h3>
-<pre><span class="cm"># targetPort: 8080   ← app listens on 3000</span>
+        <h3>Build it up: the other checkpoints</h3>
+        <h4>Checkpoint 4: wrong targetPort</h4>
+<pre><span class="cm"># targetPort: 8080   ← the app listens on 3000</span>
 <span class="pr">$</span> kubectl get endpoints taskflow-api -n taskflow
 <span class="out">NAME           ENDPOINTS                           AGE
-taskflow-api   10.244.0.14:8080,10.244.0.15:8080   9m</span>      <span class="cm">← endpoints exist, port is wrong</span>
-<span class="pr">/ #</span> wget -qO- -T 3 taskflow-api/health
-<span class="out">wget: can't connect to remote host (10.96.45.12): Connection refused</span>
-<span class="pr">$</span> kubectl exec deploy/taskflow-api -n taskflow -- wget -qO- localhost:3000/health   <span class="cm"># app itself is fine</span>
+taskflow-api   10.244.0.14:8080,10.244.0.15:8080   9m</span>      <span class="cm">← endpoints exist, the port is wrong</span>
+<span class="pr">$</span> kubectl exec deploy/taskflow-api -n taskflow -- wget -qO- localhost:3000/health   <span class="cm"># the app itself is fine</span>
 <span class="out">{"status":"ok"}</span></pre>
-        <p><strong>Fix</strong>: <code class="inl">targetPort: 3000</code> or the named port <code class="inl">http</code>. Remember: <code class="inl">port</code> = what clients call (80), <code class="inl">targetPort</code> = the container's port (3000). Through ingress-nginx this shows as <code class="inl">502 Bad Gateway</code>.</p>
-
-        <h3>Case 3 — readiness failing (READY 0/1)</h3>
-<pre><span class="cm"># readinessProbe.httpGet.path: /healthz   ← app serves /health</span>
+        <p>In-cluster you get <code class="inl">Connection refused</code>. Through ingress-nginx it shows as <code class="inl">502 Bad Gateway</code>. <strong>Fix:</strong> <code class="inl">targetPort: 3000</code>, or better, the named port <code class="inl">http</code>.</p>
+        <h4>Checkpoint 3 again: readiness failing (READY 0/1)</h4>
+<pre><span class="cm"># readinessProbe.httpGet.path: /healthz   ← the app serves /health</span>
 <span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
 <span class="out">NAME                            READY   STATUS    RESTARTS   AGE
 taskflow-api-59c8d7f6b4-h2j9k   0/1     Running   0          2m</span>
 <span class="pr">$</span> kubectl describe pod taskflow-api-59c8d7f6b4-h2j9k -n taskflow | tail -1
-<span class="out">  Warning  Unhealthy  3s (x25 over 2m)  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 404</span>
-<span class="pr">$</span> kubectl get endpoints taskflow-api -n taskflow
-<span class="out">NAME           ENDPOINTS   AGE
-taskflow-api   &lt;none&gt;      2m</span>           <span class="cm">← not-ready pods are excluded</span></pre>
-        <p><strong>Fix</strong>: correct the path. Not-ready pods are never restarted (that's liveness) — they just sit at 0/1 forever.</p>
-
-        <h3>Case 4 — DNS: wrong namespace or CoreDNS down</h3>
+<span class="out">  Warning  Unhealthy  3s (x25 over 2m)  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 404</span></pre>
+        <p>Endpoints show <code class="inl">&lt;none&gt;</code> again, because not-ready pods are excluded, even though the selector is right. Not-ready pods are never restarted (that's liveness), so they sit at 0/1 forever. Correct the path.</p>
+        <h4>Checkpoint 1: DNS, wrong namespace or CoreDNS down</h4>
 <pre><span class="cm"># from a pod in the "monitoring" namespace</span>
 <span class="pr">/ #</span> wget -qO- -T 3 taskflow-api/health
 <span class="out">wget: bad address 'taskflow-api'</span>
@@ -869,41 +896,42 @@ Address:	10.96.0.10:53
 Name:	taskflow-api.taskflow.svc.cluster.local
 Address: 10.96.45.12</span>
 <span class="cm"># short names only work inside the same namespace → use taskflow-api.taskflow (or the FQDN)</span>
-
-<span class="cm"># nothing resolves at all ("connection timed out; no servers could be reached")? check CoreDNS</span>
+<span class="cm"># nothing resolves at all ("connection timed out; no servers could be reached")? check CoreDNS:</span>
 <span class="pr">$</span> kubectl get pods -n kube-system -l k8s-app=kube-dns
 <span class="out">NAME                       READY   STATUS    RESTARTS   AGE
 coredns-668d6bf9bc-8xk2l   1/1     Running   0          3d</span>
-<span class="pr">$</span> kubectl get svc kube-dns -n kube-system
-<span class="out">NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)                  AGE
-kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP   3d</span>
 <span class="pr">$</span> kubectl logs -n kube-system -l k8s-app=kube-dns --tail=20</pre>
-
-        <h3>Isolate the layer with port-forward</h3>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Test</th><th>Works?</th><th>Conclusion</th></tr></thead>
+            <thead><tr><th>Test</th><th>Result</th><th>Conclusion</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">kubectl port-forward pod/… 8080:3000</code> + <code class="inl">curl localhost:8080/health</code></td><td>No</td><td>App problem → logs, exec</td></tr>
-              <tr><td>Pod works, <code class="inl">wget taskflow-api/health</code> from tmp pod fails</td><td>—</td><td>Service problem → endpoints, selector, targetPort, readiness</td></tr>
-              <tr><td>Service works in-cluster, <code class="inl">curl taskflow.local</code> fails</td><td>—</td><td>Ingress problem → <code class="inl">/etc/hosts</code>, ingressClassName, host/path rules (Session 12)</td></tr>
+              <tr><td><code class="inl">port-forward pod/… 8080:3000</code> + <code class="inl">curl localhost:8080/health</code></td><td>Fails</td><td>App problem → logs, exec (§3–§4)</td></tr>
+              <tr><td>Pod works; <code class="inl">wget taskflow-api/health</code> from a tmp pod fails</td><td>—</td><td>Service problem → endpoints, selector, targetPort, readiness</td></tr>
+              <tr><td>Service works in-cluster; <code class="inl">curl https://taskflow.local</code> fails</td><td>—</td><td>Ingress problem → <code class="inl">/etc/hosts</code>, ingressClassName, host/path rules (Session 12)</td></tr>
               <tr><td>Ingress returns <code class="inl">404</code> / <code class="inl">503</code> / <code class="inl">502</code></td><td>—</td><td>No rule matched / no ready endpoints / endpoint refused (wrong targetPort)</td></tr>
             </tbody>
           </table>
         </div>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Testing the Service from your laptop with <code class="inl">curl 10.96.45.12</code> — ClusterIPs only work inside the cluster. Use a tmp pod or port-forward.</li>
-            <li><code class="inl">ping</code>ing a Service IP: ClusterIPs are virtual and usually don't answer ICMP. Test the TCP port with <code class="inl">wget</code>/<code class="inl">nc</code>.</li>
-            <li>BusyBox <code class="inl">nslookup</code> of a short name can print odd NXDOMAIN lines because of search domains; query the FQDN, or use <code class="inl">registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3</code> for <code class="inl">dig</code>.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Test the Service from your laptop with <code class="inl">curl 10.96.45.12</code>." <strong>✗</strong> ClusterIPs only work inside the cluster. Use a tmp pod or port-forward.</p>
+          <p>"<code class="inl">ping taskflow-api</code> failed, so the Service is down." <strong>✗</strong> ClusterIPs are virtual and usually don't answer ICMP. Test the TCP port with <code class="inl">wget</code> or <code class="inl">nc</code>.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Walk the chain: DNS → Service → endpoints → targetPort → ready pod. <code class="inl">&lt;none&gt;</code> endpoints = selector mismatch or no ready pods. Wrong port = connection refused / 502. Cross-namespace = <code class="inl">svc.namespace</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Walk the chain: DNS → Service → endpoints → targetPort → ready pod.</strong><br /><strong><code class="inl">&lt;none&gt;</code> = selector mismatch or no ready pods (503) · wrong port = refused (502) · other namespace = <code class="inl">svc.namespace</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Diagnose: endpoints show <code class="inl">10.244.0.14:8080,10.244.0.15:8080</code>, and the ingress returns <code class="inl">502</code>. The pods listen on 3000.</summary>
+            <p class="ans">The selector is fine (endpoints exist) but <code class="inl">targetPort</code> is 8080, so connections to the pods are refused, which ingress-nginx reports as 502. Set <code class="inl">targetPort: http</code> (or 3000).</p></details>
+          <details class="quiz"><summary>Q2. Diagnose: from namespace <code class="inl">monitoring</code>, <code class="inl">wget taskflow-api/metrics</code> → <code class="inl">bad address</code>; from inside <code class="inl">taskflow</code> it works.</summary>
+            <p class="ans">Short names resolve through the pod's own namespace search domain. From <code class="inl">monitoring</code>, use <code class="inl">taskflow-api.taskflow</code> or the FQDN <code class="inl">taskflow-api.taskflow.svc.cluster.local</code>.</p></details>
+          <details class="quiz"><summary>Q3. Diagnose: endpoints <code class="inl">&lt;none&gt;</code>, <code class="inl">kubectl get pods -l app=taskflow-api</code> lists 2 pods, both <code class="inl">0/1 Running</code>. Selector bug?</summary>
+            <p class="ans">No, the selector matches (the label query found them). The pods fail readiness, and not-ready pods are left out of the endpoints. <code class="inl">describe pod</code> → <code class="inl">Readiness probe failed: …</code> shows why.</p></details>
         </div>
       </section>
 
@@ -915,14 +943,14 @@ kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP  
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">kubectl get pods -n taskflow -o wide</code></td><td>Status, restarts, pod IP, node.</td></tr>
-              <tr><td><code class="inl">kubectl get pods -A -w</code></td><td>Watch every namespace.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -n taskflow -o wide</code> / <code class="inl">-A -w</code></td><td>Status, restarts, pod IP, node / every namespace, live.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -l app=taskflow-api --show-labels</code></td><td>Filter by label; see the labels a selector must match.</td></tr>
               <tr><td><code class="inl">kubectl get pod POD -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'</code></td><td>Why the last run died (Error / OOMKilled).</td></tr>
               <tr><td><code class="inl">kubectl describe pod POD -n taskflow</code></td><td>State, Last State, exit code, probes, env refs, Events.</td></tr>
               <tr><td><code class="inl">kubectl get events -n taskflow --sort-by=.lastTimestamp</code></td><td>Timeline of the namespace.</td></tr>
-              <tr><td><code class="inl">kubectl get events -A --field-selector type=Warning</code></td><td>Only failures, cluster-wide.</td></tr>
+              <tr><td><code class="inl">kubectl get events -A --field-selector type=Warning</code> / <code class="inl">kubectl events --for pod/POD</code></td><td>Only failures, cluster-wide / one object's events, sorted.</td></tr>
               <tr><td><code class="inl">kubectl logs POD --previous</code></td><td>Logs of the crashed instance.</td></tr>
-              <tr><td><code class="inl">kubectl logs -l app=taskflow-api --prefix -f</code></td><td>Stream all replicas.</td></tr>
+              <tr><td><code class="inl">kubectl logs -l app=taskflow-api --prefix -f</code> / <code class="inl">-c NAME</code></td><td>Stream all replicas / pick a container.</td></tr>
               <tr><td><code class="inl">kubectl exec -it deploy/taskflow-api -- sh</code></td><td>Shell inside; test env, localhost, DNS, DB port.</td></tr>
               <tr><td><code class="inl">kubectl debug -it POD --image=busybox:1.36 --target=api</code></td><td>Ephemeral debug container (no-shell images).</td></tr>
               <tr><td><code class="inl">kubectl debug POD -it --copy-to=api-debug --container=api -- sh</code></td><td>Debug a crashing pod via a copy.</td></tr>
@@ -930,6 +958,7 @@ kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP  
               <tr><td><code class="inl">kubectl run tmp --rm -it --image=busybox:1.36 --restart=Never -- sh</code></td><td>Throwaway pod for wget/nslookup tests.</td></tr>
               <tr><td><code class="inl">kubectl get endpoints,endpointslices -n taskflow</code></td><td>Does the Service have ready backends?</td></tr>
               <tr><td><code class="inl">kubectl describe node minikube</code></td><td>Allocated requests, taints, pressure conditions.</td></tr>
+              <tr><td><code class="inl">kubectl set image deploy/taskflow-api api=IMAGE:TAG</code></td><td>Fix a bad image tag quickly (then fix Git).</td></tr>
               <tr><td><code class="inl">kubectl rollout undo deploy/taskflow-api</code></td><td>Roll back a bad release immediately.</td></tr>
               <tr><td><code class="inl">kubectl top pods -n taskflow</code></td><td>Live CPU/memory (OOM suspicion).</td></tr>
             </tbody>
@@ -943,7 +972,7 @@ kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP  
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>Every TaskFlow failure leaves a trail: STATUS in <code class="inl">get</code> says <em>where</em> it broke, <code class="inl">describe</code> + Events say <em>why</em> (scheduler, kubelet, controllers each write their reason), <code class="inl">logs --previous</code> shows what the app said before dying, and <code class="inl">exec</code>/<code class="inl">debug</code>/<code class="inl">port-forward</code> let you test each network hop. Fix the manifest in Git, re-apply, and confirm with <code class="inl">rollout status</code> — and use <code class="inl">rollout undo</code> while you investigate.</p>
+          <p>Every TaskFlow failure leaves a trail. STATUS in <code class="inl">get</code> says <em>where</em> it broke. <code class="inl">describe</code> and Events say <em>why</em>, because the scheduler, the kubelet and the controllers each write down their reason. <code class="inl">logs --previous</code> shows what the app said before dying, and <code class="inl">exec</code>/<code class="inl">debug</code>/<code class="inl">port-forward</code> let you test each hop. Use <code class="inl">rollout undo</code> while you investigate, then fix the manifest in Git, re-apply, and confirm with <code class="inl">rollout status</code>.</p>
         </div>
 
         <h3>Master table: symptom → cause → command → fix</h3>
@@ -965,43 +994,29 @@ kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP  
               <tr><td><code class="inl">Pending</code> "affinity/selector" / "taint"</td><td>No eligible node</td><td><code class="inl">get nodes -L</code>, <code class="inl">describe node</code></td><td>Label node / toleration / untaint</td></tr>
               <tr><td>Deploy 0/2, no pods exist</td><td>Quota/admission rejection</td><td><code class="inl">describe rs</code></td><td>Adjust quota or add requests/limits</td></tr>
               <tr><td><code class="inl">Running 0/1</code></td><td>Readiness failing</td><td><code class="inl">describe pod</code> Unhealthy</td><td>Fix probe path/port or the dependency</td></tr>
-              <tr><td>Service: connection refused, ENDPOINTS <code class="inl">&lt;none&gt;</code></td><td>Selector mismatch / no ready pods</td><td><code class="inl">get endpoints</code>, <code class="inl">get pods --show-labels</code></td><td>Fix selector / readiness</td></tr>
-              <tr><td>Service: refused, endpoints present</td><td>Wrong targetPort</td><td><code class="inl">get endpoints</code> (port)</td><td><code class="inl">targetPort: http</code></td></tr>
+              <tr><td>Service: connection refused, ENDPOINTS <code class="inl">&lt;none&gt;</code>; Ingress 503</td><td>Selector mismatch / no ready pods</td><td><code class="inl">get endpoints</code>, <code class="inl">get pods --show-labels</code></td><td>Fix selector / readiness</td></tr>
+              <tr><td>Service: refused, endpoints present; Ingress 502</td><td>Wrong targetPort</td><td><code class="inl">get endpoints</code> (port)</td><td><code class="inl">targetPort: http</code></td></tr>
               <tr><td><code class="inl">bad address 'svc'</code></td><td>Other namespace / typo / CoreDNS down</td><td><code class="inl">nslookup FQDN</code>, CoreDNS pods</td><td><code class="inl">svc.namespace</code>; fix CoreDNS</td></tr>
               <tr><td>HPA <code class="inl">&lt;unknown&gt;</code></td><td>No metrics-server / no requests</td><td><code class="inl">describe hpa</code>, <code class="inl">top pods</code></td><td>Enable metrics-server, add requests</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>A pod shows <code class="inl">CrashLoopBackOff</code> and <code class="inl">kubectl logs POD</code> prints nothing. What do you run next?</summary>
-          <p class="ans"><code class="inl">kubectl logs POD --previous</code> (logs of the crashed instance) and <code class="inl">kubectl describe pod POD</code> to read <code class="inl">Last State: Terminated</code> → Reason + Exit Code.</p>
-        </details>
-        <details class="quiz">
-          <summary>Last State shows <code class="inl">Reason: OOMKilled, Exit Code: 137</code>. Explain 137 and two fixes.</summary>
-          <p class="ans">137 = 128 + 9 (SIGKILL) — the kernel killed the container for exceeding <code class="inl">limits.memory</code>. Raise the limit based on measured usage, and/or reduce memory (cap Node heap with <code class="inl">--max-old-space-size</code>, fix the leak).</p>
-        </details>
-        <details class="quiz">
-          <summary>Event: <code class="inl">0/3 nodes are available: 3 Insufficient memory</code>. The nodes show only 30% memory <em>usage</em> in <code class="inl">kubectl top nodes</code>. How?</summary>
-          <p class="ans">The scheduler uses <strong>requests</strong>, not actual usage. Already-scheduled pods have requested most of the allocatable memory (see <code class="inl">describe node</code> → Allocated resources). Lower requests or add nodes.</p>
-        </details>
-        <details class="quiz">
-          <summary><code class="inl">kubectl get endpoints taskflow-api</code> shows <code class="inl">&lt;none&gt;</code> but the pods are Running 1/1. Most likely cause?</summary>
-          <p class="ans">The Service selector doesn't match the pod labels (e.g. <code class="inl">app=taskflow</code> vs <code class="inl">app=taskflow-api</code>). Verify with <code class="inl">kubectl get pods -l &lt;selector&gt;</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>What's the difference between <code class="inl">ImagePullBackOff</code> and <code class="inl">CreateContainerConfigError</code>?</summary>
-          <p class="ans">ImagePullBackOff: the kubelet can't fetch the image (tag, auth, rate limit). CreateContainerConfigError: image is fine but the container spec references a ConfigMap/Secret or key that doesn't exist. Both: read <code class="inl">describe pod</code> Events; no app logs exist.</p>
-        </details>
-        <details class="quiz">
-          <summary>From namespace <code class="inl">monitoring</code>, <code class="inl">wget taskflow-api/metrics</code> fails with <code class="inl">bad address</code>, but works from inside <code class="inl">taskflow</code>. Fix?</summary>
-          <p class="ans">Short names resolve only within the pod's own namespace (search domain). Use <code class="inl">taskflow-api.taskflow</code> or the FQDN <code class="inl">taskflow-api.taskflow.svc.cluster.local</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>A new release crash-loops but users see no outage. Why, and what's the fastest recovery?</summary>
-          <p class="ans">RollingUpdate keeps old ReplicaSet pods until new ones are Ready, so the rollout just stalls. <code class="inl">kubectl rollout undo deploy/taskflow-api</code> returns to the previous revision immediately.</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — diagnose the output</span>
+          <details class="quiz"><summary>Q1. <code class="inl">kubectl get pods</code>: <code class="inl">taskflow-api-… 0/1 CrashLoopBackOff 6</code>. <code class="inl">describe</code>: <code class="inl">Last State: Terminated, Reason: Error, Exit Code: 1</code>. <code class="inl">logs --previous</code>: <code class="inl">Error: connect ECONNREFUSED 10.96.200.7:5432</code>. Where's the bug, and what do you check next?</summary>
+            <p class="ans">The API crashes because it can't reach Postgres (exit 1, from the app), so the real problem is the database path. Check <code class="inl">kubectl get pods -l app=taskflow-db</code> (is it Running and Ready?), then <code class="inl">kubectl get endpoints taskflow-db</code> (selector/readiness, §7), and <code class="inl">describe</code> the DB pod (Pending on its PVC? §6). Long-term, the API should retry the DB at startup instead of exiting.</p></details>
+          <details class="quiz"><summary>Q2. After a deploy: the new pod is <code class="inl">Pending</code>, <code class="inl">kubectl get pods -A --field-selector=status.phase=Pending</code> shows 6 pods across namespaces, and the HPA shows <code class="inl">REPLICAS 10</code> with max 10. What happened?</summary>
+            <p class="ans">The HPA scaled up (Session 13), and the new replicas' <strong>requests</strong> no longer fit on the nodes, so they're Pending with <code class="inl">Insufficient cpu/memory</code> (§6). Confirm with <code class="inl">describe pod</code> → FailedScheduling and <code class="inl">describe node</code> → Allocated resources. Fix: right-size requests, add nodes (Cluster Autoscaler), or lower <code class="inl">maxReplicas</code>.</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl get pods</code>: <code class="inl">ImagePullBackOff</code>. <code class="inl">kubectl logs POD</code>: <code class="inl">container "api" … is waiting to start: trying and failing to pull image</code>. A teammate wants to <code class="inl">exec</code> in to check. What's wrong with that plan, and what do you run instead?</summary>
+            <p class="ans">There's no container to exec into, and no logs, because it never started (§3, §5). Run <code class="inl">kubectl describe pod POD</code> and read the <code class="inl">Failed to pull image</code> event: not found → tag typo, 401 → <code class="inl">imagePullSecrets</code>, 429 → rate limit.</p></details>
+          <details class="quiz"><summary>Q4. Pods are <code class="inl">1/1 Running</code>, but <code class="inl">curl https://taskflow.local/api/tasks</code> returns <code class="inl">502</code>, and in-cluster <code class="inl">wget taskflow-api/health</code> → <code class="inl">Connection refused</code>. <code class="inl">get endpoints</code> shows <code class="inl">10.244.0.14:80</code>. Diagnose.</summary>
+            <p class="ans">Endpoints exist, so the selector and readiness are fine (§7), but they point at port 80 on the pods: <code class="inl">targetPort</code> is wrong (probably omitted, which defaults it to <code class="inl">port: 80</code>). The pods listen on 3000, so connections are refused and ingress-nginx returns 502. Set <code class="inl">targetPort: http</code>.</p></details>
+          <details class="quiz"><summary>Q5. <code class="inl">describe pod</code> shows <code class="inl">Restart Count: 9</code>, <code class="inl">Last State: Reason: Error, Exit Code: 137</code>, OOMKilled not mentioned, and events show <code class="inl">Liveness probe failed: … context deadline exceeded</code> only under load. Cause and fix?</summary>
+            <p class="ans">Under load, <code class="inl">/health</code> answers slower than <code class="inl">timeoutSeconds</code> (default 1 s), so liveness fails and the kubelet kills the container (137 = SIGKILL after the grace period, because the busy event loop never finished its SIGTERM handler; it's not an OOM) (§2, §4). Each restart adds load to the other pods. Fix: <code class="inl">timeoutSeconds: 2–5</code>, a higher <code class="inl">failureThreshold</code>, and a cheap health handler. Check <code class="inl">kubectl top</code> for CPU throttling against the limit.</p></details>
+          <details class="quiz"><summary>Q6. A pod has been <code class="inl">CreateContainerConfigError</code> for 3 hours. <code class="inl">describe pod</code> shows no Events at all. Is the cause unknowable now?</summary>
+            <p class="ans">No. The events expired (about 1 h TTL, §2), but the error is still current, so the reason is still visible in <code class="inl">describe pod</code> → <code class="inl">State: Waiting, Reason: CreateContainerConfigError, Message: …</code>, or via <code class="inl">-o jsonpath='{.status.containerStatuses[0].state.waiting.message}'</code>. It names the missing Secret, ConfigMap or key (§5).</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -1033,6 +1048,6 @@ kube-dns   ClusterIP   10.96.0.10   &lt;none&gt;        53/UDP,53/TCP,9153/TCP  
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 14 — K8s Troubleshooting</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

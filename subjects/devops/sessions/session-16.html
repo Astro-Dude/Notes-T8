@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 16 — Kubernetes Security &amp; Scheduling</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,10 @@
       <span class="kicker">Term 9 · DevOps · Session 16</span>
       <h1>Kubernetes Security &amp; Scheduling</h1>
       <p class="lead">
-        Lock down the <code class="inl">taskflow</code> namespace (who may do what, what pods may do, who may talk to whom)
-        and control where pods land and how nodes are drained without downtime.
+        Decide who may do what in the <code class="inl">taskflow</code> namespace and prove it with <code class="inl">kubectl auth can-i</code>.
+        Limit what a hacked container can do and whom it can reach. Then steer pods onto the right nodes and drain a node without dropping traffic.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 27 min read</span><span class="badge-rt">📖 7 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 40 min read</span><span class="badge-rt">📖 9 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -35,11 +35,13 @@
       <nav class="toc" aria-label="Table of contents">
         <h4>On this page</h4>
         <ol>
-          <li><a href="#rbac">Authn, authz &amp; RBAC</a></li>
+          <li><a href="#auth">Authentication vs authorization</a></li>
+          <li><a href="#rbac">RBAC: Roles &amp; bindings</a></li>
           <li><a href="#serviceaccounts">ServiceAccounts</a></li>
-          <li><a href="#pod-security">securityContext &amp; Pod Security Standards</a></li>
+          <li><a href="#security-context">Pod securityContext</a></li>
+          <li><a href="#pod-security">Pod Security Standards</a></li>
           <li><a href="#network-policies">NetworkPolicies</a></li>
-          <li><a href="#placement">nodeSelector &amp; affinity</a></li>
+          <li><a href="#placement">nodeSelector, affinity &amp; spreading</a></li>
           <li><a href="#taints">Taints &amp; tolerations</a></li>
           <li><a href="#maintenance">Cordon, drain &amp; PDBs</a></li>
           <li><a href="#commands">Commands you must know</a></li>
@@ -57,7 +59,7 @@
 
         <div class="callout example">
           <span class="c-title">Lab setup used on this page</span>
-          <p>Scheduling demos need several nodes and NetworkPolicies need a CNI that enforces them, so start a 3-node minikube with Calico
+          <p>Scheduling demos need several nodes, and NetworkPolicies need a CNI that enforces them, so start a 3-node minikube with Calico
           (<code class="inl">minikube delete</code> first if you have an old cluster). TaskFlow from Sessions 10–15 runs in namespace
           <code class="inl">taskflow</code>: API pods labelled <code class="inl">app: taskflow-api</code>, Postgres pod <code class="inl">postgres-0</code> labelled <code class="inl">app: taskflow-db</code>.</p>
         </div>
@@ -68,55 +70,130 @@ minikube       Ready    control-plane   3m    v1.35.0
 minikube-m02   Ready    &lt;none&gt;          2m    v1.35.0
 minikube-m03   Ready    &lt;none&gt;          90s   v1.35.0</span></pre>
 
-      <!-- ===================== 1. RBAC ===================== -->
-      <section id="rbac">
-        <h2><span class="sec-num">1</span> Authentication, authorization &amp; RBAC</h2>
+      <!-- ===================== 1. AUTHN vs AUTHZ ===================== -->
+      <section id="auth">
+        <h2><span class="sec-num">1</span> Authentication vs authorization</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Authentication is the guard checking your ID card. Authorization is the list of rooms that card opens. RBAC is how Kubernetes writes that list.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Everyone on the project team uses a copy of the same minikube kubeconfig. Ask what that identity may do:</p>
+<pre><span class="pr">$</span> kubectl config view --minify -o jsonpath='{.contexts[0].context.user}{"\n"}'
+<span class="out">minikube</span>
+<span class="pr">$</span> kubectl auth can-i '*' '*' --all-namespaces
+<span class="out">yes</span></pre>
+        <p>Everyone is the same all-powerful user, so one script aimed at the wrong context can <code class="inl">kubectl delete namespace taskflow</code>. You can't give a new teammate "logs only", and the audit log can't say who did what.</p>
 
-        <p>Every request to the API server (from <code class="inl">kubectl</code>, a controller, or a pod) passes three gates in order:</p>
+        <h3>The idea</h3>
+        <p>Every request to the API server, from <code class="inl">kubectl</code>, a controller or a pod, passes three gates in order:</p>
 <pre>kubectl / pod ──HTTPS──► kube-apiserver
    1. Authentication  "who are you?"         client cert, bearer token, OIDC   ✘ → 401 Unauthorized
    2. Authorization   "may you do this?"     RBAC: verb + resource + namespace ✘ → 403 Forbidden
    3. Admission       "is this object OK?"   PodSecurity, ResourceQuota, ...   ✘ → request rejected
    4. Stored in etcd → controllers / scheduler act on it</pre>
+        <p><span class="term">Authentication (authn)</span> proves identity. Kubernetes has <strong>no User object</strong>: a human is whoever a trusted credential names, either a client certificate signed by the cluster CA (CN = username, O = group) or an OIDC token from SSO (Google, Okta, AWS IAM on EKS). Programs in the cluster use <span class="term">ServiceAccounts</span> (section 3). <span class="term">Authorization (authz)</span>, here RBAC (section 2), then decides if that identity may act.</p>
 
-        <ul>
-          <li><span class="term">Authentication (authn)</span> proves identity. Kubernetes has <strong>no User object</strong>: humans come from outside — a client certificate (CN = username, O = group), or an OIDC token from SSO (Google, Okta, AWS IAM on EKS).</li>
-          <li>Programs running <em>inside</em> the cluster use <span class="term">ServiceAccounts</span> — real API objects (topic 2).</li>
-          <li><span class="term">Authorization (authz)</span> decides if that identity may do the action. The standard authorizer is <span class="term">RBAC</span> (Role-Based Access Control). RBAC is <strong>allow-only</strong>: no rule = denied; there are no "deny" rules.</li>
-        </ul>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>Back in Session 15's office building. <strong>Authentication is the guard at the door checking your ID card.</strong> <strong>Authorization is your keycard's access list</strong>: which doors it opens and what you may do inside. <strong>Admission is the security scanner</strong> checking what you carry in. There's no guest list: the guard trusts any ID its own office (the cluster CA) issued.</p>
+        </div>
 
-        <h3>The four RBAC objects</h3>
+        <h3>See it: a real user called Riya</h3>
+<pre><span class="pr">$</span> openssl genrsa -out riya.key 2048
+<span class="pr">$</span> openssl req -new -key riya.key -out riya.csr -subj "/CN=riya/O=dev"
+<span class="pr">$</span> openssl x509 -req -in riya.csr -CA ~/.minikube/ca.crt -CAkey ~/.minikube/ca.key -CAcreateserial -out riya.crt -days 30
+<span class="pr">$</span> kubectl config set-credentials riya --client-certificate=riya.crt --client-key=riya.key
+<span class="out">User "riya" set.</span>
+<span class="pr">$</span> kubectl config set-context riya@minikube --cluster=minikube --user=riya --namespace=taskflow
+<span class="out">Context "riya@minikube" created.</span>
+<span class="pr">$</span> kubectl --context riya@minikube get pods
+<span class="out">Error from server (Forbidden): pods is forbidden: User "riya" cannot list resource "pods" in API group "" in the namespace "taskflow"</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Object</th><th>Scope</th><th>Contains</th><th>Use it for</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">Role</code></td><td>One namespace</td><td>Rules (what is allowed)</td><td>"read pods in <code class="inl">taskflow</code>"</td></tr>
-              <tr><td><code class="inl">ClusterRole</code></td><td>Cluster-wide</td><td>Rules</td><td>Cluster-scoped resources (nodes, PVs, namespaces) or a reusable rule set</td></tr>
-              <tr><td><code class="inl">RoleBinding</code></td><td>One namespace</td><td>Subjects + roleRef</td><td>Give a Role <em>or</em> ClusterRole to someone, only in this namespace</td></tr>
-              <tr><td><code class="inl">ClusterRoleBinding</code></td><td>Cluster-wide</td><td>Subjects + roleRef</td><td>Give a ClusterRole in <em>every</em> namespace</td></tr>
+              <tr><td><code class="inl">-subj "/CN=riya/O=dev"</code></td><td>The identity inside the certificate: username <code class="inl">riya</code>, group <code class="inl">dev</code></td></tr>
+              <tr><td><code class="inl">x509 -req … -CA ~/.minikube/ca.crt -CAkey …</code></td><td>Sign it with the cluster's own CA, which is what makes the API server trust it</td></tr>
+              <tr><td><code class="inl">set-credentials</code> / <code class="inl">set-context</code></td><td>Add the cert to your kubeconfig and pair it with the cluster as context <code class="inl">riya@minikube</code></td></tr>
+              <tr><td><code class="inl">Forbidden</code> (403)</td><td>Gate 1 passed: the server knows this is Riya. Gate 2 failed: nothing allows her anything yet.</td></tr>
             </tbody>
           </table>
         </div>
+        <p><strong>What it does <em>not</em> do:</strong> grant anything, or create a user anywhere. <code class="inl">kubectl get users</code> answers <code class="inl">error: the server doesn't have a resource type "users"</code>. A forged or expired cert fails at gate 1 instead: <code class="inl">error: You must be logged in to the server (Unauthorized)</code>. Section 2 gives Riya her permissions.</p>
 
-        <p>A rule = <strong>apiGroups</strong> + <strong>resources</strong> + <strong>verbs</strong>. Find the group of any resource with <code class="inl">kubectl api-resources</code>:</p>
-<pre><span class="pr">$</span> kubectl api-resources -o wide | grep -E '^(NAME|pods |deployments|ingresses|networkpolicies)'
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Kubernetes stores users and passwords in etcd." <strong>✗</strong> There are no User objects. Users come from certificates or an external identity provider. Only ServiceAccounts are API objects.</p>
+          <p>"403 Forbidden means wrong credentials." <strong>✗</strong> Wrong or missing credentials are 401. 403 means the server knows who you are and RBAC said no.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Authn = who are you? (401) · Authz = may you? (403) · Admission = is this object OK?</strong><br /><strong>Humans = certs / OIDC · programs = ServiceAccounts.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Thirty days later Riya's commands fail with <code class="inl">You must be logged in to the server (Unauthorized)</code>. Which gate failed, and why?</summary>
+            <p class="ans">Authentication. The cert was signed with <code class="inl">-days 30</code> and has expired, so the server no longer accepts it as proof of identity. RBAC is never even consulted.</p></details>
+          <details class="quiz"><summary>Q2. A cert has subject <code class="inl">/CN=arjun/O=dev/O=qa</code>. What are the username and groups?</summary>
+            <p class="ans">Username <code class="inl">arjun</code>, groups <code class="inl">dev</code> and <code class="inl">qa</code> (plus the built-in <code class="inl">system:authenticated</code>). RBAC can bind to any of them.</p></details>
+          <details class="quiz"><summary>Q3. Riya, with no permissions, applies a pod spec that would also break the namespace's Pod Security level. Which error does she see?</summary>
+            <p class="ans">403 Forbidden. Authorization (gate 2) runs before admission (gate 3), so the pod spec is never inspected.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 2. RBAC ===================== -->
+      <section id="rbac">
+        <h2><span class="sec-num">2</span> RBAC: Roles &amp; bindings</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>Riya is now authenticated, but everything returns 403. You want her to read pods, logs and Deployments in <code class="inl">taskflow</code>, but not Secrets (the DB password lives there), and nothing in other namespaces. You need a way to write "this person may do these verbs on these resources, here".</p>
+
+        <h3>The idea</h3>
+        <p><span class="term">RBAC</span> (Role-Based Access Control) splits that sentence in two. A <strong>Role</strong> lists what is allowed: verbs on resources, inside one namespace. A <strong>RoleBinding</strong> says who gets that Role, in that namespace. RBAC is <strong>allow-only</strong>: there are no deny rules, and anything not allowed is denied.</p>
+<pre> Role dev-readonly  (ns: taskflow)              RoleBinding dev-readonly-binding  (ns: taskflow)
+   rules: get, list, watch on                     subjects: User riya, Group dev
+          pods, pods/log, services, …   ◀─────── roleRef:  Role dev-readonly
+   "WHAT may be done"                           "WHO gets it, and WHERE"
+
+ ClusterRole / ClusterRoleBinding: the same pair, cluster-wide</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A <strong>Role is an access profile</strong> written on paper: "may read files in the taskflow office". A <strong>RoleBinding loads that profile onto specific keycards</strong> (Riya's, everyone in group dev). No profile says "deny". A door just stays shut unless some profile opens it.</p>
+        </div>
+
+        <h3>See it: two one-liners</h3>
+<pre><span class="pr">$</span> kubectl create role pod-reader --verb=get,list,watch --resource=pods -n taskflow
+<span class="out">role.rbac.authorization.k8s.io/pod-reader created</span>
+<span class="pr">$</span> kubectl create rolebinding riya-pod-reader --role=pod-reader --user=riya -n taskflow
+<span class="out">rolebinding.rbac.authorization.k8s.io/riya-pod-reader created</span>
+<span class="pr">$</span> kubectl auth can-i list pods -n taskflow --as riya
+<span class="out">yes</span>
+<span class="pr">$</span> kubectl auth can-i delete pods -n taskflow --as riya
+<span class="out">no</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">--verb=get,list,watch --resource=pods</code></td><td>One rule: these verbs on pods</td></tr>
+              <tr><td><code class="inl">--role=pod-reader --user=riya</code></td><td>Bind that Role to a user (or <code class="inl">--group=dev</code>, <code class="inl">--serviceaccount=taskflow:ci-deployer</code>)</td></tr>
+              <tr><td><code class="inl">auth can-i VERB RESOURCE</code></td><td>Ask the authorizer yes/no without doing anything</td></tr>
+              <tr><td><code class="inl">--as riya</code></td><td>Ask <em>as</em> Riya (impersonation, which your admin user is allowed to do). No need to log in as her.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">can-i</code> performs nothing, and the Role reaches no other namespace. Add <code class="inl">--dry-run=client -o yaml</code> to either <code class="inl">create</code> to get the YAML instead.</p>
+
+        <h3>Build it up: the real role, as a file</h3>
+        <p>A rule is <strong>apiGroups + resources + verbs</strong>. <code class="inl">kubectl api-resources</code> tells you each resource's group:</p>
+<pre><span class="pr">$</span> kubectl api-resources -o wide | grep -E '^(NAME|pods |deployments|networkpolicies)'
 <span class="out">NAME              SHORTNAMES   APIVERSION             NAMESPACED   KIND            VERBS
 pods              po           v1                     true         Pod             create,delete,deletecollection,get,list,patch,update,watch
 deployments       deploy       apps/v1                true         Deployment      create,delete,deletecollection,get,list,patch,update,watch
-ingresses         ing          networking.k8s.io/v1   true         Ingress         create,delete,deletecollection,get,list,patch,update,watch
 networkpolicies   netpol       networking.k8s.io/v1   true         NetworkPolicy   create,delete,deletecollection,get,list,patch,update,watch</span></pre>
-        <ul>
-          <li>APIVERSION <code class="inl">v1</code> (no slash) → core group, written <code class="inl">""</code> in a Role. <code class="inl">apps/v1</code> → group <code class="inl">apps</code>.</li>
-          <li>kubectl → verb: <code class="inl">get pod x</code> = get · <code class="inl">get pods</code> = list · <code class="inl">-w</code> = watch · <code class="inl">apply</code> = get + create/patch · <code class="inl">edit</code> = patch · <code class="inl">logs</code> = get on <code class="inl">pods/log</code> · <code class="inl">exec</code> = create on <code class="inl">pods/exec</code>.</li>
-        </ul>
-
-        <h3>A read-only "dev" role for the taskflow namespace</h3>
+        <p>APIVERSION <code class="inl">v1</code> (no slash) is the core group, written <code class="inl">""</code> in a Role; <code class="inl">apps/v1</code> is group <code class="inl">apps</code>. kubectl commands map to verbs: <code class="inl">get pod x</code> = get · <code class="inl">get pods</code> = list · <code class="inl">-w</code> = watch · <code class="inl">apply</code> = get + create/patch · <code class="inl">edit</code> = patch · <code class="inl">logs</code> = get on <code class="inl">pods/log</code> · <code class="inl">exec</code> = create on <code class="inl">pods/exec</code>.</p>
         <div class="fname">k8s/rbac-dev.yaml</div>
 <pre><span class="kw">apiVersion</span>: rbac.authorization.k8s.io/v1
 <span class="kw">kind</span>: Role
@@ -148,40 +225,30 @@ networkpolicies   netpol       networking.k8s.io/v1   true         NetworkPolicy
   kind: Role
   name: dev-readonly
   apiGroup: rbac.authorization.k8s.io</pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">rules[].apiGroups</code></td><td>API group of the resources. <code class="inl">""</code> core, <code class="inl">apps</code>, <code class="inl">batch</code> (Jobs), <code class="inl">networking.k8s.io</code> (Ingress, NetworkPolicy), <code class="inl">autoscaling</code> (HPA).</td></tr>
+              <tr><td><code class="inl">rules[].apiGroups</code></td><td><code class="inl">""</code> core, <code class="inl">apps</code>, <code class="inl">batch</code> (Jobs), <code class="inl">networking.k8s.io</code> (Ingress, NetworkPolicy), <code class="inl">autoscaling</code> (HPA)</td></tr>
               <tr><td><code class="inl">rules[].resources</code></td><td>Plural lowercase names. Subresources (<code class="inl">pods/log</code>, <code class="inl">pods/exec</code>, <code class="inl">deployments/scale</code>) must be listed separately.</td></tr>
-              <tr><td><code class="inl">rules[].verbs</code></td><td><code class="inl">get list watch create update patch delete deletecollection</code>, or <code class="inl">"*"</code> (avoid).</td></tr>
-              <tr><td><code class="inl">rules[].resourceNames</code></td><td>Optional: limit to named objects, e.g. only the ConfigMap <code class="inl">taskflow-config</code>.</td></tr>
-              <tr><td><code class="inl">subjects[].kind</code></td><td><code class="inl">User</code>, <code class="inl">Group</code> or <code class="inl">ServiceAccount</code> (the last needs <code class="inl">namespace</code>, no apiGroup).</td></tr>
-              <tr><td><code class="inl">roleRef</code></td><td>The Role/ClusterRole being granted. Can't be edited — delete and recreate the binding to change it.</td></tr>
+              <tr><td><code class="inl">rules[].verbs</code></td><td><code class="inl">get list watch create update patch delete deletecollection</code>, or <code class="inl">"*"</code> (avoid)</td></tr>
+              <tr><td><code class="inl">rules[].resourceNames</code></td><td>Optional: only named objects, e.g. just the ConfigMap <code class="inl">taskflow-config</code></td></tr>
+              <tr><td><code class="inl">subjects[].kind</code></td><td><code class="inl">User</code>, <code class="inl">Group</code> or <code class="inl">ServiceAccount</code> (the last needs <code class="inl">namespace</code> and no apiGroup)</td></tr>
+              <tr><td><code class="inl">roleRef</code></td><td>The Role or ClusterRole granted. It can't be edited: delete and recreate the binding to change it.</td></tr>
             </tbody>
           </table>
         </div>
-
-        <p>Apply it and test with impersonation (<code class="inl">--as</code>) — no need to log in as Riya:</p>
 <pre><span class="pr">$</span> kubectl apply -f k8s/rbac-dev.yaml
 <span class="out">role.rbac.authorization.k8s.io/dev-readonly created
 rolebinding.rbac.authorization.k8s.io/dev-readonly-binding created</span>
-
-<span class="pr">$</span> kubectl auth can-i list pods -n taskflow --as riya
-<span class="out">yes</span>
-<span class="pr">$</span> kubectl auth can-i delete pods -n taskflow --as riya
-<span class="out">no</span>
 <span class="pr">$</span> kubectl auth can-i get secrets -n taskflow --as riya
 <span class="out">no</span>
-<span class="pr">$</span> kubectl auth can-i list pods -n default --as riya        <span class="cm"># other namespace</span>
+<span class="pr">$</span> kubectl auth can-i list pods -n default --as riya                       <span class="cm"># other namespace</span>
 <span class="out">no</span>
 <span class="pr">$</span> kubectl auth can-i list deployments -n taskflow --as anyone --as-group dev
 <span class="out">yes</span>
-
 <span class="pr">$</span> kubectl delete pod taskflow-api-7d9c6b5f4d-h2x9k -n taskflow --as riya
 <span class="out">Error from server (Forbidden): pods "taskflow-api-7d9c6b5f4d-h2x9k" is forbidden: User "riya" cannot delete resource "pods" in API group "" in the namespace "taskflow"</span>
-
 <span class="pr">$</span> kubectl auth can-i --list -n taskflow --as riya
 <span class="out">Resources                                       Non-Resource URLs   Resource Names   Verbs
 pods                                            []                  []               [get list watch]
@@ -190,7 +257,7 @@ services                                        []                  []          
 deployments.apps                                []                  []               [get list watch]
 ...</span></pre>
 
-        <h3>ClusterRoles and the built-in roles</h3>
+        <h4>ClusterRoles and the built-in roles</h4>
 <pre><span class="cm"># nodes are cluster-scoped → needs ClusterRole + ClusterRoleBinding</span>
 <span class="pr">$</span> kubectl create clusterrole node-reader --verb=get,list,watch --resource=nodes
 <span class="out">clusterrole.rbac.authorization.k8s.io/node-reader created</span>
@@ -200,67 +267,80 @@ deployments.apps                                []                  []          
 <span class="cm"># reuse the built-in "view" ClusterRole, but only inside taskflow (RoleBinding!)</span>
 <span class="pr">$</span> kubectl create rolebinding riya-view --clusterrole=view --user=riya -n taskflow
 <span class="out">rolebinding.rbac.authorization.k8s.io/riya-view created</span></pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Combination</th><th>Result</th></tr></thead>
             <tbody>
-              <tr><td>Role + RoleBinding</td><td>Permissions in that one namespace.</td></tr>
-              <tr><td>ClusterRole + RoleBinding</td><td>ClusterRole's rules, but <strong>only in the RoleBinding's namespace</strong> (reuse one definition across namespaces).</td></tr>
-              <tr><td>ClusterRole + ClusterRoleBinding</td><td>Rules in <strong>all</strong> namespaces + cluster-scoped resources.</td></tr>
-              <tr><td>Role + ClusterRoleBinding</td><td>Not possible — a ClusterRoleBinding can only reference a ClusterRole.</td></tr>
+              <tr><td>Role + RoleBinding</td><td>Permissions in that one namespace</td></tr>
+              <tr><td>ClusterRole + RoleBinding</td><td>The ClusterRole's rules, but <strong>only in the RoleBinding's namespace</strong> (one definition, reused per namespace)</td></tr>
+              <tr><td>ClusterRole + ClusterRoleBinding</td><td>Rules in <strong>all</strong> namespaces, plus cluster-scoped resources</td></tr>
+              <tr><td>Role + ClusterRoleBinding</td><td>Not possible: a ClusterRoleBinding can only reference a ClusterRole</td></tr>
             </tbody>
           </table>
         </div>
-        <p>Built-in ClusterRoles: <code class="inl">cluster-admin</code> (everything), <code class="inl">admin</code> (all in a namespace incl. RBAC), <code class="inl">edit</code> (read/write most objects, incl. reading Secrets, no RBAC), <code class="inl">view</code> (read-only, no Secrets).</p>
+        <p>Built-in ClusterRoles: <code class="inl">cluster-admin</code> (everything), <code class="inl">admin</code> (everything in a namespace, RBAC included), <code class="inl">edit</code> (read/write most objects, including reading Secrets, but no RBAC), <code class="inl">view</code> (read-only, no Secrets).</p>
 
-        <div class="callout example">
-          <span class="c-title">Example: a real certificate user "riya" on minikube</span>
-          <p>The cert's CN becomes the username and O the group, signed by the cluster CA. After this, <code class="inl">kubectl --context riya@minikube get pods</code> works and <code class="inl">get secrets</code> returns Forbidden.</p>
-        </div>
-<pre><span class="pr">$</span> openssl genrsa -out riya.key 2048
-<span class="pr">$</span> openssl req -new -key riya.key -out riya.csr -subj "/CN=riya/O=dev"
-<span class="pr">$</span> openssl x509 -req -in riya.csr -CA ~/.minikube/ca.crt -CAkey ~/.minikube/ca.key -CAcreateserial -out riya.crt -days 30
-<span class="pr">$</span> kubectl config set-credentials riya --client-certificate=riya.crt --client-key=riya.key
-<span class="out">User "riya" set.</span>
-<span class="pr">$</span> kubectl config set-context riya@minikube --cluster=minikube --user=riya --namespace=taskflow
-<span class="out">Context "riya@minikube" created.</span>
-<span class="pr">$</span> kubectl --context riya@minikube get secrets
-<span class="out">Error from server (Forbidden): secrets is forbidden: User "riya" cannot list resource "secrets" in API group "" in the namespace "taskflow"</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><code class="inl">apiGroups: [""]</code> for deployments → still denied. Deployments are in <code class="inl">apps</code>.</li>
-            <li>RoleBinding created in <code class="inl">default</code> instead of <code class="inl">taskflow</code> → permissions apply to the wrong namespace.</li>
-            <li>Granting <code class="inl">pods</code> but not <code class="inl">pods/log</code> → <code class="inl">kubectl logs</code> is Forbidden.</li>
-            <li>Binding <code class="inl">cluster-admin</code> "to make it work" — gives full control of every namespace.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Add a deny rule for Secrets." <strong>✗</strong> RBAC has no deny. You leave Secrets out, and permissions from all bindings add up.</p>
+          <p>"Binding <code class="inl">cluster-admin</code> to the CI user is fine if it makes the deploy work." <strong>✗</strong> That gives full control of every namespace. Grant the few verbs it needs (section 3).</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Authn = who (401), authz = allowed? (403), then admission. Role/ClusterRole say <em>what</em>; RoleBinding/ClusterRoleBinding say <em>who</em> and <em>where</em>. Test with <code class="inl">kubectl auth can-i ... --as</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Role / ClusterRole = WHAT (apiGroups + resources + verbs) · RoleBinding / ClusterRoleBinding = WHO and WHERE.</strong><br /><strong>Allow-only. Test with <code class="inl">kubectl auth can-i … --as</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Spot the bug: a Role allows <code class="inl">apiGroups: [""]</code>, <code class="inl">resources: ["deployments"]</code>, <code class="inl">verbs: ["patch"]</code>, but CI still can't patch the Deployment.</summary>
+            <p class="ans">Deployments live in the <code class="inl">apps</code> group, not the core group. Use <code class="inl">apiGroups: ["apps"]</code>.</p></details>
+          <details class="quiz"><summary>Q2. You bind the built-in ClusterRole <code class="inl">edit</code> to Riya with a RoleBinding in <code class="inl">taskflow</code>. Where can she edit things? Can she read the DB password?</summary>
+            <p class="ans">Only in <code class="inl">taskflow</code>: a RoleBinding limits a ClusterRole to its own namespace. And yes, <code class="inl">edit</code> includes reading Secrets, so she can. <code class="inl">view</code> wouldn't allow it.</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl --context riya@minikube get pods</code> works, but <code class="inl">kubectl logs taskflow-api-…</code> is Forbidden. Why?</summary>
+            <p class="ans">Logs are the subresource <code class="inl">pods/log</code>, which must be granted separately. Add it to the Role's resources (our <code class="inl">dev-readonly</code> has it; the one-liner <code class="inl">pod-reader</code> didn't).</p></details>
+          <details class="quiz"><summary>Q4. You created the RoleBinding without <code class="inl">-n taskflow</code>. Predict <code class="inl">kubectl auth can-i list pods -n taskflow --as riya</code>.</summary>
+            <p class="ans"><code class="inl">no</code>. The binding landed in <code class="inl">default</code>, so it grants nothing in <code class="inl">taskflow</code> (and refers to a Role that doesn't exist in <code class="inl">default</code>).</p></details>
         </div>
       </section>
 
-      <!-- ===================== 2. SERVICE ACCOUNTS ===================== -->
+      <!-- ===================== 3. SERVICE ACCOUNTS ===================== -->
       <section id="serviceaccounts">
-        <h2><span class="sec-num">2</span> ServiceAccounts</h2>
+        <h2><span class="sec-num">3</span> ServiceAccounts</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Look inside an API pod:</p>
+<pre><span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- ls /var/run/secrets/kubernetes.io/serviceaccount
+<span class="out">ca.crt
+namespace
+token</span>
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -o jsonpath='{.items[0].spec.serviceAccountName}{"\n"}'
+<span class="out">default</span></pre>
+        <p>TaskFlow's API never calls the Kubernetes API, yet every API pod carries a live token, free to anyone who breaks into the app. Meanwhile CI (Session 19) <em>does</em> need to deploy, and handing it your admin kubeconfig is section 1's problem again.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">ServiceAccount</span> (SA) is an identity for processes running in pods, and unlike users it's a real API object. Every namespace gets a <code class="inl">default</code> SA, which pods use unless they name another. In RBAC its username is <code class="inl">system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code>. The kubelet mounts a <strong>short-lived, auto-rotated</strong> token into the pod; since v1.24 no long-lived token Secret is created.</p>
+<pre> pod  (serviceAccountName: ci-deployer)
+   └─ /var/run/secrets/kubernetes.io/serviceaccount/token   (signed JWT, rotated by the kubelet)
+         │  Authorization: Bearer &lt;token&gt;
+         ▼
+ kube-apiserver  authn → "system:serviceaccount:taskflow:ci-deployer"
+                 authz → RoleBinding ci-deployer-binding → Role deployer → patch deployments ✔ · delete ✘</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A ServiceAccount is an ID badge for a program instead of a person, so RBAC can decide what that program may touch.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>A ServiceAccount is <strong>a badge for a robot</strong> rather than a person. The delivery robot (CI) gets a badge that opens only the loading bay. The vending machine (TaskFlow's API), which never needs to open a door, shouldn't carry a badge at all.</p>
         </div>
 
-        <ul>
-          <li>Every namespace gets a <code class="inl">default</code> ServiceAccount; a pod without <code class="inl">serviceAccountName</code> uses it.</li>
-          <li>Its username in RBAC is <code class="inl">system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code>.</li>
-          <li>The kubelet mounts a <strong>short-lived, auto-rotated</strong> token into the pod at <code class="inl">/var/run/secrets/kubernetes.io/serviceaccount/</code> (<code class="inl">token</code>, <code class="inl">ca.crt</code>, <code class="inl">namespace</code>). Since v1.24 no long-lived token Secret is created automatically.</li>
-          <li>Who needs one? Anything that calls the Kubernetes API: CI deployers, operators, Prometheus (lists pods), Argo CD. TaskFlow's API never calls the K8s API → it should get <strong>no token at all</strong>.</li>
-        </ul>
+        <h3>See it: an identity with no permissions</h3>
+<pre><span class="pr">$</span> kubectl create serviceaccount ci-deployer -n taskflow
+<span class="out">serviceaccount/ci-deployer created</span>
+<span class="pr">$</span> kubectl auth can-i patch deployments -n taskflow --as=system:serviceaccount:taskflow:ci-deployer
+<span class="out">no</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> grant anything. A ServiceAccount is just a name until a RoleBinding gives it a Role, exactly like Riya in section 1.</p>
 
+        <h3>Build it up: one SA per job</h3>
         <div class="fname">k8s/serviceaccounts.yaml</div>
 <pre><span class="kw">apiVersion</span>: v1
 <span class="kw">kind</span>: ServiceAccount
@@ -308,65 +388,95 @@ deployments.apps                                []                  []          
   kind: Role
   name: deployer
   apiGroup: rbac.authorization.k8s.io</pre>
-
-        <p>Use it in the pod template of <code class="inl">k8s/deployment.yaml</code>:</p>
+        <p>The Role is the minimum <code class="inl">kubectl apply</code> + <code class="inl">kubectl rollout status</code> need: write Deployments, Services and ConfigMaps, read ReplicaSets and pods. Use the SA in the pod template of <code class="inl">k8s/deployment.yaml</code>:</p>
 <pre>    <span class="kw">spec</span>:
       serviceAccountName: taskflow-api          <span class="cm"># must exist in the SAME namespace as the pod</span>
       automountServiceAccountToken: <span class="nm">false</span>       <span class="cm"># pod-level value overrides the SA's value</span>
       containers:
         - name: api
           image: shauryav/taskflow-api:1.0.0</pre>
-
 <pre><span class="pr">$</span> kubectl apply -f k8s/serviceaccounts.yaml
 <span class="pr">$</span> kubectl get serviceaccounts -n taskflow
 <span class="out">NAME           SECRETS   AGE
 ci-deployer    0         8s
 default        0         4d
-taskflow-api   0         8s</span>
-
+taskflow-api   0         8s</span>                    <span class="cm"># SECRETS 0: no long-lived token Secrets since v1.24</span>
 <span class="pr">$</span> kubectl auth can-i patch deployments -n taskflow --as=system:serviceaccount:taskflow:ci-deployer
 <span class="out">yes</span>
 <span class="pr">$</span> kubectl auth can-i delete namespaces --as=system:serviceaccount:taskflow:ci-deployer
 <span class="out">no</span>
-
-<span class="cm"># short-lived token for that SA (e.g. to build a kubeconfig for CI)</span>
-<span class="pr">$</span> kubectl create token ci-deployer -n taskflow --duration=1h
+<span class="pr">$</span> kubectl create token ci-deployer -n taskflow --duration=1h     <span class="cm"># short-lived token, e.g. for a CI kubeconfig</span>
 <span class="out">eyJhbGciOiJSUzI1NiIsImtpZCI6IkpYb2...   (a signed JWT, valid 1 hour)</span>
-
-<span class="cm"># Postgres pod uses "default" SA with automount → token is there</span>
-<span class="pr">$</span> kubectl exec -n taskflow postgres-0 -- ls /var/run/secrets/kubernetes.io/serviceaccount
-<span class="out">ca.crt
-namespace
-token</span>
 <span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- ls /var/run/secrets/kubernetes.io/serviceaccount
 <span class="out">ls: /var/run/secrets/kubernetes.io/serviceaccount: No such file or directory
-command terminated with exit code 1</span></pre>
+command terminated with exit code 1</span>              <span class="cm"># the token from the problem is gone</span></pre>
+        <p><code class="inl">postgres-0</code> still runs as <code class="inl">default</code> with a token; give it its own SA with automount off too.</p>
 
         <div class="callout warn">
           <span class="c-title">Common mistake</span>
-          <p>Pods never appear and <code class="inl">kubectl describe rs</code> shows
-          <code class="inl">Error creating: pods "taskflow-api-..." is forbidden: error looking up service account taskflow/taskflow-api: serviceaccount "taskflow-api" not found</code>.
-          Apply <code class="inl">serviceaccounts.yaml</code> before the Deployment (or fix the name/namespace).</p>
+          <p>Pods never appear, and <code class="inl">kubectl describe rs</code> shows <code class="inl">Error creating: pods "taskflow-api-..." is forbidden: error looking up service account taskflow/taskflow-api: serviceaccount "taskflow-api" not found</code>. Apply <code class="inl">serviceaccounts.yaml</code> before the Deployment, or fix the name or namespace.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          ServiceAccount = identity for pods/CI. Bind it to a minimal Role. Turn off token mounting (<code class="inl">automountServiceAccountToken: false</code>) for apps that don't call the API.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"A pod without <code class="inl">serviceAccountName</code> has no identity." <strong>✗</strong> It runs as the namespace's <code class="inl">default</code> SA, with a token mounted unless automount is off.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>ServiceAccount = identity for pods/CI: <code class="inl">system:serviceaccount:ns:name</code>.</strong><br /><strong>One SA per job, a minimal Role, and <code class="inl">automountServiceAccountToken: false</code> for apps that never call the API.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. The SA has <code class="inl">automountServiceAccountToken: false</code>, but a pod using it sets <code class="inl">automountServiceAccountToken: true</code>. Is the token mounted?</summary>
+            <p class="ans">Yes. The pod-level setting overrides the ServiceAccount's.</p></details>
+          <details class="quiz"><summary>Q2. Fill in: the ci-deployer SA's RBAC username is ________, and you test its rights with <code class="inl">kubectl auth can-i … --as=________</code>.</summary>
+            <p class="ans"><code class="inl">system:serviceaccount:taskflow:ci-deployer</code>, both times.</p></details>
+          <details class="quiz"><summary>Q3. Predict: CI runs <code class="inl">kubectl delete pod taskflow-api-xyz -n taskflow</code> with the ci-deployer token. What happens, and why is that good?</summary>
+            <p class="ans">403 Forbidden: the <code class="inl">deployer</code> Role has no <code class="inl">delete</code> verb. A leaked CI token can roll out a new image but can't wipe the namespace or read Secrets.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 3. POD SECURITY ===================== -->
-      <section id="pod-security">
-        <h2><span class="sec-num">3</span> Pod securityContext &amp; Pod Security Standards</h2>
+      <!-- ===================== 4. SECURITY CONTEXT ===================== -->
+      <section id="security-context">
+        <h2><span class="sec-num">4</span> Pod securityContext</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>A teammate deploys the draft image from Session 7, the one that lost its <code class="inl">USER node</code> line. Now suppose an attacker finds a remote-code bug in an npm package:</p>
+<pre><span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- id
+<span class="out">uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)</span>
+<span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- sh -c 'echo "// backdoor" &gt;&gt; /app/server.js &amp;&amp; echo appended'
+<span class="out">appended</span></pre>
+        <p>Kubernetes ran a root image without complaint, and a hijacked process could rewrite the app's own code. By default a container runs as whatever user its image says, with a writable filesystem and a default set of Linux capabilities.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">securityContext</span> tells the kubelet and the runtime what a container is <em>not</em> allowed to do. It exists at two levels: the <strong>pod</strong> level applies to every container, and the <strong>container</strong> level overrides it. This is the Session 6 point made concrete: root in a container is root on a shared kernel, so take every power the app doesn't need.</p>
+<pre> what a hijacked API process could do        securityContext line that stops it
+ run as root                                  runAsNonRoot: true · runAsUser: 1000
+ gain root via setuid / sudo                  allowPrivilegeEscalation: false
+ raw sockets, chown, bind &lt;1024 …            capabilities: drop: ["ALL"]
+ write a backdoor into /app                   readOnlyRootFilesystem: true
+ call rare, dangerous syscalls                seccompProfile: RuntimeDefault</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>RBAC controls what <em>people</em> can do to the cluster; <code class="inl">securityContext</code> controls what a <em>container</em> can do on the node if it gets hacked.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>RBAC controls what <em>people</em> may do to the building. securityContext controls what a <em>worker inside a room</em> can do if they turn rogue: no master key (non-root), no toolbox (capabilities dropped), furniture bolted down (read-only filesystem).</p>
         </div>
 
-        <p>By default a container runs as whatever user the image says (often root), with a writable filesystem and a default set of Linux capabilities. Harden TaskFlow's API:</p>
+        <h3>See it: one line that refuses root</h3>
+<pre>    <span class="kw">spec</span>:
+      securityContext:
+        runAsNonRoot: <span class="nm">true</span>            <span class="cm"># kubelet checks the UID before starting the container</span></pre>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
+<span class="out">NAME                            READY   STATUS                       RESTARTS   AGE
+taskflow-api-5d8c7b9f6d-p2m4x   0/1     CreateContainerConfigError   0          12s</span>
+<span class="pr">$</span> kubectl describe pod taskflow-api-5d8c7b9f6d-p2m4x -n taskflow | grep Error:
+<span class="out">  Warning  Failed  10s (x2 over 12s)  kubelet  Error: container has runAsNonRoot and image will run as root</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> fix the image. It only refuses to start it. Rebuild with <code class="inl">USER node</code> (Session 7) or set <code class="inl">runAsUser</code>.</p>
 
+        <h3>Build it up: TaskFlow's hardened Deployment</h3>
         <div class="fname">k8s/deployment.yaml</div>
 <pre><span class="kw">apiVersion</span>: apps/v1
 <span class="kw">kind</span>: Deployment
@@ -399,7 +509,7 @@ command terminated with exit code 1</span></pre>
             - containerPort: <span class="nm">3000</span>
           envFrom:
             - secretRef:
-                name: taskflow-db         <span class="cm"># DATABASE_URL (Session 12)</span>
+                name: taskflow-db-secret  <span class="cm"># DATABASE_URL + POSTGRES_PASSWORD (Sessions 12–13)</span>
           securityContext:                <span class="cm"># CONTAINER level → overrides pod level</span>
             allowPrivilegeEscalation: <span class="nm">false</span> <span class="cm"># no setuid/sudo tricks to gain root</span>
             readOnlyRootFilesystem: <span class="nm">true</span>   <span class="cm"># attacker can't drop files into the image FS</span>
@@ -411,23 +521,21 @@ command terminated with exit code 1</span></pre>
       volumes:
         - name: tmp
           emptyDir: {}</pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Level</th><th>What it prevents</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">runAsNonRoot: true</code></td><td>pod/container</td><td>Running as root. Kubelet checks the UID before start.</td></tr>
-              <tr><td><code class="inl">runAsUser</code> / <code class="inl">runAsGroup</code></td><td>pod/container</td><td>Forces numeric UID/GID regardless of the image's <code class="inl">USER</code>.</td></tr>
-              <tr><td><code class="inl">fsGroup</code></td><td>pod only</td><td>"Permission denied" on volumes — files get this GID.</td></tr>
-              <tr><td><code class="inl">seccompProfile: RuntimeDefault</code></td><td>pod/container</td><td>Rare, dangerous syscalls (e.g. kernel module loading).</td></tr>
-              <tr><td><code class="inl">allowPrivilegeEscalation: false</code></td><td>container</td><td>A process gaining more privileges than its parent (setuid binaries).</td></tr>
-              <tr><td><code class="inl">readOnlyRootFilesystem: true</code></td><td>container</td><td>Writing anywhere except mounted volumes.</td></tr>
-              <tr><td><code class="inl">capabilities.drop: ["ALL"]</code></td><td>container</td><td>Root-like powers (raw sockets, chown, bind &lt;1024). Add back one with <code class="inl">add: ["NET_BIND_SERVICE"]</code>.</td></tr>
+              <tr><td><code class="inl">runAsNonRoot: true</code></td><td>pod/container</td><td>Running as root: the kubelet checks the UID before start</td></tr>
+              <tr><td><code class="inl">runAsUser</code> / <code class="inl">runAsGroup</code></td><td>pod/container</td><td>Forces a numeric UID/GID, whatever the image's <code class="inl">USER</code> says</td></tr>
+              <tr><td><code class="inl">fsGroup</code></td><td>pod only</td><td>"Permission denied" on volumes: their files get this GID</td></tr>
+              <tr><td><code class="inl">seccompProfile: RuntimeDefault</code></td><td>pod/container</td><td>Rare, dangerous syscalls (e.g. loading kernel modules)</td></tr>
+              <tr><td><code class="inl">allowPrivilegeEscalation: false</code></td><td>container</td><td>A process gaining more privileges than its parent (setuid binaries)</td></tr>
+              <tr><td><code class="inl">readOnlyRootFilesystem: true</code></td><td>container</td><td>Writing anywhere except mounted volumes (here <code class="inl">/tmp</code>, an <code class="inl">emptyDir</code>)</td></tr>
+              <tr><td><code class="inl">capabilities.drop: ["ALL"]</code></td><td>container</td><td>Root-like powers (raw sockets, chown, bind &lt;1024). Add one back with <code class="inl">add: ["NET_BIND_SERVICE"]</code>.</td></tr>
               <tr><td><code class="inl">privileged: true</code></td><td>container</td><td>The opposite: full host access. Never for apps.</td></tr>
             </tbody>
           </table>
         </div>
-
 <pre><span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- id
 <span class="out">uid=1000(node) gid=1000(node) groups=1000(node)</span>
 <span class="pr">$</span> kubectl exec -n taskflow deploy/taskflow-api -- touch /app/hacked.js
@@ -440,44 +548,84 @@ command terminated with exit code 1</span>
           <span class="c-title">Common mistakes</span>
           <ul>
             <li><code class="inl">runAsNonRoot: true</code> without <code class="inl">runAsUser</code> on an image with <code class="inl">USER node</code> → <code class="inl">CreateContainerConfigError</code>: <em>"container has runAsNonRoot and image has non-numeric user (node), cannot verify user is non-root"</em>. Set <code class="inl">runAsUser: 1000</code> (or <code class="inl">USER 1000</code> in the Dockerfile).</li>
-            <li>Image that runs as root + <code class="inl">runAsNonRoot: true</code> → <em>"container has runAsNonRoot and image will run as root"</em>. Fix the image, don't drop the check.</li>
             <li><code class="inl">readOnlyRootFilesystem: true</code> and the app crashes with <code class="inl">EROFS: read-only file system</code> → mount an <code class="inl">emptyDir</code> where it writes (<code class="inl">/tmp</code>, cache dirs).</li>
           </ul>
         </div>
 
-        <h3>Pod Security Standards (PSS) — enforced per namespace</h3>
-        <p>Instead of trusting every YAML author, the built-in <span class="term">Pod Security Admission</span> controller checks pods against one of three levels, chosen with namespace labels. (It replaced PodSecurityPolicy, removed in v1.25.)</p>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Level</th><th>Allows</th><th>Typical namespace</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">privileged</code></td><td>Everything (no checks)</td><td><code class="inl">kube-system</code>, CNI/storage agents</td></tr>
-              <tr><td><code class="inl">baseline</code></td><td>Blocks known escalations: <code class="inl">privileged</code>, <code class="inl">hostNetwork</code>/<code class="inl">hostPID</code>, <code class="inl">hostPath</code> volumes, host ports, extra capabilities</td><td>General apps, easy default</td></tr>
-              <tr><td><code class="inl">restricted</code></td><td>Baseline <strong>plus</strong>: <code class="inl">runAsNonRoot: true</code>, <code class="inl">allowPrivilegeEscalation: false</code>, <code class="inl">capabilities.drop: ["ALL"]</code>, seccomp <code class="inl">RuntimeDefault</code>/<code class="inl">Localhost</code>, limited volume types</td><td>Your app namespaces (<code class="inl">taskflow</code>)</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"The image says <code class="inl">USER node</code>, so the pod is guaranteed non-root." <strong>✗</strong> Only for that image. Without <code class="inl">runAsNonRoot</code>, the next image (like the draft) runs as root without a word. The securityContext makes it a rule.</p>
         </div>
-        <p>Note: <code class="inl">readOnlyRootFilesystem</code> is good practice but <em>not</em> required by <code class="inl">restricted</code>.</p>
 
-        <div class="fname">k8s/namespace.yaml</div>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Non-root · no privilege escalation · drop ALL capabilities · read-only root FS · seccomp RuntimeDefault.</strong><br /><strong>Pod level applies to all containers; container level overrides.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. The pod level says <code class="inl">runAsUser: 1000</code> and the container level says <code class="inl">runAsUser: 2000</code>. Which UID does the container run as?</summary>
+            <p class="ans">2000. Container-level settings override pod-level ones for that container.</p></details>
+          <details class="quiz"><summary>Q2. After adding <code class="inl">readOnlyRootFilesystem: true</code>, the API crashes writing <code class="inl">/app/uploads/tmp-123</code>. Give the fix that keeps the hardening.</summary>
+            <p class="ans">Mount an <code class="inl">emptyDir</code> (or a PVC if the data must last) at <code class="inl">/app/uploads</code>. Only mounted volumes are writable; the image's files stay read-only.</p></details>
+          <details class="quiz"><summary>Q3. Diagnose: <code class="inl">CreateContainerConfigError</code> with "image has non-numeric user (node), cannot verify user is non-root".</summary>
+            <p class="ans">The kubelet can't map the name <code class="inl">node</code> to a UID, so it can't prove non-root. Add <code class="inl">runAsUser: 1000</code>, or use <code class="inl">USER 1000</code> in the Dockerfile.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 5. POD SECURITY STANDARDS ===================== -->
+      <section id="pod-security">
+        <h2><span class="sec-num">5</span> Pod Security Standards</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>Section 4 works only if every YAML author remembers it. Next week someone applies <code class="inl">bad-deploy.yaml</code> with no securityContext at all, and it deploys happily. You want a <em>minimum</em> for the whole namespace that nobody can forget.</p>
+
+        <h3>The idea</h3>
+        <p>The built-in <span class="term">Pod Security Admission</span> controller checks every new pod against one of three <span class="term">Pod Security Standards</span>, chosen with namespace labels. It runs at admission, gate 3 from section 1. (It replaced PodSecurityPolicy, which was removed in v1.25.) Each label also has a <strong>mode</strong>: <code class="inl">enforce</code> rejects, <code class="inl">warn</code> prints a warning, <code class="inl">audit</code> logs.</p>
+<pre> namespace taskflow   pod-security.kubernetes.io/enforce=restricted
+   kubectl apply bad-deploy.yaml ──▶ Deployment ✔ created         (PSA checks PODS, not Deployments)
+         ReplicaSet creates pods ──▶ PSA: violates "restricted" ──▶ ✘ FailedCreate
+   result:  deployment bad-api   READY 0/2</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The <strong>building code for a tenant's floor</strong>. Inspectors at the door turn away any worker who breaks it. The company's hiring plan (the Deployment) is still filed, but none of its workers (pods) get in.</p>
+        </div>
+
+        <h3>See it: label the namespace</h3>
+        <div class="fname">k8s/namespace.yaml (Session 15's file, with Pod Security labels)</div>
 <pre><span class="kw">apiVersion</span>: v1
 <span class="kw">kind</span>: Namespace
 <span class="kw">metadata</span>:
   name: taskflow
   labels:
+    app.kubernetes.io/part-of: taskflow
+    env: dev
     pod-security.kubernetes.io/enforce: restricted         <span class="cm"># reject violating pods</span>
     pod-security.kubernetes.io/enforce-version: latest     <span class="cm"># rules of the cluster's K8s version</span>
     pod-security.kubernetes.io/warn: restricted            <span class="cm"># print a warning to kubectl users</span>
     pod-security.kubernetes.io/audit: restricted           <span class="cm"># record violations in the audit log</span></pre>
-
 <pre><span class="cm"># preview first: which running pods would violate? (nothing is changed)</span>
 <span class="pr">$</span> kubectl label --dry-run=server --overwrite ns taskflow pod-security.kubernetes.io/enforce=restricted
 <span class="out">Warning: existing pods in namespace "taskflow" violate the new PodSecurity enforce level "restricted:latest"
 Warning: postgres-0: allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
-namespace/taskflow labeled</span>
+namespace/taskflow labeled</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> touch running pods. <code class="inl">postgres-0</code> keeps running even after you enforce; the check applies when a pod is <em>created</em>. Fix Postgres first: in the official <code class="inl">postgres:16</code> image the <code class="inl">postgres</code> user is UID 999, so set <code class="inl">runAsUser: 999</code>, <code class="inl">fsGroup: 999</code> plus section 4's container settings, or run the database in a separate namespace labelled <code class="inl">baseline</code>.</p>
 
-<span class="cm"># a Deployment without securityContext in an enforced namespace:</span>
-<span class="pr">$</span> kubectl apply -f bad-deploy.yaml
+        <h3>Build it up: the three levels, and a violation</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Level</th><th>Allows</th><th>Typical namespace</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">privileged</code></td><td>Everything (no checks)</td><td><code class="inl">kube-system</code>, CNI/storage agents</td></tr>
+              <tr><td><code class="inl">baseline</code></td><td>Blocks known escalations: <code class="inl">privileged</code>, <code class="inl">hostNetwork</code>/<code class="inl">hostPID</code>, <code class="inl">hostPath</code> volumes, host ports, extra capabilities</td><td>General apps, an easy default</td></tr>
+              <tr><td><code class="inl">restricted</code></td><td>Baseline <strong>plus</strong>: <code class="inl">runAsNonRoot: true</code>, <code class="inl">allowPrivilegeEscalation: false</code>, <code class="inl">capabilities.drop: ["ALL"]</code>, seccomp <code class="inl">RuntimeDefault</code>/<code class="inl">Localhost</code>, limited volume types</td><td>Your app namespaces (<code class="inl">taskflow</code>)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code class="inl">readOnlyRootFilesystem</code> is good practice but <em>not</em> required by <code class="inl">restricted</code>. Now apply a Deployment with no securityContext:</p>
+<pre><span class="pr">$</span> kubectl apply -f bad-deploy.yaml
 <span class="out">Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "api" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "api" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "api" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "api" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
 deployment.apps/bad-api created</span>
 <span class="pr">$</span> kubectl get deploy bad-api -n taskflow
@@ -485,41 +633,70 @@ deployment.apps/bad-api created</span>
 bad-api   0/2     0            0           20s</span>
 <span class="pr">$</span> kubectl describe rs -n taskflow -l app=bad-api | grep FailedCreate
 <span class="out">  Warning  FailedCreate  15s  replicaset-controller  Error creating: pods "bad-api-5c9f8d7b6-" is forbidden: violates PodSecurity "restricted:latest": ...</span></pre>
+        <p>The warning came from <code class="inl">warn</code> at apply time, the rejection from <code class="inl">enforce</code> when the ReplicaSet created pods. Section 4's hardened Deployment passes.</p>
 
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>PSS checks <strong>pods</strong>, so a bad Deployment is still "created" — it just has 0 pods. Always check READY and the ReplicaSet events.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Pod Security Admission rejects the bad Deployment." <strong>✗</strong> It checks <strong>pods</strong>. The Deployment is created with 0 pods, so always check READY and the ReplicaSet events.</p>
         </div>
-        <p>Postgres needs the same treatment before you enforce <code class="inl">restricted</code>: in the official <code class="inl">postgres:16</code> image the <code class="inl">postgres</code> user is UID 999, so set <code class="inl">runAsUser: 999</code>, <code class="inl">fsGroup: 999</code> plus the container settings above (or keep the database in a separate namespace labelled <code class="inl">baseline</code>).</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          securityContext hardens one pod (non-root, no escalation, drop ALL caps, read-only FS). Pod Security Standards enforce a minimum level for a whole namespace via <code class="inl">pod-security.kubernetes.io/enforce</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>privileged ⊃ baseline ⊃ restricted, set per namespace with <code class="inl">pod-security.kubernetes.io/&lt;mode&gt;=&lt;level&gt;</code>.</strong><br /><strong>Modes: enforce (reject) · warn (tell the user) · audit (log). Preview with <code class="inl">--dry-run=server</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. In a <code class="inl">baseline</code> namespace, which is rejected: (a) a pod running as root with default capabilities, (b) a pod with <code class="inl">hostNetwork: true</code>?</summary>
+            <p class="ans">(b). Baseline blocks host namespaces, hostPath and privileged pods, but still allows root. Rejecting (a) takes <code class="inl">restricted</code>.</p></details>
+          <details class="quiz"><summary>Q2. Why would putting Session 15's node-exporter DaemonSet in <code class="inl">taskflow</code> fail, and where should it live?</summary>
+            <p class="ans">It uses <code class="inl">hostNetwork</code>, <code class="inl">hostPID</code> and hostPath, which even <code class="inl">baseline</code> forbids. Node agents belong in their own namespace (<code class="inl">monitoring</code>) labelled <code class="inl">privileged</code>.</p></details>
+          <details class="quiz"><summary>Q3. You set only <code class="inl">warn: restricted</code>, not <code class="inl">enforce</code>. What happens to <code class="inl">bad-deploy.yaml</code>?</summary>
+            <p class="ans">kubectl prints the same "would violate" warning, but the pods are created and run. Teams often start with warn/audit, fix the warnings, then switch on enforce.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 4. NETWORK POLICIES ===================== -->
+      <!-- ===================== 6. NETWORK POLICIES ===================== -->
       <section id="network-policies">
-        <h2><span class="sec-num">4</span> NetworkPolicies</h2>
+        <h2><span class="sec-num">6</span> NetworkPolicies</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>By default every pod can phone every other pod. A NetworkPolicy is a firewall rule saying "only the API may call the database".</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Session 15 said namespaces don't block traffic. Prove it: can a random pod reach Postgres?</p>
+<pre><span class="pr">$</span> kubectl run pgtest -n taskflow --rm -it --restart=Never --image=postgres:16 -- pg_isready -h taskflow-db -t 3
+<span class="out">taskflow-db:5432 - accepting connections</span>
+<span class="pr">$</span> kubectl run pgtest -n riya-demo --rm -it --restart=Never --image=postgres:16 -- pg_isready -h taskflow-db.taskflow -t 3
+<span class="out">taskflow-db.taskflow:5432 - accepting connections</span>      <span class="cm"># from ANOTHER namespace, too</span></pre>
+        <p>Every pod can reach every pod. If any pod in the cluster is compromised, Postgres is one network hop away, guarded only by its password.</p>
 
-        <ul>
-          <li>Default: <strong>all pods can reach all pods</strong> in all namespaces. A compromised pod can hit Postgres on 5432 directly.</li>
-          <li>A <span class="term">NetworkPolicy</span> selects pods (<code class="inl">podSelector</code>) and lists what is allowed in (<code class="inl">ingress</code>) and/or out (<code class="inl">egress</code>).</li>
-          <li>Once <em>any</em> policy selects a pod for a direction, everything not explicitly allowed in that direction is denied. Policies are additive (union of allows).</li>
-          <li>Enforced by the <strong>CNI plugin</strong>, not by Kubernetes itself. Calico and Cilium enforce; minikube's default CNI does not — policies are silently ignored.</li>
-        </ul>
-
+        <h3>The idea</h3>
+        <p>A <span class="term">NetworkPolicy</span> selects pods (<code class="inl">podSelector</code>) and lists the traffic allowed in (<code class="inl">ingress</code>) or out (<code class="inl">egress</code>). Once <em>any</em> policy selects a pod for a direction, everything not allowed in that direction is denied, and policies add up (a union of allows). The <strong>CNI plugin</strong> enforces them, not Kubernetes: Calico and Cilium do; minikube's default CNI silently ignores them.</p>
 <pre>namespace ingress-nginx              namespace taskflow
   ingress controller ──TCP 3000 ✔──► taskflow-api ──TCP 5432 ✔──► taskflow-db (postgres-0)
                                      any other pod ──── 3000 ✘ ──► taskflow-api
                                      any other pod ──── 5432 ✘ ──► taskflow-db</pre>
 
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The building's <strong>internal phone system</strong>. By default any room can dial any room. NetworkPolicies are the switchboard rules: "the database room only takes calls from the API room's extension". A switchboard without rule support (some CNIs) ignores them silently.</p>
+        </div>
+
+        <h3>See it: deny everything in</h3>
+        <p>The smallest useful policy selects every pod in the namespace and allows nothing in:</p>
+<pre><span class="kw">apiVersion</span>: networking.k8s.io/v1
+<span class="kw">kind</span>: NetworkPolicy
+<span class="kw">metadata</span>:
+  name: default-deny-ingress
+  namespace: taskflow
+<span class="kw">spec</span>:
+  podSelector: {}                 <span class="cm"># {} = ALL pods in this namespace</span>
+  policyTypes:
+    - Ingress                     <span class="cm"># Ingress listed, but no ingress rules → nothing allowed in</span></pre>
+<pre><span class="pr">$</span> kubectl run pgtest -n taskflow --rm -it --restart=Never --image=postgres:16 -- pg_isready -h taskflow-db -t 3
+<span class="out">taskflow-db:5432 - no response</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> limit outgoing traffic (only <code class="inl">Ingress</code> is listed), or affect other namespaces. It also blocks the traffic you <em>want</em>: right now the API can't reach the DB and the Ingress can't reach the API. The full file adds those two flows back.</p>
+
+        <h3>Build it up: allow exactly TaskFlow's flows</h3>
         <div class="fname">k8s/networkpolicy.yaml</div>
 <pre><span class="cm"># 1) Deny all inbound traffic to every pod in the namespace</span>
 <span class="kw">apiVersion</span>: networking.k8s.io/v1
@@ -573,37 +750,31 @@ bad-api   0/2     0            0           20s</span>
       ports:
         - protocol: TCP
           port: <span class="nm">3000</span>               <span class="cm"># the container port (targetPort), not the Service port 80</span></pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
               <tr><td><code class="inl">spec.podSelector</code></td><td>Which pods the policy applies to. <code class="inl">{}</code> = all pods in the namespace.</td></tr>
-              <tr><td><code class="inl">policyTypes</code></td><td><code class="inl">Ingress</code> (incoming), <code class="inl">Egress</code> (outgoing), or both. A listed type with no rules = deny all for that direction.</td></tr>
-              <tr><td><code class="inl">ingress[].from[]</code></td><td>Sources: <code class="inl">podSelector</code>, <code class="inl">namespaceSelector</code>, or <code class="inl">ipBlock</code> (CIDR, e.g. <code class="inl">10.0.0.0/16</code>).</td></tr>
-              <tr><td><code class="inl">ports[]</code></td><td>Destination port on the <em>pod</em> (container port), with protocol.</td></tr>
-              <tr><td><code class="inl">egress[].to[]</code></td><td>Same selectors, for outgoing traffic.</td></tr>
+              <tr><td><code class="inl">policyTypes</code></td><td><code class="inl">Ingress</code> (incoming), <code class="inl">Egress</code> (outgoing) or both. A listed type with no rules = deny all in that direction.</td></tr>
+              <tr><td><code class="inl">ingress[].from[]</code></td><td>Sources: <code class="inl">podSelector</code>, <code class="inl">namespaceSelector</code>, or <code class="inl">ipBlock</code> (a CIDR such as <code class="inl">10.0.0.0/16</code>)</td></tr>
+              <tr><td><code class="inl">ports[]</code></td><td>Destination port on the <em>pod</em> (the container port), with protocol</td></tr>
+              <tr><td><code class="inl">egress[].to[]</code></td><td>The same selectors, for outgoing traffic</td></tr>
             </tbody>
           </table>
         </div>
-
-        <p>Test it. A pod started with <code class="inl">kubectl run</code> gets label <code class="inl">run=&lt;name&gt;</code>, so it is blocked; give it the API's label and it is allowed:</p>
+        <p>Test it. A pod started with <code class="inl">kubectl run</code> gets the label <code class="inl">run=&lt;name&gt;</code>, so it's blocked; give it the API's label and it's allowed:</p>
 <pre><span class="pr">$</span> kubectl apply -f k8s/networkpolicy.yaml
-<span class="out">networkpolicy.networking.k8s.io/default-deny-ingress created
-networkpolicy.networking.k8s.io/allow-api-to-db created
-networkpolicy.networking.k8s.io/allow-ingress-to-api created</span>
 <span class="pr">$</span> kubectl get netpol -n taskflow
 <span class="out">NAME                   POD-SELECTOR       AGE
 allow-api-to-db        app=taskflow-db    10s
 allow-ingress-to-api   app=taskflow-api   10s
 default-deny-ingress   &lt;none&gt;             10s</span>
-
 <span class="pr">$</span> kubectl run pgtest -n taskflow --rm -it --restart=Never --image=postgres:16 -- pg_isready -h taskflow-db -t 3
 <span class="out">taskflow-db:5432 - no response</span>
 <span class="pr">$</span> kubectl run pgtest -n taskflow --rm -it --restart=Never --image=postgres:16 --labels=app=taskflow-api -- pg_isready -h taskflow-db -t 3
 <span class="out">taskflow-db:5432 - accepting connections</span></pre>
 
-        <h3>Two gotchas</h3>
+        <h4>Two gotchas</h4>
         <p><strong>1. AND vs OR.</strong> Two list items under <code class="inl">from</code> = OR. One item holding both selectors = AND:</p>
 <pre>  ingress:
     - from:
@@ -612,7 +783,7 @@ default-deny-ingress   &lt;none&gt;             10s</span>
     - from:
         - namespaceSelector: {matchLabels: {team: web}}
           podSelector: {matchLabels: {app: frontend}}      <span class="cm"># same item → AND: frontend pods IN team=web namespaces</span></pre>
-        <p><strong>2. Default-deny egress kills DNS.</strong> With <code class="inl">policyTypes: [Egress]</code> you must allow UDP/TCP 53 to kube-dns, or every hostname lookup (even <code class="inl">taskflow-db</code>) times out:</p>
+        <p><strong>2. Default-deny egress kills DNS.</strong> With <code class="inl">policyTypes: [Egress]</code> you must allow UDP/TCP 53 to kube-dns, or every lookup (even <code class="inl">taskflow-db</code>) times out:</p>
 <pre>  egress:
     - to:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
@@ -620,46 +791,68 @@ default-deny-ingress   &lt;none&gt;             10s</span>
       ports:
         - {protocol: UDP, port: <span class="nm">53</span>}
         - {protocol: TCP, port: <span class="nm">53</span>}</pre>
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Policy "does nothing" on minikube → cluster started without <code class="inl">--cni=calico</code>. Check <code class="inl">kubectl get pods -n kube-system | grep calico</code>.</li>
-            <li>Default-deny applied, website returns 504 → you forgot the ingress-controller → API allow (policy 3).</li>
-            <li><code class="inl">port: 80</code> in the policy when the container listens on 3000 → blocked. Policies see pod ports, not Service ports.</li>
-          </ul>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"I applied a NetworkPolicy, so the traffic is blocked." <strong>✗</strong> Only if the CNI enforces it. On a cluster started without <code class="inl">--cni=calico</code>, check <code class="inl">kubectl get pods -n kube-system | grep calico</code> first.</p>
+          <p>"The policy port is the Service port (80)." <strong>✗</strong> Policies see traffic arriving at the <em>pod</em>, after the Service, so it's the container port: 3000.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Start with <code class="inl">default-deny-ingress</code>, then allow exact flows (ingress → api:3000, api → db:5432). Needs an enforcing CNI. Separate <code class="inl">from</code> items = OR, same item = AND.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Default-deny first, then allow exact flows (ingress → api:3000, api → db:5432).</strong><br /><strong>Needs an enforcing CNI · separate <code class="inl">from</code> items = OR, same item = AND · egress deny? allow DNS.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. After applying only <code class="inl">default-deny-ingress</code> and <code class="inl">allow-api-to-db</code>, <code class="inl">http://taskflow.local</code> returns 504. Why?</summary>
+            <p class="ans">Default-deny also blocks the ingress controller's traffic to the API pods. Add <code class="inl">allow-ingress-to-api</code> (namespaceSelector <code class="inl">ingress-nginx</code>, port 3000).</p></details>
+          <details class="quiz"><summary>Q2. Predict: <code class="inl">kubectl run pgtest -n riya-demo --labels=app=taskflow-api … pg_isready -h taskflow-db.taskflow</code>.</summary>
+            <p class="ans"><code class="inl">no response</code>. A bare <code class="inl">podSelector</code> in <code class="inl">from</code> only matches pods in the policy's <em>own</em> namespace, so the label doesn't help from <code class="inl">riya-demo</code>.</p></details>
+          <details class="quiz"><summary>Q3. What does <code class="inl">podSelector: {}</code> with <code class="inl">policyTypes: [Egress]</code> and no egress rules do to the API?</summary>
+            <p class="ans">It blocks all outgoing traffic from every pod in the namespace, DNS included, so the API can't even resolve <code class="inl">taskflow-db</code>. Add allows for DNS and for port 5432.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 5. PLACEMENT ===================== -->
+      <!-- ===================== 7. PLACEMENT ===================== -->
       <section id="placement">
-        <h2><span class="sec-num">5</span> Scheduling: nodeSelector, affinity &amp; spreading</h2>
+        <h2><span class="sec-num">7</span> nodeSelector, affinity &amp; spreading</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The scheduler is a seating planner. nodeSelector and affinity are the pod saying "seat me near the window"; anti-affinity is "don't seat my twins at the same table".</p>
-        </div>
+        <h3>The problem</h3>
+        <p>You scale the API to 3 replicas on the 3-node cluster and check where they landed:</p>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+<span class="out">NAME                            NODE
+taskflow-api-6b8d9c7f5d-2xk9p   minikube-m02
+taskflow-api-6b8d9c7f5d-8qwrt   minikube-m02
+taskflow-api-6b8d9c7f5d-tz4mn   minikube-m02</span></pre>
+        <p>All three are on <code class="inl">minikube-m02</code>. Built-in spreading is only a soft preference (skew ≤ 3 per node), so this is legal, and if m02 dies, so does TaskFlow. Postgres, meanwhile, should sit on the node with the fast SSD (<code class="inl">minikube-m03</code>), but nothing says so.</p>
 
-        <p>The scheduler first <strong>filters</strong> nodes that can't run the pod (not enough requested CPU/memory, wrong labels, untolerated taints), then <strong>scores</strong> the rest. These fields steer both steps:</p>
+        <h3>The idea</h3>
+        <p>The scheduler (Session 9) first <strong>filters</strong> out nodes that can't run the pod, then <strong>scores</strong> the rest. Fields on the pod steer both steps:</p>
+<pre> new pod ──▶ FILTER (hard rules)                         ──▶ SCORE (soft preferences) ──▶ bind to best node
+              requests fit? (S15) · nodeSelector               preferred node affinity
+              required node affinity                           preferred pod (anti-)affinity
+              required pod anti-affinity · taints (section 8)  spread: ScheduleAnyway</pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Mechanism</th><th>Set on</th><th>Effect</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">nodeSelector</code></td><td>Pod</td><td>Hard rule: node must have <em>all</em> these labels (exact match).</td></tr>
-              <tr><td><code class="inl">nodeAffinity</code></td><td>Pod</td><td>Expressive node rules (<code class="inl">In</code>, <code class="inl">NotIn</code>, <code class="inl">Exists</code>, <code class="inl">Gt</code>…), hard (<em>required</em>) or soft (<em>preferred</em>).</td></tr>
-              <tr><td><code class="inl">podAffinity</code> / <code class="inl">podAntiAffinity</code></td><td>Pod</td><td>Place near / away from <em>other pods</em> with given labels.</td></tr>
-              <tr><td><code class="inl">topologySpreadConstraints</code></td><td>Pod</td><td>Keep replica counts balanced across nodes/zones (max skew).</td></tr>
-              <tr><td>Taints + tolerations</td><td>Node + Pod</td><td>Node <em>repels</em> pods unless they tolerate (topic 6).</td></tr>
+              <tr><td><code class="inl">nodeSelector</code></td><td>Pod</td><td>Hard rule: the node must have <em>all</em> these labels (exact match)</td></tr>
+              <tr><td><code class="inl">nodeAffinity</code></td><td>Pod</td><td>Expressive node rules (<code class="inl">In</code>, <code class="inl">NotIn</code>, <code class="inl">Exists</code>, <code class="inl">Gt</code>…), hard (<em>required</em>) or soft (<em>preferred</em>)</td></tr>
+              <tr><td><code class="inl">podAffinity</code> / <code class="inl">podAntiAffinity</code></td><td>Pod</td><td>Place near / away from <em>other pods</em> with given labels</td></tr>
+              <tr><td><code class="inl">topologySpreadConstraints</code></td><td>Pod</td><td>Keep replica counts balanced across nodes/zones (max skew)</td></tr>
+              <tr><td>Taints + tolerations</td><td>Node + Pod</td><td>The node <em>repels</em> pods unless they tolerate it (section 8)</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>nodeSelector — the simple one</h3>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The building's seating planner. <strong>nodeSelector</strong> = "I need a room with a sink" (no sink, no seat). <strong>Preferred affinity</strong> = "a window would be nice". <strong>Anti-affinity</strong> = "don't seat the twins in the same room", so one fire can't get both. <strong>Spread</strong> = "keep the team evenly across floors".</p>
+        </div>
+
+        <h3>See it: nodeSelector</h3>
 <pre><span class="pr">$</span> kubectl label nodes minikube-m03 disktype=ssd
 <span class="out">node/minikube-m03 labeled</span>
 <span class="pr">$</span> kubectl get nodes -L disktype
@@ -670,8 +863,10 @@ minikube-m03   Ready    &lt;none&gt;          1d    v1.35.0   ssd</span></pre>
 <pre>    <span class="kw">spec</span>:                    <span class="cm"># Postgres StatefulSet pod template</span>
       nodeSelector:
         disktype: ssd          <span class="cm"># only nodes labelled disktype=ssd</span></pre>
+        <p><code class="inl">-L disktype</code> shows that label as a column. <strong>What it does <em>not</em> do:</strong> keep other pods off <code class="inl">m03</code>. It pulls Postgres there; it doesn't reserve the node (section 8 does that). And if no node has the label, the pod stays Pending.</p>
 
-        <h3>nodeAffinity — required vs preferred</h3>
+        <h3>Build it up</h3>
+        <h4>nodeAffinity: required vs preferred</h4>
 <pre>    <span class="kw">spec</span>:
       affinity:
         nodeAffinity:
@@ -688,13 +883,9 @@ minikube-m03   Ready    &lt;none&gt;          1d    v1.35.0   ssd</span></pre>
                   - key: topology.kubernetes.io/zone
                     operator: In
                     values: [<span class="st">"ap-south-1a"</span>]</pre>
-        <ul>
-          <li><code class="inl">IgnoredDuringExecution</code> = if node labels change later, running pods are <strong>not</strong> evicted.</li>
-          <li>Well-known node labels: <code class="inl">kubernetes.io/hostname</code>, <code class="inl">topology.kubernetes.io/zone</code> (e.g. ap-south-1a on EKS), <code class="inl">kubernetes.io/arch</code>, <code class="inl">node.kubernetes.io/instance-type</code>.</li>
-        </ul>
+        <p><code class="inl">IgnoredDuringExecution</code> means that if node labels change later, running pods are <strong>not</strong> evicted. Well-known node labels: <code class="inl">kubernetes.io/hostname</code>, <code class="inl">topology.kubernetes.io/zone</code> (e.g. ap-south-1a on EKS), <code class="inl">kubernetes.io/arch</code>, <code class="inl">node.kubernetes.io/instance-type</code>.</p>
 
-        <h3>podAntiAffinity — spread API replicas across nodes</h3>
-        <p>If all 3 <code class="inl">taskflow-api</code> pods land on one node and it dies, the app is down. Ask the scheduler to avoid nodes that already run one:</p>
+        <h4>podAntiAffinity: spread the API replicas (solves the problem)</h4>
 <pre>    <span class="kw">spec</span>:                                         <span class="cm"># taskflow-api Deployment pod template</span>
       affinity:
         podAntiAffinity:
@@ -710,9 +901,9 @@ minikube-m03   Ready    &lt;none&gt;          1d    v1.35.0   ssd</span></pre>
 taskflow-api-6b8d9c7f5d-2xk9p   1/1     Running   0          40s   10.244.120.71   minikube       &lt;none&gt;           &lt;none&gt;
 taskflow-api-6b8d9c7f5d-8qwrt   1/1     Running   0          40s   10.244.205.194  minikube-m02   &lt;none&gt;           &lt;none&gt;
 taskflow-api-6b8d9c7f5d-tz4mn   1/1     Running   0          40s   10.244.151.3    minikube-m03   &lt;none&gt;           &lt;none&gt;</span></pre>
-        <p>Use <strong>preferred</strong> here: with <em>required</em> anti-affinity, replica #4 on a 3-node cluster stays Pending forever. <code class="inl">podAffinity</code> (same shape) does the opposite, e.g. put the API next to its Redis cache.</p>
+        <p>Use <strong>preferred</strong> here: with <em>required</em> anti-affinity, replica 4 on a 3-node cluster stays Pending forever. <code class="inl">podAffinity</code> has the same shape and does the opposite, e.g. put the API next to its Redis cache.</p>
 
-        <h3>topologySpreadConstraints (brief)</h3>
+        <h4>topologySpreadConstraints (brief)</h4>
 <pre>      topologySpreadConstraints:
         - maxSkew: <span class="nm">1</span>                              <span class="cm"># zones may differ by at most 1 pod</span>
           topologyKey: topology.kubernetes.io/zone
@@ -720,55 +911,76 @@ taskflow-api-6b8d9c7f5d-tz4mn   1/1     Running   0          40s   10.244.151.3 
           labelSelector:
             matchLabels:
               app: taskflow-api</pre>
-        <p>6 replicas over ap-south-1a/b/c → 2/2/2. Anti-affinity says "not together"; spread constraints say "evenly".</p>
-
-        <p>Pod stuck in Pending? The scheduler explains why in the Events:</p>
+        <p>6 replicas over ap-south-1a/b/c → 2/2/2. Anti-affinity says "not together"; spread says "evenly". When a pod is stuck Pending, the scheduler explains why:</p>
 <pre><span class="pr">$</span> kubectl describe pod postgres-0 -n taskflow | tail -3
 <span class="out">Events:
   Type     Reason            Age   From               Message
   Warning  FailedScheduling  12s   default-scheduler  0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</span></pre>
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Typo in the label (<code class="inl">diskType</code> vs <code class="inl">disktype</code> — labels are case-sensitive) or the node was never labelled → Pending as above.</li>
-            <li><em>Required</em> anti-affinity with more replicas than nodes → extra replicas Pending. Use <em>preferred</em> or add nodes.</li>
-          </ul>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Required anti-affinity is always safer." <strong>✗</strong> With more replicas than nodes, the extras stay Pending. Prefer <em>preferred</em> unless co-location is truly forbidden.</p>
+          <p>"Changing a node's labels moves running pods off it." <strong>✗</strong> <code class="inl">IgnoredDuringExecution</code>: rules apply at scheduling time only.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          nodeSelector = exact labels (hard). nodeAffinity = expressions, required or preferred. podAntiAffinity + <code class="inl">topologyKey: kubernetes.io/hostname</code> spreads replicas for HA.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>nodeSelector = exact labels (hard) · nodeAffinity = expressions, required or preferred.</strong><br /><strong>podAntiAffinity + <code class="inl">topologyKey: kubernetes.io/hostname</code> = one replica per node, for HA.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Spot the bug: the node is labelled <code class="inl">disktype=ssd</code>, the pod's nodeSelector says <code class="inl">diskType: ssd</code>, and the pod is Pending.</summary>
+            <p class="ans">Labels are case-sensitive: <code class="inl">diskType</code> ≠ <code class="inl">disktype</code>. No node matches, hence "didn't match Pod's node affinity/selector".</p></details>
+          <details class="quiz"><summary>Q2. Four API replicas, three nodes, <em>required</em> pod anti-affinity on <code class="inl">kubernetes.io/hostname</code>. Predict the pods. And with <em>preferred</em>?</summary>
+            <p class="ans">Required: 3 Running (one per node), 1 Pending forever. Preferred: all 4 Running, with two sharing a node, because the rule only lowers that node's score.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: nodeSelector and required affinity act in the scheduler's ________ step; preferred rules act in the ________ step.</summary>
+            <p class="ans">Filter · score.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 6. TAINTS ===================== -->
+      <!-- ===================== 8. TAINTS ===================== -->
       <section id="taints">
-        <h2><span class="sec-num">6</span> Taints &amp; tolerations</h2>
+        <h2><span class="sec-num">8</span> Taints &amp; tolerations</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>The nodeSelector pulled Postgres onto <code class="inl">minikube-m03</code>. Now look at who else is there:</p>
+<pre><span class="pr">$</span> kubectl get pods -A --field-selector spec.nodeName=minikube-m03 -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name
+<span class="out">NS            NAME
+kube-system   calico-node-x7k2p
+kube-system   kube-proxy-9tq2w
+taskflow      postgres-0
+taskflow      taskflow-api-6b8d9c7f5d-tz4mn
+riya-demo     loadgen-5f7b9c8d6-2kq8m</span></pre>
+        <p>Riya's load generator is eating the database node's CPU and disk. A nodeSelector attracts a pod; it can't keep others away.</p>
+
+        <h3>The idea</h3>
+        <p>Affinity <strong>attracts</strong> pods to nodes and is set on the pod. A <span class="term">taint</span> <strong>repels</strong> pods from a node and is set on the node. A <span class="term">toleration</span> on a pod lets it ignore a matching taint, but does <em>not</em> send it there. A taint is written <code class="inl">key=value:Effect</code>.</p>
+<pre> node minikube-m03   taint  dedicated=db:NoSchedule              "Staff only"
+   postgres-0     toleration dedicated=db  ✔ may enter    + nodeSelector dedicated=db → must go here
+   taskflow-api   no toleration            ✘ repelled
+   loadgen        no toleration            ✘ repelled
+ a reserved node needs BOTH: taint + toleration (keeps others out) AND nodeSelector (pulls this pod in)</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A taint is a "Staff only" sign on a node. Only pods carrying the matching pass (a toleration) may enter.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>A taint is a <strong>"Staff only" sign</strong> on a room. A toleration is <strong>the staff pass</strong>: it lets you ignore the sign, but nobody sends you into the room just because you hold one. The nodeSelector is what actually seats you there.</p>
         </div>
 
-        <ul>
-          <li>Affinity <strong>attracts</strong> pods to nodes (set on the pod). A <span class="term">taint</span> <strong>repels</strong> pods from a node (set on the node).</li>
-          <li>A <span class="term">toleration</span> on a pod lets it ignore a matching taint. It does <em>not</em> force the pod onto that node.</li>
-          <li>Format: <code class="inl">key=value:Effect</code>. Remove with a trailing <code class="inl">-</code>.</li>
-        </ul>
-
+        <h3>See it</h3>
 <pre><span class="pr">$</span> kubectl taint nodes minikube-m03 dedicated=db:NoSchedule
 <span class="out">node/minikube-m03 tainted</span>
-<span class="pr">$</span> kubectl describe node minikube-m03 | grep Taints
-<span class="out">Taints:             dedicated=db:NoSchedule</span>
 <span class="pr">$</span> kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 <span class="out">NAME           TAINTS
 minikube       &lt;none&gt;
 minikube-m02   &lt;none&gt;
 minikube-m03   [map[effect:NoSchedule key:dedicated value:db]]</span>
-<span class="pr">$</span> kubectl taint nodes minikube-m03 dedicated=db:NoSchedule-      <span class="cm"># remove</span>
+<span class="pr">$</span> kubectl taint nodes minikube-m03 dedicated=db:NoSchedule-      <span class="cm"># trailing "-" removes it</span>
 <span class="out">node/minikube-m03 untainted</span></pre>
+        <p><code class="inl">kubectl describe node minikube-m03 | grep Taints</code> shows the same thing. <strong>What it does <em>not</em> do:</strong> evict anything. With <code class="inl">NoSchedule</code>, the load generator already on m03 stays put until it's rescheduled; only <code class="inl">NoExecute</code> evicts running pods.</p>
 
+        <h3>Build it up: a dedicated database node</h3>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Effect</th><th>New pods without toleration</th><th>Already-running pods</th></tr></thead>
@@ -779,8 +991,6 @@ minikube-m03   [map[effect:NoSchedule key:dedicated value:db]]</span>
             </tbody>
           </table>
         </div>
-
-        <h3>Dedicated database node = taint + toleration + nodeSelector</h3>
 <pre><span class="pr">$</span> kubectl taint nodes minikube-m03 dedicated=db:NoSchedule    <span class="cm"># keep everything else OFF m03</span>
 <span class="pr">$</span> kubectl label nodes minikube-m03 dedicated=db               <span class="cm"># label so postgres can target m03</span></pre>
         <div class="fname">k8s/postgres.yaml (StatefulSet pod template excerpt)</div>
@@ -795,62 +1005,79 @@ minikube-m03   [map[effect:NoSchedule key:dedicated value:db]]</span>
       containers:
         - name: postgres
           image: postgres:16</pre>
-
+        <p>Kubernetes taints nodes itself, too: <code class="inl">node.kubernetes.io/not-ready</code>, <code class="inl">unreachable</code>, <code class="inl">disk-pressure</code>, <code class="inl">memory-pressure</code>, and kubeadm control planes carry <code class="inl">node-role.kubernetes.io/control-plane:NoSchedule</code> (Session 15's DaemonSet needed a toleration for it). Every pod gets a default 300-second toleration for <code class="inl">not-ready</code> and <code class="inl">unreachable</code>; shorten it to fail over faster:</p>
 <pre><span class="cm"># a pod that only tolerates node failure for 60s instead of the default 300s</span>
       tolerations:
         - key: node.kubernetes.io/unreachable
           operator: Exists
           effect: NoExecute
           tolerationSeconds: <span class="nm">60</span>   <span class="cm"># evicted 60s after the node becomes unreachable</span></pre>
-        <p>Kubernetes taints nodes itself: <code class="inl">node.kubernetes.io/not-ready</code>, <code class="inl">unreachable</code>, <code class="inl">disk-pressure</code>, <code class="inl">memory-pressure</code>, and kubeadm control planes carry <code class="inl">node-role.kubernetes.io/control-plane:NoSchedule</code> (why app pods don't run there). DaemonSets tolerate most of these automatically.</p>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>Node affinity / nodeSelector</th><th>Taints &amp; tolerations</th></tr></thead>
             <tbody>
               <tr><td>Set on</td><td>Pod</td><td>Taint on node, toleration on pod</td></tr>
               <tr><td>Direction</td><td>Pull: "I want those nodes"</td><td>Push: "this node rejects you"</td></tr>
-              <tr><td>Guarantees</td><td>Pod goes only to matching nodes</td><td>Other pods stay off the node</td></tr>
+              <tr><td>Guarantees</td><td>The pod goes only to matching nodes</td><td>Other pods stay off the node</td></tr>
               <tr><td>Can evict running pods?</td><td>No</td><td>Yes, with <code class="inl">NoExecute</code></td></tr>
               <tr><td>Use for</td><td>Hardware needs (SSD, GPU, zone)</td><td>Dedicated / special nodes, node problems</td></tr>
             </tbody>
           </table>
         </div>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p>Adding only the toleration and expecting Postgres to move to m03 — it may still land on m01/m02. Dedicated nodes need <strong>both</strong>: taint + toleration (keeps others out) and nodeSelector/affinity (pulls this pod in). Pending event for a missing toleration:
-          <code class="inl">0/3 nodes are available: 1 node(s) had untolerated taint {dedicated: db}, 2 node(s) didn't match Pod's node affinity/selector.</code></p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Give Postgres a toleration and it will move to m03." <strong>✗</strong> A toleration only <em>permits</em> m03; Postgres may still land on m01 or m02. Pending event for the opposite mistake, a nodeSelector without the toleration: <code class="inl">0/3 nodes are available: 1 node(s) had untolerated taint {dedicated: db}, 2 node(s) didn't match Pod's node affinity/selector.</code></p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">kubectl taint nodes N key=val:NoSchedule</code> repels; a toleration permits; nodeSelector attracts. NoExecute also evicts running pods.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Taint (node) repels · toleration (pod) permits · nodeSelector/affinity (pod) attracts.</strong><br /><strong>NoSchedule = no new pods · NoExecute = also evicts running ones.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You taint m03 with <code class="inl">dedicated=db:NoExecute</code> instead of <code class="inl">NoSchedule</code>. Predict what happens to the load generator and the API pod already on m03.</summary>
+            <p class="ans">Both are evicted at once (no toleration) and recreated elsewhere by their Deployments. So is <code class="inl">postgres-0</code>: its toleration says <code class="inl">effect: NoSchedule</code>, which doesn't match a NoExecute taint. Its replacement then stays Pending, because the nodeSelector requires m03 and m03 repels it. Change the toleration to <code class="inl">effect: NoExecute</code>, or omit the effect.</p></details>
+          <details class="quiz"><summary>Q2. A toleration uses <code class="inl">operator: Exists</code> with <code class="inl">key: dedicated</code> and no value. Which taints does it tolerate?</summary>
+            <p class="ans">Any taint with key <code class="inl">dedicated</code>, whatever its value (<code class="inl">db</code>, <code class="inl">gpu</code>…), for the given effect, or for all effects if <code class="inl">effect</code> is omitted.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 7. MAINTENANCE ===================== -->
+      <!-- ===================== 9. MAINTENANCE ===================== -->
       <section id="maintenance">
-        <h2><span class="sec-num">7</span> Node maintenance: cordon, drain &amp; PodDisruptionBudgets</h2>
+        <h2><span class="sec-num">9</span> Cordon, drain &amp; PodDisruptionBudgets</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p><code class="inl">minikube-m02</code> needs a kernel patch and a reboot. The naive way is to delete its pods:</p>
+<pre><span class="pr">$</span> kubectl delete pod taskflow-api-6b8d9c7f5d-8qwrt -n taskflow
+<span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -o wide | grep m02
+<span class="out">taskflow-api-6b8d9c7f5d-w7r2c   1/1     Running   0          6s    10.244.205.197   minikube-m02   &lt;none&gt;           &lt;none&gt;</span></pre>
+        <p>The replacement landed straight back on m02, because the scheduler sees nothing wrong with it. And a script that deletes every pod on a node at once can take down every replica it hosts at the same moment.</p>
+
+        <h3>The idea</h3>
+        <p><strong>Cordon</strong> marks a node unschedulable, so no new pods land there. <strong>Drain</strong> cordons it, then <em>evicts</em> its pods one by one through the Eviction API, so their controllers recreate them elsewhere. A <span class="term">PodDisruptionBudget</span> (PDB) caps how many of an app's pods voluntary evictions may take down at once, and drain respects it.</p>
+<pre> cordon m02 ──▶ drain m02 (evict pod by pod) ──────────────────▶ patch / reboot ──▶ uncordon m02
+ no new pods    each eviction asks the PDB: "3 healthy − minAvailable 2      node empty      schedulable again
+                = 1 allowed" → evict one, wait until its replacement is Ready</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Cordon = "no new guests at this table". Drain = politely move the current guests to other tables. A PDB = "never move so many at once that the party stops".</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Renovating a floor. <strong>Cordon</strong> = stop seating new people there. <strong>Drain</strong> = move the current staff, politely, to other floors. The <strong>PDB</strong> is the rule "at least 2 receptionists on duty at all times", so they move one at a time.</p>
         </div>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">kubectl cordon N</code></td><td>Marks node unschedulable. Running pods stay.</td></tr>
-              <tr><td><code class="inl">kubectl drain N</code></td><td>Cordons, then <strong>evicts</strong> pods (respecting PDBs); controllers recreate them elsewhere.</td></tr>
-              <tr><td><code class="inl">kubectl uncordon N</code></td><td>Schedulable again. Pods do <em>not</em> move back automatically.</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <h3>See it: cordon</h3>
+<pre><span class="pr">$</span> kubectl cordon minikube-m02
+<span class="out">node/minikube-m02 cordoned</span>
+<span class="pr">$</span> kubectl get nodes
+<span class="out">NAME           STATUS                     ROLES           AGE   VERSION
+minikube       Ready                      control-plane   1d    v1.35.0
+minikube-m02   Ready,SchedulingDisabled   &lt;none&gt;          1d    v1.35.0
+minikube-m03   Ready                      &lt;none&gt;          1d    v1.35.0</span></pre>
+        <p><strong>What it does <em>not</em> do:</strong> move anything. Running pods stay on m02. Cordon only stops new arrivals, so a deleted pod's replacement now goes elsewhere. <code class="inl">kubectl uncordon minikube-m02</code> reverses it.</p>
 
-        <h3>PodDisruptionBudget first</h3>
+        <h3>Build it up: a budget, then a drain</h3>
         <div class="fname">k8s/pdb.yaml</div>
 <pre><span class="kw">apiVersion</span>: policy/v1
 <span class="kw">kind</span>: PodDisruptionBudget
@@ -868,59 +1095,54 @@ minikube-m03   [map[effect:NoSchedule key:dedicated value:db]]</span>
 <span class="out">NAME               MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
 taskflow-api-pdb   2               N/A               1                     6s</span></pre>
         <p>3 healthy replicas − minAvailable 2 = <strong>1 allowed disruption</strong>: drain may evict one API pod at a time.</p>
-
-        <h3>Draining a node for an upgrade</h3>
 <pre><span class="pr">$</span> kubectl drain minikube-m02 --ignore-daemonsets --delete-emptydir-data
-<span class="out">node/minikube-m02 cordoned
+<span class="out">node/minikube-m02 already cordoned
 Warning: ignoring DaemonSet-managed Pods: kube-system/calico-node-7xk2p, kube-system/kube-proxy-q9z8d
 evicting pod taskflow/taskflow-api-6b8d9c7f5d-8qwrt
 pod/taskflow-api-6b8d9c7f5d-8qwrt evicted
 node/minikube-m02 drained</span>
-
-<span class="pr">$</span> kubectl get nodes
-<span class="out">NAME           STATUS                     ROLES           AGE   VERSION
-minikube       Ready                      control-plane   1d    v1.35.0
-minikube-m02   Ready,SchedulingDisabled   &lt;none&gt;          1d    v1.35.0
-minikube-m03   Ready                      &lt;none&gt;          1d    v1.35.0</span>
-
 <span class="cm"># ... patch / reboot the node ...</span>
 <span class="pr">$</span> kubectl uncordon minikube-m02
 <span class="out">node/minikube-m02 uncordoned</span></pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>drain flag</th><th>Why you need it</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">--ignore-daemonsets</code></td><td>DaemonSet pods can't be moved (one per node). Without it drain refuses to start.</td></tr>
-              <tr><td><code class="inl">--delete-emptydir-data</code></td><td>Pods with <code class="inl">emptyDir</code> (like our <code class="inl">/tmp</code>) lose that data; drain makes you confirm.</td></tr>
-              <tr><td><code class="inl">--force</code></td><td>Also delete bare pods with no controller (they will <em>not</em> come back).</td></tr>
-              <tr><td><code class="inl">--timeout=5m</code></td><td>Give up instead of retrying forever.</td></tr>
+              <tr><td><code class="inl">--ignore-daemonsets</code></td><td>DaemonSet pods can't move (one per node). Without it drain refuses to start.</td></tr>
+              <tr><td><code class="inl">--delete-emptydir-data</code></td><td>Pods with an <code class="inl">emptyDir</code> (like our <code class="inl">/tmp</code>) lose that data, so drain makes you confirm</td></tr>
+              <tr><td><code class="inl">--force</code></td><td>Also delete bare pods with no controller (they will <em>not</em> come back)</td></tr>
+              <tr><td><code class="inl">--timeout=5m</code></td><td>Give up instead of retrying forever</td></tr>
             </tbody>
           </table>
         </div>
-
         <div class="callout example">
           <span class="c-title">Example: the PDB doing its job</span>
-          <p>One API pod per node. Drain m02: its pod is evicted (1 disruption allowed). Drain m03 straight away while the replacement is still starting (not Ready yet): ALLOWED DISRUPTIONS is now 0, so the eviction waits:</p>
-        </div>
+          <p>One API pod per node. You drain m02, and its pod is evicted (1 disruption allowed). You drain m03 straight away, while the replacement is still starting: ALLOWED DISRUPTIONS is now 0, so that eviction waits until a replacement is Ready, and 2 replicas keep serving throughout.</p>
 <pre><span class="out">evicting pod taskflow/taskflow-api-6b8d9c7f5d-tz4mn
 error when evicting pods/"taskflow-api-6b8d9c7f5d-tz4mn" -n "taskflow" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
 ...
 pod/taskflow-api-6b8d9c7f5d-tz4mn evicted</span></pre>
-        <p>Drain retries until a replacement pod is Ready elsewhere, so 2 replicas keep serving throughout.</p>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>PDB with <code class="inl">minAvailable</code> equal to replicas (e.g. 3 of 3) or a single-replica app with <code class="inl">minAvailable: 1</code> → ALLOWED DISRUPTIONS 0 → drain hangs forever.</li>
-            <li>PDBs only cover <strong>voluntary</strong> evictions (drain, autoscaler). They don't stop a node crash or <code class="inl">kubectl delete pod</code>, and don't govern rolling updates (that's <code class="inl">maxUnavailable</code> in the Deployment).</li>
-            <li>Forgetting <code class="inl">uncordon</code> — the node stays <code class="inl">SchedulingDisabled</code> and new pods pile onto the others.</li>
-          </ul>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          cordon → drain <code class="inl">--ignore-daemonsets --delete-emptydir-data</code> → maintain → uncordon. A PDB (<code class="inl">policy/v1</code>) caps how many pods voluntary evictions may take down at once.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"A PDB protects pods from node crashes." <strong>✗</strong> PDBs cover <strong>voluntary</strong> evictions only (drain, cluster autoscaler). A crashed node or <code class="inl">kubectl delete pod</code> ignores them, and rolling updates follow the Deployment's <code class="inl">maxUnavailable</code> instead.</p>
+          <p>"Uncordon moves the pods back." <strong>✗</strong> It only makes the node schedulable again. Existing pods stay where they are.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>cordon → drain <code class="inl">--ignore-daemonsets --delete-emptydir-data</code> → maintain → uncordon.</strong><br /><strong>PDB (<code class="inl">policy/v1</code>): allowed disruptions = healthy − minAvailable.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A Deployment has 3 replicas and a PDB with <code class="inl">minAvailable: 3</code>. What happens on <code class="inl">kubectl drain</code>?</summary>
+            <p class="ans">ALLOWED DISRUPTIONS is 0, so every eviction is refused and drain retries forever. Use <code class="inl">minAvailable: 2</code> or <code class="inl">maxUnavailable: 1</code>. A single-replica app with <code class="inl">minAvailable: 1</code> blocks drain the same way.</p></details>
+          <details class="quiz"><summary>Q2. You forgot <code class="inl">uncordon</code> after the reboot. What do you see over the next week?</summary>
+            <p class="ans">m02 stays <code class="inl">Ready,SchedulingDisabled</code>. It runs nothing new, so every new pod piles onto the other two nodes.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: with <code class="inl">maxUnavailable: 1</code> and 4 healthy replicas, ALLOWED DISRUPTIONS = ____; with <code class="inl">minAvailable: 50%</code> and 4 healthy, it's ____.</summary>
+            <p class="ans">1 · 2 (4 − 2).</p></details>
         </div>
       </section>
 
@@ -932,22 +1154,23 @@ pod/taskflow-api-6b8d9c7f5d-tz4mn evicted</span></pre>
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">kubectl auth can-i delete pods -n taskflow --as riya</code></td><td>Check one permission for another user (yes/no).</td></tr>
-              <tr><td><code class="inl">kubectl auth can-i --list -n taskflow --as=system:serviceaccount:taskflow:ci-deployer</code></td><td>List everything a ServiceAccount may do.</td></tr>
-              <tr><td><code class="inl">kubectl create role R --verb=get,list --resource=pods -n NS</code></td><td>Imperative Role (add <code class="inl">--dry-run=client -o yaml</code> to get YAML).</td></tr>
-              <tr><td><code class="inl">kubectl create rolebinding B --role=R --user=riya -n NS</code></td><td>Bind a Role (or <code class="inl">--clusterrole=view</code>) to a user/group/SA in one namespace.</td></tr>
-              <tr><td><code class="inl">kubectl create clusterrolebinding B --clusterrole=C --group=dev</code></td><td>Cluster-wide grant.</td></tr>
-              <tr><td><code class="inl">kubectl get roles,rolebindings -n taskflow</code></td><td>See RBAC objects in a namespace.</td></tr>
-              <tr><td><code class="inl">kubectl create serviceaccount ci-deployer -n taskflow</code></td><td>Create a ServiceAccount.</td></tr>
-              <tr><td><code class="inl">kubectl create token ci-deployer -n taskflow --duration=1h</code></td><td>Issue a short-lived SA token.</td></tr>
-              <tr><td><code class="inl">kubectl label ns taskflow pod-security.kubernetes.io/enforce=restricted</code></td><td>Enforce a Pod Security Standard (try <code class="inl">--dry-run=server</code> first).</td></tr>
-              <tr><td><code class="inl">kubectl get netpol -n taskflow</code> / <code class="inl">describe netpol X</code></td><td>List / inspect NetworkPolicies.</td></tr>
-              <tr><td><code class="inl">minikube start --nodes 3 --cni=calico</code></td><td>Local multi-node cluster that enforces NetworkPolicies.</td></tr>
-              <tr><td><code class="inl">kubectl label nodes N disktype=ssd</code> / <code class="inl">get nodes -L disktype</code></td><td>Label a node / show label as a column.</td></tr>
-              <tr><td><code class="inl">kubectl taint nodes N dedicated=db:NoSchedule</code> (add <code class="inl">-</code> to remove)</td><td>Add / remove a taint.</td></tr>
-              <tr><td><code class="inl">kubectl cordon N</code> / <code class="inl">uncordon N</code></td><td>Stop / resume scheduling onto a node.</td></tr>
-              <tr><td><code class="inl">kubectl drain N --ignore-daemonsets --delete-emptydir-data</code></td><td>Safely evict everything for maintenance.</td></tr>
-              <tr><td><code class="inl">kubectl get pdb -n taskflow</code></td><td>Check ALLOWED DISRUPTIONS before draining.</td></tr>
+              <tr><td><code class="inl">kubectl auth can-i delete pods -n taskflow --as riya</code></td><td>Check one permission for another user (yes/no)</td></tr>
+              <tr><td><code class="inl">kubectl auth can-i --list -n taskflow --as=system:serviceaccount:taskflow:ci-deployer</code></td><td>List everything a ServiceAccount may do</td></tr>
+              <tr><td><code class="inl">kubectl create role R --verb=get,list --resource=pods -n NS</code></td><td>Imperative Role (add <code class="inl">--dry-run=client -o yaml</code> to get YAML)</td></tr>
+              <tr><td><code class="inl">kubectl create rolebinding B --role=R --user=riya -n NS</code></td><td>Bind a Role (or <code class="inl">--clusterrole=view</code>) to a user/group/SA in one namespace</td></tr>
+              <tr><td><code class="inl">kubectl create clusterrolebinding B --clusterrole=C --group=dev</code></td><td>Cluster-wide grant</td></tr>
+              <tr><td><code class="inl">kubectl get roles,rolebindings -n taskflow</code></td><td>See RBAC objects in a namespace</td></tr>
+              <tr><td><code class="inl">kubectl config set-credentials riya --client-certificate=riya.crt --client-key=riya.key</code></td><td>Add a certificate user to your kubeconfig</td></tr>
+              <tr><td><code class="inl">kubectl create serviceaccount ci-deployer -n taskflow</code></td><td>Create a ServiceAccount</td></tr>
+              <tr><td><code class="inl">kubectl create token ci-deployer -n taskflow --duration=1h</code></td><td>Issue a short-lived SA token</td></tr>
+              <tr><td><code class="inl">kubectl label ns taskflow pod-security.kubernetes.io/enforce=restricted</code></td><td>Enforce a Pod Security Standard (try <code class="inl">--dry-run=server</code> first)</td></tr>
+              <tr><td><code class="inl">kubectl get netpol -n taskflow</code> / <code class="inl">describe netpol X</code></td><td>List / inspect NetworkPolicies</td></tr>
+              <tr><td><code class="inl">minikube start --nodes 3 --cni=calico</code></td><td>Local multi-node cluster that enforces NetworkPolicies</td></tr>
+              <tr><td><code class="inl">kubectl label nodes N disktype=ssd</code> / <code class="inl">get nodes -L disktype</code></td><td>Label a node / show a label as a column</td></tr>
+              <tr><td><code class="inl">kubectl taint nodes N dedicated=db:NoSchedule</code> (add <code class="inl">-</code> to remove)</td><td>Add / remove a taint</td></tr>
+              <tr><td><code class="inl">kubectl cordon N</code> / <code class="inl">uncordon N</code></td><td>Stop / resume scheduling onto a node</td></tr>
+              <tr><td><code class="inl">kubectl drain N --ignore-daemonsets --delete-emptydir-data</code></td><td>Safely evict everything for maintenance</td></tr>
+              <tr><td><code class="inl">kubectl get pdb -n taskflow</code></td><td>Check ALLOWED DISRUPTIONS before draining</td></tr>
             </tbody>
           </table>
         </div>
@@ -959,38 +1182,22 @@ pod/taskflow-api-6b8d9c7f5d-tz4mn evicted</span></pre>
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>Security is layered. RBAC decides which humans and ServiceAccounts may change the <code class="inl">taskflow</code> namespace (Riya reads, <code class="inl">ci-deployer</code> patches Deployments). securityContext and the <code class="inl">restricted</code> Pod Security level limit what a hacked TaskFlow container can do; NetworkPolicies limit whom it can reach (only the API talks to Postgres). Scheduling controls placement: anti-affinity spreads API replicas, taints + nodeSelector reserve a node for Postgres, and a PDB lets you drain nodes without dropping below 2 API pods.</p>
+          <p>Security is layered. Authentication says who is calling, and RBAC decides what each human and ServiceAccount may change in <code class="inl">taskflow</code>: Riya reads, <code class="inl">ci-deployer</code> patches Deployments, the API holds no token at all. A securityContext and the <code class="inl">restricted</code> Pod Security level limit what a hacked container can do; NetworkPolicies limit whom it can reach (only the API talks to Postgres). Scheduling controls placement: anti-affinity spreads the API replicas, a taint plus a nodeSelector reserve a node for Postgres, and a PDB lets you drain nodes without dropping below 2 API pods.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>A user gets "403 Forbidden" from the API server. Did authentication or authorization fail?</summary>
-          <p class="ans">Authorization. Authentication succeeded (the server knows who they are); RBAC found no rule allowing the verb on that resource. Failed authentication returns 401.</p>
-        </details>
-        <details class="quiz">
-          <summary>You bind the built-in ClusterRole <code class="inl">edit</code> to Riya using a RoleBinding in namespace <code class="inl">taskflow</code>. Where can she edit things?</summary>
-          <p class="ans">Only in <code class="inl">taskflow</code>. A RoleBinding limits a ClusterRole's rules to its own namespace. A ClusterRoleBinding would grant it everywhere.</p>
-        </details>
-        <details class="quiz">
-          <summary>Your Role allows <code class="inl">apiGroups: [""]</code>, <code class="inl">resources: ["deployments"]</code>, verbs <code class="inl">["patch"]</code>, but CI still can't patch the Deployment. Why?</summary>
-          <p class="ans">Deployments are in the <code class="inl">apps</code> group, not the core group. Use <code class="inl">apiGroups: ["apps"]</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>What does <code class="inl">podSelector: {}</code> with <code class="inl">policyTypes: [Ingress]</code> and no <code class="inl">ingress</code> rules do?</summary>
-          <p class="ans">Selects every pod in the namespace and allows no inbound traffic: a default-deny for ingress. Other policies then add specific allows.</p>
-        </details>
-        <details class="quiz">
-          <summary>Difference between a taint with <code class="inl">NoSchedule</code> and <code class="inl">NoExecute</code>?</summary>
-          <p class="ans">NoSchedule only stops new non-tolerating pods from being scheduled. NoExecute also evicts already-running pods that don't tolerate it (after <code class="inl">tolerationSeconds</code> if set).</p>
-        </details>
-        <details class="quiz">
-          <summary>A Deployment has 3 replicas and a PDB with <code class="inl">minAvailable: 3</code>. What happens on <code class="inl">kubectl drain</code>?</summary>
-          <p class="ans">ALLOWED DISRUPTIONS is 0, so every eviction is refused ("would violate the pod's disruption budget") and drain retries forever. Use <code class="inl">minAvailable: 2</code> or <code class="inl">maxUnavailable: 1</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>Pods are rejected with <em>"image has non-numeric user (node), cannot verify user is non-root"</em>. Fix?</summary>
-          <p class="ans"><code class="inl">runAsNonRoot: true</code> can't verify a username. Add <code class="inl">runAsUser: 1000</code> to the securityContext (or use <code class="inl">USER 1000</code> in the Dockerfile).</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — combine everything</span>
+          <details class="quiz"><summary>Q1. In CI (Session 19) <code class="inl">helm upgrade</code> runs with the ci-deployer token and fails: <code class="inl">secrets is forbidden: User "system:serviceaccount:taskflow:ci-deployer" cannot list resource "secrets"</code>. The Deployment permissions are fine. Why, and what's the minimal fix?</summary>
+            <p class="ans">Helm stores each release's state as Secrets in the namespace (Session 17), and the <code class="inl">deployer</code> Role deliberately has no Secrets access. Add a rule for <code class="inl">secrets</code> with only the verbs Helm needs (get, list, create, update, delete), plus rules for every other kind the chart creates (Ingress in <code class="inl">networking.k8s.io</code>, HPA in <code class="inl">autoscaling</code>). Don't bind <code class="inl">cluster-admin</code>.</p></details>
+          <details class="quiz"><summary>Q2. You enforce <code class="inl">restricted</code> on <code class="inl">taskflow</code>. A week later you drain Postgres's node (section 9), and <code class="inl">postgres-0</code> never comes back. Diagnose and give two fixes.</summary>
+            <p class="ans">The drain evicted the pod, and the StatefulSet's new <code class="inl">postgres-0</code> is rejected by Pod Security, because the Postgres pod never got a securityContext. Running pods are never re-checked, so the problem only shows when a pod is re-created. Fix: add <code class="inl">runAsUser: 999</code>, <code class="inl">fsGroup: 999</code>, <code class="inl">runAsNonRoot</code>, <code class="inl">allowPrivilegeEscalation: false</code>, drop ALL and seccomp RuntimeDefault, or move the DB to a namespace labelled <code class="inl">baseline</code>.</p></details>
+          <details class="quiz"><summary>Q3. Riya (bound to <code class="inl">dev-readonly</code>) wants to test the DB from inside the cluster: <code class="inl">kubectl run dbg -n taskflow --image=postgres:16 -- pg_isready -h taskflow-db</code>. Two separate layers stop her. Which?</summary>
+            <p class="ans">(1) RBAC: her role has no <code class="inl">create</code> on pods, so she gets 403 Forbidden. (2) Even when an admin runs it, the pod is labelled <code class="inl">run=dbg</code>, and <code class="inl">allow-api-to-db</code> only admits <code class="inl">app: taskflow-api</code>, so the answer is <code class="inl">no response</code>. Authorization and network policy are independent.</p></details>
+          <details class="quiz"><summary>Q4. You reserve m03 with the <code class="inl">dedicated=db:NoSchedule</code> taint. Session 15's node-exporter DaemonSet (tolerating only the control-plane taint) now shows DESIRED one lower. Why, and how do you fix it?</summary>
+            <p class="ans">A DaemonSet pod needs to tolerate a node's taints too, and node-exporter has no toleration for <code class="inl">dedicated=db</code>, so m03 is no longer eligible. Add that toleration, or use <code class="inl">operator: Exists</code> with no key to tolerate every taint, which is common for node agents.</p></details>
+          <details class="quiz"><summary>Q5. Three API replicas, one per node via <em>required</em> anti-affinity, and a PDB with <code class="inl">minAvailable: 2</code>. You drain m02 and it finishes. Then you drain m03, and it hangs. Explain.</summary>
+            <p class="ans">The pod evicted from m02 can't be placed: m02 is cordoned, and both other nodes already run an API pod, which required anti-affinity forbids. It stays Pending, so only 2 are healthy and ALLOWED DISRUPTIONS = 2 − 2 = 0. Every eviction on m03 is refused. Use <em>preferred</em> anti-affinity, or uncordon m02 first.</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -1022,6 +1229,6 @@ pod/taskflow-api-6b8d9c7f5d-tz4mn evicted</span></pre>
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 16 — Kubernetes Security &amp; Scheduling</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

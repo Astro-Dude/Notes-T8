@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 4 — Networking Fundamentals</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,11 @@
       <span class="kicker">Term 9 · DevOps · Session 04</span>
       <h1>Networking Fundamentals</h1>
       <p class="lead">
-        Read any IP/CIDR, know which ports and protocols TaskFlow uses, follow a request from DNS lookup to
-        HTTP response, and debug "my app isn't reachable" with the right command at each step.
+        Read any IP and CIDR and do the subnet math, tell private from public addresses, and know which ports and protocols
+        TaskFlow uses. Then follow one request from DNS lookup through TCP and TLS to an HTTP response, and debug
+        "my app isn't reachable" one layer at a time.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 29 min read</span><span class="badge-rt">📖 7 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 42 min read</span><span class="badge-rt">📖 8 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -37,11 +38,12 @@
         <h4>On this page</h4>
         <ol>
           <li><a href="#ip">IP addresses &amp; subnets</a></li>
-          <li><a href="#public-private">Public vs private IP</a></li>
-          <li><a href="#ports">Ports &amp; sockets</a></li>
+          <li><a href="#public-private">Public vs private IP &amp; NAT</a></li>
+          <li><a href="#ports">Ports &amp; listening addresses</a></li>
           <li><a href="#tcp-udp">TCP vs UDP</a></li>
           <li><a href="#dns">DNS</a></li>
-          <li><a href="#http">HTTP &amp; HTTPS</a></li>
+          <li><a href="#http">HTTP</a></li>
+          <li><a href="#https">HTTPS &amp; TLS</a></li>
           <li><a href="#toolkit">Networking commands &amp; troubleshooting</a></li>
           <li><a href="#commands">Commands you must know</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
@@ -57,26 +59,74 @@
         <h2><span class="sec-num">1</span> IP addresses &amp; subnets</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>An IP address is a house number for a machine. The subnet is the street: houses on the same street talk directly; anything else goes via the post office (the gateway).</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Your friend tries TaskFlow's API from their laptop:</p>
+<pre><span class="pr">$</span> curl --connect-timeout 5 http://api.taskflow.example.com:3000/health
+<span class="out">curl: (28) Failed to connect to api.taskflow.example.com port 3000 after 5002 ms: Timeout was reached</span></pre>
+        <p>Something between their laptop and your Node process is broken. Each part of that URL belongs to a different layer, and each layer can fail on its own:</p>
+<pre> http://   api.taskflow.example.com   :3000    /health
+   │                  │                 │         └─ path inside the app ............. HTTP (§6)
+   │                  │                 └─ which program on that machine .............. port (§3)
+   │                  └─ a name, turned into an IP address ............. DNS (§5) → IP (§1–2)
+   └─ the language spoken once connected (http = plain, https = encrypted) .. HTTP over TCP (§4, §6–7)</pre>
+        <p>You'll crack this exact failure in section 8. Start at the bottom: a packet needs an address, and your laptop must decide where to send it. It reaches the TaskFlow VM on the same Wi-Fi directly, but GitHub only through the router. How does it know which is which?</p>
 
-        <ul>
-          <li>An <span class="term">IPv4 address</span> is <strong>32 bits</strong>, written as 4 <span class="term">octets</span> (0–255) in dotted decimal: <code class="inl">192.168.1.50</code>.</li>
-          <li>Every address = <strong>network part</strong> + <strong>host part</strong>. The <span class="term">subnet mask</span> (or CIDR prefix) says where the split is.</li>
-          <li><span class="term">CIDR</span> notation <code class="inl">/n</code> = the first <em>n</em> bits are the network. <code class="inl">192.168.1.50/24</code> → network <code class="inl">192.168.1.0</code>, host <code class="inl">.50</code>.</li>
-          <li>The <span class="term">default gateway</span> is the router IP on your subnet (usually <code class="inl">.1</code>). Packets for any other network are sent to it.</li>
-        </ul>
-
-<pre><span class="cm"># 192.168.10.37/28 in binary — the mask's 1-bits mark the network part</span>
+        <h3>The idea</h3>
+        <p>An <span class="term">IPv4 address</span> is 32 bits, written as four 8-bit numbers (<span class="term">octets</span>, 0–255): <code class="inl">192.168.1.50</code>. Every address has a <strong>network part</strong> (which network) and a <strong>host part</strong> (which machine on it). <span class="term">CIDR</span> notation <code class="inl">/n</code> says the first <em>n</em> bits are the network part. The same split written as an address is the <span class="term">subnet mask</span>.</p>
+<pre><span class="cm"># 192.168.10.37/28: the mask's 1-bits mark the network part</span>
 IP      192      .168      .10       .37
         11000000 .10101000 .00001010 .0010|0101
 Mask    11111111 .11111111 .11111111 .1111|0000   = 255.255.255.240  (/28 → 28 ones)
-                                          ^ network | host (4 bits → 16 addresses)</pre>
+                              network ◀───┘└───▶ host (4 bits → 16 addresses)</pre>
+        <p>Your machine uses that split to make one decision for every packet:</p>
+<pre>laptop 192.168.1.23/24
+  ├─▶ 192.168.1.50   first 24 bits match (192.168.1.x) → same network → deliver directly
+  └─▶ 140.82.112.3   no match → hand it to the default gateway 192.168.1.1 (the router)</pre>
+        <p>The <span class="term">default gateway</span> is the router's address on your network, usually <code class="inl">.1</code>. It forwards everything that isn't local.</p>
 
-        <h3>CIDR cheat table</h3>
-        <p>Usable hosts = 2<sup>(32 − n)</sup> − 2 (the first address is the <strong>network address</strong>, the last is the <strong>broadcast</strong>).</p>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A campus postal system (this page reuses it throughout). The <strong>network part is the campus</strong>, the <strong>host part the building number</strong>: /24 means "the first three numbers name the campus". Mail for a building on your own campus you deliver yourself. Everything else goes to the <strong>campus gate</strong> (the default gateway), which knows the roads outside.</p>
+        </div>
+
+        <h3>See it: your addresses and your gateway</h3>
+<pre><span class="pr">$</span> ip -br a
+<span class="out">lo               UNKNOWN        127.0.0.1/8 ::1/128
+enp0s3           UP             192.168.1.50/24 metric 100 fe80::a00:27ff:fe3a:915c/64
+docker0          DOWN           172.17.0.1/16</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">ip</code></td><td>The Linux network tool (package iproute2). It replaces the old <code class="inl">ifconfig</code>.</td></tr>
+              <tr><td><code class="inl">-br</code></td><td>Brief: one line per interface</td></tr>
+              <tr><td><code class="inl">a</code></td><td>Short for <code class="inl">address</code>: show the addresses on each interface</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The <code class="inl">enp0s3</code> line says this VM is host .50 on network <code class="inl">192.168.1.0/24</code> (cloud VMs name the NIC <code class="inl">eth0</code> or <code class="inl">ens5</code>). <code class="inl">lo</code> is loopback (section 2) and <code class="inl">docker0</code> is Docker's bridge (Session 8). The decision from the diagram, as the kernel stores it:</p>
+<pre><span class="pr">$</span> ip route
+<span class="out">default via 192.168.1.1 dev enp0s3 proto dhcp src 192.168.1.50 metric 100
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown
+192.168.1.0/24 dev enp0s3 proto kernel scope link src 192.168.1.50 metric 100</span></pre>
+        <p><code class="inl">192.168.1.0/24 … scope link</code> means "directly attached: deliver directly". <code class="inl">default via 192.168.1.1</code> means "everything else goes to the gateway". When several routes match, the most specific one (longest prefix) wins.</p>
+        <p><strong>What it does <em>not</em> do:</strong> show the address the internet sees. <code class="inl">ip a</code> lists only the addresses configured on this machine, and none of them is public here (section 2).</p>
+
+        <h3>Build it up: subnet math</h3>
+        <p>How many machines fit in a network? The host part has 32 − n bits, so there are 2<sup>(32 − n)</sup> addresses. Two are reserved: the first (host bits all 0) is the <strong>network address</strong> and the last (all 1) is the <strong>broadcast address</strong>. So <strong>usable hosts = 2<sup>(32 − n)</sup> − 2</strong>.</p>
+        <div class="callout example">
+          <span class="c-title">Worked example: which subnet is 192.168.10.37/28 in?</span>
+          <ol>
+            <li>Host bits = 32 − 28 = 4, so the block size is 2<sup>4</sup> = <strong>16</strong> addresses.</li>
+            <li>Blocks in the last octet start at 0, 16, 32, 48… and 37 falls in the block starting at <strong>32</strong>.</li>
+            <li>Network = <code class="inl">192.168.10.32</code>, broadcast = 32 + 15 = <code class="inl">192.168.10.47</code>.</li>
+            <li>Usable = <code class="inl">.33 – .46</code>, which is <strong>14 hosts</strong> (16 − 2).</li>
+          </ol>
+        </div>
+        <p>Check your arithmetic the way you'd check it on a server. Python's <code class="inl">ipaddress</code> module ships with every Ubuntu:</p>
+<pre><span class="pr">$</span> python3 -c "import ipaddress as i; n = i.ip_interface('192.168.10.37/28').network; print(n, n.netmask, n[1], n[-2], n.broadcast_address)"
+<span class="out">192.168.10.32/28 255.255.255.240 192.168.10.33 192.168.10.46 192.168.10.47</span></pre>
+        <p>Network, mask, first usable, last usable, broadcast: the same as the worked example. Likewise <code class="inl">10.0.0.0/16</code> → 65,534 hosts and <code class="inl">10.0.1.0/24</code> → 254 hosts, sitting <em>inside</em> the /16 (AWS reserves 5 IPs per subnet, so 251 there; Session 21). Now the cheat table:</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>CIDR</th><th>Mask</th><th>Addresses</th><th>Usable hosts</th><th>Typical use</th></tr></thead>
@@ -85,7 +135,7 @@ Mask    11111111 .11111111 .11111111 .1111|0000   = 255.255.255.240  (/28 → 28
               <tr><td><code class="inl">/16</code></td><td>255.255.0.0</td><td>65,536</td><td>65,534</td><td>An AWS VPC: <code class="inl">10.0.0.0/16</code></td></tr>
               <tr><td><code class="inl">/20</code></td><td>255.255.240.0</td><td>4,096</td><td>4,094</td><td>AWS default-VPC subnets (<code class="inl">172.31.0.0/20</code>)</td></tr>
               <tr><td><code class="inl">/24</code></td><td>255.255.255.0</td><td>256</td><td>254</td><td>Home Wi-Fi, one subnet per AZ (<code class="inl">10.0.1.0/24</code>)</td></tr>
-              <tr><td><code class="inl">/28</code></td><td>255.255.255.240</td><td>16</td><td>14</td><td>Tiny subnet (e.g. a few NAT/LB nodes)</td></tr>
+              <tr><td><code class="inl">/28</code></td><td>255.255.255.240</td><td>16</td><td>14</td><td>Tiny subnet (a few NAT/LB nodes)</td></tr>
               <tr><td><code class="inl">/30</code></td><td>255.255.255.252</td><td>4</td><td>2</td><td>Point-to-point router link</td></tr>
               <tr><td><code class="inl">/32</code></td><td>255.255.255.255</td><td>1</td><td>1 (exact host)</td><td>Firewall rule "only my IP": <code class="inl">203.0.113.45/32</code></td></tr>
               <tr><td><code class="inl">/0</code></td><td>0.0.0.0</td><td>all</td><td>—</td><td><code class="inl">0.0.0.0/0</code> = "anywhere" (default route, open SG rule)</td></tr>
@@ -93,90 +143,75 @@ Mask    11111111 .11111111 .11111111 .1111|0000   = 255.255.255.240  (/28 → 28
           </table>
         </div>
 
-        <div class="callout example">
-          <span class="c-title">Worked example: which subnet is 192.168.10.37/28 in?</span>
-          <ol>
-            <li>Host bits = 32 − 28 = 4 → block size = 2<sup>4</sup> = <strong>16</strong> addresses.</li>
-            <li>Blocks in the last octet start at 0, 16, 32, 48… → 37 falls in the block starting at <strong>32</strong>.</li>
-            <li>Network = <code class="inl">192.168.10.32</code>, broadcast = 32 + 15 = <code class="inl">192.168.10.47</code>.</li>
-            <li>Usable = <code class="inl">.33 – .46</code> → <strong>14 hosts</strong> (16 − 2).</li>
-          </ol>
-          <p>Same method: <code class="inl">10.0.0.0/16</code> → 65,534 hosts (<code class="inl">10.0.0.1–10.0.255.254</code>);
-          <code class="inl">10.0.1.0/24</code> → 254 hosts (<code class="inl">10.0.1.1–10.0.1.254</code>) and it sits <em>inside</em> the /16. (AWS reserves 5 IPs per subnet, so a /24 there gives 251 — see Session 21.)</p>
+        <p>Plain <code class="inl">ip a show enp0s3</code> adds details: <code class="inl">state UP</code> (<code class="inl">NO-CARRIER</code> = no link), <code class="inl">mtu 1500</code> (max packet bytes), <code class="inl">link/ether 08:00:27:3a:91:5c</code> (the <span class="term">MAC address</span>, local-network only), <code class="inl">brd 192.168.1.255</code> (broadcast) and <code class="inl">dynamic … valid_lft 85912sec</code> (a ~24 h DHCP lease).</p>
+
+        <h4>IPv6 in one minute</h4>
+        <p>IPv4's ~4.3 billion addresses ran out, so <span class="term">IPv6</span> uses <strong>128 bits</strong>, 8 groups of 4 hex digits: <code class="inl">2404:6800:4007:080f:0000:0000:0000:200e</code>. Drop leading zeros and replace <em>one</em> run of zero groups with <code class="inl">::</code> → <code class="inl">2404:6800:4007:80f::200e</code>. <code class="inl">::1</code> = loopback, <code class="inl">fe80::/10</code> = link-local (every interface has one), <code class="inl">/64</code> = the standard subnet.</p>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"A /24 has 256 hosts." <strong>✗</strong> 256 <em>addresses</em>, 254 usable: the network and broadcast addresses are reserved.</p>
+          <p>"/24 is bigger than /16, because 24 &gt; 16." <strong>✗</strong> A bigger prefix = more network bits, fewer host bits. /16 has 65,536 addresses, /24 has 256.</p>
+          <p>"A VPC can have subnets <code class="inl">10.0.1.0/24</code> and <code class="inl">10.0.1.128/25</code>." <strong>✗</strong> They overlap (.128–.255 is in both), so AWS rejects the second.</p>
         </div>
 
-        <h3>See your own addresses</h3>
-<pre><span class="pr">$</span> ip -br a                     <span class="cm"># brief: one line per interface</span>
-<span class="out">lo               UNKNOWN        127.0.0.1/8 ::1/128
-enp0s3           UP             192.168.1.50/24 metric 100 fe80::a00:27ff:fe3a:915c/64
-docker0          DOWN           172.17.0.1/16</span>
-
-<span class="pr">$</span> ip a show enp0s3             <span class="cm"># full details for one interface</span>
-<span class="out">2: enp0s3: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc fq_codel state UP group default qlen 1000
-    link/ether 08:00:27:3a:91:5c brd ff:ff:ff:ff:ff:ff
-    inet 192.168.1.50/24 metric 100 brd 192.168.1.255 scope global dynamic enp0s3
-       valid_lft 85912sec preferred_lft 85912sec
-    inet6 fe80::a00:27ff:fe3a:915c/64 scope link
-       valid_lft forever preferred_lft forever</span>
-
-<span class="pr">$</span> ip route                     <span class="cm"># routing table</span>
-<span class="out">default via 192.168.1.1 dev enp0s3 proto dhcp src 192.168.1.50 metric 100
-172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown
-192.168.1.0/24 dev enp0s3 proto kernel scope link src 192.168.1.50 metric 100</span></pre>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">lo</code>, <code class="inl">enp0s3</code>, <code class="inl">docker0</code></td><td>Loopback, the real NIC (<code class="inl">eth0</code>/<code class="inl">ens5</code> on cloud VMs), Docker's bridge (Session 8).</td></tr>
-              <tr><td><code class="inl">UP,LOWER_UP</code> / <code class="inl">state UP</code></td><td>Interface enabled and cable/link present. <code class="inl">NO-CARRIER</code>/<code class="inl">DOWN</code> = no link.</td></tr>
-              <tr><td><code class="inl">mtu 1500</code></td><td>Max packet size on this link (bytes).</td></tr>
-              <tr><td><code class="inl">link/ether 08:00:27:…</code></td><td>MAC address — layer-2, only meaningful on the local network.</td></tr>
-              <tr><td><code class="inl">inet 192.168.1.50/24 … brd 192.168.1.255</code></td><td>IPv4 address + prefix, broadcast address.</td></tr>
-              <tr><td><code class="inl">dynamic</code>, <code class="inl">valid_lft 85912sec</code></td><td>Address came from DHCP; lease expires in ~24 h.</td></tr>
-              <tr><td><code class="inl">default via 192.168.1.1</code></td><td>The default gateway: everything not matched by a more specific route goes here.</td></tr>
-              <tr><td><code class="inl">192.168.1.0/24 dev enp0s3 … scope link</code></td><td>Directly connected subnet — reached without the gateway.</td></tr>
-            </tbody>
-          </table>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>IP = network part + host part · /n = how many bits name the network.</strong><br /><strong>Usable hosts = 2<sup>(32 − n)</sup> − 2.</strong><br /><strong>Same network → deliver directly · anything else → default gateway.</strong></p>
         </div>
 
-        <h3>IPv6 glimpse</h3>
-        <ul>
-          <li><strong>128 bits</strong>, 8 groups of 4 hex digits: <code class="inl">2404:6800:4007:080f:0000:0000:0000:200e</code>.</li>
-          <li>Shorten: drop leading zeros in a group, replace <em>one</em> run of zero groups with <code class="inl">::</code> → <code class="inl">2404:6800:4007:80f::200e</code>.</li>
-          <li><code class="inl">::1</code> = loopback, <code class="inl">fe80::/10</code> = link-local (every interface gets one), <code class="inl">/64</code> = standard subnet size. Exists because IPv4's ~4.3 billion addresses ran out.</li>
-        </ul>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>"A /24 has 256 hosts" — it has 256 <em>addresses</em>, 254 usable.</li>
-            <li>Smaller prefix = <strong>bigger</strong> network: /16 (65k) is larger than /24 (256).</li>
-            <li>Two subnets in one VPC must not overlap: <code class="inl">10.0.1.0/24</code> and <code class="inl">10.0.1.128/25</code> overlap → AWS rejects it.</li>
-          </ul>
-        </div>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          IPv4 = 32 bits; <code class="inl">/n</code> = network bits; hosts = 2<sup>32−n</sup> − 2. <code class="inl">ip a</code> shows your addresses, <code class="inl">ip route</code> shows the gateway.
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. How many usable hosts are in <code class="inl">10.0.2.0/27</code>? What are the first and last usable IPs?</summary>
+            <p class="ans">32 − 27 = 5 host bits, so 2<sup>5</sup> = 32 addresses, minus 2 = <strong>30 usable</strong>: <code class="inl">10.0.2.1</code> to <code class="inl">10.0.2.30</code>. <code class="inl">.0</code> is the network address and <code class="inl">.31</code> is the broadcast.</p></details>
+          <details class="quiz"><summary>Q2. Predict: your laptop is <code class="inl">192.168.1.23/24</code> and sends a packet to <code class="inl">192.168.2.10</code>. Direct, or via the gateway? What changes if the laptop's prefix were /16?</summary>
+            <p class="ans">With /24 the first 24 bits must match, and <code class="inl">192.168.1</code> ≠ <code class="inl">192.168.2</code>, so it goes to the gateway. With /16 only <code class="inl">192.168</code> must match, so the laptop treats 192.168.2.10 as local and delivers it directly on the Wi-Fi.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: <code class="inl">10.0.0.0/16</code> holds ________ addresses and can be split into ________ /24 subnets of ________ usable hosts each.</summary>
+            <p class="ans">65,536 · 256 · 254 (251 in AWS, which reserves 5 per subnet).</p></details>
+          <details class="quiz"><summary>Q4. On a server, <code class="inl">ip route</code> has no <code class="inl">default via …</code> line. What can the server still reach, and what can't it?</summary>
+            <p class="ans">Only machines on its directly attached networks (the <code class="inl">scope link</code> routes). Everything else, the internet included, fails with "Network is unreachable": no route says where non-local packets go.</p></details>
         </div>
       </section>
 
       <!-- ===================== 2. PUBLIC VS PRIVATE ===================== -->
       <section id="public-private">
-        <h2><span class="sec-num">2</span> Public vs private IP</h2>
+        <h2><span class="sec-num">2</span> Public vs private IP &amp; NAT</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Ask the VM for its address, then ask the internet:</p>
+<pre><span class="pr">$</span> ip -4 -br a show enp0s3        <span class="cm"># what the machine thinks its IP is</span>
+<span class="out">enp0s3           UP             192.168.1.50/24</span>
+<span class="pr">$</span> curl ifconfig.me               <span class="cm"># what the internet sees</span>
+<span class="out">203.0.113.45</span></pre>
+        <p>Two different answers, and both are right. Stranger still, your friend's laptop on <em>their</em> home Wi-Fi is also <code class="inl">192.168.1.23</code>, exactly like yours. Internet addresses are supposed to be unique, so how can two machines share one?</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">public IP</span> is globally unique and routable on the internet, handed out by ISPs and cloud providers. A <span class="term">private IP</span> comes from ranges reserved by <span class="term">RFC 1918</span>, which any home, college or VPC can reuse, because internet routers <strong>never route them</strong>. The router in between does <span class="term">NAT</span> (Network Address Translation): it rewrites the private source address to its own public one and remembers the mapping so the reply finds its way back.</p>
+<pre>Laptop 192.168.1.23:52344 ──▶ Router (NAT) ──▶ 203.0.113.45:40001 ──▶ github.com 140.82.112.3:443
+                              table: 203.0.113.45:40001 ⇄ 192.168.1.23:52344
+Reply  ◀── 192.168.1.23:52344 ◀── router looks up the table ◀── 140.82.112.3:443 → 203.0.113.45:40001</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A private IP is your hostel room number — unique inside the hostel only. The public IP is the hostel's street address; the reception desk (NAT) forwards letters to the right room.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Back on the campus. <strong>Building numbers are private IPs</strong>: they only mean something inside, and every campus has a "Building 23". The <strong>campus street address is the public IP</strong>, unique in the country. The <strong>gate guard is NAT</strong>: they stamp the campus address on every outgoing letter and log which building sent it, so the reply reaches the right building. A letter from outside that matches no log entry has nowhere to go, which is why the internet can't simply connect <em>in</em> to your laptop.</p>
         </div>
 
-        <ul>
-          <li><span class="term">Public IP</span>: globally unique, routable on the internet, assigned by ISPs / cloud providers (an EC2 public IP, your router's WAN IP).</li>
-          <li><span class="term">Private IP</span>: reusable inside any LAN/VPC, <strong>never routed on the internet</strong>. Defined by <span class="term">RFC 1918</span>.</li>
-        </ul>
+        <h3>See it</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">ip -4 -br a show enp0s3</code></td><td><code class="inl">-4</code> = IPv4 only, <code class="inl">show enp0s3</code> = just that interface. The address configured on the machine.</td></tr>
+              <tr><td><code class="inl">curl ifconfig.me</code></td><td>Ask a public web service "which IP did my request come from?" That is your address <em>after</em> NAT.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>That solves the puzzle. 192.168.1.50 is the VM's building number inside the campus, and 203.0.113.45 is the router's public address, shared by every device behind it. Your friend's 192.168.1.23 and yours never meet on the internet: each leaves home as its own router's public IP.</p>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">curl ifconfig.me</code> says nothing about whether anyone can connect <em>in</em>. NAT only creates mappings for connections that start inside.</p>
 
+        <h3>Build it up</h3>
+        <h4>The three private ranges</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Range</th><th>CIDR</th><th>Size</th><th>Where you'll see it</th></tr></thead>
@@ -188,92 +223,127 @@ docker0          DOWN           172.17.0.1/16</span>
           </table>
         </div>
 
-        <p>Special addresses you must recognise:</p>
+        <h4>Special addresses you must recognise</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Address</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">127.0.0.1</code> (<code class="inl">127.0.0.0/8</code>), <code class="inl">localhost</code>, <code class="inl">::1</code></td><td><span class="term">Loopback</span> — "this machine". Traffic never leaves the host.</td></tr>
-              <tr><td><code class="inl">0.0.0.0</code></td><td>As a <strong>listen</strong> address: "all interfaces". As a route/rule: "any address" (<code class="inl">0.0.0.0/0</code>).</td></tr>
-              <tr><td><code class="inl">169.254.0.0/16</code></td><td>Link-local (no DHCP answer). <code class="inl">169.254.169.254</code> = cloud instance metadata service.</td></tr>
-              <tr><td><code class="inl">100.64.0.0/10</code></td><td>Carrier-grade NAT (mobile/ISP networks) — not your real public IP.</td></tr>
-              <tr><td><code class="inl">203.0.113.0/24</code>, <code class="inl">198.51.100.0/24</code></td><td>Documentation ranges — used as "public IPs" in these notes.</td></tr>
+              <tr><td><code class="inl">127.0.0.1</code> (<code class="inl">127.0.0.0/8</code>), <code class="inl">localhost</code>, <code class="inl">::1</code></td><td><span class="term">Loopback</span>: "this machine". Traffic never leaves the host.</td></tr>
+              <tr><td><code class="inl">0.0.0.0</code></td><td>As a <strong>listen</strong> address: "all interfaces" (section 3). In a route or firewall rule (<code class="inl">0.0.0.0/0</code>): "any address".</td></tr>
+              <tr><td><code class="inl">169.254.0.0/16</code></td><td>Link-local (DHCP never answered). <code class="inl">169.254.169.254</code> is the cloud instance metadata service.</td></tr>
+              <tr><td><code class="inl">100.64.0.0/10</code></td><td>Carrier-grade NAT (mobile and ISP networks). It isn't your real public IP.</td></tr>
+              <tr><td><code class="inl">203.0.113.0/24</code>, <code class="inl">198.51.100.0/24</code></td><td>Documentation ranges, used as "public IPs" in these notes</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>NAT: how private machines reach the internet</h3>
-        <p><span class="term">NAT</span> (Network Address Translation) on the router rewrites the private source IP:port to its public IP:port and remembers the mapping for the reply.</p>
-<pre>Laptop 192.168.1.23:52344 ──▶ Router (NAT) ──▶ 203.0.113.45:40001 ──▶ github.com 140.82.112.3:443
-                              table: 203.0.113.45:40001 ⇄ 192.168.1.23:52344
-Reply  ◀── 192.168.1.23:52344 ◀── router looks up the table ◀── 140.82.112.3:443 → 203.0.113.45:40001</pre>
-        <ul>
-          <li>Outbound connections work automatically. <strong>Inbound</strong> to a private IP needs port forwarding (home router) or a public IP / load balancer (cloud).</li>
-          <li>In AWS: an <em>Internet Gateway</em> does 1:1 NAT for instances with public IPs; a <em>NAT Gateway</em> gives private subnets outbound-only internet (Session 21).</li>
-        </ul>
+        <h4>In the cloud</h4>
+        <p>An EC2 instance gets a private IP from its subnet (say <code class="inl">10.0.1.25</code>), the only address <code class="inl">ip a</code> shows. Its public IP lives in AWS's <em>Internet Gateway</em>, which does 1:1 NAT between the two. Instances in private subnets have no public IP and go out through a <em>NAT Gateway</em>, outbound only (Session 21).</p>
 
-<pre><span class="pr">$</span> ip -4 -br a show enp0s3      <span class="cm"># the IP the machine thinks it has</span>
-<span class="out">enp0s3           UP             192.168.1.50/24</span>
-<span class="pr">$</span> curl ifconfig.me             <span class="cm"># the IP the internet sees (after NAT)</span>
-<span class="out">203.0.113.45</span></pre>
-
-        <h3><code class="inl">0.0.0.0</code> vs <code class="inl">127.0.0.1</code> — the binding that breaks Docker</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>App listens on</th><th>Reachable from same machine</th><th>From other machines / Docker <code class="inl">-p</code></th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">127.0.0.1:3000</code></td><td>✅ <code class="inl">curl localhost:3000</code></td><td>❌ refused / reset</td></tr>
-              <tr><td><code class="inl">0.0.0.0:3000</code> (or <code class="inl">[::]:3000</code>)</td><td>✅</td><td>✅ (if the firewall allows it)</td></tr>
-              <tr><td><code class="inl">192.168.1.50:3000</code></td><td>Only via that IP</td><td>✅ on that one interface</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Anyone who knows my laptop's 192.168.1.23 can connect to it over the internet." <strong>✗</strong> Private addresses are never routed there. Outsiders only see the router's public IP.</p>
+          <p>"172.32.0.1 is private." <strong>✗</strong> The block is 172.<strong>16</strong>–172.<strong>31</strong>, so it's public.</p>
+          <p>"NAT lets the internet reach machines behind the router." <strong>✗</strong> Only connections that start inside. Inbound needs port forwarding, a public IP or a load balancer.</p>
         </div>
 
-        <div class="fname">server.js (excerpt — listen part)</div>
-<pre><span class="kw">const</span> PORT = process.env.PORT || <span class="nm">3000</span>;          <span class="cm">// port from env, default 3000</span>
-<span class="kw">const</span> HOST = process.env.HOST || <span class="st">'0.0.0.0'</span>;   <span class="cm">// all interfaces — required inside containers</span>
-
-app.listen(PORT, HOST, () =&gt; {
-  console.log(`taskflow-api listening on ${HOST}:${PORT}`);
-});</pre>
-
-        <div class="callout example">
-          <span class="c-title">Example: same app, two bindings, inside Docker</span>
-<pre><span class="cm"># app inside the container bound to 127.0.0.1:3000, published with -p 8080:3000</span>
-<span class="pr">$</span> curl localhost:8080/health
-<span class="out">curl: (56) Recv failure: Connection reset by peer</span>
-<span class="pr">$</span> docker exec api netstat -tln
-<span class="out">Proto Recv-Q Send-Q Local Address           Foreign Address         State
-tcp        0      0 127.0.0.1:3000          0.0.0.0:*               LISTEN</span>
-
-<span class="cm"># fix: HOST=0.0.0.0 → container's own loopback is no longer the only door</span>
-<span class="pr">$</span> curl localhost:8080/health
-<span class="out">{"status":"ok"}</span></pre>
-          <p>The container has its <em>own</em> loopback. Docker forwards host:8080 to the container's eth0 IP, where nothing listens.</p>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Private = 10/8 · 172.16/12 · 192.168/16: reusable, never routed on the internet.</strong><br /><strong>NAT = many private addresses share one public one, outbound only.</strong></p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Private = 10/8, 172.16/12, 192.168/16, not internet-routable; NAT maps them to a public IP. Servers (and every container) must listen on <code class="inl">0.0.0.0</code>, not <code class="inl">127.0.0.1</code>.
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Public or private: <code class="inl">172.20.5.9</code>, <code class="inl">172.32.0.1</code>, <code class="inl">10.200.0.4</code>, <code class="inl">192.169.1.1</code>?</summary>
+            <p class="ans">Private, public, private, public. 172.20 is inside 172.16–172.31. 172.32 is just outside it. 10.x is always private. 192.<strong>169</strong> isn't 192.168.</p></details>
+          <details class="quiz"><summary>Q2. Predict: TaskFlow runs on your home laptop. Your friend, on another network, runs <code class="inl">curl http://203.0.113.45:3000/health</code> (your router's public IP). What happens, and why?</summary>
+            <p class="ans">It fails, usually as a timeout. The packet reaches your router, but no NAT mapping exists for an inbound connection to 3000, so the router can't tell which machine should get it and drops it. You'd need port forwarding (3000 → 192.168.1.23:3000) or a server with a public IP.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: NAT rewrites the ________ IP and port of outgoing packets to the router's ________ IP, and keeps a ________ so replies reach the right machine.</summary>
+            <p class="ans">Source · public · translation table (mapping).</p></details>
         </div>
       </section>
 
       <!-- ===================== 3. PORTS ===================== -->
       <section id="ports">
-        <h2><span class="sec-num">3</span> Ports &amp; sockets</h2>
+        <h2><span class="sec-num">3</span> Ports &amp; listening addresses</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>The TaskFlow VM at 192.168.1.50 runs SSH, PostgreSQL and the Node API at the same time. A packet arrives for 192.168.1.50. Which of the three gets it? And here is a puzzle you will hit in your first week:</p>
+<pre><span class="pr">shaurya@taskflow-vm:~$</span> curl localhost:3000/health
+<span class="out">{"status":"ok"}</span>
+<span class="pr">laptop$</span> curl http://192.168.1.50:3000/health
+<span class="out">curl: (7) Failed to connect to 192.168.1.50 port 3000 after 2 ms: Couldn't connect to server</span></pre>
+        <p>The app works on the server and is unreachable from one metre away.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">port</span> is a 16-bit number (0–65535) that picks out one program's endpoint on a host, and a <span class="term">socket</span> is IP + port: <code class="inl">192.168.1.50:3000</code>. A server <strong>listens</strong> on a fixed, known port. A client <strong>connects</strong> from a random <span class="term">ephemeral port</span> its OS picks. A TCP connection is identified by its <strong>5-tuple</strong>: protocol, source IP, source port, destination IP, destination port.</p>
+<pre> laptop 192.168.1.23                         taskflow-vm 192.168.1.50
+ browser  :52410 ───────── TCP ─────────────▶ :3000  node (taskflow-api)
+ ssh      :52344 ───────── TCP ─────────────▶ :22    sshd
+                                              :5432  postgres (listening, nobody connected)
+ one connection = (TCP, 192.168.1.23, 52410, 192.168.1.50, 3000)</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The IP finds the building; the port is the flat number inside it. Port 22 is SSH's flat, port 5432 is Postgres's flat.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>If the IP is the building, the <strong>port is the flat number</strong> inside it. A listening program lives in that flat and answers the door: SSH in flat 22, Postgres in flat 5432. A visitor writes their own randomly chosen flat number as the return address (the ephemeral port), so the reply reaches the right person.</p>
         </div>
 
-        <ul>
-          <li>A <span class="term">port</span> is a 16-bit number (0–65535) that identifies one process's endpoint on a host.</li>
-          <li>A <span class="term">socket</span> = IP + port, e.g. <code class="inl">192.168.1.50:3000</code>. A TCP connection is identified by the <strong>5-tuple</strong>: protocol, src IP, src port, dst IP, dst port.</li>
-          <li><strong>Listening</strong> (server) uses a fixed known port. <strong>Connecting</strong> (client) gets a random <span class="term">ephemeral port</span> from the OS.</li>
-        </ul>
+        <h3>See it: who is connected right now</h3>
+<pre><span class="pr">$</span> ss -tn
+<span class="out">State  Recv-Q Send-Q   Local Address:Port      Peer Address:Port  Process
+ESTAB  0      0         192.168.1.50:22        192.168.1.23:52344
+ESTAB  0      0         192.168.1.50:3000      192.168.1.23:52410</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">ss</code></td><td>Socket statistics: lists sockets (it replaces the old <code class="inl">netstat</code>)</td></tr>
+              <tr><td><code class="inl">-t</code></td><td>TCP sockets only</td></tr>
+              <tr><td><code class="inl">-n</code></td><td>Numeric: show <code class="inl">22</code>, not <code class="inl">ssh</code>, and skip DNS lookups</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Server side: fixed ports (22, 3000). Laptop side: ephemeral ones (52344, 52410). <strong>What it does <em>not</em> do:</strong> list servers waiting for connections. Plain <code class="inl">ss -t</code> shows established connections only; add <code class="inl">-l</code> for listeners.</p>
 
+        <h3>Build it up</h3>
+        <h4>Who is listening, and on which address?</h4>
+<pre><span class="pr">$</span> sudo ss -tulpn
+<span class="out">Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*     users:(("systemd-resolve",pid=612,fd=13))
+tcp   LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*     users:(("systemd-resolve",pid=612,fd=14))
+tcp   LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=901,fd=3))
+tcp   LISTEN 0      511        127.0.0.1:3000       0.0.0.0:*     users:(("node",pid=2210,fd=19))
+tcp   LISTEN 0      200        127.0.0.1:5432       0.0.0.0:*     users:(("postgres",pid=1005,fd=6))
+tcp   LISTEN 0      4096            [::]:22            [::]:*     users:(("sshd",pid=901,fd=4))</span></pre>
+        <p>New flags: <code class="inl">-u</code> adds UDP, <code class="inl">-l</code> = listening sockets, <code class="inl">-p</code> = owning process (needs <code class="inl">sudo</code> for other users' processes). TCP servers show <code class="inl">LISTEN</code>, UDP sockets <code class="inl">UNCONN</code>, and a listener's <code class="inl">Send-Q</code> is its accept backlog (Node's default is 511). The column that matters is <strong>Local Address</strong>: sshd listens on <code class="inl">0.0.0.0</code>, but node on <code class="inl">127.0.0.1</code>. That solves the puzzle.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>App listens on</th><th>From the same machine</th><th>From other machines / Docker <code class="inl">-p</code></th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">127.0.0.1:3000</code></td><td>✅ <code class="inl">curl localhost:3000</code></td><td>❌ refused / reset</td></tr>
+              <tr><td><code class="inl">0.0.0.0:3000</code> (or <code class="inl">[::]:3000</code>, <code class="inl">*:3000</code>)</td><td>✅</td><td>✅ (if the firewall allows it)</td></tr>
+              <tr><td><code class="inl">192.168.1.50:3000</code></td><td>Only via that IP</td><td>✅ on that one interface</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>TaskFlow makes the listen address configurable and defaults to all interfaces:</p>
+        <div class="fname">server.js (excerpt: the listen part)</div>
+<pre><span class="kw">const</span> PORT = process.env.PORT || <span class="nm">3000</span>;          <span class="cm">// port from the environment, default 3000</span>
+<span class="kw">const</span> HOST = process.env.HOST || <span class="st">'0.0.0.0'</span>;   <span class="cm">// all interfaces: required inside containers</span>
+
+app.listen(PORT, HOST, () =&gt; {
+  console.log(`taskflow-api listening on ${HOST}:${PORT}`);
+});</pre>
+        <p>Containers make this bite harder: each has its <em>own</em> loopback, and Docker forwards host port 8080 to the container's IP, where a 127.0.0.1-bound app isn't listening (Sessions 6 and 8):</p>
+<pre><span class="cm"># app inside the container bound to 127.0.0.1:3000, published with -p 8080:3000</span>
+<span class="pr">$</span> curl localhost:8080/health
+<span class="out">curl: (56) Recv failure: Connection reset by peer</span>
+<span class="pr">$</span> docker exec api netstat -tln
+<span class="out">Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 127.0.0.1:3000          0.0.0.0:*               LISTEN</span></pre>
+
+        <h4>Ports you must know</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Port</th><th>Protocol</th><th>Service</th><th>Where in this course</th></tr></thead>
@@ -292,41 +362,37 @@ tcp        0      0 127.0.0.1:3000          0.0.0.0:*               LISTEN</span
             </tbody>
           </table>
         </div>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Range</th><th>Name</th><th>Notes</th></tr></thead>
-            <tbody>
-              <tr><td>0 – 1023</td><td>Well-known / system</td><td>Binding needs root (or <code class="inl">CAP_NET_BIND_SERVICE</code>) on Linux.</td></tr>
-              <tr><td>1024 – 49151</td><td>Registered</td><td>Apps: 3000, 5432, 8080…</td></tr>
-              <tr><td>49152 – 65535</td><td>Dynamic / ephemeral (IANA)</td><td>Client-side ports. Linux actually uses <code class="inl">32768–60999</code>.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-<pre><span class="pr">$</span> cat /proc/sys/net/ipv4/ip_local_port_range
-<span class="out">32768	60999</span>
-
-<span class="pr">$</span> ss -tn                       <span class="cm"># established TCP connections on the server</span>
-<span class="out">State  Recv-Q Send-Q   Local Address:Port      Peer Address:Port  Process
-ESTAB  0      0         192.168.1.50:22        192.168.1.23:52344
-ESTAB  0      0         192.168.1.50:3000      192.168.1.23:52410</span>
-<span class="cm"># server side = fixed ports 22 / 3000; laptop side = ephemeral 52344 / 52410</span></pre>
+        <p>Ranges: <strong>0–1023</strong> well-known (binding needs root or <code class="inl">CAP_NET_BIND_SERVICE</code> on Linux) · <strong>1024–49151</strong> registered (3000, 5432, 8080) · <strong>49152–65535</strong> IANA's dynamic/ephemeral range. Linux actually picks client ports from <code class="inl">cat /proc/sys/net/ipv4/ip_local_port_range</code> → <code class="inl">32768	60999</code>.</p>
 
         <div class="callout warn">
-          <span class="c-title">Common mistakes (real Node errors)</span>
-<pre><span class="out">Error: listen EADDRINUSE: address already in use :::3000</span>   <span class="cm"># another process owns 3000</span>
-<span class="out">Error: listen EACCES: permission denied 0.0.0.0:80</span>        <span class="cm"># non-root binding a port &lt; 1024</span></pre>
-          <p>Find the owner: <code class="inl">sudo ss -tlnp | grep :3000</code> or <code class="inl">sudo lsof -i :3000</code>, then stop it or change <code class="inl">PORT</code>. For port 80, run on 3000 and put nginx / a load balancer / Docker <code class="inl">-p 80:3000</code> in front.</p>
-        </div>
-
-<pre><span class="pr">$</span> sudo lsof -i :3000
+          <span class="c-title">The two Node errors everyone hits</span>
+<pre><span class="out">Error: listen EADDRINUSE: address already in use :::3000</span>   <span class="cm"># another process already owns 3000</span>
+<span class="out">Error: listen EACCES: permission denied 0.0.0.0:80</span>        <span class="cm"># a non-root user binding a port below 1024</span>
+<span class="pr">$</span> sudo lsof -i :3000
 <span class="out">COMMAND  PID    USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
 node    2210 shaurya   19u  IPv6  41235      0t0  TCP *:3000 (LISTEN)</span></pre>
+          <p>Find the owner (<code class="inl">sudo ss -tlnp | grep :3000</code> or <code class="inl">lsof</code>), then stop it or change <code class="inl">PORT</code>. For port 80, keep the app on 3000 behind nginx, a load balancer or Docker's <code class="inl">-p 80:3000</code>.</p>
+        </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Socket = IP:port. Servers listen on known ports (22, 80, 443, 5432…); clients use ephemeral ports. EADDRINUSE → find the owner with <code class="inl">ss -tlnp</code> / <code class="inl">lsof -i</code>.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">curl localhost:3000</code> works on the server, so the app is reachable." <strong>✗</strong> localhost takes the loopback path and skips the network, the bind address and the firewall. Test from another machine.</p>
+          <p>"The client connects <em>from</em> port 3000 too." <strong>✗</strong> Only the server side is 3000. The client uses an ephemeral port, different for every connection.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Socket = IP:port · servers listen on known ports, clients use random ones.</strong><br /><strong>127.0.0.1 = this machine only · 0.0.0.0 = every interface.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Two browser tabs on the same laptop both talk to <code class="inl">192.168.1.50:3000</code>. Same client IP, same server IP and port. How does the server keep the connections apart?</summary>
+            <p class="ans">Each connection gets its own ephemeral source port (say 52410 and 52411), so the 5-tuples differ. The kernel delivers each packet to the matching connection.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">sudo ss -tlnp</code> shows <code class="inl">127.0.0.1:5432</code> for postgres. Can <code class="inl">taskflow-api</code> on <em>another</em> VM connect? What would it see?</summary>
+            <p class="ans">No. Postgres only accepts loopback connections, so the remote API gets "Connection refused". The fix is Postgres's <code class="inl">listen_addresses</code> setting (plus <code class="inl">pg_hba.conf</code> and the firewall). For a database, local-only is often exactly what you want.</p></details>
+          <details class="quiz"><summary>Q3. Predict: the app listens on <code class="inl">192.168.1.50:3000</code> (not 0.0.0.0). On the server you run <code class="inl">curl localhost:3000</code>. Result?</summary>
+            <p class="ans">It fails to connect. localhost is 127.0.0.1, and nothing listens on 127.0.0.1:3000. <code class="inl">curl 192.168.1.50:3000</code> would work, from the server and from other machines.</p></details>
         </div>
       </section>
 
@@ -335,17 +401,63 @@ node    2210 shaurya   19u  IPv6  41235      0t0  TCP *:3000 (LISTEN)</span></pr
         <h2><span class="sec-num">4</span> TCP vs UDP</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Different traffic needs different guarantees:</p>
+<pre>POST /tasks {"title":"Write S4 notes"}   → must arrive complete, in order, exactly once
+"What is the IP of github.com?"           → one tiny question, one tiny answer: speed matters most
+One frame of a video call                 → if it's late it's useless: skip it, don't resend</pre>
+        <p>One set of rules can't be ideal for all three, so the internet has two transport protocols.</p>
+
+        <h3>The idea</h3>
+        <p><span class="term">TCP</span> is <strong>connection-oriented</strong>: a 3-way handshake first, then every byte numbered, acknowledged and resent if lost, with slow-down under congestion. <span class="term">UDP</span> is <strong>connectionless</strong>: independent datagrams with an 8-byte header, no handshake, no acknowledgements, no ordering. Fast, but packets can be lost.</p>
+<pre>  Laptop 192.168.1.23:52410                        taskflow-api 192.168.1.50:3000
+        │ ── SYN        seq=x ─────────────────────────▶ │   "can we talk?"
+        │ ◀─ SYN-ACK    seq=y, ack=x+1 ───────────────── │   "yes, can you hear me?"
+        │ ── ACK        ack=y+1 ───────────────────────▶ │   "yes" → ESTABLISHED
+        │ ══ GET /health HTTP/1.1 ═════════════════════▶ │
+        │ ◀═ HTTP/1.1 200 OK {"status":"ok"} ═══════════ │
+        │ ── FIN ──▶  ◀── ACK, FIN ──  ── ACK ──▶        │   4-step close</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>TCP is a phone call: you say hello first and confirm every sentence was heard. UDP is shouting announcements: fast, but nobody confirms they heard you.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><strong>TCP is a registered courier.</strong> They phone ahead to check someone is home (the handshake), number every page, get a signature for each delivery (ACK) and resend anything that went missing. <strong>UDP is a postcard.</strong> You drop it in the box and hope. Nobody confirms anything, which is exactly why it's quick.</p>
         </div>
 
+        <h3>See it: watch a handshake</h3>
+<pre><span class="pr">$</span> sudo tcpdump -i lo -n 'tcp port 3000'      <span class="cm"># then, in terminal 2: curl localhost:3000/health</span>
+<span class="out">10:31:02.114201 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [S], seq 1849302211, win 65495, length 0
+10:31:02.114215 IP 127.0.0.1.3000 &gt; 127.0.0.1.52410: Flags [S.], seq 2210331876, ack 1849302212, win 65483, length 0
+10:31:02.114228 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [.], ack 1, win 512, length 0
+10:31:02.114310 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [P.], seq 1:84, ack 1, win 512, length 83: HTTP: GET /health HTTP/1.1</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">tcpdump -i lo</code></td><td>Capture packets on the loopback interface (needs root)</td></tr>
+              <tr><td><code class="inl">-n</code> · <code class="inl">'tcp port 3000'</code></td><td>Don't resolve names · only capture TCP traffic to or from port 3000</td></tr>
+              <tr><td><code class="inl">[S]</code> · <code class="inl">[S.]</code> · <code class="inl">[.]</code></td><td>SYN · SYN-ACK · ACK: the handshake</td></tr>
+              <tr><td><code class="inl">[P.]</code> · <code class="inl">[F.]</code></td><td>Push data (here, the HTTP request) · FIN (closing)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> the handshake carries no data. Look at <code class="inl">length 0</code> on the first three packets. The HTTP request travels only in the fourth, which is why every new TCP connection costs one round trip before any data moves.</p>
+
+        <h3>Build it up: testing TCP and UDP ports</h3>
+<pre><span class="pr">$</span> nc -zv 192.168.1.50 5432          <span class="cm"># TCP: a real handshake, so the answer is trustworthy</span>
+<span class="out">Connection to 192.168.1.50 5432 port [tcp/postgresql] succeeded!</span>
+<span class="pr">$</span> nc -zuv 8.8.8.8 53                <span class="cm"># UDP: no handshake, so "succeeded" only means no error came back</span>
+<span class="out">Connection to 8.8.8.8 53 port [udp/domain] succeeded!</span></pre>
+        <p><code class="inl">nc</code> (netcat) opens a raw connection: <code class="inl">-z</code> = just test, <code class="inl">-v</code> = report, <code class="inl">-u</code> = UDP. With no handshake to rely on, test a UDP service by speaking its protocol (<code class="inl">dig @8.8.8.8 google.com</code>, section 5).</p>
+        <div class="callout key">
+          <span class="c-title">Why DNS picked UDP</span>
+          <p>A DNS lookup is one small question and one small answer, so a handshake first would double the wait. DNS uses UDP 53 for normal queries and falls back to <strong>TCP 53</strong> for large responses and zone transfers, so firewalls must allow both.</p>
+        </div>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>TCP</th><th>UDP</th></tr></thead>
             <tbody>
-              <tr><td>Connection</td><td>Connection-oriented (3-way handshake first)</td><td>Connectionless — just send datagrams</td></tr>
-              <tr><td>Reliability</td><td>ACKs + retransmission; guaranteed delivery</td><td>Best effort; packets may be lost</td></tr>
+              <tr><td>Connection</td><td>Connection-oriented (3-way handshake first)</td><td>Connectionless: just send datagrams</td></tr>
+              <tr><td>Reliability</td><td>ACKs + retransmission: guaranteed delivery</td><td>Best effort: packets may be lost</td></tr>
               <tr><td>Ordering</td><td>In order (sequence numbers)</td><td>No ordering</td></tr>
               <tr><td>Flow / congestion control</td><td>Yes (window size, slow start)</td><td>No</td></tr>
               <tr><td>Header size</td><td>20–60 bytes</td><td>8 bytes</td></tr>
@@ -355,39 +467,26 @@ node    2210 shaurya   19u  IPv6  41235      0t0  TCP *:3000 (LISTEN)</span></pr
           </table>
         </div>
 
-        <h3>The 3-way handshake</h3>
-<pre>  Laptop 192.168.1.23:52410                        taskflow-api 192.168.1.50:3000
-        │ ── SYN        seq=x ─────────────────────────▶ │   "can we talk?"
-        │ ◀─ SYN-ACK    seq=y, ack=x+1 ───────────────── │   "yes, can you hear me?"
-        │ ── ACK        ack=y+1 ───────────────────────▶ │   "yes" → ESTABLISHED
-        │ ══ GET /health HTTP/1.1 ═════════════════════▶ │
-        │ ◀═ HTTP/1.1 200 OK {"status":"ok"} ═══════════ │
-        │ ── FIN ──▶  ◀── ACK, FIN ──  ── ACK ──▶        │   4-step close</pre>
-
-        <p>You can watch it happen with <code class="inl">tcpdump</code> (flags: <code class="inl">S</code> = SYN, <code class="inl">S.</code> = SYN-ACK, <code class="inl">.</code> = ACK, <code class="inl">P</code> = push data, <code class="inl">F</code> = FIN):</p>
-<pre><span class="pr">$</span> sudo tcpdump -i lo -n 'tcp port 3000'      <span class="cm"># in terminal 2: curl localhost:3000/health</span>
-<span class="out">10:31:02.114201 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [S], seq 1849302211, win 65495, length 0
-10:31:02.114215 IP 127.0.0.1.3000 &gt; 127.0.0.1.52410: Flags [S.], seq 2210331876, ack 1849302212, win 65483, length 0
-10:31:02.114228 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [.], ack 1, win 512, length 0
-10:31:02.114310 IP 127.0.0.1.52410 &gt; 127.0.0.1.3000: Flags [P.], seq 1:84, ack 1, win 512, length 83: HTTP: GET /health HTTP/1.1</span></pre>
-
-        <div class="callout example">
-          <span class="c-title">Example: testing TCP vs UDP ports</span>
-<pre><span class="pr">$</span> nc -zv 192.168.1.50 5432          <span class="cm"># TCP: real handshake → trustworthy answer</span>
-<span class="out">Connection to 192.168.1.50 5432 port [tcp/postgresql] succeeded!</span>
-<span class="pr">$</span> nc -zuv 8.8.8.8 53                <span class="cm"># UDP: no handshake → "succeeded" only means no error came back</span>
-<span class="out">Connection to 8.8.8.8 53 port [udp/domain] succeeded!</span></pre>
-          <p>For UDP services, test the protocol itself (<code class="inl">dig @8.8.8.8 google.com</code>) rather than trusting <code class="inl">nc -u</code>.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"UDP is unreliable, so nothing important uses it." <strong>✗</strong> DNS, DHCP and video calls all run on UDP. When an app needs reliability on top of UDP it builds its own, as QUIC does for HTTP/3.</p>
+          <p>"HTTP always runs over TCP." <strong>✗</strong> HTTP/1.1 and HTTP/2 do. HTTP/3 runs over QUIC, which runs over UDP.</p>
+          <p>"<code class="inl">nc -zu … succeeded</code> proves the UDP port is open." <strong>✗</strong> With no handshake, silence looks the same as success.</p>
         </div>
 
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>DNS uses UDP 53 for normal queries (one small question, one small answer — a handshake would double the latency) and falls back to TCP 53 for large responses and zone transfers. Firewalls must allow both.</p>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>TCP = handshake, reliable, ordered (web, SSH, databases).</strong><br /><strong>UDP = fire-and-forget, fast (DNS, video, QUIC).</strong><br /><strong>SYN → SYN-ACK → ACK, then data.</strong></p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          TCP = handshake, reliable, ordered (web, SSH, databases). UDP = fire-and-forget, fast (DNS, streaming, QUIC). SYN → SYN-ACK → ACK opens every TCP connection.
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. TCP or UDP: SSH · a Postgres query · a DNS lookup · a Google Meet video stream · HTTP/3?</summary>
+            <p class="ans">TCP · TCP · UDP (TCP for big answers) · UDP · UDP (QUIC). Rule of thumb: if losing a byte corrupts the result, use TCP. If late data is worthless, use UDP.</p></details>
+          <details class="quiz"><summary>Q2. Predict: your laptop sends a SYN to <code class="inl">192.168.1.50:3000</code>, but nothing is listening there. What comes back, and what does curl print? What if a firewall silently drops the SYN instead?</summary>
+            <p class="ans">The server's kernel replies <strong>RST</strong> (reset) at once, and curl prints "Couldn't connect to server" (connection refused). If a firewall drops the SYN, nothing comes back; the client retries, then gives up with a <strong>timeout</strong>. Section 8 turns this into a diagnostic.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: the client sends ________, the server replies ________, the client answers ________, and only then does ________ flow.</summary>
+            <p class="ans">SYN · SYN-ACK · ACK · application data (for example, the HTTP request).</p></details>
         </div>
       </section>
 
@@ -396,12 +495,18 @@ node    2210 shaurya   19u  IPv6  41235      0t0  TCP *:3000 (LISTEN)</span></pr
         <h2><span class="sec-num">5</span> DNS</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>DNS is the internet's phonebook: you know the name (<code class="inl">github.com</code>), DNS tells you the number (<code class="inl">140.82.112.3</code>).</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Nobody types <code class="inl">142.250.183.142</code>, and a server's IP changes every time you move it. So names have to be turned into IPs. That raises its own puzzle:</p>
+<pre><span class="pr">$</span> grep taskflow /etc/hosts
+<span class="out">192.168.1.50    taskflow.local api.taskflow.local</span>
+<span class="pr">$</span> curl -s http://taskflow.local:3000/health     <span class="cm"># works</span>
+<span class="out">{"status":"ok"}</span>
+<span class="pr">$</span> dig +short taskflow.local                     <span class="cm"># …and the lookup tool finds nothing?</span>
+<span class="pr">$</span></pre>
+        <p>And when you move <code class="inl">api.taskflow.example.com</code> to a new server, some users keep hitting the old one for an hour.</p>
 
-        <h3>Resolution flow</h3>
+        <h3>The idea</h3>
+        <p><span class="term">DNS</span> (Domain Name System) is a distributed directory that maps names to records, mostly IP addresses. Your OS checks <code class="inl">/etc/hosts</code> first. If there's no match, it asks a <strong>recursive resolver</strong>, which walks the tree from the root to the TLD to the domain's own <strong>authoritative</strong> server. Every level caches the answer for its <span class="term">TTL</span> (time to live, in seconds).</p>
 <pre>curl https://api.taskflow.example.com/health
  1. Application / browser cache ─────────────── hit? done
  2. OS: /etc/hosts  (nsswitch "hosts: files dns") ── match? done
@@ -413,68 +518,32 @@ node    2210 shaurya   19u  IPv6  41235      0t0  TCP *:3000 (LISTEN)</span></pr
         └──▶ 7. Authoritative server        → "A 203.0.113.10, TTL 300"
  8. Answer cached at each level for TTL seconds → curl connects to 203.0.113.10:443</pre>
 
-        <h3>Record types</h3>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>DNS is the campus directory. You check <strong>your own contacts list</strong> first (<code class="inl">/etc/hosts</code>). Otherwise you ring <strong>directory enquiries</strong> (the recursive resolver). The operator asks the national index (root) who handles ".com", asks .com who handles "example.com", then asks that company's receptionist (the authoritative server), and remembers the answer for TTL seconds, even if it changes meanwhile.</p>
+        </div>
+
+        <h3>See it: one lookup</h3>
+<pre><span class="pr">$</span> dig +short google.com
+<span class="out">142.250.183.142</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Type</th><th>Maps</th><th>Example</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">A</code></td><td>name → IPv4</td><td><code class="inl">api.taskflow.example.com. 300 IN A 203.0.113.10</code></td></tr>
-              <tr><td><code class="inl">AAAA</code></td><td>name → IPv6</td><td><code class="inl">api… IN AAAA 2001:db8::10</code></td></tr>
-              <tr><td><code class="inl">CNAME</code></td><td>name → another name (alias)</td><td><code class="inl">www.taskflow.example.com. IN CNAME taskflow-alb-123.ap-south-1.elb.amazonaws.com.</code></td></tr>
-              <tr><td><code class="inl">MX</code></td><td>domain → mail server (with priority)</td><td><code class="inl">example.com. IN MX 10 mail.example.com.</code></td></tr>
-              <tr><td><code class="inl">TXT</code></td><td>arbitrary text</td><td>SPF, domain-ownership verification, Let's Encrypt DNS-01 challenge</td></tr>
-              <tr><td><code class="inl">NS</code></td><td>zone → its authoritative name servers</td><td><code class="inl">example.com. IN NS ns1.exampledns.net.</code></td></tr>
-              <tr><td><code class="inl">PTR</code></td><td>IP → name (reverse DNS)</td><td><code class="inl">8.8.8.8 → dns.google.</code></td></tr>
+              <tr><td><code class="inl">dig</code></td><td>DNS lookup tool (package <code class="inl">bind9-dnsutils</code> on Ubuntu)</td></tr>
+              <tr><td><code class="inl">+short</code></td><td>Print only the answer</td></tr>
+              <tr><td><code class="inl">google.com</code></td><td>The name to look up. The record type defaults to <code class="inl">A</code> (IPv4).</td></tr>
             </tbody>
           </table>
         </div>
-        <ul>
-          <li><span class="term">TTL</span> (seconds) = how long resolvers may cache the answer. TTL 300 → after you change the record, some users see the old IP for up to 5 min. Lower the TTL a day before a migration.</li>
-          <li>A CNAME can't sit at the zone apex (<code class="inl">example.com</code> itself) alongside other records — clouds offer "alias" records instead.</li>
-        </ul>
+        <p><strong>What it does <em>not</em> do:</strong> read <code class="inl">/etc/hosts</code>. dig queries a DNS server directly, while curl, browsers and your app use the OS resolver, which checks the hosts file first. That solves the puzzle. To resolve a name <em>the way apps do</em>, use <code class="inl">getent</code>:</p>
+<pre><span class="pr">$</span> getent hosts taskflow.local
+<span class="out">192.168.1.50    taskflow.local api.taskflow.local</span></pre>
 
-        <h3>The two files on every Linux box</h3>
-        <div class="fname">/etc/hosts</div>
-<pre>127.0.0.1       localhost
-<span class="cm"># this machine's own hostname</span>
-127.0.1.1       taskflow-vm
-<span class="cm"># added by hand: IP  name [aliases…] — checked BEFORE DNS</span>
-192.168.1.50    taskflow.local api.taskflow.local
-
-<span class="cm"># The following lines are desirable for IPv6 capable hosts</span>
-::1     ip6-localhost ip6-loopback</pre>
-        <ul>
-          <li>Format: <code class="inl">IP  hostname  [aliases…]</code>, one per line, <code class="inl">#</code> comments. Needs <code class="inl">sudo</code> to edit.</li>
-          <li>Used for local names with no real DNS — e.g. <code class="inl">taskflow.local</code> pointing at <code class="inl">minikube ip</code> for Ingress (Session 12).</li>
-        </ul>
-
-        <div class="fname">/etc/resolv.conf (Ubuntu, managed by systemd-resolved)</div>
-<pre><span class="cm"># This is /run/systemd/resolve/stub-resolv.conf managed by man:systemd-resolved(8).</span>
-<span class="cm"># Do not edit.</span>
-nameserver 127.0.0.53
-options edns0 trust-ad
-search .</pre>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">nameserver 127.0.0.53</code></td><td>Send queries to the local systemd-resolved stub (it caches and forwards to the real upstream DNS). Up to 3 <code class="inl">nameserver</code> lines allowed.</td></tr>
-              <tr><td><code class="inl">options edns0 trust-ad</code></td><td>Allow larger UDP responses (EDNS0); trust the DNSSEC "authenticated data" bit from this server.</td></tr>
-              <tr><td><code class="inl">search .</code></td><td>Domains appended to short names (<code class="inl">.</code> = none). Kubernetes pods get <code class="inl">search taskflow.svc.cluster.local svc.cluster.local …</code> — Session 11.</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Comments in <code class="inl">resolv.conf</code> must start the line (<code class="inl">#</code> or <code class="inl">;</code> in column 1) — a trailing <code class="inl"># …</code> after <code class="inl">search</code> would be read as extra search domains.</p>
-<pre><span class="pr">$</span> resolvectl status enp0s3 | grep -E 'Current DNS|DNS Servers'
-<span class="out">Current DNS Server: 192.168.1.1
-       DNS Servers: 192.168.1.1 8.8.8.8</span></pre>
-
-        <h3>dig — read every line</h3>
-<pre><span class="pr">$</span> dig google.com
-<span class="out">; &lt;&lt;&gt;&gt; DiG 9.18.30-0ubuntu0.24.04.2-Ubuntu &lt;&lt;&gt;&gt; google.com
-;; global options: +cmd
-;; Got answer:
-;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 22587
+        <h3>Build it up</h3>
+        <h4>Read every line of dig</h4>
+<pre><span class="pr">$</span> dig google.com                         <span class="cm"># trimmed</span>
+<span class="out">;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 22587
 ;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
 
 ;; QUESTION SECTION:
@@ -484,79 +553,120 @@ search .</pre>
 google.com.		77	IN	A	142.250.183.142
 
 ;; Query time: 24 msec
-;; SERVER: 127.0.0.53#53(127.0.0.53) (UDP)
-;; WHEN: Fri Oct 09 10:15:02 IST 2026
-;; MSG SIZE  rcvd: 55</span></pre>
+;; SERVER: 127.0.0.53#53(127.0.0.53) (UDP)</span></pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">status: NOERROR</code></td><td>Success. <code class="inl">NXDOMAIN</code> = name doesn't exist (typo?). <code class="inl">SERVFAIL</code> = resolver/authoritative broken.</td></tr>
-              <tr><td><code class="inl">flags: qr rd ra</code></td><td>query response, recursion desired, recursion available. <code class="inl">aa</code> would mean "authoritative answer".</td></tr>
-              <tr><td><code class="inl">QUESTION SECTION</code></td><td>What was asked: name, class <code class="inl">IN</code> (internet), type <code class="inl">A</code>.</td></tr>
-              <tr><td><code class="inl">google.com. 77 IN A 142.250.183.142</code></td><td>name · <strong>remaining TTL</strong> (77 s left in cache) · class · type · value.</td></tr>
-              <tr><td><code class="inl">SERVER: 127.0.0.53#53 (UDP)</code></td><td>Which resolver answered, on which port/protocol.</td></tr>
+              <tr><td><code class="inl">status: NOERROR</code></td><td>Success. <code class="inl">NXDOMAIN</code> = the name doesn't exist (typo?). <code class="inl">SERVFAIL</code> = the resolver or authoritative server is broken.</td></tr>
+              <tr><td><code class="inl">flags: qr rd ra</code></td><td>Query response, recursion desired, recursion available. <code class="inl">aa</code> would mean "authoritative answer".</td></tr>
+              <tr><td><code class="inl">google.com. 77 IN A 142.250.183.142</code></td><td>Name · <strong>remaining TTL</strong> (77 s left in the cache) · class (<code class="inl">IN</code> = internet) · type · value</td></tr>
+              <tr><td><code class="inl">SERVER: 127.0.0.53#53 (UDP)</code></td><td>Which resolver answered, on which port and protocol (section 4)</td></tr>
             </tbody>
           </table>
         </div>
-
-<pre><span class="pr">$</span> dig +short google.com                 <span class="cm"># just the answer</span>
-<span class="out">142.250.183.142</span>
-<span class="pr">$</span> dig +short google.com MX              <span class="cm"># any record type</span>
+<pre><span class="pr">$</span> dig +short google.com MX              <span class="cm"># any record type</span>
 <span class="out">10 smtp.google.com.</span>
-<span class="pr">$</span> dig @8.8.8.8 +short github.com        <span class="cm"># ask a specific resolver (bypass local cache)</span>
+<span class="pr">$</span> dig @8.8.8.8 +short github.com        <span class="cm"># ask a specific resolver (bypasses the local cache)</span>
 <span class="out">20.207.73.82</span>
 <span class="pr">$</span> dig -x 8.8.8.8 +short                 <span class="cm"># reverse lookup (PTR)</span>
 <span class="out">dns.google.</span>
 <span class="pr">$</span> dig +trace +nodnssec google.com       <span class="cm"># walk root → TLD → authoritative yourself (trimmed)</span>
 <span class="out">.			516418	IN	NS	a.root-servers.net.
-;; Received 239 bytes from 127.0.0.53#53(127.0.0.53) in 4 ms
 com.			172800	IN	NS	a.gtld-servers.net.
-;; Received 835 bytes from 192.33.4.12#53(c.root-servers.net) in 89 ms
 google.com.		172800	IN	NS	ns1.google.com.
-;; Received 287 bytes from 192.31.80.30#53(d.gtld-servers.net) in 84 ms
-google.com.		300	IN	A	142.251.221.110
-;; Received 55 bytes from 216.239.36.10#53(ns3.google.com) in 166 ms</span>
+google.com.		300	IN	A	142.251.221.110</span>
+<span class="pr">$</span> host google.com                       <span class="cm"># shortest output; nslookup is the older tool</span>
+<span class="out">google.com has address 142.250.183.142</span></pre>
 
-<span class="pr">$</span> nslookup google.com                   <span class="cm"># older tool, same job</span>
-<span class="out">Server:		127.0.0.53
-Address:	127.0.0.53#53
+        <h4>Record types</h4>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Type</th><th>Maps</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">A</code></td><td>name → IPv4</td><td><code class="inl">api.taskflow.example.com. 300 IN A 203.0.113.10</code></td></tr>
+              <tr><td><code class="inl">AAAA</code></td><td>name → IPv6</td><td><code class="inl">api… IN AAAA 2001:db8::10</code></td></tr>
+              <tr><td><code class="inl">CNAME</code></td><td>name → another name (alias)</td><td><code class="inl">www.taskflow.example.com. IN CNAME taskflow-alb-123.ap-south-1.elb.amazonaws.com.</code></td></tr>
+              <tr><td><code class="inl">MX</code></td><td>domain → mail server (with priority)</td><td><code class="inl">example.com. IN MX 10 mail.example.com.</code></td></tr>
+              <tr><td><code class="inl">TXT</code></td><td>arbitrary text</td><td>SPF, domain-ownership checks, Let's Encrypt DNS-01 challenge</td></tr>
+              <tr><td><code class="inl">NS</code></td><td>zone → its authoritative name servers</td><td><code class="inl">example.com. IN NS ns1.exampledns.net.</code></td></tr>
+              <tr><td><code class="inl">PTR</code></td><td>IP → name (reverse DNS)</td><td><code class="inl">8.8.8.8 → dns.google.</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>That explains the second puzzle. With TTL 3600, resolvers that cached the old A record keep serving it for up to an hour, so lower the TTL (to 300, say) a day <em>before</em> a migration.</p>
 
-Non-authoritative answer:
-Name:	google.com
-Address: 142.250.183.142
-Name:	google.com
-Address: 2404:6800:4007:80f::200e</span>
-<span class="pr">$</span> host google.com                       <span class="cm"># shortest human-readable output</span>
-<span class="out">google.com has address 142.250.183.142
-google.com has IPv6 address 2404:6800:4007:80f::200e
-google.com mail is handled by 10 smtp.google.com.</span></pre>
+        <h4>The two files on every Linux box</h4>
+        <div class="fname">/etc/hosts</div>
+<pre>127.0.0.1       localhost
+<span class="cm"># this machine's own hostname</span>
+127.0.1.1       taskflow-vm
+<span class="cm"># added by hand: IP  name [aliases…], checked BEFORE DNS</span>
+192.168.1.50    taskflow.local api.taskflow.local
 
-        <div class="callout warn">
-          <span class="c-title">Common mistake: "dig says NXDOMAIN but curl works"</span>
-<pre><span class="pr">$</span> dig +short taskflow.local            <span class="cm"># dig talks to DNS servers directly — ignores /etc/hosts</span>
-<span class="pr">$</span> getent hosts taskflow.local          <span class="cm"># getent uses the OS resolver (nsswitch) like curl/apps do</span>
-<span class="out">192.168.1.50    taskflow.local api.taskflow.local</span></pre>
-          <p>Also: don't hand-edit <code class="inl">/etc/resolv.conf</code> on Ubuntu — systemd-resolved overwrites it. Configure DNS in netplan or <code class="inl">/etc/systemd/resolved.conf</code>.</p>
+<span class="cm"># The following lines are desirable for IPv6 capable hosts</span>
+::1     ip6-localhost ip6-loopback</pre>
+        <p>One <code class="inl">IP  hostname  [aliases…]</code> per line, and editing needs <code class="inl">sudo</code>. Use it for names with no real DNS, like <code class="inl">taskflow.local</code> → <code class="inl">minikube ip</code> for an Ingress (Session 12).</p>
+        <div class="fname">/etc/resolv.conf (Ubuntu, managed by systemd-resolved)</div>
+<pre><span class="cm"># This is /run/systemd/resolve/stub-resolv.conf managed by man:systemd-resolved(8).</span>
+<span class="cm"># Do not edit.</span>
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .</pre>
+        <ul>
+          <li><code class="inl">nameserver 127.0.0.53</code>: send queries to the local systemd-resolved stub, which caches and forwards upstream (the <code class="inl">127.0.0.53:53</code> listener in section 3). Up to 3 <code class="inl">nameserver</code> lines.</li>
+          <li><code class="inl">options edns0 trust-ad</code>: allow larger UDP responses (EDNS0); trust the DNSSEC "authenticated data" bit.</li>
+          <li><code class="inl">search .</code>: domains appended to short names (<code class="inl">.</code> = none). K8s pods get <code class="inl">search taskflow.svc.cluster.local …</code> (Session 11).</li>
+        </ul>
+        <p>Comments must start in column 1: a trailing <code class="inl"># …</code> after <code class="inl">search</code> becomes extra search domains. Don't hand-edit it on Ubuntu (systemd-resolved overwrites it). Use netplan or <code class="inl">/etc/systemd/resolved.conf</code>; <code class="inl">resolvectl status</code> shows the upstream servers.</p>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"TTL is how long a DNS record exists." <strong>✗</strong> TTL is how long resolvers may <em>cache</em> the answer.</p>
+          <p>"dig returns nothing, so the hosts-file entry is broken." <strong>✗</strong> dig never reads <code class="inl">/etc/hosts</code>. Check with <code class="inl">getent hosts</code>.</p>
+          <p>"Put a CNAME on example.com pointing to the load balancer." <strong>✗</strong> The zone apex can't be a CNAME. Use an A record or the cloud's alias record.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Cache → <code class="inl">/etc/hosts</code> → resolver → root → TLD → authoritative. Know A/AAAA/CNAME/MX/TXT/NS/PTR and TTL. Use <code class="inl">dig +short</code> for DNS, <code class="inl">getent hosts</code> to include <code class="inl">/etc/hosts</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>cache → /etc/hosts → resolver → root → TLD → authoritative.</strong><br /><strong>dig asks DNS directly · getent asks like an app does.</strong><br /><strong>TTL = cache time.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. <code class="inl">/etc/hosts</code> maps <code class="inl">api.taskflow.local</code> → 192.168.1.50, and DNS says 192.168.1.60. Which IP does curl use? Which does dig show?</summary>
+            <p class="ans">curl uses 192.168.1.50, because the OS resolver checks files before DNS (<code class="inl">hosts: files dns</code> in <code class="inl">/etc/nsswitch.conf</code>). dig shows 192.168.1.60, because it only asks DNS.</p></details>
+          <details class="quiz"><summary>Q2. Which record type? (a) <code class="inl">www</code> → an AWS load balancer's hostname (b) where mail for example.com goes (c) proving to Let's Encrypt that you own the domain (d) 8.8.8.8 → dns.google</summary>
+            <p class="ans">(a) CNAME · (b) MX · (c) TXT · (d) PTR.</p></details>
+          <details class="quiz"><summary>Q3. One name returns <code class="inl">status: NXDOMAIN</code>, another <code class="inl">status: SERVFAIL</code>. What does each suggest you check?</summary>
+            <p class="ans">NXDOMAIN: the name doesn't exist, so check for a typo or a missing record in the zone. SERVFAIL: the lookup itself broke (the authoritative servers are unreachable or misconfigured, or DNSSEC failed), so try <code class="inl">dig @8.8.8.8</code> and <code class="inl">dig +trace</code> to see where.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 6. HTTP / HTTPS ===================== -->
+      <!-- ===================== 6. HTTP ===================== -->
       <section id="http">
-        <h2><span class="sec-num">6</span> HTTP &amp; HTTPS</h2>
+        <h2><span class="sec-num">6</span> HTTP</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>TCP gives you a reliable pipe of bytes and nothing more. The API still needs to know <em>what</em> you want (list tasks or create one?), <em>which site</em> you mean (one IP can host many), what format your data is in and who you are, and you need to know whether it worked. Both sides must agree on a format.</p>
+
+        <h3>The idea</h3>
+        <p><span class="term">HTTP</span> is that format, and in HTTP/1.1 it is plain text. A <strong>request</strong> is a request line (method, path, version), headers, a blank line and an optional body. A <strong>response</strong> is a status line (version, code, reason), headers, a blank line and a body.</p>
+<pre>Request (laptop → API)                         Response (API → laptop)
+POST /tasks HTTP/1.1         <span class="cm">← request line</span>     HTTP/1.1 201 Created            <span class="cm">← status line</span>
+Host: 192.168.1.50:3000      <span class="cm">← headers start</span>    Content-Type: application/json
+Content-Type: application/json                 Content-Length: 46
+Content-Length: 26
+                             <span class="cm">← blank line = headers end</span>
+{"title":"Write S4 notes"}   <span class="cm">← body (26 bytes)</span>  {"id":1,"title":"Write S4 notes","done":false}</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>HTTP is a polite letter format: "GET me /tasks please" → "200 OK, here they are". HTTPS puts that letter in a locked box only the real server can open.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>HTTP is the agreed <strong>letter format</strong> inside the courier's envelope. The first line says what you want ("POST to /tasks"), the headers are labels (who it's for, what language, how long), then a blank line and the letter. The reply starts with a <strong>stamp</strong>, the status code: 201 Created, 404 Not Found.</p>
         </div>
 
-        <h3>Anatomy of a request and response (<code class="inl">curl -v</code>)</h3>
+        <h3>See it: one request, every line</h3>
 <pre><span class="pr">$</span> curl -v http://192.168.1.50:3000/health
 <span class="out">*   Trying 192.168.1.50:3000...
 * Connected to 192.168.1.50 (192.168.1.50) port 3000
@@ -580,28 +690,21 @@ google.com mail is handled by 10 smtp.google.com.</span></pre>
           <table>
             <thead><tr><th>Line(s)</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">* Trying … / Connected</code></td><td>curl's own notes: DNS done, TCP handshake to port 3000 succeeded.</td></tr>
-              <tr><td><code class="inl">&gt; GET /health HTTP/1.1</code></td><td><strong>Request line</strong>: method, path, version. <code class="inl">&gt;</code> = sent by curl.</td></tr>
-              <tr><td><code class="inl">&gt; Host:</code></td><td>Mandatory in HTTP/1.1 — lets one IP serve many sites (virtual hosts, Ingress host rules).</td></tr>
-              <tr><td><code class="inl">&gt; User-Agent / Accept</code></td><td>Client identity; content types the client accepts.</td></tr>
-              <tr><td>empty <code class="inl">&gt;</code> line</td><td>End of headers (GET has no body).</td></tr>
-              <tr><td><code class="inl">&lt; HTTP/1.1 200 OK</code></td><td><strong>Status line</strong>: version, code, reason. <code class="inl">&lt;</code> = received.</td></tr>
-              <tr><td><code class="inl">&lt; Content-Type / Content-Length</code></td><td>Body is JSON, 15 bytes (<code class="inl">{"status":"ok"}</code>).</td></tr>
-              <tr><td><code class="inl">&lt; ETag</code></td><td>Version tag of the body; client can send <code class="inl">If-None-Match</code> and get <code class="inl">304</code>.</td></tr>
-              <tr><td><code class="inl">&lt; Connection: keep-alive</code></td><td>TCP connection reused for more requests (no new handshake).</td></tr>
-              <tr><td>last line</td><td>The response body.</td></tr>
+              <tr><td><code class="inl">* Trying … / Connected</code></td><td>curl's own notes. The name is resolved and the TCP handshake to port 3000 has succeeded (section 4).</td></tr>
+              <tr><td><code class="inl">&gt; GET /health HTTP/1.1</code></td><td><strong>Request line</strong>. Lines starting <code class="inl">&gt;</code> were sent by curl.</td></tr>
+              <tr><td><code class="inl">&gt; Host:</code></td><td>Mandatory in HTTP/1.1. It lets one IP serve many sites (virtual hosts, Ingress host rules).</td></tr>
+              <tr><td>empty <code class="inl">&gt;</code> line</td><td>End of headers. A GET has no body.</td></tr>
+              <tr><td><code class="inl">&lt; HTTP/1.1 200 OK</code></td><td><strong>Status line</strong>. Lines starting <code class="inl">&lt;</code> were received.</td></tr>
+              <tr><td><code class="inl">&lt; Content-Type / Content-Length</code></td><td>The body is JSON, 15 bytes long (<code class="inl">{"status":"ok"}</code>)</td></tr>
+              <tr><td><code class="inl">&lt; ETag</code></td><td>A version tag for the body. A client can send <code class="inl">If-None-Match</code> and get <code class="inl">304</code>.</td></tr>
+              <tr><td><code class="inl">&lt; Connection: keep-alive</code></td><td>The TCP connection is reused for more requests, so there's no new handshake</td></tr>
             </tbody>
           </table>
         </div>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">-v</code> (verbose) changes nothing about the request. It only shows what's on the wire, and all of it crossed the network as readable text (section 7 fixes that).</p>
 
-        <p>A request with a body, as raw text on the wire:</p>
-<pre>POST /tasks HTTP/1.1                   <span class="cm">← request line</span>
-Host: 192.168.1.50:3000                <span class="cm">← headers start</span>
-Content-Type: application/json
-Content-Length: 26
-                                       <span class="cm">← blank line = headers end</span>
-{"title":"Write S4 notes"}             <span class="cm">← body (26 bytes)</span></pre>
-
+        <h3>Build it up</h3>
+        <h4>Sending data: POST</h4>
 <pre><span class="pr">$</span> curl -i -X POST http://192.168.1.50:3000/tasks \
     -H "Content-Type: application/json" \
     -d '{"title":"Write S4 notes"}'
@@ -614,70 +717,107 @@ Date: Fri, 09 Oct 2026 05:14:02 GMT
 {"id":1,"title":"Write S4 notes","done":false}</span>
 <span class="pr">$</span> curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Content-Type: application/json" -d '{}' http://192.168.1.50:3000/tasks
 <span class="out">400</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-i</code></td><td>Include the response headers in the output (<code class="inl">-I</code> instead sends a HEAD request and shows only headers)</td></tr>
+              <tr><td><code class="inl">-X POST</code> · <code class="inl">-H "K: V"</code> · <code class="inl">-d '…'</code></td><td>Method · add a header · request body (<code class="inl">-d</code> alone already implies POST)</td></tr>
+              <tr><td><code class="inl">-s -o /dev/null -w '%{http_code}\n'</code></td><td>Silent, throw the body away, print only the status code. Ideal for scripts and health checks.</td></tr>
+            </tbody>
+          </table>
+        </div>
 
-        <h3>Methods</h3>
+        <h4>Methods</h4>
+        <p><strong>Safe</strong> = changes nothing on the server. <strong>Idempotent</strong> = repeating it leaves the same state as doing it once.</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Method</th><th>Purpose</th><th>Safe?</th><th>Idempotent?</th><th>TaskFlow</th></tr></thead>
             <tbody>
               <tr><td><code class="inl">GET</code></td><td>Read</td><td>✅</td><td>✅</td><td><code class="inl">GET /tasks</code></td></tr>
               <tr><td><code class="inl">POST</code></td><td>Create / action</td><td>❌</td><td>❌ (2 calls = 2 tasks)</td><td><code class="inl">POST /tasks</code></td></tr>
-              <tr><td><code class="inl">PUT</code></td><td>Replace whole resource</td><td>❌</td><td>✅</td><td><code class="inl">PUT /tasks/1</code></td></tr>
+              <tr><td><code class="inl">PUT</code></td><td>Replace the whole resource</td><td>❌</td><td>✅</td><td><code class="inl">PUT /tasks/1</code></td></tr>
               <tr><td><code class="inl">PATCH</code></td><td>Partial update</td><td>❌</td><td>not guaranteed</td><td><code class="inl">PATCH /tasks/1 {"done":true}</code></td></tr>
               <tr><td><code class="inl">DELETE</code></td><td>Delete</td><td>❌</td><td>✅</td><td><code class="inl">DELETE /tasks/1</code></td></tr>
-              <tr><td><code class="inl">HEAD</code></td><td>GET without body (headers only)</td><td>✅</td><td>✅</td><td><code class="inl">curl -I</code></td></tr>
+              <tr><td><code class="inl">HEAD</code></td><td>GET without the body (headers only)</td><td>✅</td><td>✅</td><td><code class="inl">curl -I</code></td></tr>
               <tr><td><code class="inl">OPTIONS</code></td><td>Which methods are allowed (CORS preflight)</td><td>✅</td><td>✅</td><td>Browser → API</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Status codes</h3>
-        <p>Classes: <strong>1xx</strong> info · <strong>2xx</strong> success · <strong>3xx</strong> redirect · <strong>4xx</strong> client's fault · <strong>5xx</strong> server's fault.</p>
+        <h4>Status codes</h4>
+        <p>Learn the five classes first: <strong>1xx</strong> info · <strong>2xx</strong> success · <strong>3xx</strong> redirect · <strong>4xx</strong> the client's fault · <strong>5xx</strong> the server's fault. Then these:</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Code</th><th>Meaning</th><th>Where you'll hit it</th></tr></thead>
             <tbody>
-              <tr><td>200 OK</td><td>Success</td><td><code class="inl">GET /health</code></td></tr>
-              <tr><td>201 Created</td><td>New resource created</td><td><code class="inl">POST /tasks</code></td></tr>
-              <tr><td>301 Moved Permanently</td><td>Permanent redirect (cached by browsers)</td><td>http:// → https://</td></tr>
-              <tr><td>302 Found</td><td>Temporary redirect</td><td>Login redirects</td></tr>
-              <tr><td>304 Not Modified</td><td>Your cached copy is still valid (ETag matched)</td><td>Static files from nginx</td></tr>
-              <tr><td>400 Bad Request</td><td>Malformed / invalid input</td><td>POST without <code class="inl">title</code></td></tr>
-              <tr><td>401 Unauthorized</td><td><strong>Not authenticated</strong> (no/invalid credentials)</td><td>Missing token</td></tr>
-              <tr><td>403 Forbidden</td><td><strong>Authenticated but not allowed</strong></td><td>Valid user, wrong role; S3 bucket policy</td></tr>
-              <tr><td>404 Not Found</td><td>No such path/resource</td><td>Typo in URL, wrong Ingress path</td></tr>
-              <tr><td>500 Internal Server Error</td><td>App crashed/threw</td><td>Unhandled exception in Express</td></tr>
-              <tr><td>502 Bad Gateway</td><td>Proxy got an <strong>invalid/no response</strong> from the upstream</td><td>nginx/Ingress → api container is down or wrong port</td></tr>
+              <tr><td>200 OK · 201 Created</td><td>Success · a new resource was created</td><td><code class="inl">GET /health</code> · <code class="inl">POST /tasks</code></td></tr>
+              <tr><td>301 / 302</td><td>Permanent redirect (browsers cache it) / temporary redirect</td><td>http:// → https:// · login redirects</td></tr>
+              <tr><td>304 Not Modified</td><td>Your cached copy is still valid (the ETag matched)</td><td>Static files from nginx</td></tr>
+              <tr><td>400 Bad Request</td><td>Malformed or invalid input</td><td>POST without <code class="inl">title</code></td></tr>
+              <tr><td>401 Unauthorized</td><td><strong>Not authenticated</strong> (no or invalid credentials)</td><td>Missing token</td></tr>
+              <tr><td>403 Forbidden</td><td><strong>Authenticated but not allowed</strong></td><td>Valid user, wrong role; an S3 bucket policy</td></tr>
+              <tr><td>404 Not Found</td><td>No such path or resource</td><td>Typo in the URL, wrong Ingress path</td></tr>
+              <tr><td>500 Internal Server Error</td><td>The app crashed or threw</td><td>Unhandled exception in Express</td></tr>
+              <tr><td>502 Bad Gateway</td><td>A proxy got an <strong>invalid or no response</strong> from its upstream</td><td>nginx/Ingress → the api is down or on the wrong port</td></tr>
               <tr><td>503 Service Unavailable</td><td>Temporarily can't serve</td><td>No healthy backends, maintenance, overload</td></tr>
-              <tr><td>504 Gateway Timeout</td><td>Proxy <strong>waited too long</strong> for upstream</td><td>Slow DB query behind the API</td></tr>
+              <tr><td>504 Gateway Timeout</td><td>A proxy <strong>waited too long</strong> for its upstream</td><td>Slow DB query behind the API</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Headers you'll actually use</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Header</th><th>Direction</th><th>Purpose</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">Host</code></td><td>req</td><td>Which site (virtual host / Ingress rule)</td></tr>
-              <tr><td><code class="inl">Content-Type</code></td><td>both</td><td>Body format (<code class="inl">application/json</code>)</td></tr>
-              <tr><td><code class="inl">Authorization: Bearer &lt;token&gt;</code></td><td>req</td><td>Credentials</td></tr>
-              <tr><td><code class="inl">Cookie</code> / <code class="inl">Set-Cookie</code></td><td>req / resp</td><td>Sessions</td></tr>
-              <tr><td><code class="inl">Location</code></td><td>resp</td><td>Redirect target (3xx)</td></tr>
-              <tr><td><code class="inl">Cache-Control</code>, <code class="inl">ETag</code></td><td>resp</td><td>Caching rules / versioning</td></tr>
-              <tr><td><code class="inl">X-Forwarded-For</code></td><td>req (added by proxies)</td><td>Original client IP behind a load balancer</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Versions: <strong>HTTP/1.1</strong> text, one request at a time per connection · <strong>HTTP/2</strong> binary, many streams over one TCP connection · <strong>HTTP/3</strong> runs over QUIC (UDP).</p>
+        <p><strong>Headers you'll actually use:</strong> <code class="inl">Host</code> (which site) · <code class="inl">Content-Type</code> (body format, both directions) · <code class="inl">Authorization: Bearer &lt;token&gt;</code> (credentials) · <code class="inl">Cookie</code> / <code class="inl">Set-Cookie</code> (sessions) · <code class="inl">Location</code> (where a 3xx redirects to) · <code class="inl">Cache-Control</code> and <code class="inl">ETag</code> (caching) · <code class="inl">X-Forwarded-For</code> (the original client IP, added by proxies and load balancers).</p>
+        <p>Versions: <strong>HTTP/1.1</strong> is text, one request at a time per connection. <strong>HTTP/2</strong> is binary, with many parallel streams over one TCP connection. <strong>HTTP/3</strong> runs over QUIC (UDP).</p>
 
-        <h3>HTTPS = HTTP + TLS</h3>
-        <ul>
-          <li><span class="term">TLS</span> gives <strong>encryption</strong> (no eavesdropping), <strong>integrity</strong> (no tampering) and <strong>authentication</strong> (you're talking to the real server). Default port <strong>443</strong>.</li>
-          <li>Handshake (TLS 1.3, simplified): ClientHello (supported ciphers, SNI hostname) → ServerHello + <strong>certificate</strong> → both derive a shared session key → encrypted HTTP flows.</li>
-          <li>A <span class="term">certificate</span> binds a public key to names (<strong>subject / SAN</strong>), is signed by a <strong>CA</strong> (issuer), and has <strong>notBefore / notAfter</strong> dates. Trust chain: leaf → intermediate → root CA in the OS trust store.</li>
-          <li>Free certs: Let's Encrypt (certbot; cert-manager in K8s — Session 12).</li>
-        </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"401 and 403 mean the same thing." <strong>✗</strong> 401 = we don't know who you are. 403 = we know, and the answer is no.</p>
+          <p>"A 502 from nginx means nginx is broken." <strong>✗</strong> nginx couldn't get a valid response from the app behind it. Look at the upstream.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Request = method + path + headers + body · Response = status + headers + body.</strong><br /><strong>4xx = the client's fault · 5xx = the server's fault · 502 = bad upstream, 504 = slow upstream.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. nginx in front of taskflow-api returns 502 on one request and 504 on another. What's the difference?</summary>
+            <p class="ans">502 Bad Gateway: nginx got no valid response from the upstream (the api is down, refused the connection, or is on the wrong port). 504 Gateway Timeout: the upstream accepted the request but didn't answer within nginx's timeout (a slow handler or DB query).</p></details>
+          <details class="quiz"><summary>Q2. Spot the bug: <code class="inl">curl -X POST localhost:3000/tasks -d '{"title":"x"}'</code> fails, but the same command with <code class="inl">-H "Content-Type: application/json"</code> returns 201. Why?</summary>
+            <p class="ans">Without the header, <code class="inl">curl -d</code> labels the body <code class="inl">application/x-www-form-urlencoded</code>, so <code class="inl">express.json()</code> skips it. Express 5 leaves <code class="inl">req.body</code> undefined, reading <code class="inl">title</code> from it throws, and you get a 500 (Express 4 set <code class="inl">{}</code>, giving a 400). The server trusts Content-Type, not your intentions.</p></details>
+          <details class="quiz"><summary>Q3. Predict: you send the same <code class="inl">POST /tasks</code> twice, then the same <code class="inl">PUT /tasks/1 {"title":"A","done":true}</code> twice. How many tasks exist, and what state is task 1 in?</summary>
+            <p class="ans">Two tasks, because POST isn't idempotent. Task 1 is <code class="inl">{"title":"A","done":true}</code> after the first PUT and unchanged by the second, because PUT is idempotent.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 7. HTTPS ===================== -->
+      <section id="https">
+        <h2><span class="sec-num">7</span> HTTPS &amp; TLS</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>Section 6 showed that HTTP/1.1 is plain text. On college Wi-Fi that means:</p>
+<pre>laptop ── POST /login {"password":"hunter2"} ──▶ Wi-Fi router ──▶ ISP ──▶ … ──▶ server
+          Authorization: Bearer eyJhbGciOi…            ▲ readable, and editable, at every hop</pre>
+        <p>Anyone on the path can read your token and change the response. And how do you know that <code class="inl">203.0.113.10</code> really is your API, and not an impostor someone pointed your DNS at?</p>
+
+        <h3>The idea</h3>
+        <p><strong>HTTPS = HTTP inside a <span class="term">TLS</span> tunnel</strong>, on port 443. TLS gives <strong>encryption</strong> (nobody can read it), <strong>integrity</strong> (nobody can change it undetected) and <strong>authentication</strong> (it's the real server). The server proves who it is with a <span class="term">certificate</span>: a public key bound to names (the <strong>SAN</strong>, Subject Alternative Names), signed by a <strong>CA</strong> (certificate authority) your OS trusts, valid between two dates.</p>
+<pre> client                                                  server (api.taskflow.example.com)
+   │ ── ClientHello: TLS versions, ciphers, SNI = "api.taskflow.example.com" ──▶ │
+   │ ◀── ServerHello + certificate (signed by a CA) ─────────────────────────── │
+   │     client checks: CA trusted? name matches the SAN? not expired?           │
+   │ ◀════ both derive the same session key (TLS 1.3: one round trip) ═══════▶ │
+   │ ════ encrypted HTTP: GET /tasks, Authorization: … ═════════════════════════▶ │
+ trust chain: leaf cert → intermediate CA → root CA in the OS trust store</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The courier now carries a <strong>sealed, tamper-evident envelope</strong> (encryption and integrity). Before handing it over, the recipient shows an <strong>ID card</strong> (the certificate) from an authority you trust (the CA), and the name on it must match the address you wrote (the SAN). The postman still sees which building it goes to (the IP and SNI name), never what's inside.</p>
+        </div>
+
+        <h3>See it: the handshake in curl</h3>
 <pre><span class="pr">$</span> curl -v https://example.com -o /dev/null      <span class="cm"># trimmed to the TLS part</span>
 <span class="out">* Connected to example.com (104.20.23.154) port 443
 * ALPN: curl offers h2,http/1.1
@@ -693,159 +833,77 @@ Date: Fri, 09 Oct 2026 05:14:02 GMT
 *  subjectAltName: host "example.com" matched cert's "example.com"
 *  issuer: C=US; O=SSL Corporation; CN=Cloudflare TLS Issuing ECC CA 3
 *  SSL certificate verify ok.
-&gt; GET / HTTP/2</span>
+&gt; GET / HTTP/2</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">Client hello</code> / <code class="inl">Server hello</code> / <code class="inl">Certificate</code></td><td>The handshake steps from the diagram</td></tr>
+              <tr><td><code class="inl">TLSv1.3 / TLS_AES_256_GCM_SHA384</code></td><td>Protocol version and cipher suite they agreed on</td></tr>
+              <tr><td><code class="inl">ALPN: server accepted h2</code></td><td>They also agreed to speak HTTP/2 inside the tunnel</td></tr>
+              <tr><td><code class="inl">subjectAltName … matched</code></td><td>The name in the URL is in the certificate</td></tr>
+              <tr><td><code class="inl">issuer</code> + <code class="inl">verify ok</code></td><td>Signed by a CA that chains to a trusted root, and within its dates</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> hide where you're going (the IP address and the SNI hostname travel in the clear), or make the server itself secure. TLS protects the data in transit and nothing else.</p>
 
-<span class="pr">$</span> openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null 2&gt;/dev/null \
-    | openssl x509 -noout -subject -issuer -dates     <span class="cm"># who issued it, when it expires</span>
+        <h3>Build it up</h3>
+        <h4>Inspect any server's certificate</h4>
+<pre><span class="pr">$</span> openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null 2&gt;/dev/null \
+    | openssl x509 -noout -subject -issuer -dates
 <span class="out">subject=CN = example.com
 issuer=C = US, O = SSL Corporation, CN = Cloudflare TLS Issuing ECC CA 3
 notBefore=Sep 26 22:49:11 2026 GMT
-notAfter=Dec 25 22:56:35 2026 GMT</span>
+notAfter=Dec 25 22:56:35 2026 GMT</span></pre>
+        <ul>
+          <li><code class="inl">s_client -connect host:443</code> does the TLS handshake. <code class="inl">-servername</code> sends SNI, so a server hosting many sites returns the right certificate.</li>
+          <li><code class="inl">&lt;/dev/null</code> closes the connection at once; <code class="inl">2&gt;/dev/null</code> hides the chatter. <code class="inl">x509 -noout -subject -issuer -dates</code> decodes the certificate: who it's for, who signed it, when it expires.</li>
+        </ul>
 
-<span class="pr">$</span> curl -I http://github.com                      <span class="cm"># typical HTTP → HTTPS redirect</span>
+        <h4>Redirects and the errors you'll meet</h4>
+<pre><span class="pr">$</span> curl -I http://github.com                      <span class="cm"># typical HTTP → HTTPS redirect</span>
 <span class="out">HTTP/1.1 301 Moved Permanently
 Content-Length: 0
 Location: https://github.com/</span></pre>
+        <ul>
+          <li><code class="inl">curl: (60) SSL certificate problem: self-signed certificate</code> is expected with a self-signed dev cert. <code class="inl">curl -k</code> skips verification: testing only, never in scripts against production.</li>
+          <li>The URL's host must be in the SAN, or you get a name mismatch. Free certificates: Let's Encrypt (certbot on a VM, cert-manager in Kubernetes, Session 12).</li>
+        </ul>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><code class="inl">curl: (60) SSL certificate problem: self-signed certificate</code> — expected with a self-signed dev cert. <code class="inl">curl -k</code> skips verification for <em>testing only</em>; never in scripts against prod.</li>
-            <li>Certificate for <code class="inl">taskflow.local</code> but you browse <code class="inl">192.168.1.50</code> → name mismatch. The URL host must be in the SAN.</li>
-            <li>Confusing 401 and 403, or 502 and 504 — see the table above.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"HTTPS hides which website I'm visiting." <strong>✗</strong> The path, headers and body are encrypted, but the destination IP and the SNI hostname are visible.</p>
+          <p>"SSL is the current protocol." <strong>✗</strong> SSL is long deprecated. Today it's TLS 1.2 or 1.3, even though people still say "SSL certificate".</p>
+          <p>"The padlock means the site is safe." <strong>✗</strong> It means the connection is encrypted to whoever holds that certificate. A phishing site can have a valid certificate too.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Request = method + path + headers + body; response = status + headers + body. Know 2xx/3xx/4xx/5xx codes cold. HTTPS = HTTP inside TLS on 443, authenticated by a CA-signed certificate.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>HTTPS = HTTP + TLS on 443: encryption + integrity + authentication.</strong><br /><strong>Certificate = public key + names (SAN) + dates, signed by a CA.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. TaskFlow's dev certificate is for <code class="inl">taskflow.local</code>. You open <code class="inl">https://192.168.1.50</code> and the browser warns you. Why, and what's the fix?</summary>
+            <p class="ans">The host in the URL (192.168.1.50) isn't in the certificate's SAN, so authentication fails even though encryption would work. Browse via <code class="inl">https://taskflow.local</code> (map it in <code class="inl">/etc/hosts</code>), or issue a certificate that includes the IP.</p></details>
+          <details class="quiz"><summary>Q2. You call <code class="inl">https://api.taskflow.example.com/tasks</code> with a Bearer token on café Wi-Fi. What can someone sniffing the Wi-Fi see, and what can't they?</summary>
+            <p class="ans">They can see your DNS lookup (unless it's encrypted), the destination IP, the SNI hostname, and the timing and size of the traffic. They can't see the path <code class="inl">/tasks</code>, the headers (so not the token), or the body.</p></details>
+          <details class="quiz"><summary>Q3. Predict: <code class="inl">curl http://github.com</code> with no flags. What do you see, and what changes with <code class="inl">-L</code>?</summary>
+            <p class="ans">Nothing visible. The reply is a <code class="inl">301</code> with an empty body (<code class="inl">Content-Length: 0</code>) and a <code class="inl">Location: https://github.com/</code> header, which curl only shows with <code class="inl">-i</code>. <code class="inl">-L</code> follows the redirect, does the TLS handshake and prints the HTTPS page.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 7. TOOLKIT ===================== -->
+      <!-- ===================== 8. TOOLKIT ===================== -->
       <section id="toolkit">
-        <h2><span class="sec-num">7</span> Networking commands &amp; troubleshooting</h2>
+        <h2><span class="sec-num">8</span> Networking commands &amp; troubleshooting</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Each command answers one question: "does the name work?", "can I reach the machine?", "is the door open?", "is anyone home behind it?".</p>
-        </div>
+        <h3>The problem</h3>
+        <p>Back to section 1: your friend's <code class="inl">curl http://api.taskflow.example.com:3000/health</code> hangs for 5 seconds and gives up. It could be DNS, routing, a firewall, the bind address or the app. Restarting things at random wastes an evening and can hide the real cause.</p>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Question</th><th>Command</th></tr></thead>
-            <tbody>
-              <tr><td>What's my IP / gateway?</td><td><code class="inl">ip a</code>, <code class="inl">ip route</code></td></tr>
-              <tr><td>Does the name resolve?</td><td><code class="inl">dig +short host</code>, <code class="inl">nslookup</code>, <code class="inl">host</code>, <code class="inl">getent hosts</code></td></tr>
-              <tr><td>Is the host reachable (ICMP)?</td><td><code class="inl">ping -c 4 host</code></td></tr>
-              <tr><td>Where does the path break?</td><td><code class="inl">traceroute -n host</code>, <code class="inl">tracepath host</code></td></tr>
-              <tr><td>What's listening on <em>this</em> machine?</td><td><code class="inl">sudo ss -tulpn</code> (old: <code class="inl">netstat -tulpn</code>)</td></tr>
-              <tr><td>Is a remote TCP port open?</td><td><code class="inl">nc -zv host port</code>, <code class="inl">telnet host port</code></td></tr>
-              <tr><td>Does the HTTP app answer?</td><td><code class="inl">curl -v</code>, <code class="inl">curl -I</code>, <code class="inl">wget -qO-</code></td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>ping</h3>
-<pre><span class="pr">$</span> ping -c 4 google.com
-<span class="out">PING google.com (142.250.183.142) 56(84) bytes of data.
-64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=1 ttl=117 time=12.4 ms
-64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=2 ttl=117 time=11.9 ms
-64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=3 ttl=117 time=12.6 ms
-64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=4 ttl=117 time=12.2 ms
-
---- google.com ping statistics ---
-4 packets transmitted, 4 received, 0% packet loss, time 3005ms
-rtt min/avg/max/mdev = 11.982/12.301/12.644/0.241 ms</span></pre>
-        <ul>
-          <li><code class="inl">-c 4</code> = stop after 4 (Linux pings forever otherwise; Ctrl+C). <code class="inl">time</code> = round-trip latency. <code class="inl">ttl</code> = hops left (starts at 64/128/255). <code class="inl">packet loss</code> &gt; 0% = flaky network.</li>
-          <li>ping uses <strong>ICMP</strong>, not TCP. AWS security groups block ICMP by default → "no reply" doesn't mean the server is down.</li>
-        </ul>
-
-        <h3>traceroute / tracepath</h3>
-<pre><span class="pr">$</span> traceroute -n google.com                <span class="cm"># sudo apt install traceroute; -n = don't resolve hop names</span>
-<span class="out">traceroute to google.com (142.250.183.142), 30 hops max, 60 byte packets
- 1  192.168.1.1  1.204 ms  1.150 ms  1.112 ms
- 2  10.120.0.1  4.820 ms  4.790 ms  4.755 ms
- 3  * * *
- 4  72.14.218.90  11.902 ms  11.870 ms  11.851 ms
- 5  142.250.183.142  12.301 ms  12.288 ms  12.270 ms</span>
-<span class="pr">$</span> tracepath -n google.com                 <span class="cm"># preinstalled, no root needed</span>
-<span class="out"> 1?: [LOCALHOST]                      pmtu 1500
- 1:  192.168.1.1                                           1.204ms
- 2:  10.120.0.1                                            4.820ms</span></pre>
-        <p>Each line = one router hop, 3 probe times. <code class="inl">* * *</code> = that hop doesn't answer probes (common, not necessarily a problem) — worry only if every hop after it is <code class="inl">*</code>.</p>
-
-        <h3>ss — what is listening here?</h3>
-<pre><span class="pr">$</span> sudo ss -tulpn                <span class="cm"># t=TCP u=UDP l=listening p=process n=numeric</span>
-<span class="out">Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
-udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*     users:(("systemd-resolve",pid=612,fd=13))
-tcp   LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*     users:(("systemd-resolve",pid=612,fd=14))
-tcp   LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=901,fd=3))
-tcp   LISTEN 0      511        127.0.0.1:3000       0.0.0.0:*     users:(("node",pid=2210,fd=19))
-tcp   LISTEN 0      200        127.0.0.1:5432       0.0.0.0:*     users:(("postgres",pid=1005,fd=6))
-tcp   LISTEN 0      4096            [::]:22            [::]:*     users:(("sshd",pid=901,fd=4))</span>
-<span class="pr">$</span> sudo netstat -tulpn           <span class="cm"># same info, legacy net-tools package</span>
-<span class="out">Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
-tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      901/sshd
-tcp        0      0 127.0.0.1:3000          0.0.0.0:*               LISTEN      2210/node</span></pre>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Column</th><th>Read it as</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">Netid</code> / <code class="inl">State</code></td><td>tcp/udp; <code class="inl">LISTEN</code> for TCP servers, <code class="inl">UNCONN</code> for UDP sockets.</td></tr>
-              <tr><td><code class="inl">Local Address:Port</code></td><td><strong>The key column.</strong> <code class="inl">0.0.0.0</code>/<code class="inl">[::]</code>/<code class="inl">*</code> = all interfaces; <code class="inl">127.0.0.1</code> = local only. Here node is local-only → unreachable from outside.</td></tr>
-              <tr><td><code class="inl">Send-Q</code> (for LISTEN)</td><td>Accept backlog size (Node's default is 511).</td></tr>
-              <tr><td><code class="inl">Process</code></td><td>Program, PID, file descriptor — needs <code class="inl">sudo</code> to show other users' processes.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>nc, telnet, wget, curl flags</h3>
-<pre><span class="pr">$</span> nc -zv -w 3 192.168.1.50 22        <span class="cm"># -z scan only, -v verbose, -w 3 s timeout</span>
-<span class="out">Connection to 192.168.1.50 22 port [tcp/ssh] succeeded!</span>
-<span class="pr">$</span> nc -zv -w 3 192.168.1.50 3000
-<span class="out">nc: connect to 192.168.1.50 port 3000 (tcp) failed: Connection refused</span>
-<span class="pr">$</span> nc -zv -w 3 203.0.113.10 3000
-<span class="out">nc: connect to 203.0.113.10 port 3000 (tcp) timed out: Operation now in progress</span>
-
-<span class="pr">$</span> telnet 192.168.1.50 22              <span class="cm"># older alternative; Ctrl+] then "quit" to exit</span>
-<span class="out">Trying 192.168.1.50...
-Connected to 192.168.1.50.
-Escape character is '^]'.
-SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5</span>
-
-<span class="pr">$</span> wget -qO- http://192.168.1.50:3000/health     <span class="cm"># -q quiet, -O- write body to stdout</span>
-<span class="out">{"status":"ok"}</span></pre>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th><code class="inl">nc</code> result</th><th>What it proves</th><th>Look at</th></tr></thead>
-            <tbody>
-              <tr><td><strong>succeeded</strong></td><td>Network path + firewall OK, something listens</td><td>The app itself (<code class="inl">curl -v</code>)</td></tr>
-              <tr><td><strong>Connection refused</strong></td><td>Host reached; it actively said "nobody on that port" (RST)</td><td>Is the app running? Listening on <code class="inl">127.0.0.1</code>? Wrong port?</td></tr>
-              <tr><td><strong>timed out</strong></td><td>Packets silently dropped</td><td>Firewall (<code class="inl">ufw</code>), AWS security group, wrong IP, routing</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>curl flag</th><th>Does</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">-v</code></td><td>Verbose: DNS, connect, TLS, request &amp; response headers</td></tr>
-              <tr><td><code class="inl">-I</code> / <code class="inl">-i</code></td><td>HEAD request (headers only) / include response headers with body</td></tr>
-              <tr><td><code class="inl">-X POST -H "K: V" -d '…'</code></td><td>Method, header, body</td></tr>
-              <tr><td><code class="inl">-L</code></td><td>Follow redirects (3xx)</td></tr>
-              <tr><td><code class="inl">-s -o /dev/null -w '%{http_code}'</code></td><td>Print only the status code — perfect for scripts/health checks</td></tr>
-              <tr><td><code class="inl">--connect-timeout 5</code>, <code class="inl">-m 10</code></td><td>Fail fast instead of hanging</td></tr>
-              <tr><td><code class="inl">-k</code></td><td>Skip TLS verification (testing only)</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>The troubleshooting ladder: "my app isn't reachable"</h3>
+        <h3>The idea</h3>
+        <p>Every command you've met tests exactly <strong>one layer</strong>. So walk the layers in order, and each answer cuts the search space down:</p>
         <div class="flow">
           <div class="step"><div class="s-ico">📖</div><div class="s-t">1. DNS</div><div class="s-d">dig +short</div></div>
           <div class="arrow">→</div>
@@ -860,15 +918,64 @@ SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5</span>
           <div class="step"><div class="s-ico">📜</div><div class="s-t">6. App logs</div><div class="s-d">journalctl, curl -v</div></div>
         </div>
 
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A lost-parcel investigation on the campus. Is the address in the directory (DNS)? Can the courier reach the campus (ping, traceroute)? Is the gate open for that flat (<code class="inl">nc</code>)? Does someone live there, answering the right door (<code class="inl">ss</code>)? What did they say (<code class="inl">curl -v</code>, logs)?</p>
+        </div>
+
+        <h3>See it: ping</h3>
+<pre><span class="pr">$</span> ping -c 4 google.com
+<span class="out">PING google.com (142.250.183.142) 56(84) bytes of data.
+64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=1 ttl=117 time=12.4 ms
+64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=2 ttl=117 time=11.9 ms
+64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=3 ttl=117 time=12.6 ms
+64 bytes from bom12s19-in-f14.1e100.net (142.250.183.142): icmp_seq=4 ttl=117 time=12.2 ms
+
+--- google.com ping statistics ---
+4 packets transmitted, 4 received, 0% packet loss, time 3005ms
+rtt min/avg/max/mdev = 11.982/12.301/12.644/0.241 ms</span></pre>
+        <p><code class="inl">-c 4</code> stops after 4 pings (otherwise Linux pings until Ctrl+C). <code class="inl">time</code> = round-trip latency, <code class="inl">ttl</code> = router hops the reply had left (starts at 64, 128 or 255), and loss above 0% = a flaky network.</p>
+        <p><strong>What it does <em>not</em> do:</strong> test a port. ping uses <strong>ICMP</strong>, not TCP, and AWS security groups block ICMP by default. "No reply" doesn't mean the server is down.</p>
+
+        <h3>Build it up</h3>
+        <h4>Where does the path break? traceroute</h4>
+<pre><span class="pr">$</span> traceroute -n google.com                <span class="cm"># sudo apt install traceroute; -n = don't resolve hop names</span>
+<span class="out">traceroute to google.com (142.250.183.142), 30 hops max, 60 byte packets
+ 1  192.168.1.1  1.204 ms  1.150 ms  1.112 ms
+ 2  10.120.0.1  4.820 ms  4.790 ms  4.755 ms
+ 3  * * *
+ 4  72.14.218.90  11.902 ms  11.870 ms  11.851 ms
+ 5  142.250.183.142  12.301 ms  12.288 ms  12.270 ms</span></pre>
+        <p>One line per router hop, three probe times each. Hop 1 is your default gateway (section 1). <code class="inl">* * *</code> = that hop ignores probes, which is common; worry only when every hop after a point is <code class="inl">*</code>. <code class="inl">tracepath -n</code> is preinstalled and needs no root.</p>
+
+        <h4>Is the port open? nc: refused vs timed out</h4>
+<pre><span class="pr">$</span> nc -zv -w 3 192.168.1.50 22         <span class="cm"># -w 3 = give up after 3 seconds</span>
+<span class="out">Connection to 192.168.1.50 22 port [tcp/ssh] succeeded!</span>
+<span class="pr">$</span> nc -zv -w 3 192.168.1.50 3000
+<span class="out">nc: connect to 192.168.1.50 port 3000 (tcp) failed: Connection refused</span>
+<span class="pr">$</span> nc -zv -w 3 203.0.113.10 3000
+<span class="out">nc: connect to 203.0.113.10 port 3000 (tcp) timed out: Operation now in progress</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th><code class="inl">nc</code> result</th><th>What it proves (section 4's RST vs silence)</th><th>Look at next</th></tr></thead>
+            <tbody>
+              <tr><td><strong>succeeded</strong></td><td>Network path and firewall are fine, and something is listening</td><td>The app itself (<code class="inl">curl -v</code>)</td></tr>
+              <tr><td><strong>Connection refused</strong></td><td>You reached the host, and it replied RST: "nobody on that port"</td><td>Is the app running? Listening on <code class="inl">127.0.0.1</code>? Wrong port?</td></tr>
+              <tr><td><strong>timed out</strong></td><td>Packets were silently dropped</td><td>Firewall (<code class="inl">ufw</code>), AWS security group, wrong IP, routing</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Older tools: <code class="inl">telnet 192.168.1.50 22</code> connects and prints the banner (<code class="inl">SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5</code>; exit with Ctrl+], <code class="inl">quit</code>). <code class="inl">wget -qO- URL</code> prints a page. Listeners: <code class="inl">sudo ss -tulpn</code> (section 3).</p>
+
         <div class="callout example">
-          <span class="c-title">Worked example: http://api.taskflow.example.com:3000/health times out from the laptop</span>
-<pre><span class="cm"># 1. DNS — resolves to the server's public IP, fine</span>
+          <span class="c-title">Worked example: section 1's timeout, solved</span>
+<pre><span class="cm"># 1. DNS: resolves to the server's public IP. Fine.</span>
 <span class="pr">$</span> dig +short api.taskflow.example.com
 <span class="out">203.0.113.10</span>
-<span class="cm"># 2. ping — no reply, but the SG blocks ICMP anyway → inconclusive, move on</span>
+<span class="cm"># 2. ping: no reply, but the security group blocks ICMP anyway. Inconclusive, move on.</span>
 <span class="pr">$</span> ping -c 2 203.0.113.10
 <span class="out">2 packets transmitted, 0 received, 100% packet loss, time 1012ms</span>
-<span class="cm"># 3. port — 22 works, 3000 times out → something drops 3000</span>
+<span class="cm"># 3. port: 22 works, 3000 times out, so something drops 3000</span>
 <span class="pr">$</span> nc -zv -w 3 203.0.113.10 22
 <span class="out">Connection to 203.0.113.10 22 port [tcp/ssh] succeeded!</span>
 <span class="pr">$</span> nc -zv -w 3 203.0.113.10 3000
@@ -876,7 +983,7 @@ SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5</span>
 <span class="cm"># 4. on the server: is the app listening on all interfaces?</span>
 <span class="pr">shaurya@taskflow-vm:~$</span> sudo ss -tlnp | grep 3000
 <span class="out">LISTEN 0      511        127.0.0.1:3000      0.0.0.0:*    users:(("node",pid=2210,fd=19))</span>
-<span class="cm">#    → bug #1: bound to 127.0.0.1. Set HOST=0.0.0.0 in the unit file, restart:</span>
+<span class="cm">#    → bug #1: bound to 127.0.0.1 (section 3). Set HOST=0.0.0.0 in the unit file and restart:</span>
 <span class="pr">shaurya@taskflow-vm:~$</span> sudo systemctl restart taskflow &amp;&amp; sudo ss -tlnp | grep 3000
 <span class="out">LISTEN 0      511          0.0.0.0:3000      0.0.0.0:*    users:(("node",pid=2391,fd=19))</span>
 <span class="cm"># 5. firewall: ufw only allows 22 → bug #2</span>
@@ -889,28 +996,35 @@ To                         Action      From
 <span class="pr">shaurya@taskflow-vm:~$</span> sudo ufw allow 3000/tcp
 <span class="out">Rule added
 Rule added (v6)</span>
-<span class="cm">#    + in AWS: security group inbound rule TCP 3000 from 0.0.0.0/0 (or your /32)</span>
-<span class="cm"># 6. verify end to end, and check logs if it's still wrong</span>
+<span class="cm">#    + in AWS: a security-group inbound rule for TCP 3000 from 0.0.0.0/0 (or your /32)</span>
+<span class="cm"># 6. verify end to end, and read the logs</span>
 <span class="pr">$</span> curl -s -o /dev/null -w '%{http_code}\n' http://api.taskflow.example.com:3000/health
 <span class="out">200</span>
 <span class="pr">shaurya@taskflow-vm:~$</span> journalctl -u taskflow -n 2 --no-pager
 <span class="out">Oct 09 10:41:07 taskflow-vm systemd[1]: Started taskflow.service - TaskFlow API.
 Oct 09 10:41:07 taskflow-vm node[2391]: taskflow-api listening on 0.0.0.0:3000</span></pre>
-          <p>Notice the order: each step narrows the fault to one layer, so you never "try random things".</p>
+          <p>Two bugs, and the timeout came from the firewall. Fixing only the bind address would change nothing for your friend; fixing only the firewall would turn the timeout into "refused". The ladder found both.</p>
         </div>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Concluding "server is down" from a failed ping — test the actual TCP port.</li>
-            <li>Testing with <code class="inl">curl localhost</code> on the server and declaring victory — that bypasses the firewall and the bind-address problem. Test from <em>outside</em> too.</li>
-            <li>Running <code class="inl">ss -tulpn</code> without <code class="inl">sudo</code> → the Process column is empty for other users' processes.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"ping fails, so the server is down." <strong>✗</strong> ICMP is often blocked. Test the actual TCP port.</p>
+          <p>"Connection refused means a firewall is blocking me." <strong>✗</strong> Usually the opposite: you reached the host and nothing listens there. Firewalls that drop packets cause timeouts.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Walk the ladder: DNS → reachability → port (refused vs timeout) → listen address → firewall/SG → app logs. <code class="inl">nc -zv</code> and <code class="inl">ss -tlnp</code> answer most "unreachable" questions.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>DNS → reachable → port → listen address → firewall → app logs.</strong><br /><strong>Refused = reached, nobody listening · Timed out = dropped on the way.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You run <code class="inl">ss -tulpn</code> without sudo and the Process column is empty for port 3000. Is nothing listening?</summary>
+            <p class="ans">Something is listening, because the socket line is there. Without root, ss can't show processes owned by other users. Re-run it with <code class="inl">sudo</code>.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">traceroute</code> shows hops 1–4 fine, then <code class="inl">* * *</code> for every hop up to 30. Where would you look?</summary>
+            <p class="ans">At the boundary after hop 4. Either a device there drops everything (a firewall or broken router), or the destination itself drops probes. Then test the real service port with <code class="inl">nc -zv</code>, because traceroute probes may be filtered while TCP 443 works fine.</p></details>
+          <details class="quiz"><summary>Q3. Put these in ladder order and name what each one rules out: <code class="inl">sudo ss -tlnp</code>, <code class="inl">dig +short</code>, <code class="inl">nc -zv</code>, <code class="inl">journalctl -u taskflow</code>.</summary>
+            <p class="ans"><code class="inl">dig</code> (the name resolves to the right IP) → <code class="inl">nc -zv</code> (the path and firewall let the port through) → <code class="inl">ss -tlnp</code> (the app listens on the right address and port) → <code class="inl">journalctl</code> (what the app itself did with the request).</p></details>
         </div>
       </section>
 
@@ -922,28 +1036,29 @@ Oct 09 10:41:07 taskflow-vm node[2391]: taskflow-api listening on 0.0.0.0:3000</
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">ip a</code> / <code class="inl">ip -br a</code></td><td>Show interfaces and IP addresses (replaces <code class="inl">ifconfig</code>).</td></tr>
-              <tr><td><code class="inl">ip route</code></td><td>Routing table, default gateway.</td></tr>
-              <tr><td><code class="inl">curl ifconfig.me</code></td><td>Your public IP as the internet sees it.</td></tr>
-              <tr><td><code class="inl">ping -c 4 host</code></td><td>ICMP reachability + latency.</td></tr>
-              <tr><td><code class="inl">traceroute -n host</code> / <code class="inl">tracepath host</code></td><td>Router hops to the destination.</td></tr>
-              <tr><td><code class="inl">dig +short name [TYPE]</code></td><td>DNS lookup (A, MX, CNAME…); <code class="inl">@8.8.8.8</code> picks the resolver.</td></tr>
-              <tr><td><code class="inl">dig +trace name</code></td><td>Follow root → TLD → authoritative.</td></tr>
-              <tr><td><code class="inl">dig -x IP</code></td><td>Reverse (PTR) lookup.</td></tr>
-              <tr><td><code class="inl">nslookup name</code> / <code class="inl">host name</code></td><td>Simpler DNS lookups.</td></tr>
-              <tr><td><code class="inl">getent hosts name</code></td><td>Resolve like apps do (includes <code class="inl">/etc/hosts</code>).</td></tr>
-              <tr><td><code class="inl">sudo ss -tulpn</code></td><td>Listening TCP/UDP sockets with process names.</td></tr>
-              <tr><td><code class="inl">ss -tn</code></td><td>Established TCP connections.</td></tr>
-              <tr><td><code class="inl">sudo lsof -i :3000</code></td><td>Which process owns port 3000.</td></tr>
+              <tr><td><code class="inl">ip a</code> / <code class="inl">ip -br a</code></td><td>Show interfaces and IP addresses (replaces <code class="inl">ifconfig</code>)</td></tr>
+              <tr><td><code class="inl">ip route</code></td><td>Routing table and default gateway</td></tr>
+              <tr><td><code class="inl">python3 -c "import ipaddress …"</code></td><td>Check subnet math (network, mask, first/last host, broadcast)</td></tr>
+              <tr><td><code class="inl">curl ifconfig.me</code></td><td>Your public IP as the internet sees it (after NAT)</td></tr>
+              <tr><td><code class="inl">ping -c 4 host</code></td><td>ICMP reachability and latency</td></tr>
+              <tr><td><code class="inl">traceroute -n host</code> / <code class="inl">tracepath host</code></td><td>Router hops to the destination</td></tr>
+              <tr><td><code class="inl">dig +short name [TYPE]</code> / <code class="inl">dig @8.8.8.8 name</code></td><td>DNS lookup (A, MX, CNAME…) / ask a specific resolver</td></tr>
+              <tr><td><code class="inl">dig +trace name</code> / <code class="inl">dig -x IP</code></td><td>Follow root → TLD → authoritative / reverse (PTR) lookup</td></tr>
+              <tr><td><code class="inl">nslookup name</code> / <code class="inl">host name</code></td><td>Simpler DNS lookups</td></tr>
+              <tr><td><code class="inl">getent hosts name</code></td><td>Resolve the way apps do (includes <code class="inl">/etc/hosts</code>)</td></tr>
+              <tr><td><code class="inl">sudo ss -tulpn</code> / <code class="inl">netstat -tulpn</code></td><td>Listening TCP/UDP sockets with process names</td></tr>
+              <tr><td><code class="inl">ss -tn</code></td><td>Established TCP connections</td></tr>
+              <tr><td><code class="inl">sudo lsof -i :3000</code></td><td>Which process owns port 3000</td></tr>
+              <tr><td><code class="inl">sudo tcpdump -i any -n 'tcp port 3000'</code></td><td>Watch packets (handshake flags S, S., ., P., F.)</td></tr>
               <tr><td><code class="inl">nc -zv -w 3 host port</code></td><td>Is a remote TCP port open? (refused vs timed out)</td></tr>
-              <tr><td><code class="inl">telnet host port</code></td><td>Manual TCP connect (legacy).</td></tr>
-              <tr><td><code class="inl">curl -v URL</code></td><td>Full request/response trace incl. TLS.</td></tr>
-              <tr><td><code class="inl">curl -I URL</code></td><td>Headers only (HEAD).</td></tr>
-              <tr><td><code class="inl">curl -X POST -H 'Content-Type: application/json' -d '{…}' URL</code></td><td>Send JSON to an API.</td></tr>
-              <tr><td><code class="inl">curl -s -o /dev/null -w '%{http_code}' URL</code></td><td>Status code only (scripts).</td></tr>
-              <tr><td><code class="inl">wget -qO- URL</code></td><td>Fetch a URL to stdout.</td></tr>
-              <tr><td><code class="inl">openssl s_client -connect host:443 -servername host</code></td><td>Inspect a server's TLS certificate.</td></tr>
-              <tr><td><code class="inl">sudo ufw status</code> / <code class="inl">sudo ufw allow 3000/tcp</code></td><td>Check / open the host firewall.</td></tr>
+              <tr><td><code class="inl">telnet host port</code></td><td>Manual TCP connect (legacy)</td></tr>
+              <tr><td><code class="inl">curl -v URL</code> / <code class="inl">curl -I URL</code></td><td>Full request/response trace including TLS / headers only (HEAD)</td></tr>
+              <tr><td><code class="inl">curl -X POST -H 'Content-Type: application/json' -d '{…}' URL</code></td><td>Send JSON to an API</td></tr>
+              <tr><td><code class="inl">curl -s -o /dev/null -w '%{http_code}' URL</code></td><td>Status code only (scripts)</td></tr>
+              <tr><td>curl flags: <code class="inl">-L --connect-timeout 5 -m 10 -k</code></td><td>Follow redirects · fail fast on connect · total time limit · skip TLS checks (testing only)</td></tr>
+              <tr><td><code class="inl">wget -qO- URL</code></td><td>Fetch a URL to stdout</td></tr>
+              <tr><td><code class="inl">openssl s_client -connect host:443 -servername host</code></td><td>Inspect a server's TLS certificate</td></tr>
+              <tr><td><code class="inl">sudo ufw status</code> / <code class="inl">sudo ufw allow 3000/tcp</code></td><td>Check / open the host firewall</td></tr>
             </tbody>
           </table>
         </div>
@@ -955,38 +1070,26 @@ Oct 09 10:41:07 taskflow-vm node[2391]: taskflow-api listening on 0.0.0.0:3000</
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>When you open <code class="inl">https://api.taskflow.example.com/tasks</code>: DNS turns the name into an IP; your private IP is NATed to a public one; TCP does a handshake to port 443; TLS proves the server's identity and encrypts; then an HTTP <code class="inl">GET</code> goes in and a <code class="inl">200</code> with JSON comes back. Every DevOps tool later in the course — Docker port mapping, Kubernetes Services, Ingress, security groups — is just configuring one of these layers, and every outage is debugged by walking them in order.</p>
+          <p>When you open <code class="inl">https://api.taskflow.example.com/tasks</code>, DNS turns the name into an IP. Your laptop sees it isn't local and sends the packet to the default gateway, which NATs your private address to its public one. TCP does a handshake with port 443, TLS proves the server's identity and encrypts everything, then an HTTP <code class="inl">GET</code> goes in and a <code class="inl">200</code> with JSON comes back. Every later DevOps tool (Docker port mapping, Kubernetes Services, Ingress, security groups) configures one of these layers, and every outage is debugged by walking them in order.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>How many usable hosts are in 10.0.2.0/27? What are the first and last usable IPs?</summary>
-          <p class="ans">32 − 27 = 5 host bits → 2<sup>5</sup> = 32 addresses − 2 = <strong>30 usable</strong>: <code class="inl">10.0.2.1</code> to <code class="inl">10.0.2.30</code> (network <code class="inl">.0</code>, broadcast <code class="inl">.31</code>).</p>
-        </details>
-        <details class="quiz">
-          <summary>Is 172.20.5.9 public or private? What about 172.32.0.1?</summary>
-          <p class="ans">172.20.5.9 is private (inside 172.16.0.0/12 = 172.16–172.31). 172.32.0.1 is outside that range → public.</p>
-        </details>
-        <details class="quiz">
-          <summary><code class="inl">curl localhost:3000/health</code> works on the server, but not from your laptop. <code class="inl">ss -tlnp</code> shows <code class="inl">127.0.0.1:3000</code>. Explain and fix.</summary>
-          <p class="ans">The app is bound to loopback, so only processes on the same host can connect. Make it listen on <code class="inl">0.0.0.0</code> (e.g. <code class="inl">HOST=0.0.0.0</code>), restart, then make sure the firewall/security group allows TCP 3000.</p>
-        </details>
-        <details class="quiz">
-          <summary><code class="inl">nc -zv host 5432</code> says "Connection refused" on one server and "timed out" on another. What does each tell you?</summary>
-          <p class="ans">Refused: packets reached the host and it replied with a reset → nothing listening on 5432 (service down, wrong port, or bound to 127.0.0.1). Timed out: packets were silently dropped → firewall / security group / routing / wrong IP.</p>
-        </details>
-        <details class="quiz">
-          <summary>Why does DNS use UDP, and when does it switch to TCP?</summary>
-          <p class="ans">A query and answer are tiny, so a TCP handshake would roughly double latency; UDP sends one packet each way. TCP 53 is used when the response is too big for UDP (truncated, TC flag) and for zone transfers.</p>
-        </details>
-        <details class="quiz">
-          <summary>nginx in front of taskflow-api returns 502 on one request and 504 on another. What's the difference?</summary>
-          <p class="ans">502 Bad Gateway: nginx got no valid response from the upstream (api down, connection refused, wrong port). 504 Gateway Timeout: the upstream accepted the request but didn't answer within nginx's timeout (slow handler / DB).</p>
-        </details>
-        <details class="quiz">
-          <summary>You added <code class="inl">192.168.49.2 taskflow.local</code> to <code class="inl">/etc/hosts</code>. Browser works, <code class="inl">dig taskflow.local</code> returns nothing. Is something broken?</summary>
-          <p class="ans">No. <code class="inl">dig</code> queries DNS servers directly and ignores <code class="inl">/etc/hosts</code>. Apps use the OS resolver (nsswitch: files, then dns). Check with <code class="inl">getent hosts taskflow.local</code>.</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — combine everything</span>
+          <details class="quiz"><summary>Q1. List every step between typing <code class="inl">https://api.taskflow.example.com/tasks</code> and seeing JSON, and name one command that tests each step.</summary>
+            <p class="ans">(1) Name → IP: <code class="inl">dig +short</code> / <code class="inl">getent hosts</code>. (2) Not local, so to the default gateway and NAT: <code class="inl">ip route</code>, <code class="inl">traceroute</code>. (3) TCP handshake to 443: <code class="inl">nc -zv host 443</code>. (4) TLS and the certificate check: <code class="inl">curl -v</code> / <code class="inl">openssl s_client</code>. (5) HTTP request and status: <code class="inl">curl -v</code>. (6) On the server, the app listening and logging: <code class="inl">ss -tlnp</code>, <code class="inl">journalctl</code>.</p></details>
+          <details class="quiz"><summary>Q2. EC2 instance: private 10.0.1.25, public 13.233.10.20. The security group allows TCP 3000 from anywhere, but the app listens on <code class="inl">127.0.0.1:3000</code>. Does your friend's <code class="inl">curl http://13.233.10.20:3000</code> get refused or time out? Why?</summary>
+            <p class="ans">Refused. The Internet Gateway NATs the SYN to 10.0.1.25, the security group lets it through, and nothing listens on 10.0.1.25:3000, so the kernel replies RST. Fix: <code class="inl">HOST=0.0.0.0</code>.</p></details>
+          <details class="quiz"><summary>Q3. Same instance, the app fixed to <code class="inl">0.0.0.0:3000</code>, but the security group only allows port 22. Refused or timeout? Which command proves it from your laptop?</summary>
+            <p class="ans">Timeout: the security group silently drops the SYN. <code class="inl">nc -zv -w 3 13.233.10.20 3000</code> → "timed out" while port 22 succeeds. Fix: an inbound rule for TCP 3000.</p></details>
+          <details class="quiz"><summary>Q4. Your home Wi-Fi is <code class="inl">192.168.1.0/24</code>, and the college VPN also hands out <code class="inl">192.168.1.0/24</code>. With the VPN up, you can't reach the college server <code class="inl">192.168.1.10</code>. Why?</summary>
+            <p class="ans">The two private ranges overlap. Your routing table treats 192.168.1.10 as directly attached on the Wi-Fi, so the packet is delivered locally and never enters the VPN tunnel. Fix: non-overlapping ranges, or a more specific route for the server.</p></details>
+          <details class="quiz"><summary>Q5. nginx (taskflow-web, port 80) proxies <code class="inl">/api</code> to <code class="inl">http://127.0.0.1:3000</code> on the same host. Users get 502, and <code class="inl">sudo ss -tlnp | grep 3000</code> prints nothing. What happened, and what's your next command?</summary>
+            <p class="ans">Nothing listens on 3000, so nginx's upstream connection is refused: a 502. The API crashed or never started. Next: <code class="inl">systemctl status taskflow</code> and <code class="inl">journalctl -u taskflow -n 50</code>.</p></details>
+          <details class="quiz"><summary>Q6. You moved <code class="inl">api.taskflow.example.com</code> (TTL 3600) to a new server. <code class="inl">dig +short</code> on your laptop shows the new IP, but your friend's shows the old one, so their curl hits the dead server. Explain, and say how you'd check what the authoritative server says.</summary>
+            <p class="ans">Their resolver cached the old A record and serves it until the TTL runs out (up to an hour). <code class="inl">dig +trace</code> or <code class="inl">dig @&lt;authoritative NS&gt;</code> shows the source of truth. Next time, lower the TTL before migrating.</p></details>
+          <details class="quiz"><summary>Q7. <code class="inl">curl https://taskflow.local</code> prints "SSL certificate problem: self-signed certificate", and <code class="inl">dig taskflow.local</code> returns nothing. Which layers worked, and which one failed?</summary>
+            <p class="ans">The name resolved through <code class="inl">/etc/hosts</code> (which dig ignores), TCP to 443 connected, and TLS got as far as the certificate check. Only trust failed: no CA your system trusts signed it. Add your dev CA to the trust store, or use <code class="inl">-k</code> for a one-off test.</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -1020,6 +1123,6 @@ Oct 09 10:41:07 taskflow-vm node[2391]: taskflow-api listening on 0.0.0.0:3000</
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 4 — Networking Fundamentals</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

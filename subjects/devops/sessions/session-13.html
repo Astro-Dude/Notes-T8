@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 13 — Kubernetes Storage, HPA &amp; Probes</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,11 @@
       <span class="kicker">Term 9 · DevOps · Session 13</span>
       <h1>Kubernetes Storage, HPA &amp; Probes</h1>
       <p class="lead">
-        Give TaskFlow's Postgres a disk that survives pod restarts (PV, PVC, StorageClass), autoscale
-        <code class="inl">taskflow-api</code> on CPU with an HPA, and add probes so traffic only reaches healthy pods.
+        Give TaskFlow's Postgres a disk that survives pod deletion (volumes, PV, PVC, StorageClass) and prove it.
+        Autoscale <code class="inl">taskflow-api</code> on CPU with Metrics Server and an HPA, working out the replica count yourself.
+        Add startup, readiness and liveness probes so traffic only reaches pods that can serve it.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 28 min read</span><span class="badge-rt">📖 6 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 39 min read</span><span class="badge-rt">📖 7 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -40,7 +41,8 @@
           <li><a href="#storageclass">StorageClass &amp; dynamic provisioning</a></li>
           <li><a href="#metrics-server">Metrics Server &amp; kubectl top</a></li>
           <li><a href="#hpa">Horizontal Pod Autoscaler (HPA)</a></li>
-          <li><a href="#probes">Liveness, readiness &amp; startup probes</a></li>
+          <li><a href="#probes">Readiness &amp; liveness probes</a></li>
+          <li><a href="#startup">Startup probes &amp; probe timing</a></li>
           <li><a href="#commands">Commands you must know</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
           <li><a href="#refs">References</a></li>
@@ -54,38 +56,39 @@
         <h2><span class="sec-num">1</span> Volumes: emptyDir, hostPath &amp; friends</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>The API keeps a warm cache in <code class="inl">/tmp</code>. Then its container gets OOM-killed and restarted:</p>
+<pre><span class="pr">$</span> kubectl exec taskflow-api-5d7f9c8b6-4kq2x -n taskflow -- sh -c 'echo warm &gt; /tmp/cache.txt'
+   <span class="cm"># … the container is OOMKilled and restarted: RESTARTS 0 → 1 …</span>
+<span class="pr">$</span> kubectl exec taskflow-api-5d7f9c8b6-4kq2x -n taskflow -- cat /tmp/cache.txt
+<span class="out">cat: can't open '/tmp/cache.txt': No such file or directory</span></pre>
+        <p>Same pod name, but a restart in Kubernetes is a brand-new container with a fresh writable layer (Session 6). There's a second problem too: a log-shipper sidecar in the same pod can't read the API's log files, because each container has its own filesystem.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">volume</span> is a directory that belongs to the <strong>pod</strong>, not to a container. You declare it once in <code class="inl">spec.volumes</code> and mount it into each container that needs it with <code class="inl">volumeMounts</code>. How long the data lives depends on the volume <em>type</em>.</p>
+<pre> Pod emptydir-demo
+ ┌─────────────────────────────────────────────────────┐
+ │  container writer            container reader       │
+ │   mounts /cache ──┐       ┌── mounts /cache (ro)    │
+ │                   ▼       ▼                         │
+ │            volume "cache" (emptyDir)                │ ← created when the pod lands on a node,
+ └─────────────────────────────────────────────────────┘   deleted when the pod is removed
+
+ lifetime:  container layer  &lt;  emptyDir (pod)  &lt;  hostPath (node)  &lt;  PVC → PV (independent)</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A container's filesystem is a whiteboard wiped on every restart. A volume is a notebook handed to the pod; a PersistentVolume is a locker that's still there after the pod is gone.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>A restaurant kitchen. Each <strong>cook</strong> (container) has a personal whiteboard (the writable layer) that's wiped when the cook is replaced. A <strong>station</strong> (pod) has a shared tray (<code class="inl">emptyDir</code>) that every cook at the station can use, and it goes when the station closes. A shelf bolted into one building (<code class="inl">hostPath</code>) is useless if you move to another branch. For things that must last there's the walk-in freezer (a PersistentVolume, §2). The kitchen comes back in every section on this page.</p>
         </div>
 
-        <ul>
-          <li>A container's writable layer is <strong>ephemeral</strong>: container restarts → files written there are lost.</li>
-          <li>A <span class="term">volume</span> is declared once at pod level (<code class="inl">spec.volumes</code>) and mounted into each container that needs it (<code class="inl">containers[].volumeMounts</code>).</li>
-          <li>Two lifetimes matter: <strong>pod-lifetime</strong> (emptyDir — dies with the pod) vs <strong>independent</strong> (PVC → PV — outlives pods).</li>
-        </ul>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Volume type</th><th>Lifetime</th><th>Use for</th><th>Watch out</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">emptyDir</code></td><td>Pod. Survives container restarts, deleted when the pod is removed from the node.</td><td>Scratch space, caches, sharing files between containers in one pod.</td><td><code class="inl">medium: Memory</code> = tmpfs; counts toward the container's memory limit.</td></tr>
-              <tr><td><code class="inl">hostPath</code></td><td>Node. A directory on the node's disk.</td><td>Node agents only (log collectors reading <code class="inl">/var/log</code>, node-exporter reading <code class="inl">/proc</code>).</td><td>Pod sees different data on each node; security risk (can mount <code class="inl">/</code>). Never for app data.</td></tr>
-              <tr><td><code class="inl">configMap</code> / <code class="inl">secret</code></td><td>Tied to the ConfigMap/Secret object.</td><td>Config files, certs (Session 12).</td><td>Read-only; with <code class="inl">subPath</code> updates are NOT propagated.</td></tr>
-              <tr><td><code class="inl">persistentVolumeClaim</code></td><td>Independent of pods — until the PVC is deleted.</td><td>Databases, uploads — anything that must survive.</td><td>Covered in §2–§3.</td></tr>
-              <tr><td><code class="inl">nfs</code>, <code class="inl">csi</code>, <code class="inl">projected</code>, <code class="inl">downwardAPI</code></td><td>Varies</td><td>Network shares, cloud disks, combining sources, exposing pod metadata as files.</td><td>Usually used through PVs, not directly.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>emptyDir: two containers sharing a folder</h3>
+        <h3>See it: two containers sharing a folder</h3>
         <div class="fname">emptydir-demo.yaml</div>
-<pre>apiVersion: v1
-kind: Pod
-metadata:
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Pod
+<span class="kw">metadata:</span>
   name: emptydir-demo
   namespace: taskflow
-spec:
+<span class="kw">spec:</span>
   containers:
     - name: writer
       image: busybox:1.36
@@ -103,13 +106,7 @@ spec:
   volumes:
     - name: cache
       emptyDir:
-        sizeLimit: 100Mi               <span class="cm"># pod is evicted if it writes more than this</span></pre>
-
-        <ul>
-          <li>The volume <code class="inl">name</code> links <code class="inl">spec.volumes</code> to each container's <code class="inl">volumeMounts</code>; each container may mount it at a different <code class="inl">mountPath</code>.</li>
-          <li>On the node it lives at <code class="inl">/var/lib/kubelet/pods/&lt;pod-uid&gt;/volumes/kubernetes.io~empty-dir/cache</code>.</li>
-        </ul>
-
+        sizeLimit: 100Mi               <span class="cm"># the pod is evicted if it writes more than this</span></pre>
 <pre><span class="pr">$</span> kubectl apply -f emptydir-demo.yaml
 <span class="out">pod/emptydir-demo created</span>
 <span class="pr">$</span> kubectl get pod emptydir-demo -n taskflow
@@ -119,28 +116,53 @@ emptydir-demo   2/2     Running   0          12s</span>
 <span class="out">Fri Oct  9 05:41:02 UTC 2026
 Fri Oct  9 05:41:07 UTC 2026
 Fri Oct  9 05:41:12 UTC 2026</span>
-<span class="pr">$</span> kubectl exec emptydir-demo -n taskflow -c writer -- ls -l /cache
-<span class="out">total 4
--rw-r--r--    1 root     root           145 Oct  9 05:41 heartbeat.log</span>
 <span class="pr">$</span> kubectl delete pod emptydir-demo -n taskflow     <span class="cm"># heartbeat.log is gone for good</span>
 <span class="out">pod "emptydir-demo" deleted</span></pre>
+        <p>The reader prints lines the writer wrote, so the two containers really share <code class="inl">/cache</code>. The volume's <code class="inl">name</code> is the link between <code class="inl">spec.volumes</code> and each <code class="inl">volumeMounts</code> entry, and each container may mount it at a different <code class="inl">mountPath</code>. On the node it lives under <code class="inl">/var/lib/kubelet/pods/&lt;pod-uid&gt;/volumes/kubernetes.io~empty-dir/cache</code>.</p>
+        <p><strong>What it does <em>not</em> do:</strong> survive the pod. A container restart keeps the emptyDir, but deleting the pod (or evicting or rescheduling it) deletes the directory.</p>
 
-        <h3>hostPath (snippet — for node agents only)</h3>
-        <div class="fname">pod.spec.volumes (snippet)</div>
+        <h3>Build it up: hostPath, and the full list</h3>
+        <div class="fname">pod.spec.volumes (snippet: for node agents only)</div>
 <pre>volumes:
   - name: varlog
     hostPath:
       path: /var/log           <span class="cm"># a directory on the NODE, not in the image</span>
       type: Directory          <span class="cm"># must already exist; DirectoryOrCreate / File / FileOrCreate / Socket also valid</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p>Using <code class="inl">hostPath</code> for Postgres data "because it works on minikube". On a 3-node cluster the pod gets rescheduled to another node and sees an empty directory — the data is still on the old node. Use a PVC.</p>
+        <p><code class="inl">hostPath</code> hands the pod a real directory on whichever node it runs on. That's right for a log collector reading <code class="inl">/var/log</code>, and wrong for Postgres. On a 3-node cluster the pod gets rescheduled to another node and finds an empty directory, while its data sits on the old node. It's also a security risk, because it can mount <code class="inl">/</code>.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Volume type</th><th>Lifetime</th><th>Use for</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">emptyDir</code></td><td>Pod (survives container restarts)</td><td>Scratch space, caches, sharing files between containers</td><td><code class="inl">medium: Memory</code> = tmpfs, which counts toward the memory limit</td></tr>
+              <tr><td><code class="inl">hostPath</code></td><td>Node</td><td>Node agents only (log collectors, node-exporter reading <code class="inl">/proc</code>)</td><td>Different data on each node; security risk. Never for app data.</td></tr>
+              <tr><td><code class="inl">configMap</code> / <code class="inl">secret</code></td><td>The ConfigMap/Secret object</td><td>Config files, certs (Session 12)</td><td>Read-only; with <code class="inl">subPath</code>, updates aren't propagated</td></tr>
+              <tr><td><code class="inl">persistentVolumeClaim</code></td><td>Independent of pods, until the PVC is deleted</td><td>Databases, uploads: anything that must survive</td><td>§2–§3</td></tr>
+              <tr><td><code class="inl">nfs</code>, <code class="inl">csi</code>, <code class="inl">projected</code>, <code class="inl">downwardAPI</code></td><td>Varies</td><td>Network shares, cloud disks, combined sources, pod metadata as files</td><td>Usually used through PVs, not directly</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Declare in <code class="inl">spec.volumes</code>, mount with <code class="inl">volumeMounts</code>. emptyDir = pod-lifetime scratch/shared space; hostPath = node agents only; real data → PVC.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"An emptyDir is wiped every time the container restarts." <strong>✗</strong> It belongs to the pod, so it survives container restarts. Only removing the pod deletes it. (The container's <em>own</em> filesystem is the thing that's wiped.)</p>
+          <p>"hostPath is fine for database data." <strong>✗</strong> Only on a single-node cluster, and only by luck. Use a PVC.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Declare in <code class="inl">spec.volumes</code>, mount with <code class="inl">volumeMounts</code>, linked by name.</strong><br /><strong>container layer &lt; emptyDir (pod) &lt; hostPath (node) &lt; PVC (independent).</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Predict: in <code class="inl">emptydir-demo</code>, the <code class="inl">writer</code> container crashes and is restarted. Is <code class="inl">heartbeat.log</code> still there?</summary>
+            <p class="ans">Yes. The emptyDir belongs to the pod, which still exists, so the file keeps growing after the restart. It's only lost when the pod itself is deleted or evicted.</p></details>
+          <details class="quiz"><summary>Q2. Spot the bug: a container mounts <code class="inl">name: cache-vol</code>, but <code class="inl">spec.volumes</code> lists <code class="inl">name: cache</code>.</summary>
+            <p class="ans">The pod is rejected (<code class="inl">spec.containers[0].volumeMounts[0].name: Not found: "cache-vol"</code>). Mounts refer to volumes by name, and the names must match exactly.</p></details>
+          <details class="quiz"><summary>Q3. A pod with <code class="inl">limits.memory: 256Mi</code> writes 300 MiB into an <code class="inl">emptyDir</code> with <code class="inl">medium: Memory</code>. What happens?</summary>
+            <p class="ans">It gets OOM-killed or evicted. A memory-backed emptyDir is tmpfs, and its pages count toward the container's memory limit.</p></details>
+          <details class="quiz"><summary>Q4. Fill in: a volume is declared at the ________ level and mounted by each ________; an emptyDir lives as long as the ________.</summary>
+            <p class="ans">Pod · container · pod.</p></details>
         </div>
       </section>
 
@@ -149,109 +171,96 @@ Fri Oct  9 05:41:12 UTC 2026</span>
         <h2><span class="sec-num">2</span> PersistentVolume &amp; PersistentVolumeClaim</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Postgres from Session 12 keeps its data inside the container. Watch what one pod deletion does:</p>
+<pre><span class="pr">$</span> kubectl exec deploy/taskflow-db -n taskflow -- psql -U taskflow -tc "SELECT count(*) FROM tasks;"
+<span class="out">    42</span>
+<span class="pr">$</span> kubectl delete pod -l app=taskflow-db -n taskflow      <span class="cm"># a node drain or eviction does the same</span>
+<span class="out">pod "taskflow-db-7f6d8c9b5-l4vzt" deleted</span>
+<span class="pr">$</span> kubectl exec deploy/taskflow-db -n taskflow -- psql -U taskflow -tc "SELECT count(*) FROM tasks;"
+<span class="out">ERROR:  relation "tasks" does not exist
+LINE 1: SELECT count(*) FROM tasks;
+                             ^</span></pre>
+        <p>All 42 tasks are gone. You need storage that outlives any pod. And because the real disk is different on every cluster (an EBS volume on EKS, an NFS share on-prem, a folder on minikube), the app's YAML shouldn't have to say which.</p>
+
+        <h3>The idea</h3>
+        <p>Kubernetes splits storage into two objects. A <span class="term">PersistentVolume (PV)</span> is a real piece of storage. It's <strong>cluster-scoped</strong> and created by an admin (<em>static</em>) or a provisioner (<em>dynamic</em>, §3). A <span class="term">PersistentVolumeClaim (PVC)</span> is a <strong>namespaced</strong> request: size + access mode + StorageClass. The control plane <strong>binds</strong> a claim to one PV that has the same <code class="inl">storageClassName</code>, the requested access mode and enough capacity. Binding is <strong>1:1</strong> and exclusive. The pod only ever names the claim.</p>
+<pre> developer writes                                admin (or a provisioner) supplies
+ PVC pg-manual-claim   (namespace taskflow)      PV taskflow-pv-manual   (cluster-scoped)
+   2Gi · RWO · class manual   ─── binds 1:1 ───▶   5Gi · RWO · class manual · Retain
+         ▲                                              │
+ Pod: volumes[].persistentVolumeClaim.claimName         ▼ backed by a real disk (here: hostPath /data/taskflow-pg)</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The PVC is an order slip ("5&nbsp;GB, one writer"); the PV is the actual disk handed over. The pod only ever shows the slip.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The station doesn't build its own freezer. It hands in an <strong>order slip</strong> (the PVC: "5 GB of freezer space, one station"). Management assigns a <strong>freezer unit</strong> (the PV) that fits, and that unit is now reserved for that slip only, even if it's bigger than asked. Cooks come and go, and the freezer and its contents stay.</p>
         </div>
 
-        <ul>
-          <li><span class="term">PersistentVolume (PV)</span>: a <strong>cluster-scoped</strong> object representing a real piece of storage (EBS volume, NFS share, a node directory). Created by an admin (<em>static</em>) or a provisioner (<em>dynamic</em>, §3).</li>
-          <li><span class="term">PersistentVolumeClaim (PVC)</span>: a <strong>namespaced</strong> request: size + access mode + StorageClass.</li>
-          <li><strong>Binding</strong>: the control plane finds a PV with the same <code class="inl">storageClassName</code>, whose access modes include the requested ones and capacity ≥ request, and binds them <strong>1:1</strong> (exclusive, even if the PV is bigger).</li>
-          <li>The pod references only the PVC: <code class="inl">volumes[].persistentVolumeClaim.claimName</code>. App manifests stay storage-agnostic.</li>
-        </ul>
-
-        <h3>Static provisioning: an admin-made PV</h3>
+        <h3>See it: an admin-made PV, then a claim</h3>
         <div class="fname">pv-manual.yaml</div>
-<pre>apiVersion: v1
-kind: PersistentVolume                 <span class="cm"># cluster-scoped: no namespace</span>
-metadata:
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> PersistentVolume                 <span class="cm"># cluster-scoped: no namespace</span>
+<span class="kw">metadata:</span>
   name: taskflow-pv-manual
-spec:
+<span class="kw">spec:</span>
   capacity:
     storage: 5Gi                       <span class="cm"># size this PV offers</span>
   volumeMode: Filesystem               <span class="cm"># default; "Block" = raw device</span>
   accessModes:
     - ReadWriteOnce                    <span class="cm"># RWO: mountable read-write by one node</span>
   persistentVolumeReclaimPolicy: Retain  <span class="cm"># keep data when the claim is deleted</span>
-  storageClassName: manual             <span class="cm"># PVC must ask for the same class to bind</span>
+  storageClassName: manual             <span class="cm"># a PVC must ask for the same class to bind</span>
   hostPath:
     path: /data/taskflow-pg            <span class="cm"># minikube persists /data across restarts</span></pre>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Field</th><th>Meaning</th><th>Gotcha</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">capacity.storage</code></td><td>Size offered. Units <code class="inl">Mi</code>, <code class="inl">Gi</code>, <code class="inl">Ti</code>.</td><td>For hostPath it isn't enforced — just a label for matching.</td></tr>
-              <tr><td><code class="inl">accessModes</code></td><td>What the backend supports (table below).</td><td>A matching rule, not a lock (except RWOP).</td></tr>
-              <tr><td><code class="inl">persistentVolumeReclaimPolicy</code></td><td>What happens to the PV when its PVC is deleted.</td><td>Manually created PVs default to <code class="inl">Retain</code>; dynamic ones to <code class="inl">Delete</code>.</td></tr>
-              <tr><td><code class="inl">storageClassName</code></td><td>Groups PVs; a PVC only binds PVs of its class.</td><td><code class="inl">""</code> = "no class" (static only).</td></tr>
-              <tr><td><code class="inl">hostPath</code> / <code class="inl">nfs</code> / <code class="inl">csi</code></td><td>The actual backend. Exactly one.</td><td>Real clusters use <code class="inl">csi</code> (e.g. <code class="inl">ebs.csi.aws.com</code>).</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Access modes (exam favourite)</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Mode</th><th>Short</th><th>Meaning</th><th>Typical backends</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">ReadWriteOnce</code></td><td>RWO</td><td>Read-write by <strong>one node</strong> (several pods on that same node can share it).</td><td>AWS EBS, GCE PD, Azure Disk, hostPath</td></tr>
-              <tr><td><code class="inl">ReadOnlyMany</code></td><td>ROX</td><td>Read-only by many nodes.</td><td>NFS, pre-filled disks</td></tr>
-              <tr><td><code class="inl">ReadWriteMany</code></td><td>RWX</td><td>Read-write by many nodes at once.</td><td>NFS, AWS EFS, Azure Files, CephFS</td></tr>
-              <tr><td><code class="inl">ReadWriteOncePod</code></td><td>RWOP</td><td>Read-write by <strong>one pod</strong> in the whole cluster (GA in 1.29, CSI volumes only).</td><td>EBS CSI, most CSI block drivers</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Reclaim policies &amp; PV lifecycle</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Policy</th><th>When the PVC is deleted…</th><th>Use when</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">Retain</code></td><td>PV → <code class="inl">Released</code>; data kept; admin must clean up / re-use manually.</td><td>Production databases (protects against an accidental <code class="inl">kubectl delete pvc</code>).</td></tr>
-              <tr><td><code class="inl">Delete</code></td><td>PV <strong>and the real disk</strong> are deleted.</td><td>Dev/test, dynamic provisioning default.</td></tr>
-              <tr><td><code class="inl">Recycle</code></td><td>Deprecated (<code class="inl">rm -rf</code> on the volume).</td><td>Never.</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>PV phases: <code class="inl">Available</code> → <code class="inl">Bound</code> → <code class="inl">Released</code> (claim gone) / <code class="inl">Failed</code>. PVC phases: <code class="inl">Pending</code> → <code class="inl">Bound</code> (or <code class="inl">Lost</code> if its PV vanished).</p>
-
-        <h3>The claim</h3>
         <div class="fname">pvc-manual.yaml</div>
-<pre>apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
+<pre><span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> PersistentVolumeClaim
+<span class="kw">metadata:</span>
   name: pg-manual-claim
-  namespace: taskflow                  <span class="cm"># PVCs are namespaced; pods can only use PVCs in their namespace</span>
-spec:
+  namespace: taskflow                  <span class="cm"># pods can only use PVCs in their own namespace</span>
+<span class="kw">spec:</span>
   accessModes:
     - ReadWriteOnce
   storageClassName: manual             <span class="cm"># same class as the PV → static binding</span>
   resources:
     requests:
       storage: 2Gi                     <span class="cm"># "at least 2Gi"</span></pre>
-
-<pre><span class="pr">$</span> kubectl apply -f pv-manual.yaml
-<span class="out">persistentvolume/taskflow-pv-manual created</span>
-<span class="pr">$</span> kubectl get pv
-<span class="out">NAME                 CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+<pre><span class="pr">$</span> kubectl apply -f pv-manual.yaml &amp;&amp; kubectl get pv
+<span class="out">persistentvolume/taskflow-pv-manual created
+NAME                 CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
 taskflow-pv-manual   5Gi        RWO            Retain           Available           manual         &lt;unset&gt;                          6s</span>
-<span class="pr">$</span> kubectl apply -f pvc-manual.yaml
-<span class="out">persistentvolumeclaim/pg-manual-claim created</span>
-<span class="pr">$</span> kubectl get pv,pvc -n taskflow
-<span class="out">NAME                                  CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                      STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
-persistentvolume/taskflow-pv-manual   5Gi        RWO            Retain           Bound    taskflow/pg-manual-claim   manual         &lt;unset&gt;                          40s
-
-NAME                                    STATUS   VOLUME               CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
-persistentvolumeclaim/pg-manual-claim   Bound    taskflow-pv-manual   5Gi        RWO            manual         &lt;unset&gt;                 4s</span></pre>
-
-        <div class="callout example">
-          <span class="c-title">Example: asked for 2Gi, got 5Gi</span>
-          <p>The PVC requested 2Gi but <code class="inl">CAPACITY</code> shows 5Gi: binding is to a <em>whole</em> PV. The other 3Gi can't be given to anyone else. (<code class="inl">VOLUMEATTRIBUTESCLASS</code> is a newer column for tuning IOPS; <code class="inl">&lt;unset&gt;</code> is normal.)</p>
+<span class="pr">$</span> kubectl apply -f pvc-manual.yaml &amp;&amp; kubectl get pvc -n taskflow
+<span class="out">persistentvolumeclaim/pg-manual-claim created
+NAME              STATUS   VOLUME               CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+pg-manual-claim   Bound    taskflow-pv-manual   5Gi        RWO            manual         &lt;unset&gt;                 4s</span></pre>
+        <p>The PV went from <code class="inl">Available</code> to <code class="inl">Bound</code>. Notice CAPACITY: the claim asked for 2Gi and got <strong>5Gi</strong>, because it binds a whole PV. The other 3Gi can't go to anyone else. (<code class="inl">VOLUMEATTRIBUTESCLASS</code> is a newer column for tuning IOPS, and <code class="inl">&lt;unset&gt;</code> is normal.)</p>
+        <p><strong>What it does <em>not</em> do:</strong> a bound PVC holds space but mounts nothing until a pod names it in <code class="inl">volumes[].persistentVolumeClaim.claimName</code> (§3 does that for Postgres).</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Meaning</th><th>Gotcha</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">capacity.storage</code></td><td>Size offered (<code class="inl">Mi</code>, <code class="inl">Gi</code>, <code class="inl">Ti</code>).</td><td>Not enforced for hostPath. It's just a label for matching.</td></tr>
+              <tr><td><code class="inl">accessModes</code></td><td>What the backend supports (table below).</td><td>A matching rule, not a lock (except RWOP).</td></tr>
+              <tr><td><code class="inl">persistentVolumeReclaimPolicy</code></td><td>What happens to the PV when its PVC is deleted.</td><td>Manual PVs default to <code class="inl">Retain</code>, dynamic ones to <code class="inl">Delete</code>.</td></tr>
+              <tr><td><code class="inl">storageClassName</code></td><td>Groups PVs. A PVC only binds PVs of its class.</td><td><code class="inl">""</code> = "no class" (static only).</td></tr>
+              <tr><td><code class="inl">hostPath</code> / <code class="inl">nfs</code> / <code class="inl">csi</code></td><td>The actual backend, exactly one.</td><td>Real clusters use <code class="inl">csi</code> (e.g. <code class="inl">ebs.csi.aws.com</code>).</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <p>Retain in action — delete the claim, the PV keeps the data but can't be re-bound until you clear its <code class="inl">claimRef</code>:</p>
+        <h3>Build it up: access modes and reclaim policies</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Mode</th><th>Short</th><th>Meaning</th><th>Typical backends</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">ReadWriteOnce</code></td><td>RWO</td><td>Read-write by <strong>one node</strong> (several pods on that node can share it)</td><td>AWS EBS, GCE PD, Azure Disk, hostPath</td></tr>
+              <tr><td><code class="inl">ReadOnlyMany</code></td><td>ROX</td><td>Read-only by many nodes</td><td>NFS, pre-filled disks</td></tr>
+              <tr><td><code class="inl">ReadWriteMany</code></td><td>RWX</td><td>Read-write by many nodes at once</td><td>NFS, AWS EFS, Azure Files, CephFS</td></tr>
+              <tr><td><code class="inl">ReadWriteOncePod</code></td><td>RWOP</td><td>Read-write by <strong>one pod</strong> in the whole cluster (GA in 1.29, CSI only)</td><td>EBS CSI, most CSI block drivers</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Now delete the claim and watch <code class="inl">Retain</code> do its job:</p>
 <pre><span class="pr">$</span> kubectl delete pvc pg-manual-claim -n taskflow
 <span class="out">persistentvolumeclaim "pg-manual-claim" deleted</span>
 <span class="pr">$</span> kubectl get pv taskflow-pv-manual
@@ -259,19 +268,30 @@ persistentvolumeclaim/pg-manual-claim   Bound    taskflow-pv-manual   5Gi       
 taskflow-pv-manual   5Gi        RWO            Retain           Released   taskflow/pg-manual-claim   manual         &lt;unset&gt;                          9m</span>
 <span class="pr">$</span> kubectl patch pv taskflow-pv-manual -p '{"spec":{"claimRef":null}}'   <span class="cm"># → Available again, data still on disk</span>
 <span class="out">persistentvolume/taskflow-pv-manual patched</span></pre>
+        <p><code class="inl">Released</code> means the data is kept but the PV still remembers its old claim, so no new claim can bind it until an admin clears <code class="inl">claimRef</code>. The three policies: <strong>Retain</strong> keeps the PV and data (production databases), <strong>Delete</strong> deletes the PV <em>and the real disk</em> (dev/test, the dynamic default), and <strong>Recycle</strong> is deprecated. PV phases run <code class="inl">Available → Bound → Released</code> (or <code class="inl">Failed</code>). PVC phases are <code class="inl">Pending → Bound</code> (or <code class="inl">Lost</code> if its PV vanished).</p>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><strong>PVC without <code class="inl">storageClassName</code></strong> on minikube gets the default class <code class="inl">standard</code> → a <em>new</em> PV is provisioned and your manual PV stays <code class="inl">Available</code>. Put the same class on both (or <code class="inl">storageClassName: ""</code>).</li>
-            <li><strong>PVC stuck <code class="inl">Pending</code></strong>: no PV matches (too small, wrong access mode, class typo). <code class="inl">kubectl describe pvc</code> → Events tell you which.</li>
-            <li><strong>PVC stuck <code class="inl">Terminating</code></strong>: a pod still uses it (<code class="inl">kubernetes.io/pvc-protection</code> finalizer). Delete the pod first.</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"ReadWriteOnce means one pod." <strong>✗</strong> It means one <em>node</em>. Two pods on the same node can both mount it. One pod in the whole cluster is <code class="inl">ReadWriteOncePod</code>.</p>
+          <p>"A PVC with no <code class="inl">storageClassName</code> binds my manual PV." <strong>✗</strong> On minikube it gets the default class <code class="inl">standard</code>, so a <em>new</em> PV is provisioned and yours stays Available. Name the same class on both (or <code class="inl">""</code>).</p>
+          <p>"PVs live in a namespace." <strong>✗</strong> PVs (and StorageClasses) are cluster-scoped. Only PVCs are namespaced.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          PV = the disk (cluster-scoped), PVC = the request (namespaced), binding is 1:1 by class + access mode + size. Retain keeps data, Delete destroys it.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>PV = the disk (cluster-wide) · PVC = the request (namespaced) · binding is 1:1 by class + mode + size.</strong><br /><strong>Retain keeps data · Delete destroys the disk.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A PVC requests <code class="inl">ReadWriteMany</code>, class <code class="inl">manual</code>, 2Gi. The only <code class="inl">manual</code> PV is 5Gi RWO. Predict the PVC's STATUS and how you'd find out why.</summary>
+            <p class="ans"><code class="inl">Pending</code>, because the PV doesn't offer RWX, so no PV matches. <code class="inl">kubectl describe pvc</code> shows the binder's event. Fix: request RWO, or provide an RWX-capable PV (NFS, EFS).</p></details>
+          <details class="quiz"><summary>Q2. Reclaim policy <code class="inl">Retain</code>. You delete the PVC, then create a new identical PVC. Does it get the old data?</summary>
+            <p class="ans">Not automatically. The PV is <code class="inl">Released</code> and still holds a <code class="inl">claimRef</code> to the old claim, so the new PVC can't bind it (it stays Pending, or a default class provisions a fresh empty PV). Clear <code class="inl">claimRef</code> to make the PV Available, and then it binds with the data intact.</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl delete pvc taskflow-db-data</code> hangs, and the PVC shows <code class="inl">Terminating</code>. Why?</summary>
+            <p class="ans">A pod still uses it. The <code class="inl">kubernetes.io/pvc-protection</code> finalizer blocks deletion until no pod mounts the claim. Delete or scale down the pod first.</p></details>
+          <details class="quiz"><summary>Q4. Fill in: a PV is ________-scoped, a PVC is ________-scoped, and a pod refers to ________ only.</summary>
+            <p class="ans">Cluster · namespace · the PVC (by <code class="inl">claimName</code>).</p></details>
         </div>
       </section>
 
@@ -280,11 +300,11 @@ taskflow-pv-manual   5Gi        RWO            Retain           Released   taskf
         <h2><span class="sec-num">3</span> StorageClass &amp; dynamic provisioning</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Instead of an admin pre-building lockers, a StorageClass is a vending machine: put in a PVC, out comes a brand-new PV.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>With static PVs, every claim waits for a human. A team files a PVC for 20Gi at 2 a.m. and it sits <code class="inl">Pending</code> until an admin wakes up, creates an EBS volume in the right availability zone, and writes a PV for it. Multiply that by every team, every environment and every database.</p>
 
+        <h3>The idea</h3>
+        <p>A <span class="term">StorageClass (SC)</span> is a cluster-scoped "type of storage" plus the <span class="term">provisioner</span> (a CSI driver) that can create disks of that type. When a PVC names a class, the provisioner creates a disk and a matching PV (named <code class="inl">pvc-&lt;uid&gt;</code>) on demand and binds it. That's <strong>dynamic provisioning</strong>. One class can be the <strong>default</strong>, used by PVCs that don't name one.</p>
 <pre>  Pod ──volumes.claimName──▶ PVC ──────binds 1:1──────▶ PV ──backed by──▶ real disk
                              "5Gi, RWO,                 "pvc-8f6c…, 5Gi"   (EBS vol / hostPath dir / NFS)
                               class: gp3"                    ▲
@@ -292,172 +312,126 @@ taskflow-pv-manual   5Gi        RWO            Retain           Released   taskf
                                  └──storageClassName──▶ StorageClass ──provisioner──▶ CSI driver
                                                          "gp3"            ebs.csi.aws.com</pre>
 
-        <ul>
-          <li><span class="term">StorageClass (SC)</span>: cluster-scoped "type of storage" + the <span class="term">provisioner</span> (CSI driver) that creates disks of that type.</li>
-          <li><strong>Dynamic provisioning</strong>: a PVC naming an SC triggers the provisioner → a PV called <code class="inl">pvc-&lt;uid&gt;</code> is created and bound automatically.</li>
-          <li>One SC can be marked <strong>default</strong>; PVCs that omit <code class="inl">storageClassName</code> get it.</li>
-        </ul>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>Instead of management pre-buying freezers, the kitchen has a <strong>supplier catalog</strong> (StorageClass): "gp3 freezer, delivered by AWS". Hand in an order slip that names the catalog entry, and a brand-new freezer shows up, sized exactly to the order.</p>
+        </div>
 
-<pre><span class="pr">$</span> kubectl get storageclass        <span class="cm"># minikube</span>
+        <h3>See it: the class minikube gives you</h3>
+<pre><span class="pr">$</span> kubectl get storageclass
 <span class="out">NAME                 PROVISIONER                RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
 standard (default)   k8s.io/minikube-hostpath   Delete          Immediate           false                  3d</span></pre>
-        <p>kind's default is <code class="inl">standard</code> with <code class="inl">rancher.io/local-path</code> and <code class="inl">WaitForFirstConsumer</code>. On EKS you define your own, e.g. gp3:</p>
+        <p>Left to right: <code class="inl">standard</code> is the default class, its provisioner makes host folders, deleting a claim deletes the volume, volumes are created as soon as the PVC exists, and they can't grow. kind's <code class="inl">standard</code> uses <code class="inl">rancher.io/local-path</code> with <code class="inl">WaitForFirstConsumer</code>.</p>
+        <p><strong>What it does <em>not</em> do:</strong> a StorageClass creates nothing on its own. No PVC, no disk.</p>
 
+        <h3>Build it up</h3>
+        <h4>A real class: gp3 on EKS</h4>
         <div class="fname">storageclass-gp3.yaml (EKS)</div>
-<pre>apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
+<pre><span class="kw">apiVersion:</span> storage.k8s.io/v1
+<span class="kw">kind:</span> StorageClass
+<span class="kw">metadata:</span>
   name: gp3
   annotations:
-    storageclass.kubernetes.io/is-default-class: "true"   <span class="cm"># PVCs without a class get this one</span>
-provisioner: ebs.csi.aws.com           <span class="cm"># AWS EBS CSI driver creates the volumes</span>
-parameters:                            <span class="cm"># passed to the provisioner as-is (driver-specific)</span>
+    storageclass.kubernetes.io/is-default-class: <span class="st">"true"</span>   <span class="cm"># PVCs without a class get this one</span>
+<span class="kw">provisioner:</span> ebs.csi.aws.com           <span class="cm"># AWS EBS CSI driver creates the volumes</span>
+<span class="kw">parameters:</span>                            <span class="cm"># passed to the provisioner as-is (driver-specific strings)</span>
   type: gp3                            <span class="cm"># EBS volume type</span>
   csi.storage.k8s.io/fstype: ext4
-  encrypted: "true"
-reclaimPolicy: Delete                  <span class="cm"># default; Retain for prod DBs</span>
-volumeBindingMode: WaitForFirstConsumer  <span class="cm"># create the disk only after the pod is scheduled</span>
-allowVolumeExpansion: true             <span class="cm"># lets you grow a PVC later</span></pre>
-
+  encrypted: <span class="st">"true"</span>
+<span class="kw">reclaimPolicy:</span> Delete                  <span class="cm"># default; Retain for prod DBs</span>
+<span class="kw">volumeBindingMode:</span> WaitForFirstConsumer  <span class="cm"># create the disk only after the pod is scheduled</span>
+<span class="kw">allowVolumeExpansion:</span> true             <span class="cm"># lets you grow a PVC later</span></pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">provisioner</code></td><td>Which driver makes the PV. Examples: <code class="inl">ebs.csi.aws.com</code>, <code class="inl">pd.csi.storage.gke.io</code>, <code class="inl">disk.csi.azure.com</code>, <code class="inl">k8s.io/minikube-hostpath</code>.</td></tr>
+              <tr><td><code class="inl">provisioner</code></td><td>Which driver makes the PV: <code class="inl">ebs.csi.aws.com</code>, <code class="inl">pd.csi.storage.gke.io</code>, <code class="inl">disk.csi.azure.com</code>, <code class="inl">k8s.io/minikube-hostpath</code>.</td></tr>
               <tr><td><code class="inl">parameters</code></td><td>Opaque key/values for that driver (disk type, IOPS, encryption). Values must be strings.</td></tr>
               <tr><td><code class="inl">reclaimPolicy</code></td><td>Copied into every PV this class creates. Default <code class="inl">Delete</code>.</td></tr>
-              <tr><td><code class="inl">volumeBindingMode</code></td><td><code class="inl">Immediate</code> (default): provision as soon as the PVC exists. <code class="inl">WaitForFirstConsumer</code>: wait until a pod using it is scheduled, then create the disk in <strong>that pod's zone</strong>.</td></tr>
-              <tr><td><code class="inl">allowVolumeExpansion</code></td><td>If true, increase <code class="inl">spec.resources.requests.storage</code> on the PVC to grow it. Shrinking is never allowed.</td></tr>
-              <tr><td><code class="inl">is-default-class</code> annotation</td><td>Marks the default SC (shown as <code class="inl">(default)</code>).</td></tr>
+              <tr><td><code class="inl">volumeBindingMode</code></td><td><code class="inl">Immediate</code> (default) provisions as soon as the PVC exists. <code class="inl">WaitForFirstConsumer</code> waits until a pod using it is scheduled, then creates the disk <strong>in that pod's zone</strong>. EBS volumes live in one AZ, so <code class="inl">Immediate</code> could put the disk in <code class="inl">ap-south-1a</code> and the pod in <code class="inl">ap-south-1b</code>, and it could never attach.</td></tr>
+              <tr><td><code class="inl">allowVolumeExpansion</code></td><td>If true, raise the PVC's <code class="inl">requests.storage</code> to grow it. Shrinking is never allowed.</td></tr>
             </tbody>
           </table>
         </div>
 
-        <div class="callout example">
-          <span class="c-title">Example: why WaitForFirstConsumer on EKS</span>
-          <p>EBS volumes live in one AZ. With <code class="inl">Immediate</code>, the disk may be created in <code class="inl">ap-south-1a</code> while the scheduler puts the pod on a node in <code class="inl">ap-south-1b</code> → it can never attach. With WFFC the PVC shows <code class="inl">Pending</code> with event <code class="inl">waiting for first consumer to be created before binding</code> — that's normal, not an error.</p>
-        </div>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th></th><th>Static provisioning</th><th>Dynamic provisioning</th></tr></thead>
-            <tbody>
-              <tr><td>Who creates the PV</td><td>Admin writes PV YAML in advance</td><td>Provisioner, on demand, per PVC</td></tr>
-              <tr><td>PV name</td><td>Whatever the admin chose</td><td><code class="inl">pvc-&lt;uid&gt;</code></td></tr>
-              <tr><td>Size match</td><td>PVC gets a whole existing PV (may be bigger)</td><td>Exactly the size requested</td></tr>
-              <tr><td>Default reclaim</td><td><code class="inl">Retain</code></td><td>From the SC (default <code class="inl">Delete</code>)</td></tr>
-              <tr><td>Used in</td><td>On-prem NFS, pre-existing disks</td><td>Every cloud cluster, minikube, kind</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>TaskFlow: Postgres on a dynamically provisioned PVC</h3>
-        <p>The Secret from Session 12 (both keys are used on this page):</p>
-<pre><span class="pr">$</span> kubectl create secret generic taskflow-db-secret -n taskflow \
-    --from-literal=POSTGRES_PASSWORD='tf-pass-2026' \
-    --from-literal=DATABASE_URL='postgres://taskflow:tf-pass-2026@taskflow-db:5432/taskflow'
-<span class="out">secret/taskflow-db-secret created</span></pre>
-
+        <h4>TaskFlow: Postgres on a dynamically provisioned PVC</h4>
+        <p>The password comes from Session 12's Secret <code class="inl">taskflow-db-secret</code> (keys <code class="inl">POSTGRES_PASSWORD</code> and <code class="inl">DATABASE_URL</code>).</p>
         <div class="fname">k8s/postgres.yaml</div>
-<pre><span class="cm"># --- 1. The claim: "give me 5Gi of the default class" ---</span>
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
+<pre><span class="cm"># --- 1. The claim: "give me 5Gi of the standard class" ---</span>
+<span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> PersistentVolumeClaim
+<span class="kw">metadata:</span>
   name: taskflow-db-data
   namespace: taskflow
-spec:
-  accessModes:
-    - ReadWriteOnce
+<span class="kw">spec:</span>
+  accessModes: [ReadWriteOnce]
   storageClassName: standard           <span class="cm"># minikube default; gp3 on EKS; omit = cluster default</span>
   resources:
-    requests:
-      storage: 5Gi
+    requests: { storage: 5Gi }
 ---
-<span class="cm"># --- 2. Postgres itself (Session 15 upgrades this to a StatefulSet) ---</span>
-apiVersion: apps/v1
-kind: Deployment
-metadata:
+<span class="cm"># --- 2. Postgres itself (probes are added in §6; Session 15 makes it a StatefulSet) ---</span>
+<span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
   name: taskflow-db
   namespace: taskflow
-spec:
+<span class="kw">spec:</span>
   replicas: 1                          <span class="cm"># one writer; 2 replicas would NOT replicate data</span>
   strategy:
-    type: Recreate                     <span class="cm"># stop old pod before starting new → RWO disk is free</span>
+    type: Recreate                     <span class="cm"># stop the old pod before starting the new → RWO disk is free</span>
   selector:
-    matchLabels:
-      app: taskflow-db
+    matchLabels: { app: taskflow-db }
   template:
     metadata:
-      labels:
-        app: taskflow-db
+      labels: { app: taskflow-db }     <span class="cm"># the Service below selects this</span>
     spec:
       containers:
         - name: postgres
           image: postgres:16
           ports:
-            - name: postgres
-              containerPort: 5432
+            - { name: postgres, containerPort: 5432 }
           env:
-            - name: POSTGRES_DB
-              value: taskflow
-            - name: POSTGRES_USER
-              value: taskflow
+            - { name: POSTGRES_DB,   value: taskflow }
+            - { name: POSTGRES_USER, value: taskflow }
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: taskflow-db-secret
                   key: POSTGRES_PASSWORD
-            - name: PGDATA                               <span class="cm"># sub-directory of the mount: a fresh ext4</span>
+            - name: PGDATA                               <span class="cm"># a sub-directory of the mount: a fresh ext4</span>
               value: /var/lib/postgresql/data/pgdata     <span class="cm"># disk has lost+found, which initdb rejects</span>
           resources:
-            requests:
-              cpu: 250m
-              memory: 256Mi
-            limits:
-              memory: 512Mi
-          readinessProbe:                <span class="cm"># probes explained in §6</span>
-            exec:
-              command: ["pg_isready", "-U", "taskflow", "-d", "taskflow"]
-            periodSeconds: 5
-          livenessProbe:
-            tcpSocket:
-              port: postgres
-            initialDelaySeconds: 30
-            periodSeconds: 10
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { memory: 512Mi }
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data          <span class="cm"># Postgres 16 image data dir</span>
+              mountPath: /var/lib/postgresql/data        <span class="cm"># postgres:16's data directory</span>
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: taskflow-db-data  <span class="cm"># ← the PVC above, same namespace</span>
 ---
 <span class="cm"># --- 3. Stable name "taskflow-db" for the API's DATABASE_URL ---</span>
-apiVersion: v1
-kind: Service
-metadata:
+<span class="kw">apiVersion:</span> v1
+<span class="kw">kind:</span> Service
+<span class="kw">metadata:</span>
   name: taskflow-db
   namespace: taskflow
-spec:
-  selector:
-    app: taskflow-db
+<span class="kw">spec:</span>
+  selector: { app: taskflow-db }
   ports:
-    - name: postgres
-      port: 5432
-      targetPort: postgres</pre>
-
+    - { name: postgres, port: 5432, targetPort: postgres }</pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Line</th><th>Why it's there</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">strategy: Recreate</code></td><td>Default RollingUpdate starts the new pod first; on a cloud RWO disk the new pod is stuck in <code class="inl">ContainerCreating</code> with <code class="inl">Multi-Attach error for volume "pvc-…"</code>. Recreate frees the disk first (a few seconds of DB downtime).</td></tr>
-              <tr><td><code class="inl">PGDATA=…/pgdata</code></td><td>initdb refuses a non-empty directory; new ext4 volumes contain <code class="inl">lost+found</code>.</td></tr>
-              <tr><td><code class="inl">volumes[].persistentVolumeClaim.claimName</code></td><td>The only link between the pod and storage. The pod never names a PV.</td></tr>
-              <tr><td><code class="inl">mountPath</code></td><td>Where <code class="inl">postgres:16</code> keeps its data. Mount elsewhere and data lands in the container layer → lost on restart.</td></tr>
+              <tr><td><code class="inl">strategy: Recreate</code></td><td>The default RollingUpdate starts the new pod first. On a cloud RWO disk it sticks in <code class="inl">ContainerCreating</code> with <code class="inl">Multi-Attach error for volume "pvc-…"</code>. Recreate frees the disk first, at the cost of a few seconds of DB downtime.</td></tr>
+              <tr><td><code class="inl">PGDATA=…/pgdata</code></td><td>initdb refuses a non-empty directory, and new ext4 volumes contain <code class="inl">lost+found</code>.</td></tr>
+              <tr><td><code class="inl">claimName</code></td><td>The only link between the pod and storage. The pod never names a PV.</td></tr>
+              <tr><td><code class="inl">mountPath</code></td><td>Where <code class="inl">postgres:16</code> keeps its data. Mount anywhere else and the data lands in the container layer and is lost on restart.</td></tr>
             </tbody>
           </table>
         </div>
-
 <pre><span class="pr">$</span> kubectl apply -f k8s/postgres.yaml
 <span class="out">persistentvolumeclaim/taskflow-db-data created
 deployment.apps/taskflow-db created
@@ -467,16 +441,14 @@ service/taskflow-db created</span>
 persistentvolumeclaim/taskflow-db-data   Bound    pvc-8f6c2d1a-3b4e-4c5d-9e7f-0a1b2c3d4e5f   5Gi        RWO            standard       &lt;unset&gt;                 15s
 
 NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                       STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
-persistentvolume/pvc-8f6c2d1a-3b4e-4c5d-9e7f-0a1b2c3d4e5f   5Gi        RWO            Delete           Bound    taskflow/taskflow-db-data   standard       &lt;unset&gt;                          15s</span>
-
-<span class="cm"># prove the data survives the pod</span>
-<span class="pr">$</span> kubectl exec deploy/taskflow-db -n taskflow -- psql -U taskflow -d taskflow \
+persistentvolume/pvc-8f6c2d1a-3b4e-4c5d-9e7f-0a1b2c3d4e5f   5Gi        RWO            Delete           Bound    taskflow/taskflow-db-data   standard       &lt;unset&gt;                          15s</span></pre>
+        <p>Nobody wrote a PV, yet one exists, named <code class="inl">pvc-&lt;uid&gt;</code>, sized exactly 5Gi, with reclaim <code class="inl">Delete</code> inherited from the class. Now rerun the experiment that lost 42 tasks at the start of §2:</p>
+<pre><span class="pr">$</span> kubectl exec deploy/taskflow-db -n taskflow -- psql -U taskflow -d taskflow \
     -c "CREATE TABLE IF NOT EXISTS tasks (id serial PRIMARY KEY, title text); INSERT INTO tasks (title) VALUES ('survive a restart');"
 <span class="out">INSERT 0 1</span>
-<span class="pr">$</span> kubectl delete pod -l app=taskflow-db -n taskflow
-<span class="out">pod "taskflow-db-6b8d9f7c5-x2kq9" deleted</span>
-<span class="pr">$</span> kubectl rollout status deploy/taskflow-db -n taskflow
-<span class="out">deployment "taskflow-db" successfully rolled out</span>
+<span class="pr">$</span> kubectl delete pod -l app=taskflow-db -n taskflow &amp;&amp; kubectl rollout status deploy/taskflow-db -n taskflow
+<span class="out">pod "taskflow-db-6b8d9f7c5-x2kq9" deleted
+deployment "taskflow-db" successfully rolled out</span>
 <span class="pr">$</span> kubectl exec deploy/taskflow-db -n taskflow -- psql -U taskflow -d taskflow -c "SELECT * FROM tasks;"
 <span class="out"> id |       title
 ----+-------------------
@@ -485,19 +457,38 @@ persistentvolume/pvc-8f6c2d1a-3b4e-4c5d-9e7f-0a1b2c3d4e5f   5Gi        RWO      
 <span class="pr">$</span> minikube ssh -- ls /tmp/hostpath-provisioner/taskflow/taskflow-db-data   <span class="cm"># where minikube put it</span>
 <span class="out">pgdata</span></pre>
 
-        <p>Growing a volume (only if the SC has <code class="inl">allowVolumeExpansion: true</code>):</p>
-<pre><span class="pr">$</span> kubectl patch pvc taskflow-db-data -n taskflow -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
-<span class="out">Error from server (Forbidden): persistentvolumeclaims "taskflow-db-data" is forbidden: only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize</span>
-<span class="cm"># ↑ minikube's "standard" has ALLOWVOLUMEEXPANSION=false. On EKS gp3 (above) the same patch succeeds.</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistake</span>
-          <p><code class="inl">kubectl delete -f k8s/postgres.yaml</code> also deletes the PVC → with reclaim <code class="inl">Delete</code> the disk and all tasks are gone. Keep the PVC in a separate file (or use <code class="inl">Retain</code>) for anything you care about.</p>
+        <h3>The exam table</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Static provisioning</th><th>Dynamic provisioning</th></tr></thead>
+            <tbody>
+              <tr><td>Who creates the PV</td><td>An admin writes PV YAML in advance</td><td>The provisioner, on demand, per PVC</td></tr>
+              <tr><td>PV name / size</td><td>Admin's choice / a whole existing PV (may be bigger)</td><td><code class="inl">pvc-&lt;uid&gt;</code> / exactly the size requested</td></tr>
+              <tr><td>Default reclaim</td><td><code class="inl">Retain</code></td><td>From the SC (default <code class="inl">Delete</code>)</td></tr>
+              <tr><td>Used in</td><td>On-prem NFS, pre-existing disks</td><td>Every cloud cluster, minikube, kind</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          A PVC naming a StorageClass gets a fresh <code class="inl">pvc-&lt;uid&gt;</code> PV automatically. Use WaitForFirstConsumer on multi-AZ clouds, Recreate for single-writer DB Deployments.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"My PVC is Pending, so something is broken." <strong>✗</strong> With <code class="inl">WaitForFirstConsumer</code>, <code class="inl">Pending</code> plus the event <code class="inl">waiting for first consumer to be created before binding</code> is normal until a pod uses it.</p>
+          <p>"Dynamically provisioned PVs are kept when the claim goes, like manual ones." <strong>✗</strong> They inherit the class's <code class="inl">reclaimPolicy</code>, which defaults to <code class="inl">Delete</code>, so deleting the PVC deletes the real disk. Use a <code class="inl">Retain</code> class for data you can't lose.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>PVC names a StorageClass → provisioner creates a <code class="inl">pvc-&lt;uid&gt;</code> PV → bound automatically.</strong><br /><strong>Multi-AZ cloud → WaitForFirstConsumer · single-writer DB → Recreate.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Someone switches <code class="inl">taskflow-db</code> back to the default RollingUpdate on EKS and changes the image tag. Predict what <code class="inl">kubectl get pods</code> shows.</summary>
+            <p class="ans">The new pod sticks in <code class="inl">ContainerCreating</code> with <code class="inl">Multi-Attach error for volume "pvc-…"</code>: the RWO EBS disk is still attached to the old pod's node, and RollingUpdate won't stop the old pod until the new one is ready. That's a deadlock. Recreate stops the old pod first.</p></details>
+          <details class="quiz"><summary>Q2. "Let's run Postgres with <code class="inl">replicas: 2</code> for high availability." What actually happens with this RWO PVC?</summary>
+            <p class="ans">At best, both pods land on one node and two Postgres processes write the same files, which corrupts the data. Otherwise the second pod can't attach the disk. Replicas of a Deployment don't replicate data. Real HA needs a StatefulSet with a volume per pod and Postgres replication (Session 15) or a managed DB.</p></details>
+          <details class="quiz"><summary>Q3. Predict: on minikube you run <code class="inl">kubectl patch pvc taskflow-db-data -n taskflow -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'</code>. Same command on EKS with the gp3 class?</summary>
+            <p class="ans">minikube: <code class="inl">Error from server (Forbidden): … only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize</code>, because <code class="inl">standard</code> shows <code class="inl">ALLOWVOLUMEEXPANSION false</code>. EKS: it succeeds, since gp3 has <code class="inl">allowVolumeExpansion: true</code>, and the CSI driver grows the EBS volume and filesystem. Shrinking is never allowed.</p></details>
         </div>
       </section>
 
@@ -506,63 +497,82 @@ persistentvolume/pvc-8f6c2d1a-3b4e-4c5d-9e7f-0a1b2c3d4e5f   5Gi        RWO      
         <h2><span class="sec-num">4</span> Metrics Server &amp; kubectl top</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Metrics Server is the cluster's thermometer: it reads every pod's current CPU and memory so <code class="inl">kubectl top</code> and the HPA can see them.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>You're about to autoscale on CPU, so first ask the cluster how busy things are:</p>
+<pre><span class="pr">$</span> kubectl top nodes
+<span class="out">error: Metrics API not available</span>
+<span class="pr">$</span> kubectl get hpa -n taskflow                <span class="cm"># if an HPA already existed</span>
+<span class="out">NAME           REFERENCE                 TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+taskflow-api   Deployment/taskflow-api   cpu: &lt;unknown&gt;/50%   2         10        2          3m</span></pre>
+        <p>The kubelets measure CPU and memory, but nothing collects those numbers into an API that <code class="inl">kubectl</code> and the autoscaler can read.</p>
 
+        <h3>The idea</h3>
+        <p><span class="term">Metrics Server</span> is a cluster add-on (a Deployment in <code class="inl">kube-system</code>). It scrapes every kubelet's resource metrics about every 15 s and serves the <strong>latest</strong> values through the <code class="inl">metrics.k8s.io</code> API. <code class="inl">kubectl top</code> and the HPA both read that API.</p>
 <pre>kubelet (cAdvisor) ──/metrics/resource──▶ metrics-server ──▶ metrics.k8s.io API ──▶ kubectl top
   on every node        scraped every 15s     latest values      (API aggregation)    HPA controller
                                              in memory only</pre>
 
-        <ul>
-          <li><span class="term">Metrics Server</span> is a cluster add-on (a Deployment in <code class="inl">kube-system</code>). Not installed by default on minikube/kind; EKS offers it as an add-on.</li>
-          <li>Keeps <strong>only the latest value</strong> per pod/node — no history, no dashboards. For that use Prometheus (Session 22).</li>
-          <li>Without it: <code class="inl">kubectl top</code> fails and CPU/memory HPAs show <code class="inl">&lt;unknown&gt;</code>.</li>
-        </ul>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>The floor manager walks the kitchen with a clipboard every 15 seconds, noting how busy each cook is <em>right now</em>. Last week's numbers aren't on the clipboard. For history and charts you need a proper logbook (Prometheus, Session 22).</p>
+        </div>
 
-<pre><span class="pr">$</span> kubectl top nodes
-<span class="out">error: Metrics API not available</span>
-
-<span class="pr">$</span> minikube addons enable metrics-server
+        <h3>See it: switch it on, then read the numbers</h3>
+<pre><span class="pr">$</span> minikube addons enable metrics-server
 <span class="out">    ▪ Using image registry.k8s.io/metrics-server/metrics-server:v0.7.2
 🌟  The 'metrics-server' addon is enabled</span>
-
-<span class="pr">$</span> kubectl get deploy metrics-server -n kube-system
-<span class="out">NAME             READY   UP-TO-DATE   AVAILABLE   AGE
-metrics-server   1/1     1            1           70s</span>
-<span class="pr">$</span> kubectl get apiservice v1beta1.metrics.k8s.io
-<span class="out">NAME                     SERVICE                      AVAILABLE   AGE
-v1beta1.metrics.k8s.io   kube-system/metrics-server   True        70s</span>
-
-<span class="pr">$</span> kubectl top nodes
+<span class="pr">$</span> kubectl top nodes                <span class="cm"># wait ~1 minute for the first scrape</span>
 <span class="out">NAME       CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
-minikube   312m         7%     1450Mi          37%</span>
+minikube   312m         7%     1450Mi          37%</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token / column</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">top nodes</code> / <code class="inl">top pods</code></td><td>Current usage per node / per pod, from <code class="inl">metrics.k8s.io</code></td></tr>
+              <tr><td><code class="inl">312m</code></td><td>312 millicores = 0.312 of one CPU core</td></tr>
+              <tr><td><code class="inl">CPU%</code> / <code class="inl">MEMORY%</code></td><td>Relative to the node's <em>allocatable</em> capacity</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Right after enabling, you may see <code class="inl">error: metrics not available yet</code>. That's just the first scrape not having happened yet.</p>
+        <p><strong>What it does <em>not</em> do:</strong> keep history, draw dashboards or alert. It holds one number per pod and node, in memory.</p>
 
-<span class="pr">$</span> kubectl top pods -n taskflow --sort-by=cpu
+        <h3>Build it up</h3>
+<pre><span class="pr">$</span> kubectl top pods -n taskflow --sort-by=cpu
 <span class="out">NAME                           CPU(cores)   MEMORY(bytes)
 taskflow-db-6b8d9f7c5-k7m2p    6m           38Mi
 taskflow-api-5d7f9c8b6-4kq2x   3m           52Mi
 taskflow-api-5d7f9c8b6-r7k2m   2m           49Mi</span>
-
 <span class="pr">$</span> kubectl top pod taskflow-api-5d7f9c8b6-4kq2x -n taskflow --containers
 <span class="out">POD                            NAME   CPU(cores)   MEMORY(bytes)
-taskflow-api-5d7f9c8b6-4kq2x   api    3m           52Mi</span></pre>
-
-        <ul>
-          <li><code class="inl">312m</code> = 0.312 of a core. <code class="inl">CPU%</code>/<code class="inl">MEMORY%</code> are relative to the node's <em>allocatable</em> capacity.</li>
-          <li>Right after enabling, you may see <code class="inl">error: metrics not available yet</code> — wait ~1 minute for the first scrape.</li>
-        </ul>
-
-        <p>Non-minikube clusters (kind, kubeadm):</p>
+taskflow-api-5d7f9c8b6-4kq2x   api    3m           52Mi</span>
+<span class="pr">$</span> kubectl get apiservice v1beta1.metrics.k8s.io          <span class="cm"># is the API registered and healthy?</span>
+<span class="out">NAME                     SERVICE                      AVAILABLE   AGE
+v1beta1.metrics.k8s.io   kube-system/metrics-server   True        70s</span></pre>
+        <p>On non-minikube clusters (kind, kubeadm), install it from the release manifest. On kind the kubelets use self-signed certs, so metrics-server must skip verifying them:</p>
 <pre><span class="pr">$</span> kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-<span class="cm"># kind only: kubelets use self-signed certs, so let metrics-server skip verification</span>
 <span class="pr">$</span> kubectl patch deployment metrics-server -n kube-system --type=json \
     -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'</pre>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Metrics Server = current CPU/memory via <code class="inl">metrics.k8s.io</code>. Enable it with <code class="inl">minikube addons enable metrics-server</code>; check with <code class="inl">kubectl top</code>. It's what the HPA reads.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">kubectl top</code> shows what pods have requested." <strong>✗</strong> It shows actual current <em>usage</em>. Requests are in <code class="inl">kubectl describe node</code> → Allocated resources.</p>
+          <p>"Metrics Server is part of every cluster." <strong>✗</strong> It's an add-on. minikube and kind don't install it by default, and EKS offers it as an add-on.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Metrics Server = current CPU/memory via <code class="inl">metrics.k8s.io</code>, no history.</strong><br /><strong>No Metrics Server → <code class="inl">kubectl top</code> fails and the HPA shows <code class="inl">&lt;unknown&gt;</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. <code class="inl">kubectl top pods</code> says <code class="inl">error: Metrics API not available</code>. Name the first two commands you'd run.</summary>
+            <p class="ans"><code class="inl">kubectl get deploy metrics-server -n kube-system</code> (is it installed and ready?) and <code class="inl">kubectl get apiservice v1beta1.metrics.k8s.io</code> (is AVAILABLE <code class="inl">True</code>?). On minikube, the fix is <code class="inl">minikube addons enable metrics-server</code>.</p></details>
+          <details class="quiz"><summary>Q2. A teammate wants a graph of the API's CPU over the last week from Metrics Server. Will it work?</summary>
+            <p class="ans">No. Metrics Server keeps only the latest sample in memory. Use Prometheus + Grafana (Session 22) for history.</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl top nodes</code> shows <code class="inl">CPU(cores) 1500m</code> on a 2-core node. What fraction of a core is that, and roughly what does <code class="inl">CPU%</code> show?</summary>
+            <p class="ans">1.5 cores, so about 75% of the node's allocatable CPU.</p></details>
         </div>
       </section>
 
@@ -571,35 +581,56 @@ taskflow-api-5d7f9c8b6-4kq2x   api    3m           52Mi</span></pre>
         <h2><span class="sec-num">5</span> Horizontal Pod Autoscaler (HPA)</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Monday, 9 a.m.: the whole batch opens TaskFlow before a deadline. Two API pods sit at 190% of their CPU request, and <code class="inl">/tasks</code> takes 4 s. At 3 a.m. the same two pods idle at 4%. Hard-code <code class="inl">replicas: 8</code> and you pay for the peak all night. Hard-code <code class="inl">2</code> and Monday breaks. Nobody wants to run <code class="inl">kubectl scale</code> by hand at 9 a.m.</p>
+
+        <h3>The idea</h3>
+        <p>The <span class="term">HorizontalPodAutoscaler</span> is a control loop in kube-controller-manager. Every <strong>15 s</strong> it reads the pods' metrics, computes how many replicas would bring the average back to your target, clamps that to <code class="inl">[minReplicas, maxReplicas]</code>, and writes it into the Deployment's <code class="inl">spec.replicas</code>. CPU utilization is a percentage of <code class="inl">resources.requests.cpu</code>, so <strong>no request means no percentage</strong>.</p>
+<pre> metrics-server ──avg CPU = 190% of request──▶ HPA controller (every 15 s)
+                                                │ desired = ceil(2 × 190 / 50) = 8
+                                                │ clamp to [2, 10], apply behavior limits → 6
+                                                ▼
+                         Deployment taskflow-api  spec.replicas: 2 → 6 ──▶ ReplicaSet ──▶ +4 pods</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The HPA is a thermostat for pods: average CPU above the set point → add pods; below → remove some, always staying between min and max.</p>
+          <span class="c-title">Think of it like this</span>
+          <p>The floor manager reads the clipboard (§4). If the average cook is busier than 50%, she calls in more cooks. When it's quiet she sends some home, but never below 2 cooks and never above 10. She also waits 5 minutes of quiet before sending anyone home, so a short lull doesn't empty the kitchen.</p>
         </div>
 
-        <ul>
-          <li>The <span class="term">HorizontalPodAutoscaler</span> changes <code class="inl">spec.replicas</code> of a Deployment / StatefulSet (anything with a <code class="inl">scale</code> subresource — not DaemonSets).</li>
-          <li>The controller loop runs every <strong>15&nbsp;s</strong> in kube-controller-manager, reads metrics, computes a desired count, clamps it to <code class="inl">[minReplicas, maxReplicas]</code>.</li>
-          <li><strong>Horizontal</strong> = more pods. <strong>Vertical</strong> (VPA, separate add-on) = bigger requests per pod. Cluster Autoscaler / Karpenter = more <em>nodes</em>.</li>
-          <li><strong>Requirement</strong>: CPU utilization is measured as a % of <code class="inl">resources.requests.cpu</code>. No request → no percentage → <code class="inl">&lt;unknown&gt;</code>.</li>
-        </ul>
+        <h3>See it: one command</h3>
+<pre><span class="pr">$</span> kubectl autoscale deployment taskflow-api -n taskflow --cpu=50% --min=2 --max=10
+<span class="out">horizontalpodautoscaler.autoscaling/taskflow-api autoscaled</span>
+<span class="pr">$</span> kubectl get hpa -n taskflow
+<span class="out">NAME           REFERENCE                 TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+taskflow-api   Deployment/taskflow-api   cpu: 4%/50%   2         10        2          40s</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">autoscale deployment taskflow-api</code></td><td>Create an HPA (named after the Deployment) that targets it</td></tr>
+              <tr><td><code class="inl">--cpu=50%</code></td><td>Target average CPU = 50% of each pod's request (older kubectl: <code class="inl">--cpu-percent=50</code>)</td></tr>
+              <tr><td><code class="inl">--min=2 --max=10</code></td><td>Never fewer than 2 or more than 10 replicas</td></tr>
+              <tr><td><code class="inl">TARGETS cpu: 4%/50%</code></td><td>Current average / target</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> add nodes, or make one pod bigger. And if the pods have no CPU request, TARGETS stays <code class="inl">&lt;unknown&gt;</code> forever.</p>
 
-        <p>The relevant part of <code class="inl">taskflow-api</code> (full Deployment in §6):</p>
-        <div class="fname">k8s/deployment.yaml (excerpt)</div>
+        <h3>Build it up</h3>
+        <h4>The declarative version, with a scaling behavior</h4>
+        <p>Delete the imperative HPA first (<code class="inl">kubectl delete hpa taskflow-api -n taskflow</code>); otherwise you just update it. The Deployment's request that the percentages are measured against (full file in §7):</p>
 <pre>          resources:
             requests:
-              cpu: 100m          <span class="cm"># 50% target ⇒ HPA aims for 50m average per pod</span>
-              memory: 128Mi
+              cpu: 100m          <span class="cm"># 50% target ⇒ the HPA aims for 50m average per pod</span>
             limits:
-              cpu: 500m          <span class="cm"># lets a pod burst to 500% of its request</span>
-              memory: 256Mi</pre>
-
+              cpu: 500m          <span class="cm"># a pod can burst to 500% of its request</span></pre>
         <div class="fname">k8s/hpa.yaml</div>
-<pre>apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
+<pre><span class="kw">apiVersion:</span> autoscaling/v2
+<span class="kw">kind:</span> HorizontalPodAutoscaler
+<span class="kw">metadata:</span>
   name: taskflow-api
   namespace: taskflow
-spec:
+<span class="kw">spec:</span>
   scaleTargetRef:                      <span class="cm"># WHAT to scale</span>
     apiVersion: apps/v1
     kind: Deployment
@@ -613,7 +644,7 @@ spec:
         target:
           type: Utilization            <span class="cm"># % of requests.cpu</span>
           averageUtilization: 50       <span class="cm"># keep the average pod at 50%</span>
-  behavior:                            <span class="cm"># optional: how fast to scale (values below = defaults, except scaleDown policy)</span>
+  behavior:                            <span class="cm"># optional: how fast to scale (scaleUp = the defaults)</span>
     scaleUp:
       stabilizationWindowSeconds: 0    <span class="cm"># react immediately</span>
       selectPolicy: Max                <span class="cm"># pick whichever policy allows MORE change</span>
@@ -625,186 +656,252 @@ spec:
           value: 4                     <span class="cm"># …or +4 pods, per 15 s</span>
           periodSeconds: 15
     scaleDown:
-      stabilizationWindowSeconds: 300  <span class="cm"># use the highest recommendation of the last 5 min (no flapping)</span>
+      stabilizationWindowSeconds: 300  <span class="cm"># use the highest recommendation of the last 5 min</span>
       policies:
         - type: Percent
           value: 50                    <span class="cm"># remove at most half the pods per minute</span>
           periodSeconds: 60</pre>
-
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">autoscaling/v2</code></td><td>Current API (multiple metrics, behavior). <code class="inl">autoscaling/v1</code> only supports <code class="inl">targetCPUUtilizationPercentage</code>.</td></tr>
-              <tr><td><code class="inl">scaleTargetRef</code></td><td>The workload whose replicas the HPA controls. Must be in the same namespace.</td></tr>
-              <tr><td><code class="inl">metrics[].type</code></td><td><code class="inl">Resource</code> (pod cpu/memory), <code class="inl">ContainerResource</code> (one container), <code class="inl">Pods</code> (custom per-pod metric e.g. requests/s), <code class="inl">Object</code> (metric of another object, e.g. Ingress), <code class="inl">External</code> (e.g. SQS queue length). Non-Resource types need a metrics adapter (Prometheus Adapter, KEDA).</td></tr>
-              <tr><td><code class="inl">target.type</code></td><td><code class="inl">Utilization</code> (% of request, Resource only) · <code class="inl">AverageValue</code> (absolute per pod, e.g. <code class="inl">200Mi</code>) · <code class="inl">Value</code> (total, Object/External).</td></tr>
-              <tr><td><code class="inl">behavior.*.stabilizationWindowSeconds</code></td><td>Look-back window; scale-down uses the <em>max</em> recommendation in the window so a brief dip doesn't kill pods.</td></tr>
-              <tr><td><code class="inl">behavior.*.policies</code></td><td>Rate limits per <code class="inl">periodSeconds</code>. <code class="inl">selectPolicy: Max|Min|Disabled</code>.</td></tr>
+              <tr><td><code class="inl">autoscaling/v2</code></td><td>The current API (several metrics, behavior). <code class="inl">autoscaling/v1</code> only has <code class="inl">targetCPUUtilizationPercentage</code>.</td></tr>
+              <tr><td><code class="inl">scaleTargetRef</code></td><td>The workload whose replicas the HPA controls, in the same namespace. Anything with a <code class="inl">scale</code> subresource (Deployment, StatefulSet), not a DaemonSet.</td></tr>
+              <tr><td><code class="inl">metrics[].type</code></td><td><code class="inl">Resource</code> (pod CPU/memory), <code class="inl">ContainerResource</code>, <code class="inl">Pods</code> (custom, e.g. requests/s), <code class="inl">Object</code>, <code class="inl">External</code> (e.g. SQS queue length). Non-Resource types need an adapter (Prometheus Adapter, KEDA).</td></tr>
+              <tr><td><code class="inl">target.type</code></td><td><code class="inl">Utilization</code> (% of request) · <code class="inl">AverageValue</code> (absolute per pod, e.g. <code class="inl">200Mi</code>) · <code class="inl">Value</code> (a total, for Object/External).</td></tr>
+              <tr><td><code class="inl">behavior</code></td><td><code class="inl">stabilizationWindowSeconds</code> = look-back window (scale-down uses the <em>max</em> recommendation in it). <code class="inl">policies</code> = rate limits per <code class="inl">periodSeconds</code>. <code class="inl">selectPolicy: Max|Min|Disabled</code>.</td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>The formula</h3>
+        <h4>The formula, worked through</h4>
         <div class="bigidea">
           <span class="c-title">HPA algorithm</span>
-          <p><strong>desiredReplicas = ceil( currentReplicas × currentMetric ÷ targetMetric )</strong>, then clamped to min/max and limited by <code class="inl">behavior</code>. No action if the ratio is within ±10% of 1.0 (tolerance 0.1). With several metrics, the HPA computes each and takes the <strong>largest</strong>.</p>
+          <p><strong>desiredReplicas = ceil( currentReplicas × currentMetric ÷ targetMetric )</strong>, then clamped to min/max and rate-limited by <code class="inl">behavior</code>. Nothing happens if the ratio is within ±10% of 1.0 (tolerance 0.1). With several metrics, the HPA computes each one and takes the <strong>largest</strong>.</p>
         </div>
-
-        <div class="callout example">
-          <span class="c-title">Worked example: TaskFlow under load (request 100m, target 50%)</span>
-          <div class="tbl-wrap">
-            <table>
-              <thead><tr><th>Time</th><th>Pods</th><th>Avg CPU</th><th>Calculation</th><th>Result</th></tr></thead>
-              <tbody>
-                <tr><td>idle</td><td>2</td><td>4% (4m)</td><td>ceil(2 × 4/50) = 1</td><td>clamped to min → <strong>2</strong></td></tr>
-                <tr><td>load starts</td><td>2</td><td>190% (190m)</td><td>ceil(2 × 190/50) = ceil(7.6) = 8</td><td>scaleUp policy: max(2×100% → 4, 2+4 → 6) → <strong>6</strong></td></tr>
-                <tr><td>+30 s</td><td>6</td><td>63%</td><td>ceil(6 × 63/50) = ceil(7.56) = 8</td><td><strong>8</strong></td></tr>
-                <tr><td>+60 s</td><td>8</td><td>48%</td><td>ratio 0.96 — within tolerance</td><td>stays <strong>8</strong></td></tr>
-                <tr><td>load stops</td><td>8</td><td>0%</td><td>ceil(8 × 0/50) = 0 → min 2</td><td>waits 300 s, then −50%/min: 8 → 4 → <strong>2</strong></td></tr>
-              </tbody>
-            </table>
-          </div>
-          <p>Total load ≈ 380m of CPU throughout; it's just spread over more pods.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Pods</th><th>Avg CPU</th><th>Calculation</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>idle</td><td>2</td><td>4% (4m)</td><td>ceil(2 × 4/50) = 1</td><td>clamped to min → <strong>2</strong></td></tr>
+              <tr><td>load starts</td><td>2</td><td>190% (190m)</td><td>ceil(2 × 190/50) = ceil(7.6) = 8</td><td>scaleUp policy: max(2×100% → 4, 2+4 → 6) → <strong>6</strong></td></tr>
+              <tr><td>+30 s</td><td>6</td><td>63%</td><td>ceil(6 × 63/50) = ceil(7.56) = 8</td><td><strong>8</strong></td></tr>
+              <tr><td>+60 s</td><td>8</td><td>48%</td><td>ratio 0.96, within tolerance</td><td>stays <strong>8</strong></td></tr>
+              <tr><td>load stops</td><td>8</td><td>0%</td><td>ceil(8 × 0/50) = 0 → min 2</td><td>waits 300 s, then −50%/min: 8 → 4 → <strong>2</strong></td></tr>
+            </tbody>
+          </table>
         </div>
+        <p>The total load stays at about 380m of CPU throughout (2 × 190 ≈ 6 × 63 ≈ 8 × 48). It's just spread over more pods.</p>
 
-        <h3>Create it, load it, watch it</h3>
+        <h4>Load it and watch</h4>
 <pre><span class="pr">$</span> kubectl apply -f k8s/hpa.yaml
 <span class="out">horizontalpodautoscaler.autoscaling/taskflow-api created</span>
-<span class="cm"># OR the imperative way (don't run both — same name → AlreadyExists; no behavior block; older kubectl: --cpu-percent=50)</span>
-<span class="pr">$</span> kubectl autoscale deployment taskflow-api -n taskflow --cpu=50% --min=2 --max=10
-<span class="out">horizontalpodautoscaler.autoscaling/taskflow-api autoscaled</span>
-
 <span class="cm"># terminal 2: hammer the API through its Service</span>
 <span class="pr">$</span> kubectl run load-gen -n taskflow --rm -it --image=busybox:1.36 --restart=Never -- \
     /bin/sh -c "while true; do wget -q -O- http://taskflow-api/tasks &gt; /dev/null; done"
-<span class="out">If you don't see a command prompt, try pressing enter.</span>
-
-<span class="cm"># terminal 1: watch</span>
+<span class="cm"># terminal 1</span>
 <span class="pr">$</span> kubectl get hpa taskflow-api -n taskflow -w
 <span class="out">NAME           REFERENCE                 TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
 taskflow-api   Deployment/taskflow-api   cpu: 4%/50%     2         10        2          6m
 taskflow-api   Deployment/taskflow-api   cpu: 190%/50%   2         10        2          6m30s
 taskflow-api   Deployment/taskflow-api   cpu: 190%/50%   2         10        6          6m45s
-taskflow-api   Deployment/taskflow-api   cpu: 63%/50%    2         10        6          7m15s
 taskflow-api   Deployment/taskflow-api   cpu: 63%/50%    2         10        8          7m30s
 taskflow-api   Deployment/taskflow-api   cpu: 48%/50%    2         10        8          8m</span>
-<span class="cm"># Ctrl+C the load generator ("pod "load-gen" deleted"), keep watching</span>
+<span class="cm"># Ctrl+C the load generator, keep watching</span>
 <span class="out">taskflow-api   Deployment/taskflow-api   cpu: 0%/50%     2         10        8          9m
 taskflow-api   Deployment/taskflow-api   cpu: 0%/50%     2         10        4          14m
 taskflow-api   Deployment/taskflow-api   cpu: 0%/50%     2         10        2          15m</span>
-
-<span class="pr">$</span> kubectl describe hpa taskflow-api -n taskflow
-<span class="out">Name:                                                  taskflow-api
-Namespace:                                             taskflow
-Reference:                                             Deployment/taskflow-api
-Metrics:                                               ( current / target )
+<span class="pr">$</span> kubectl describe hpa taskflow-api -n taskflow | sed -n '/Metrics:/,$p'     <span class="cm"># trimmed</span>
+<span class="out">Metrics:                                               ( current / target )
   resource cpu on pods  (as a percentage of request):  48% (48m) / 50%
-Min replicas:                                          2
-Max replicas:                                          10
-Deployment pods:                                       8 current / 8 desired
 Conditions:
-  Type            Status  Reason              Message
-  ----            ------  ------              -------
   AbleToScale     True    ReadyForNewScale    recommended size matches current size
   ScalingActive   True    ValidMetricFound    the HPA was able to successfully calculate a replica count from cpu resource utilization (percentage of request)
   ScalingLimited  False   DesiredWithinRange  the desired count is within the acceptable range
 Events:
-  Type    Reason             Age   From                       Message
-  ----    ------             ----  ----                       -------
   Normal  SuccessfulRescale  90s   horizontal-pod-autoscaler  New size: 6; reason: cpu resource utilization (percentage of request) above target
   Normal  SuccessfulRescale  60s   horizontal-pod-autoscaler  New size: 8; reason: cpu resource utilization (percentage of request) above target</span></pre>
+        <p>Match it to the worked table: 2 → 6 (the scale-up policy cap), 6 → 8, a hold at 48% inside tolerance, then the slow walk down after the 5-minute window. A second metric, such as memory with <code class="inl">target: {type: AverageValue, averageValue: 200Mi}</code>, goes under <code class="inl">spec.metrics</code> too, and the HPA follows whichever asks for more pods.</p>
 
-        <p>Optional second metric (HPA uses whichever demands more pods):</p>
-        <div class="fname">k8s/hpa.yaml — extra entry under spec.metrics (snippet)</div>
-<pre>    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: AverageValue
-          averageValue: 200Mi          <span class="cm"># absolute per-pod average, not a %</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><strong><code class="inl">cpu: &lt;unknown&gt;/50%</code></strong>: metrics-server missing, or a container has no <code class="inl">requests.cpu</code> (event <code class="inl">FailedGetResourceMetric … missing request for cpu</code>), or pods just started — wait a minute.</li>
-            <li><strong><code class="inl">replicas: 2</code> left in deployment.yaml</strong>: every <code class="inl">kubectl apply</code> resets the count to 2, fighting the HPA. Remove the field once an HPA owns the Deployment.</li>
-            <li><strong>Scaling Node.js on memory</strong>: memory usually stays high after the load is gone (V8 heap), so it scales up and rarely back down. Prefer CPU or requests/second.</li>
-            <li><strong>maxReplicas higher than the cluster can fit</strong>: new pods sit in <code class="inl">Pending</code> (Session 14) or hit a ResourceQuota (Session 15).</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Leave <code class="inl">replicas: 2</code> in <code class="inl">deployment.yaml</code>; the HPA will cope." <strong>✗</strong> Every <code class="inl">kubectl apply</code> resets the count to 2 and fights the HPA. Remove the field once an HPA owns the Deployment.</p>
+          <p>"The HPA adds nodes when pods don't fit." <strong>✗</strong> It's <em>horizontal</em>: it only changes replica counts. Bigger pods is the VPA add-on (vertical). More nodes is the Cluster Autoscaler or Karpenter. Without those, extra pods sit <code class="inl">Pending</code> (Session 14).</p>
+          <p>"Scale the Node API on memory." <strong>✗</strong> V8's heap usually stays high after the load is gone, so it scales up and rarely back down. Prefer CPU or requests/second.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          HPA (autoscaling/v2) = ceil(current × actual/target), clamped to min/max, rate-limited by behavior. Needs metrics-server + CPU requests. Watch it with <code class="inl">kubectl get hpa -w</code>.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>desired = ceil(current × actual ÷ target), clamped to [min, max], limited by behavior.</strong><br /><strong>Needs Metrics Server + <code class="inl">requests.cpu</code>. Watch with <code class="inl">kubectl get hpa -w</code>.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. 3 replicas at 80% average CPU, target 50%, max 10. How many replicas does the HPA want?</summary>
+            <p class="ans">ceil(3 × 80 / 50) = ceil(4.8) = <strong>5</strong>. That's within max, and +2 is allowed by the default scale-up policy.</p></details>
+          <details class="quiz"><summary>Q2. 4 replicas at 53%, target 50%. Predict the change.</summary>
+            <p class="ans">None. The ratio is 53/50 = 1.06, within the 0.1 tolerance, so the HPA leaves it at 4 (even though ceil(4 × 1.06) = 5).</p></details>
+          <details class="quiz"><summary>Q3. <code class="inl">kubectl get hpa</code> shows <code class="inl">cpu: &lt;unknown&gt;/50%</code> and <code class="inl">kubectl top pods</code> works fine. What's the likely cause, and where is the proof?</summary>
+            <p class="ans">A container in the target pods has no <code class="inl">resources.requests.cpu</code>, so utilization can't be computed. <code class="inl">kubectl describe hpa</code> shows <code class="inl">FailedGetResourceMetric … missing request for cpu</code>.</p></details>
+          <details class="quiz"><summary>Q4. The load stops. Why does it take over 5 minutes for 8 pods to drop to 2, while scaling up took under a minute?</summary>
+            <p class="ans">The scale-down <code class="inl">stabilizationWindowSeconds: 300</code> uses the highest recommendation of the last 5 minutes (to avoid flapping), then the policy removes at most 50% per minute: 8 → 4 → 2. Scale-up has a 0 s window and allows doubling every 15 s.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 6. PROBES ===================== -->
+      <!-- ===================== 6. READINESS & LIVENESS ===================== -->
       <section id="probes">
-        <h2><span class="sec-num">6</span> Liveness, readiness &amp; startup probes</h2>
+        <h2><span class="sec-num">6</span> Readiness &amp; liveness probes</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Two failures Kubernetes can't see on its own. <strong>One:</strong> during every rollout, each new pod shows <code class="inl">Running</code> while Node is still connecting to Postgres, and the Ingress sends it traffic anyway, so users get a few seconds of 502s per pod. <strong>Two:</strong> a bug blocks the event loop. The process is alive, so Kubernetes is happy, but every request hangs:</p>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api
+<span class="out">NAME                           READY   STATUS    RESTARTS   AGE
+taskflow-api-5d7f9c8b6-r7k2m   1/1     Running   0          3h</span>          <span class="cm"># "healthy", says Kubernetes</span>
+<span class="pr">$</span> curl -m 5 -k https://taskflow.local/api/tasks
+<span class="out">curl: (28) Operation timed out after 5001 milliseconds with 0 bytes received</span>   <span class="cm"># says the user</span></pre>
+        <p>Without probes, the only health signal Kubernetes has is "the process exists".</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">probe</span> is a health check the <strong>kubelet</strong> runs against a container on a schedule. A <strong>readiness probe</strong> answers "can it take traffic right now?" When it fails, the pod is marked NotReady and removed from the Service's endpoints, but it is <strong>not restarted</strong>. A <strong>liveness probe</strong> answers "is it stuck?" When it fails, the kubelet <strong>kills and restarts</strong> the container.</p>
+<pre>                     kubelet probes the container every periodSeconds
+ readiness ✗ × failureThreshold ──▶ READY 0/1 ──▶ removed from EndpointSlice ──▶ no traffic (no restart)
+ readiness ✓                     ──▶ READY 1/1 ──▶ added back
+ liveness  ✗ × failureThreshold ──▶ container killed ──▶ restarted ──▶ RESTARTS +1</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Startup: "are you awake yet?" Readiness: "can you take customers right now?" Liveness: "are you frozen?" — a frozen worker is replaced, a busy one just gets no new customers.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><strong>Readiness:</strong> "is this cook ready to take tickets?" A cook still setting up their station gets no tickets, but nobody fires them. <strong>Liveness:</strong> "has this cook frozen?" A cook standing motionless for 30 seconds is replaced with a fresh one.</p>
         </div>
 
-        <ul>
-          <li>A <span class="term">probe</span> is a health check the <strong>kubelet</strong> runs against a container on a schedule.</li>
-          <li>Without probes Kubernetes only knows "the process is running" — a deadlocked Node app or one still connecting to Postgres looks healthy and gets traffic.</li>
-        </ul>
+        <h3>See it: a readiness probe</h3>
+<pre>          readinessProbe:
+            httpGet:
+              path: /health          <span class="cm"># GET http://&lt;pod-ip&gt;:3000/health</span>
+              port: http             <span class="cm"># the container port NAMED http (3000)</span>
+            periodSeconds: 5         <span class="cm"># every 5 s; success = HTTP 200–399</span></pre>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -w
+<span class="out">NAME                           READY   STATUS              RESTARTS   AGE
+taskflow-api-5d7f9c8b6-r7k2m   0/1     ContainerCreating   0          1s
+taskflow-api-5d7f9c8b6-r7k2m   0/1     Running             0          2s</span>     <span class="cm">← running, not ready: no traffic yet</span>
+<span class="out">taskflow-api-5d7f9c8b6-r7k2m   1/1     Running             0          6s</span>     <span class="cm">← /health returned 200</span></pre>
+        <p>READY <code class="inl">0/1</code> while Running is the probe holding traffic back. Only at <code class="inl">1/1</code> does the pod's IP go into the EndpointSlice, and that's also what a rolling update waits for before removing an old pod. That solves failure one.</p>
+        <p><strong>What it does <em>not</em> do:</strong> restart anything. A pod that fails readiness forever just sits at <code class="inl">0/1</code> forever.</p>
 
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th></th><th>Startup probe</th><th>Readiness probe</th><th>Liveness probe</th></tr></thead>
-            <tbody>
-              <tr><td>Question</td><td>Has the app finished booting?</td><td>Can it serve traffic <em>now</em>?</td><td>Is it still alive (not hung)?</td></tr>
-              <tr><td>On failure</td><td>After <code class="inl">failureThreshold</code> fails → container killed &amp; restarted</td><td>Pod marked <strong>NotReady</strong> → removed from Service endpoints. <strong>No restart.</strong></td><td>Container <strong>killed &amp; restarted</strong> (per <code class="inl">restartPolicy</code>)</td></tr>
-              <tr><td>Runs</td><td>Only at start, until first success</td><td>Whole lifetime</td><td>Whole lifetime (after startup succeeds)</td></tr>
-              <tr><td>Side effect</td><td>Liveness &amp; readiness are paused until it passes</td><td>Rolling updates wait for it; <code class="inl">READY 0/1</code></td><td><code class="inl">RESTARTS</code> increases</td></tr>
-              <tr><td>Good check</td><td>Same endpoint as liveness, generous threshold</td><td>App + its local warm-up done (may check deps)</td><td>Cheap, process-only — <strong>no DB calls</strong></td></tr>
-              <tr><td>If not defined</td><td colspan="3">Treated as always succeeding.</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <h3>Build it up</h3>
+        <h4>Add liveness (failure two)</h4>
+<pre>          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2        <span class="cm"># a hung event loop never answers → counts as a failure</span>
+            failureThreshold: 3      <span class="cm"># 3 misses × 10 s ≈ 30 s stuck → restart</span></pre>
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-5d7f9c8b6-r7k2m -n taskflow | sed -n '/Events:/,$p'
+<span class="out">Events:
+  Type     Reason     Age                From     Message
+  ----     ------     ----               ----     -------
+  Warning  Unhealthy  41s (x6 over 56s)  kubelet  Readiness probe failed: Get "http://10.244.0.21:3000/health": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+  Warning  Unhealthy  40s (x3 over 60s)  kubelet  Liveness probe failed: Get "http://10.244.0.21:3000/health": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+  Normal   Killing    40s                kubelet  Container api failed liveness probe, will be restarted</span></pre>
+        <p>Read the sequence. Readiness failed first (period 5 s), so the pod left the Service. Liveness failed three times, and the kubelet killed and restarted the container. The stuck pod now heals itself instead of hanging for hours.</p>
 
+        <h4>Four ways to probe</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Mechanism</th><th>Success when</th><th>TaskFlow use</th></tr></thead>
             <tbody>
               <tr><td><code class="inl">httpGet</code></td><td>HTTP status 200–399</td><td><code class="inl">GET /health</code> on port 3000</td></tr>
-              <tr><td><code class="inl">tcpSocket</code></td><td>TCP connection opens</td><td>Postgres port 5432</td></tr>
-              <tr><td><code class="inl">exec</code></td><td>Command exits 0</td><td><code class="inl">pg_isready -U taskflow</code></td></tr>
-              <tr><td><code class="inl">grpc</code></td><td>gRPC health check returns SERVING</td><td>gRPC services</td></tr>
+              <tr><td><code class="inl">tcpSocket</code></td><td>A TCP connection opens</td><td>Postgres port 5432</td></tr>
+              <tr><td><code class="inl">exec</code></td><td>The command exits 0</td><td><code class="inl">pg_isready -U taskflow</code></td></tr>
+              <tr><td><code class="inl">grpc</code></td><td>The gRPC health check returns SERVING</td><td>gRPC services</td></tr>
             </tbody>
           </table>
         </div>
+        <div class="fname">k8s/postgres.yaml (add under the postgres container from §3)</div>
+<pre>          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "taskflow", "-d", "taskflow"]   <span class="cm"># exits 0 when accepting connections</span>
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: postgres           <span class="cm"># is anything listening on 5432?</span>
+            initialDelaySeconds: 30    <span class="cm"># give initdb time on first boot (§7 shows a cleaner way)</span>
+            periodSeconds: 10</pre>
 
-        <h3>Timing fields</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">initialDelaySeconds</code></td><td>0</td><td>Wait after container start before the first probe.</td></tr>
-              <tr><td><code class="inl">periodSeconds</code></td><td>10</td><td>How often to probe.</td></tr>
-              <tr><td><code class="inl">timeoutSeconds</code></td><td>1</td><td>A probe slower than this counts as a failure.</td></tr>
-              <tr><td><code class="inl">failureThreshold</code></td><td>3</td><td>Consecutive failures before acting (restart / NotReady).</td></tr>
-              <tr><td><code class="inl">successThreshold</code></td><td>1</td><td>Consecutive successes to count as passing again. Must be 1 for liveness &amp; startup.</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"A failing readiness probe restarts the container." <strong>✗</strong> Readiness only controls traffic (endpoints). Only liveness (and startup) failures restart.</p>
+          <p>"Liveness should check the database too, to be thorough." <strong>✗</strong> If Postgres blips for 20 s, every API pod fails liveness at once and restarts (a restart storm), and restarting the API can't fix the DB. Liveness checks only the process itself.</p>
+          <p>"Probe the Service port, 80." <strong>✗</strong> The kubelet probes the <em>container</em> directly: port 3000, or the name <code class="inl">http</code>.</p>
         </div>
 
-        <h3>The full TaskFlow API Deployment</h3>
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Readiness → traffic (0/1, out of endpoints, no restart).</strong><br /><strong>Liveness → restarts (RESTARTS +1). Keep it cheap: no DB calls.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. A pod shows <code class="inl">0/1 Running</code> with <code class="inl">RESTARTS 0</code> for ten minutes. Which probe is failing, and what does <code class="inl">kubectl get endpointslices -l kubernetes.io/service-name=taskflow-api</code> show for it?</summary>
+            <p class="ans">Readiness (liveness would have restarted it). The pod's IP is missing from the ready endpoints, so the Service sends it nothing. <code class="inl">describe pod</code> shows <code class="inl">Readiness probe failed: …</code>.</p></details>
+          <details class="quiz"><summary>Q2. Spot the bug: <code class="inl">readinessProbe: httpGet: {path: /healthz, port: http}</code>, and the app serves <code class="inl">/health</code>.</summary>
+            <p class="ans">Every probe gets 404, which counts as a failure, so the pod never becomes ready and the rollout stalls. The event says <code class="inl">Readiness probe failed: HTTP probe failed with statuscode: 404</code>. Fix the path.</p></details>
+          <details class="quiz"><summary>Q3. Professor's claim: "With a liveness probe you don't need a readiness probe." True or false?</summary>
+            <p class="ans">False. Liveness never removes a pod from traffic. It only restarts after it's stuck. A booting or temporarily overloaded pod would still receive requests and return errors. You want both, doing different jobs.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 7. STARTUP & TIMING ===================== -->
+      <section id="startup">
+        <h2><span class="sec-num">7</span> Startup probes &amp; probe timing</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>Version 1.2.0 runs database migrations on boot. On a busy node, a cold start now takes about 90 s, but the liveness probe from §6 starts checking straight away:</p>
+<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -w
+<span class="out">NAME                           READY   STATUS             RESTARTS      AGE
+taskflow-api-6c9d7b5f8-wq4zn   0/1     Running            0             25s
+taskflow-api-6c9d7b5f8-wq4zn   0/1     Running            1 (1s ago)    32s
+taskflow-api-6c9d7b5f8-wq4zn   0/1     CrashLoopBackOff   1 (31s ago)   63s
+taskflow-api-6c9d7b5f8-wq4zn   0/1     Running            2 (1s ago)    74s</span>
+<span class="pr">$</span> kubectl describe pod taskflow-api-6c9d7b5f8-wq4zn -n taskflow | tail -2
+<span class="out">  Warning  Unhealthy  13s (x6 over 63s)  kubelet  Liveness probe failed: Get "http://10.244.0.27:3000/health": dial tcp 10.244.0.27:3000: connect: connection refused
+  Normal   Killing    13s (x2 over 43s)  kubelet  Container api failed liveness probe, will be restarted</span></pre>
+        <p>Liveness kills it after about 30 s, every time, so it never finishes booting. No code is broken. Adding <code class="inl">initialDelaySeconds: 90</code> to liveness would "fix" it, but then a pod that really hangs in its first 90 s is never caught, and the day a boot takes 100 s the loop starts again.</p>
+
+        <h3>The idea</h3>
+        <p>A <strong>startup probe</strong> runs <em>first</em>, and only at startup. While it hasn't succeeded yet, liveness and readiness are switched off. Once it passes, it never runs again, and the other two take over. If it fails <code class="inl">failureThreshold</code> times in a row, the container is killed and restarted. Its boot budget is <strong>failureThreshold × periodSeconds</strong>, and every probe's timing follows the same rule.</p>
+<pre> t=0          startup probe every 2 s (up to 30 tries = 60 s budget)        first ✓ at t≈40 s
+ ├────────────────────────────────────────────────────────────────────────┤
+ │  liveness + readiness are OFF                                           │ then: readiness every 5 s,
+                                                                             liveness every 10 s, forever</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A new cook gets up to 60 seconds to set up their station, and the manager checks every 2 seconds whether they're done. Nobody asks "are you frozen?" during set-up. If they're still not ready after 60 seconds, they're replaced.</p>
+        </div>
+
+        <h3>See it: the startup probe</h3>
+<pre>          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30     <span class="cm"># 30 × 2 s = 60 s to boot; liveness waits until this passes</span></pre>
+        <p>Same endpoint as liveness, with a generous threshold. A fast boot passes at the first success (say 4 s), so it costs almost nothing. A slow boot gets the full 60 s.</p>
+        <p><strong>What it does <em>not</em> do:</strong> run after startup. If the app hangs at minute 30, that's liveness's job.</p>
+
+        <h3>Build it up: the full TaskFlow API Deployment</h3>
         <div class="fname">k8s/deployment.yaml</div>
-<pre>apiVersion: apps/v1
-kind: Deployment
-metadata:
+<pre><span class="kw">apiVersion:</span> apps/v1
+<span class="kw">kind:</span> Deployment
+<span class="kw">metadata:</span>
   name: taskflow-api
   namespace: taskflow
   labels:
     app: taskflow-api
-spec:
+<span class="kw">spec:</span>
   <span class="cm"># no "replicas:" — the HPA (§5) owns the count</span>
   selector:
     matchLabels:
@@ -813,7 +910,7 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 0                <span class="cm"># old pod is removed only after a new one is READY</span>
+      maxUnavailable: 0                <span class="cm"># an old pod is removed only after a new one is READY</span>
   template:
     metadata:
       labels:
@@ -823,7 +920,7 @@ spec:
         - name: api
           image: shauryav/taskflow-api:1.2.0
           ports:
-            - name: http               <span class="cm"># named port: probes &amp; Service refer to "http"</span>
+            - name: http               <span class="cm"># named port: probes and the Service refer to "http"</span>
               containerPort: 3000
           envFrom:
             - configMapRef:
@@ -835,42 +932,34 @@ spec:
                   name: taskflow-db-secret
                   key: DATABASE_URL
           resources:
-            requests:
-              cpu: 100m                <span class="cm"># HPA % is relative to this</span>
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
+            requests: { cpu: 100m, memory: 128Mi }   <span class="cm"># the HPA's % is relative to cpu: 100m</span>
+            limits:   { cpu: 500m, memory: 256Mi }
           startupProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             periodSeconds: 2
             failureThreshold: 30       <span class="cm"># up to 30 × 2 s = 60 s to boot</span>
           readinessProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3        <span class="cm"># 3 × 5 s = 15 s failing → out of the Service</span>
             successThreshold: 1        <span class="cm"># 1 success → back in</span>
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3        <span class="cm"># 3 × 10 s = 30 s hung → restart</span></pre>
-
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Line</th><th>Why</th></tr></thead>
+            <thead><tr><th>Field / line</th><th>Default</th><th>Meaning, and why it's set here</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">maxUnavailable: 0</code> + readiness</td><td>Zero-downtime rollouts: Kubernetes only removes an old pod once a new one passes readiness. Without readiness, "Running" = "ready" and users hit pods still booting.</td></tr>
-              <tr><td><code class="inl">port: http</code></td><td>Named port — change <code class="inl">containerPort</code> once, probes follow.</td></tr>
-              <tr><td>Same <code class="inl">/health</code> for all three</td><td>TaskFlow has one health endpoint. A bigger app adds <code class="inl">/ready</code> (checks warm caches/deps) and keeps <code class="inl">/health</code> process-only.</td></tr>
-              <tr><td><code class="inl">timeoutSeconds: 2</code></td><td>Default 1 s is tight for a busy Node event loop; spurious timeouts cause restarts.</td></tr>
+              <tr><td><code class="inl">initialDelaySeconds</code></td><td>0</td><td>Wait after container start before the first probe. Not needed once a startup probe exists.</td></tr>
+              <tr><td><code class="inl">periodSeconds</code></td><td>10</td><td>How often to probe.</td></tr>
+              <tr><td><code class="inl">timeoutSeconds</code></td><td>1</td><td>A slower answer counts as a failure. Raised to 2, because 1 s is tight for a busy Node event loop and spurious timeouts cause restarts.</td></tr>
+              <tr><td><code class="inl">failureThreshold</code></td><td>3</td><td>Consecutive failures before acting (restart / NotReady).</td></tr>
+              <tr><td><code class="inl">successThreshold</code></td><td>1</td><td>Consecutive successes to count as passing again. Must be 1 for liveness and startup.</td></tr>
+              <tr><td><code class="inl">maxUnavailable: 0</code> + readiness</td><td>—</td><td>Zero-downtime rollouts: an old pod goes only once a new one passes readiness.</td></tr>
+              <tr><td>Same <code class="inl">/health</code> ×3</td><td>—</td><td>TaskFlow has one health endpoint. A bigger app adds <code class="inl">/ready</code> (checks warm caches/deps) and keeps <code class="inl">/health</code> process-only.</td></tr>
             </tbody>
           </table>
         </div>
@@ -878,53 +967,51 @@ spec:
         <div class="callout example">
           <span class="c-title">Worked example: timing math (failureThreshold × periodSeconds)</span>
           <ul>
-            <li><strong>Boot budget</strong>: startup 30 × 2 s = <strong>60 s</strong>. A pod still failing at 60 s is restarted.</li>
-            <li><strong>Event loop blocks at t = 0</strong>: readiness fails at ~5, 10, 15 s → pod leaves the Service at <strong>≈15 s</strong>. Liveness fails at ~10, 20, 30 s → restart at <strong>≈30 s</strong> (each attempt can add the 2 s timeout).</li>
-            <li>Between 15 s and 30 s the pod gets no traffic but isn't killed — if it recovers (a long GC pause), no restart happens.</li>
-            <li>Without a startup probe you'd need <code class="inl">livenessProbe.initialDelaySeconds: 60</code>; if a cold start ever takes 70 s → killed at boot → CrashLoopBackOff forever. (Postgres in §3 uses <code class="inl">initialDelaySeconds: 30</code> — fine for a fast DB, a startupProbe is the cleaner option.)</li>
+            <li><strong>Boot budget:</strong> startup 30 × 2 s = <strong>60 s</strong>. A pod still failing at 60 s is restarted.</li>
+            <li><strong>Event loop blocks at t = 0:</strong> readiness fails at ~5, 10 and 15 s, so the pod leaves the Service at <strong>≈15 s</strong>. Liveness fails at ~10, 20 and 30 s, so the restart comes at <strong>≈30 s</strong> (each attempt can add the 2 s timeout).</li>
+            <li>Between 15 s and 30 s the pod gets no traffic but isn't killed. If it recovers in that window (a long GC pause), no restart happens.</li>
           </ul>
         </div>
-
-        <h3>What probes look like from kubectl</h3>
-<pre><span class="pr">$</span> kubectl get pods -n taskflow -l app=taskflow-api -w
-<span class="out">NAME                           READY   STATUS              RESTARTS   AGE
-taskflow-api-5d7f9c8b6-r7k2m   0/1     ContainerCreating   0          1s
-taskflow-api-5d7f9c8b6-r7k2m   0/1     Running             0          2s     <span class="cm">← running, not ready yet</span>
-taskflow-api-5d7f9c8b6-r7k2m   1/1     Running             0          6s     <span class="cm">← startup + readiness passed</span></span>
-
-<span class="pr">$</span> kubectl describe pod taskflow-api-5d7f9c8b6-r7k2m -n taskflow
-<span class="out">...
-    Liveness:     http-get http://:http/health delay=0s timeout=2s period=10s #success=1 #failure=3
+<pre><span class="pr">$</span> kubectl describe pod taskflow-api-5d7f9c8b6-r7k2m -n taskflow | grep -E 'Liveness|Readiness|Startup'
+<span class="out">    Liveness:     http-get http://:http/health delay=0s timeout=2s period=10s #success=1 #failure=3
     Readiness:    http-get http://:http/health delay=0s timeout=2s period=5s #success=1 #failure=3
-    Startup:      http-get http://:http/health delay=0s timeout=1s period=2s #success=1 #failure=30
-...
-Events:
-  Type     Reason     Age                From     Message
-  ----     ------     ----               ----     -------
-  Warning  Unhealthy  41s (x6 over 56s)  kubelet  Readiness probe failed: Get "http://10.244.0.21:3000/health": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
-  Warning  Unhealthy  40s (x3 over 60s)  kubelet  Liveness probe failed: Get "http://10.244.0.21:3000/health": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
-  Normal   Killing    40s                kubelet  Container api failed liveness probe, will be restarted</span>
+    Startup:      http-get http://:http/health delay=0s timeout=1s period=2s #success=1 #failure=30</span>
+<span class="pr">$</span> kubectl get events -n taskflow --field-selector reason=Unhealthy   <span class="cm"># every probe failure in the namespace</span></pre>
 
-<span class="pr">$</span> kubectl get events -n taskflow --field-selector reason=Unhealthy   <span class="cm"># all probe failures in the namespace</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><strong>Liveness that checks the database</strong>: Postgres restarts for 20 s → every API pod fails liveness → all restart at once (restart storm) → DB is back but the API is in CrashLoopBackOff. Liveness checks only the process.</li>
-            <li><strong>No readiness probe</strong>: pods get traffic while booting → 502/503 from the Ingress during every rollout.</li>
-            <li><strong>Wrong port/path</strong>: probe on <code class="inl">80</code> (the Service port) instead of <code class="inl">3000</code> (the container port), or <code class="inl">/healthz</code> when the app serves <code class="inl">/health</code> → 404 → never ready.</li>
-            <li><strong>Liveness too aggressive</strong> (<code class="inl">timeoutSeconds: 1</code>, <code class="inl">failureThreshold: 1</code>): one slow response under load = restart, which adds more load to the others.</li>
-          </ul>
+        <h3>The exam table</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th></th><th>Startup probe</th><th>Readiness probe</th><th>Liveness probe</th></tr></thead>
+            <tbody>
+              <tr><td>Question</td><td>Has the app finished booting?</td><td>Can it serve traffic <em>now</em>?</td><td>Is it still alive (not hung)?</td></tr>
+              <tr><td>On failure</td><td>After <code class="inl">failureThreshold</code> fails → container killed and restarted</td><td>Pod marked <strong>NotReady</strong> → removed from Service endpoints. <strong>No restart.</strong></td><td>Container <strong>killed and restarted</strong> (per <code class="inl">restartPolicy</code>)</td></tr>
+              <tr><td>Runs</td><td>Only at start, until the first success</td><td>The whole lifetime</td><td>The whole lifetime (after startup succeeds)</td></tr>
+              <tr><td>Visible as</td><td>Liveness and readiness paused until it passes</td><td><code class="inl">READY 0/1</code>; rollouts wait for it</td><td><code class="inl">RESTARTS</code> increases</td></tr>
+              <tr><td>Good check</td><td>Same endpoint as liveness, generous threshold</td><td>App + its local warm-up done (may check deps)</td><td>Cheap, process-only: <strong>no DB calls</strong></td></tr>
+              <tr><td>If not defined</td><td colspan="3">Treated as always succeeding.</td></tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="callout key">
-          <span class="c-title">Key takeaway</span>
-          <p>Readiness controls <strong>traffic</strong>, liveness controls <strong>restarts</strong>, startup protects <strong>slow boots</strong>. Their budget is always failureThreshold × periodSeconds.</p>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"A startup probe keeps running alongside liveness." <strong>✗</strong> It stops for good after its first success. Liveness and readiness only start then.</p>
+          <p>"A tight liveness probe (<code class="inl">timeoutSeconds: 1</code>, <code class="inl">failureThreshold: 1</code>) catches problems faster, so it's safer." <strong>✗</strong> One slow response under load triggers a restart, which piles more load onto the other pods, and they fail too.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Probes = kubelet health checks (httpGet/tcpSocket/exec/grpc). Readiness failing → <code class="inl">0/1</code>, no endpoints; liveness failing → restart; startup gates the other two.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Startup protects slow boots · readiness controls traffic · liveness controls restarts.</strong><br /><strong>Every probe's budget = failureThreshold × periodSeconds.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Startup probe: <code class="inl">periodSeconds: 10</code>, <code class="inl">failureThreshold: 30</code>. What's the maximum boot time allowed, and what runs during it?</summary>
+            <p class="ans">30 × 10 s = <strong>300 s (5 min)</strong>. Only the startup probe runs. Liveness and readiness don't start until it succeeds.</p></details>
+          <details class="quiz"><summary>Q2. Readiness: period 5 s, threshold 3. Liveness: period 10 s, threshold 3. The app freezes at t = 0 and recovers at t = 20 s. Predict what happens.</summary>
+            <p class="ans">At ≈15 s readiness has failed 3 times, so the pod leaves the Service. Liveness has failed only twice (10 s, 20 s) when the app recovers, so there's no restart. Readiness passes again and the pod rejoins. Traffic was paused for about 5–10 s, with no restart.</p></details>
+          <details class="quiz"><summary>Q3. Spot the bug: no startup probe, <code class="inl">livenessProbe.initialDelaySeconds: 60</code>, and the app sometimes needs 70 s to boot.</summary>
+            <p class="ans">On a slow boot, liveness starts at 60 s, fails, and kills the container before it's up, and the same thing happens on every retry: CrashLoopBackOff. Replace the delay with a startup probe whose budget covers the worst boot (e.g. 30 × 5 s = 150 s).</p></details>
         </div>
       </section>
 
@@ -936,19 +1023,21 @@ Events:
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
+              <tr><td><code class="inl">kubectl logs POD -c CONTAINER</code> / <code class="inl">kubectl exec POD -c CONTAINER -- ls /cache</code></td><td>Look inside one container of a multi-container pod.</td></tr>
               <tr><td><code class="inl">kubectl get pv,pvc -n taskflow</code></td><td>List volumes and claims; check STATUS is <code class="inl">Bound</code>.</td></tr>
-              <tr><td><code class="inl">kubectl describe pvc taskflow-db-data -n taskflow</code></td><td>Why a claim is Pending (events from the binder/provisioner).</td></tr>
-              <tr><td><code class="inl">kubectl get storageclass</code></td><td>Available classes, provisioner, default, binding mode.</td></tr>
+              <tr><td><code class="inl">kubectl describe pvc taskflow-db-data -n taskflow</code></td><td>Why a claim is Pending (binder/provisioner events).</td></tr>
+              <tr><td><code class="inl">kubectl get storageclass</code></td><td>Available classes, provisioner, default, binding mode, expansion.</td></tr>
               <tr><td><code class="inl">kubectl patch pv NAME -p '{"spec":{"claimRef":null}}'</code></td><td>Make a Released (Retain) PV Available again.</td></tr>
               <tr><td><code class="inl">kubectl patch pvc NAME -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'</code></td><td>Grow a PVC (needs <code class="inl">allowVolumeExpansion</code>).</td></tr>
               <tr><td><code class="inl">minikube addons enable metrics-server</code></td><td>Install Metrics Server on minikube.</td></tr>
-              <tr><td><code class="inl">kubectl top nodes</code> / <code class="inl">kubectl top pods -n taskflow --sort-by=cpu</code></td><td>Current CPU/memory usage.</td></tr>
-              <tr><td><code class="inl">kubectl top pod POD --containers</code></td><td>Per-container usage inside a pod.</td></tr>
-              <tr><td><code class="inl">kubectl apply -f k8s/hpa.yaml</code></td><td>Create/update the HPA declaratively.</td></tr>
+              <tr><td><code class="inl">kubectl top nodes</code> / <code class="inl">kubectl top pods -n taskflow --sort-by=cpu</code> / <code class="inl">--containers</code></td><td>Current CPU/memory usage (per container with <code class="inl">--containers</code>).</td></tr>
+              <tr><td><code class="inl">kubectl get apiservice v1beta1.metrics.k8s.io</code></td><td>Is the Metrics API registered and available?</td></tr>
               <tr><td><code class="inl">kubectl autoscale deployment taskflow-api --cpu=50% --min=2 --max=10</code></td><td>Imperative HPA (older kubectl: <code class="inl">--cpu-percent=50</code>).</td></tr>
-              <tr><td><code class="inl">kubectl get hpa -n taskflow -w</code></td><td>Watch TARGETS and REPLICAS change.</td></tr>
-              <tr><td><code class="inl">kubectl describe hpa taskflow-api -n taskflow</code></td><td>Current metric, conditions, SuccessfulRescale events.</td></tr>
+              <tr><td><code class="inl">kubectl apply -f k8s/hpa.yaml</code></td><td>Create/update the HPA declaratively (autoscaling/v2, behavior).</td></tr>
+              <tr><td><code class="inl">kubectl get hpa -n taskflow -w</code> / <code class="inl">describe hpa taskflow-api</code></td><td>Watch TARGETS and REPLICAS / metric, conditions, SuccessfulRescale events.</td></tr>
               <tr><td><code class="inl">kubectl run load-gen --rm -it --image=busybox:1.36 --restart=Never -- /bin/sh -c "while true; do wget -q -O- http://taskflow-api/tasks; done"</code></td><td>Generate load to trigger the HPA.</td></tr>
+              <tr><td><code class="inl">kubectl get pods -l app=taskflow-api -w</code></td><td>Watch READY flip 0/1 → 1/1 as readiness passes.</td></tr>
+              <tr><td><code class="inl">kubectl describe pod POD | grep -E 'Liveness|Readiness|Startup'</code></td><td>The probe settings the kubelet actually uses.</td></tr>
               <tr><td><code class="inl">kubectl get events -n taskflow --field-selector reason=Unhealthy</code></td><td>All probe failures.</td></tr>
               <tr><td><code class="inl">kubectl rollout status deploy/taskflow-api -n taskflow</code></td><td>Waits until new pods pass readiness.</td></tr>
             </tbody>
@@ -962,38 +1051,24 @@ Events:
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>TaskFlow's Postgres stores its data on a PVC that the <code class="inl">standard</code> (or <code class="inl">gp3</code>) StorageClass provisioned, so deleting the pod loses nothing. The API declares CPU requests, which lets Metrics Server + the HPA keep average CPU at 50% by running 2–10 replicas. Startup, readiness and liveness probes make sure each of those replicas only gets traffic once it's ready and is restarted if it hangs — so autoscaling and rolling updates never send users to a broken pod.</p>
+          <p>TaskFlow's Postgres keeps its data on a PVC that the <code class="inl">standard</code> (or <code class="inl">gp3</code>) StorageClass provisioned, so deleting the pod loses nothing. The API declares CPU requests, which lets Metrics Server and the HPA hold average CPU near 50% with 2–10 replicas. Startup, readiness and liveness probes make sure each replica gets traffic only once it's ready and is restarted if it hangs. That's why autoscaling and rolling updates never send users to a pod that can't answer.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>A PVC asks for 2Gi; the only matching PV (same class, RWO) is 5Gi. What happens and what does <code class="inl">kubectl get pvc</code> show as CAPACITY?</summary>
-          <p class="ans">It binds (capacity ≥ request) and shows <strong>5Gi</strong> — binding is 1:1 to the whole PV; the extra 3Gi can't be used by anyone else.</p>
-        </details>
-        <details class="quiz">
-          <summary>3 replicas run at 80% average CPU, target 50%, maxReplicas 10. How many replicas does the HPA want?</summary>
-          <p class="ans">ceil(3 × 80 / 50) = ceil(4.8) = <strong>5</strong> (within max, and a 3→5 jump is allowed by the default scale-up policy).</p>
-        </details>
-        <details class="quiz">
-          <summary><code class="inl">kubectl get hpa</code> shows <code class="inl">cpu: &lt;unknown&gt;/50%</code>. Give two likely causes.</summary>
-          <p class="ans">Metrics Server isn't installed/ready (<code class="inl">kubectl top pods</code> fails), or the target pods have no <code class="inl">resources.requests.cpu</code> so utilization can't be computed.</p>
-        </details>
-        <details class="quiz">
-          <summary>The readiness probe fails on one pod. Is the container restarted? What changes?</summary>
-          <p class="ans">No restart. The pod shows <code class="inl">0/1 READY</code> and is removed from the Service's endpoints until it passes again. Only a <em>liveness</em> (or startup) failure restarts the container.</p>
-        </details>
-        <details class="quiz">
-          <summary>Startup probe: <code class="inl">periodSeconds: 10</code>, <code class="inl">failureThreshold: 30</code>. What's the maximum boot time allowed?</summary>
-          <p class="ans">30 × 10 s = <strong>300 s (5 min)</strong>. Liveness and readiness don't run until it succeeds.</p>
-        </details>
-        <details class="quiz">
-          <summary>Why does the Postgres Deployment use <code class="inl">strategy: Recreate</code>, and why <code class="inl">WaitForFirstConsumer</code> on EKS?</summary>
-          <p class="ans">RWO volume can attach to one node: RollingUpdate would start a second pod that can't mount it (Multi-Attach error). WFFC delays EBS creation until the pod is scheduled, so the disk is created in the same AZ as the node.</p>
-        </details>
-        <details class="quiz">
-          <summary>Why is it a bad idea for the API's liveness probe to query Postgres?</summary>
-          <p class="ans">A DB blip makes every API pod fail liveness at once → mass restarts (restart storm) and CrashLoopBackOff, even though restarting the API can't fix the DB. Liveness should check only the process itself.</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — combine everything</span>
+          <details class="quiz"><summary>Q1. During a load spike the HPA scales <code class="inl">taskflow-api</code> from 2 to 8. Users see a burst of 502s while the new pods start. Which section's feature is missing, and why does it matter more with autoscaling?</summary>
+            <p class="ans">A readiness probe (§6). Without one, a new pod counts as ready the moment its process starts, so it joins the Service while Node is still booting. Autoscaling adds pods exactly when traffic is highest, so the unready pods get hit hard. Add readiness (and a startup probe for slow boots).</p></details>
+          <details class="quiz"><summary>Q2. The HPA's TARGETS show <code class="inl">&lt;unknown&gt;/50%</code>, and <code class="inl">kubectl top pods</code> also fails. Then, after fixing that, TARGETS is still <code class="inl">&lt;unknown&gt;</code> for the API but fine for another app. Two causes, in order?</summary>
+            <p class="ans">First, Metrics Server isn't installed or ready (§4): enable it and check the <code class="inl">metrics.k8s.io</code> APIService. Second, the API's pods have no <code class="inl">resources.requests.cpu</code> (§5), so a percentage can't be computed. <code class="inl">describe hpa</code> shows <code class="inl">missing request for cpu</code>.</p></details>
+          <details class="quiz"><summary>Q3. Postgres's liveness probe runs <code class="inl">pg_isready</code> with <code class="inl">timeoutSeconds: 1</code>. Under heavy load from 8 API replicas it times out, the DB container is restarted, and all API pods go 0/1. Explain the chain and two fixes.</summary>
+            <p class="ans">More replicas (§5) → more DB load → slow <code class="inl">pg_isready</code> → liveness kills Postgres (§6) → the API's readiness fails while the DB restarts → no ready API endpoints. Fixes: make liveness gentler (a <code class="inl">tcpSocket</code> check, <code class="inl">timeoutSeconds: 5</code>, a higher <code class="inl">failureThreshold</code>), keep <code class="inl">pg_isready</code> for readiness only, and cap <code class="inl">maxReplicas</code> or add DB connection pooling.</p></details>
+          <details class="quiz"><summary>Q4. The cluster's StorageClass is <code class="inl">gp3</code> with <code class="inl">WaitForFirstConsumer</code>. You apply only the PVC part of <code class="inl">k8s/postgres.yaml</code>. Predict the PVC's STATUS, then what changes once the Deployment is applied.</summary>
+            <p class="ans"><code class="inl">Pending</code>, with the event <code class="inl">waiting for first consumer to be created before binding</code>, which is normal. Once the Postgres pod is scheduled to a node in, say, <code class="inl">ap-south-1b</code>, the EBS CSI driver creates a 5Gi gp3 volume in that AZ, a <code class="inl">pvc-…</code> PV appears, the claim goes <code class="inl">Bound</code>, and the pod mounts it.</p></details>
+          <details class="quiz"><summary>Q5. A teammate deletes and re-applies <code class="inl">k8s/postgres.yaml</code> to "reset the pod", and all tasks vanish. A second teammate deleted only the pod last week and lost nothing. Explain both.</summary>
+            <p class="ans">Deleting the pod leaves the PVC, so the new pod mounts the same PV with the data intact (§3). Deleting the <em>file</em> also deletes the PVC, and with the class's reclaim policy <code class="inl">Delete</code>, the PV and the real disk are destroyed (§2). Keep the PVC in a separate file, or use <code class="inl">Retain</code> for production data.</p></details>
+          <details class="quiz"><summary>Q6. A slow node makes the API take 80 s to boot. The pods have only a liveness probe (period 10 s, threshold 3), and the HPA keeps adding replicas that never become ready. What's happening, and what's the fix?</summary>
+            <p class="ans">Liveness kills each new container at about 30 s, before it ever finishes booting (§7), so the pods crash-loop. The existing pods stay overloaded, so the HPA (§5) keeps asking for more pods, and those crash-loop too. Add a startup probe with a budget above 80 s (e.g. <code class="inl">periodSeconds: 5</code>, <code class="inl">failureThreshold: 24</code> = 120 s) and a readiness probe.</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -1026,6 +1101,6 @@ Events:
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 13 — Storage, HPA &amp; Probes</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>

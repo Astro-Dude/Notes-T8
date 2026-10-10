@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>DevOps · Session 6 — Docker Fundamentals</title>
-  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261009a" />
+  <link rel="stylesheet" href="../../../assets/css/styles.css?v=20261010a" />
 </head>
 <body data-accent="devops">
   <div id="progress"></div>
@@ -24,10 +24,10 @@
       <span class="kicker">Term 9 · DevOps · Session 06</span>
       <h1>Docker Fundamentals</h1>
       <p class="lead">
-        Explain how a container differs from a VM and what happens inside Docker when you type <code class="inl">docker run</code>;
-        then pull, run, inspect, debug, push and clean up containers for TaskFlow's database, web server and API.
+        Explain why a container is not a VM and prove it with one command. Trace what Docker does between typing
+        <code class="inl">docker run</code> and a process starting. Then pull, build, push, run, debug, stop and clean up TaskFlow's containers.
       </p>
-      <div class="hero-meta"><span class="badge-rt">⏱ 29 min read</span><span class="badge-rt">📖 6 topics</span></div>
+      <div class="hero-meta"><span class="badge-rt">⏱ 52 min read</span><span class="badge-rt">📖 8 topics</span></div>
     </section>
 
     <div class="article-layout">
@@ -37,10 +37,12 @@
         <h4>On this page</h4>
         <ol>
           <li><a href="#containers-vms">Containers vs virtual machines</a></li>
+          <li><a href="#isolation">Isolation: namespaces &amp; cgroups</a></li>
           <li><a href="#architecture">Docker architecture</a></li>
-          <li><a href="#images">Docker images</a></li>
-          <li><a href="#containers">Docker containers</a></li>
+          <li><a href="#images">Docker images: layers</a></li>
+          <li><a href="#getting-images">Getting images: pull, tags, build</a></li>
           <li><a href="#docker-hub">Docker Hub</a></li>
+          <li><a href="#containers">Docker containers</a></li>
           <li><a href="#lifecycle">Container lifecycle</a></li>
           <li><a href="#commands">Commands you must know</a></li>
           <li><a href="#wrapup">Putting it all together</a></li>
@@ -56,26 +58,18 @@
         <h2><span class="sec-num">1</span> Containers vs virtual machines</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A VM is a whole separate house with its own plumbing. A container is a room in a shared house: own lock and furniture, but the same plumbing (the host's kernel).</p>
-        </div>
-
         <h3>The problem: "works on my machine"</h3>
-        <div class="callout example">
-          <span class="c-title">Example: TaskFlow on two machines</span>
-          <ul>
-            <li>Laptop: Node 20, Postgres 16 → all good. College server: Node 16 → <code class="inl">TypeError: tasks.findLast is not a function</code> (added in Node 18).</li>
-            <li>Copying <code class="inl">node_modules</code> built on a Mac to Linux → <code class="inl">Error: …/bcrypt_lib.node: invalid ELF header</code> (native module compiled for the wrong OS).</li>
-          </ul>
-          <p>A container image packages the app <strong>with</strong> its runtime, libraries and default config, so <code class="inl">shauryav/taskflow-api:1.0</code> behaves identically on the laptop, in CI and on the server.</p>
-        </div>
+        <p>TaskFlow's API runs fine on your laptop. You copy it to the college server and it crashes:</p>
+<pre>Your laptop                        College server
+Node.js 20                         Node.js 16
+Postgres 16                        Postgres 12
+macOS (arm64)                      Ubuntu (amd64)
+<span class="out">taskflow-api listening on 3000</span>     <span class="out">TypeError: tasks.findLast is not a function</span></pre>
+        <p><code class="inl">findLast</code> only arrived in Node 18. If you also copy your Mac's <code class="inl">node_modules</code> across, you get <code class="inl">bcrypt_lib.node: invalid ELF header</code>, because that native module was compiled for macOS. The code is the same on both machines. The <em>environment</em> is not.</p>
+        <p>The fix is to ship the environment with the code: the runtime, the libraries and the default config, packed into one unit that behaves the same on the laptop, in CI and on the server. There are two ways to build that unit.</p>
 
-        <ul>
-          <li>A <span class="term">container</span> = an ordinary Linux process (or group of them), isolated by the kernel, running from its own filesystem (the image).</li>
-          <li>A <span class="term">virtual machine</span> = a full guest OS with its own kernel, running on virtual hardware provided by a <span class="term">hypervisor</span>.</li>
-        </ul>
-
+        <h3>The idea</h3>
+        <p>A <span class="term">virtual machine</span> fakes a whole computer. A <span class="term">hypervisor</span> gives each VM virtual hardware, and each VM boots a complete guest OS with its own kernel. A <span class="term">container</span> fakes nothing. It is an ordinary Linux process that the host kernel fences off and gives its own filesystem. Every container on a host shares that <strong>one kernel</strong>.</p>
 <pre>          Virtual machines                                  Containers
  ┌─────────┐ ┌─────────┐ ┌─────────┐          ┌─────────┐ ┌─────────┐ ┌─────────┐
  │ App A   │ │ App B   │ │ App C   │          │ App A   │ │ App B   │ │ App C   │
@@ -88,7 +82,49 @@
  ├─────────────────────────────────┤          ├─────────────────────────────────┤
  │ Hardware                        │          │ Hardware (or a cloud VM)        │
  └─────────────────────────────────┘          └─────────────────────────────────┘</pre>
+        <p>Compare the two stacks row by row. Only one row really differs: <strong>Guest OS + kernel</strong>. VMs repeat it for every app. Containers don't have it at all.</p>
 
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>VMs are <strong>separate houses</strong>. Each one has its own foundation, plumbing and wiring (its own kernel). Containers are <strong>rooms in one hotel</strong>. Each room has its own lock and its own furniture (its own files and processes), but every room uses the building's plumbing (the host kernel). Building a house takes months. Opening a room takes a key card.</p>
+        </div>
+
+        <h3>See it: one kernel, many containers</h3>
+        <p>The smallest proof: ask the host which kernel it runs, then ask a container the same question.</p>
+<pre><span class="pr">$</span> uname -r                                    <span class="cm"># on the Ubuntu host</span>
+<span class="out">6.8.0-85-generic</span>
+<span class="pr">$</span> docker run --rm alpine:3.20 uname -r        <span class="cm"># inside a container</span>
+<span class="out">6.8.0-85-generic</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">docker</code></td><td>The Docker command-line client</td></tr>
+              <tr><td><code class="inl">run</code></td><td>Create a container from an image and start it</td></tr>
+              <tr><td><code class="inl">--rm</code></td><td>Delete the container as soon as it exits, because this is a one-off</td></tr>
+              <tr><td><code class="inl">alpine:3.20</code></td><td>The image (<code class="inl">alpine</code>, tag <code class="inl">3.20</code>): an ~8 MB Linux userland. Docker downloads it the first time.</td></tr>
+              <tr><td><code class="inl">uname -r</code></td><td>The command to run inside the container, in place of the image's default command</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The version is the same because there is only one kernel. Now ask which OS the container is:</p>
+<pre><span class="pr">$</span> docker run --rm alpine:3.20 head -2 /etc/os-release
+<span class="out">NAME="Alpine Linux"
+ID=alpine</span></pre>
+        <p>A different "OS" runs on the same kernel. The OS inside a container is only a <em>userland</em>: the files in <code class="inl">/bin</code>, <code class="inl">/lib</code> and <code class="inl">/etc</code> that came with the image.</p>
+        <p><strong>What it does <em>not</em> do:</strong> boot anything. There is no BIOS, no kernel loading, no init system and no login. Docker started one process (<code class="inl">uname</code>), which printed a line and exited, and <code class="inl">--rm</code> deleted the container, all in well under a second. A VM would still be booting.</p>
+
+        <h3>Build it up: TaskFlow three ways</h3>
+        <p>TaskFlow needs an API, a database and a web server. Here's the bill each way:</p>
+<pre>As 3 VMs                                   As 3 containers
+api → Ubuntu guest (≈2 GB) + Node + code   api → node:20-alpine + code   (≈180 MB)
+db  → Ubuntu guest (≈2 GB) + Postgres      db  → postgres:16             (≈640 MB)
+web → Ubuntu guest (≈2 GB) + nginx         web → nginx:1.27-alpine       (≈77 MB)
+3 kernels to boot, ≈6 GB of OS before      no extra kernels; each starts in about a
+your code even runs                        second; shared base layers stored once</pre>
+        <p>That is why containers win on speed and density. It's also their weak spot. One shared kernel is one shared point of failure, so a VM's isolation is stronger. In the cloud you usually get both, because your containers run inside VMs (EC2 instances).</p>
+
+        <h3>The exam table</h3>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>Virtual machine</th><th>Container</th></tr></thead>
@@ -96,7 +132,7 @@
               <tr><td>Virtualises</td><td>Hardware</td><td>The operating system (kernel features)</td></tr>
               <tr><td>Kernel</td><td>Own guest kernel per VM</td><td>Shares the host kernel</td></tr>
               <tr><td>Size</td><td>GBs (full OS)</td><td>MBs (<code class="inl">alpine</code> ≈ 8 MB, <code class="inl">nginx:alpine</code> ≈ 50 MB)</td></tr>
-              <tr><td>Start time</td><td>Tens of seconds – minutes (boots an OS)</td><td>Milliseconds – seconds (starts a process)</td></tr>
+              <tr><td>Start time</td><td>Tens of seconds to minutes (boots an OS)</td><td>Milliseconds to seconds (starts a process)</td></tr>
               <tr><td>Isolation</td><td>Strong (hardware-level boundary)</td><td>Weaker (process-level; a kernel bug affects all)</td></tr>
               <tr><td>Density</td><td>Tens per host</td><td>Hundreds per host</td></tr>
               <tr><td>OS flexibility</td><td>Any OS (Windows VM on a Linux host)</td><td>Same kernel family (Linux containers need a Linux kernel)</td></tr>
@@ -105,93 +141,166 @@
           </table>
         </div>
 
-        <p>Prove the kernel is shared (Ubuntu host):</p>
-<pre><span class="pr">$</span> uname -r                                       <span class="cm"># host kernel</span>
-<span class="out">6.8.0-85-generic</span>
-<span class="pr">$</span> docker run --rm alpine:3.20 uname -r           <span class="cm"># container: SAME kernel…</span>
-<span class="out">6.8.0-85-generic</span>
-<span class="pr">$</span> docker run --rm alpine:3.20 head -2 /etc/os-release   <span class="cm"># …but a different userland (filesystem)</span>
-<span class="out">NAME="Alpine Linux"
-ID=alpine</span></pre>
-
-        <h3>The two kernel features behind containers</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Feature</th><th>Job</th><th>Examples</th></tr></thead>
-            <tbody>
-              <tr><td><span class="term">Namespaces</span></td><td><strong>What a process can see</strong> (isolation)</td><td><code class="inl">pid</code> own process tree (app is PID 1) · <code class="inl">net</code> own IP/ports · <code class="inl">mnt</code> own filesystem · <code class="inl">uts</code> own hostname · <code class="inl">ipc</code> · <code class="inl">user</code> UID mapping · <code class="inl">cgroup</code></td></tr>
-              <tr><td><span class="term">cgroups</span></td><td><strong>How much it can use</strong> (limits + accounting)</td><td>Memory, CPU, number of PIDs, disk I/O</td></tr>
-            </tbody>
-          </table>
-        </div>
-<pre><span class="pr">$</span> docker run --rm ubuntu:24.04 sh -c 'hostname; ps -e'     <span class="cm"># uts + pid namespaces</span>
-<span class="out">efb215124d96
-    PID TTY          TIME CMD
-      1 ?        00:00:00 sh
-      8 ?        00:00:00 ps</span>
-<span class="pr">$</span> docker run --rm -m 256m --cpus 0.5 ubuntu:24.04 cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max
-<span class="out">268435456
-50000 100000</span>                       <span class="cm"># 256 MiB cap; 50 ms of CPU per 100 ms = half a core</span></pre>
-
         <div class="callout note">
           <span class="c-title">Docker on Mac / Windows</span>
-          <p>Linux containers need a Linux kernel, so Docker Desktop runs a small Linux VM behind the scenes (<code class="inl">uname -r</code> in a container shows something like <code class="inl">…-linuxkit</code>). In the cloud it's the same story: containers run inside EC2 VMs. Containers and VMs are complements, not rivals.</p>
+          <p>Linux containers need a Linux kernel, so Docker Desktop runs one small Linux VM behind the scenes. Run <code class="inl">uname -r</code> in a container there and you'll see something like <code class="inl">…-linuxkit</code>. All your containers share that one VM's kernel. Containers and VMs work together. They aren't rivals.</p>
         </div>
 
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Treating a container like a VM: installing SSH in it, running 5 services in one container. One main process per container; use <code class="inl">docker exec</code> to get a shell.</li>
-            <li>Thinking root in a container is harmless — it's the same kernel. Run apps as a non-root user (Session 7: <code class="inl">USER node</code>).</li>
-          </ul>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Docker creates a lightweight virtual machine for every application." <strong>✗ Wrong.</strong> Docker uses no hypervisor, no virtual hardware and no guest kernel. A container is an isolated <em>process</em> on the host's kernel.</p>
+          <p>"Containers are more isolated than VMs." <strong>✗</strong> It's the other way round. VMs have a hardware-level boundary. Containers share a kernel.</p>
+          <p>"The kernel is shared, so a Linux host can run Windows containers." <strong>✗</strong> The app has to match the kernel, so Linux containers need a Linux kernel.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          VM = virtual hardware + own kernel (heavy, strong isolation). Container = isolated process sharing the host kernel (light, fast). Namespaces isolate, cgroups limit.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>VM = virtual hardware + its own kernel.</strong><br /><strong>Container = isolated process + the host's kernel.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. In one sentence: what is the fundamental difference between a VM and a container?</summary>
+            <p class="ans">A VM virtualises hardware and boots its own guest OS and kernel on a hypervisor. A container is an isolated process that shares the host's kernel and brings only its own files.</p></details>
+          <details class="quiz"><summary>Q2. Host OS → Docker → Container A (Node.js app) and Container B (Python app). How many kernels are running?</summary>
+            <p class="ans">One: the host's. A and B have different userlands (different files and libraries), but neither has a kernel of its own. Both make system calls into the same host kernel.</p></details>
+          <details class="quiz"><summary>Q3. Predict: the Ubuntu host runs kernel <code class="inl">6.8.0-85-generic</code>. What does <code class="inl">docker run --rm ubuntu:22.04 uname -r</code> print?</summary>
+            <p class="ans"><code class="inl">6.8.0-85-generic</code>, not Ubuntu 22.04's usual 5.15 kernel. The <code class="inl">ubuntu:22.04</code> image contains 22.04's files but no kernel, so <code class="inl">uname</code> reports the host's.</p></details>
+          <details class="quiz"><summary>Q4. Fill in: a VM runs on a ________ and boots its own ________; a container is a ________ that shares the host's ________.</summary>
+            <p class="ans">Hypervisor · kernel (OS) · process · kernel.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 2. ARCHITECTURE ===================== -->
-      <section id="architecture">
-        <h2><span class="sec-num">2</span> Docker architecture</h2>
+      <!-- ===================== 2. ISOLATION ===================== -->
+      <section id="isolation">
+        <h2><span class="sec-num">2</span> Isolation: namespaces &amp; cgroups</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>Section 1 said every container shares one kernel. That should worry you:</p>
+<pre>                       one host kernel
+          ┌───────────────────┼───────────────────┐
+     taskflow-db         taskflow-api       someone-elses-app
+     (Postgres)          (Node)             (buggy, or hostile)</pre>
+        <p>They are all just processes on one kernel. So what stops <code class="inl">someone-elses-app</code> from listing Postgres's processes, grabbing port 5432 first, or reading <code class="inl">/var/lib/postgresql</code>? And what stops it from eating all 4 GB of RAM until the database gets killed?</p>
+
+        <h3>The idea</h3>
+        <p>The Linux kernel has two features for this, and Docker switches both on for every container:</p>
+        <ul>
+          <li><span class="term">Namespaces</span> control what a process can <strong>see</strong>. Each container gets its own view of processes, network, filesystem and hostname.</li>
+          <li><span class="term">cgroups</span> (control groups) control how much a process can <strong>use</strong>: memory, CPU, number of processes and disk I/O.</li>
+        </ul>
+<pre> container A                             container B
+ sees:    its own processes (PID 1, 2 …)  sees:    its own processes (PID 1, 2 …)
+          its own IP address + ports               its own IP address + ports
+          its own files + hostname                 its own files + hostname
+ may use: 512 MB RAM, 2 CPUs              may use: 256 MB RAM, 1 CPU
+     │        namespaces = the walls  (what you see)        │
+     │        cgroups    = the meters (what you use)        │
+     └───────────────────── one host kernel ────────────────┘</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>The <code class="inl">docker</code> command is a waiter taking your order. The daemon is the kitchen that cooks it. The registry is the supermarket where the kitchen buys ingredients (images).</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Back to the hotel. <strong>Namespaces are the walls and the door lock</strong>: from inside your room you only see your own things, and every room counts its guests from 1 (each container has its own PID 1). <strong>cgroups are each room's circuit breaker</strong>: draw more power than your share and the breaker trips (memory) or the lights dim (CPU). Reception (the host) can still see into every room.</p>
         </div>
 
-<pre> docker CLI ── REST API over /var/run/docker.sock ──▶ dockerd  (Docker daemon / "Docker Engine")
- (client: docker run, ps, build…)                       │  manages images, containers, networks, volumes, builds
-                                                         │  gRPC
-                                                         ▼
-                                                    containerd  (pulls &amp; stores images, supervises containers)
-                                                         │
-                                               containerd-shim-runc-v2  (one per container; keeps it alive if
-                                                         │                containerd/dockerd restarts)
-                                                         ▼
-                                                       runc  (OCI runtime: sets up namespaces + cgroups, execs PID 1, exits)
-                                                         ▼
-                                              your process, e.g. nginx  (PID 1 inside the container)
-
- dockerd ◀────── pull / push over HTTPS ──────▶ Registry (Docker Hub docker.io, ghcr.io, ECR …)</pre>
-
+        <h3>See it: namespaces</h3>
+<pre><span class="pr">$</span> docker run --rm ubuntu:24.04 sh -c 'hostname; ps -e'
+<span class="out">efb215124d96
+    PID TTY          TIME CMD
+      1 ?        00:00:00 sh
+      8 ?        00:00:00 ps</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Component</th><th>Role</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><strong>Docker client</strong> (<code class="inl">docker</code>)</td><td>CLI that turns your command into REST API calls. Can talk to a local or remote daemon (<code class="inl">docker context</code>).</td></tr>
-              <tr><td><strong>dockerd</strong></td><td>The daemon (server). Owns Docker objects, networking, volumes, builds (via BuildKit). Runs as root, managed by systemd (<code class="inl">docker.service</code>).</td></tr>
-              <tr><td><strong>/var/run/docker.sock</strong></td><td>Unix socket where dockerd listens. Access to it = full control of Docker (= root).</td></tr>
-              <tr><td><strong>containerd</strong></td><td>Industry-standard container runtime manager (also used directly by Kubernetes).</td></tr>
-              <tr><td><strong>runc</strong></td><td>Low-level <span class="term">OCI</span> runtime that actually creates the container, then hands over to the shim.</td></tr>
-              <tr><td><strong>Registry</strong></td><td>Stores and serves images (Docker Hub is the default).</td></tr>
+              <tr><td><code class="inl">sh -c '…'</code></td><td>Run a tiny shell script inside the container: two commands separated by <code class="inl">;</code></td></tr>
+              <tr><td><code class="inl">hostname</code></td><td>Prints the container's own hostname (UTS namespace): its short ID, not your machine's name</td></tr>
+              <tr><td><code class="inl">ps -e</code></td><td>Lists every process this container can see (PID namespace)</td></tr>
             </tbody>
           </table>
         </div>
+        <p>Notice that there are only two processes, and <code class="inl">sh</code> is <strong>PID 1</strong>. The host is running hundreds of processes, and the PID namespace hides all of them.</p>
+        <p><strong>What it does <em>not</em> do:</strong> hide the container from the host. Isolation works one way only. On the host, the container's processes are ordinary processes with ordinary PIDs (<code class="inl">docker top</code> shows them in section 7).</p>
 
-        <p><code class="inl">hello-world</code> literally prints the architecture:</p>
+        <h3>See it: cgroups</h3>
+<pre><span class="pr">$</span> docker run --rm -m 256m --cpus 0.5 ubuntu:24.04 cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max
+<span class="out">268435456
+50000 100000</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-m 256m</code></td><td>Memory limit of 256 MiB for this container</td></tr>
+              <tr><td><code class="inl">--cpus 0.5</code></td><td>At most half of one CPU core</td></tr>
+              <tr><td><code class="inl">/sys/fs/cgroup/memory.max</code></td><td>The kernel file holding the cgroup's memory cap: 268435456 bytes = 256 × 1024 × 1024</td></tr>
+              <tr><td><code class="inl">/sys/fs/cgroup/cpu.max</code></td><td><code class="inl">50000 100000</code> = 50 ms of CPU time per 100 ms period, which is half a core</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>What happens at the limit depends on the resource. Use too much <strong>memory</strong> and the kernel's OOM killer kills the process, so the container shows <code class="inl">Exited (137)</code> (section 8). Use too much <strong>CPU</strong> and the process is throttled (slowed down), but never killed.</p>
+        <p><strong>What it does <em>not</em> do:</strong> set any limits unless you ask. Without <code class="inl">-m</code> and <code class="inl">--cpus</code>, a container can use all of the host's memory and CPU.</p>
+
+        <h3>The full list (for reference)</h3>
+        <p>Linux has seven namespaces, and a container gets its own of each: <code class="inl">pid</code> (process tree, so the app is PID 1), <code class="inl">net</code> (interfaces, IP, ports, routes), <code class="inl">mnt</code> (mounts, so the image's files appear at <code class="inl">/</code>), <code class="inl">uts</code> (hostname), <code class="inl">ipc</code> (shared memory, message queues), <code class="inl">user</code> (UID mapping, so root inside can be unprivileged outside, if enabled) and <code class="inl">cgroup</code> (its view of the cgroup tree). cgroups can limit memory, CPU, the number of PIDs (which stops a fork bomb) and block I/O.</p>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Namespaces limit how much memory a container can use." <strong>✗</strong> Namespaces control visibility. cgroups control limits.</p>
+          <p>"Root inside a container is harmless because the container is isolated." <strong>✗</strong> It's the same kernel. One kernel bug or one careless mount (<code class="inl">-v /:/host</code>), and root in the container is root on the host. Run apps as a non-root user (Session 7: <code class="inl">USER node</code>).</p>
+          <p>"The host can't see processes inside a container." <strong>✗</strong> It can. <code class="inl">ps aux</code> on the host lists them.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Namespaces → what you can see (isolation)</strong><br /><strong>cgroups → how much you can use (resource control)</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Container A runs <code class="inl">ps aux</code>. Container B is running 20 processes. Why doesn't A see them?</summary>
+            <p class="ans">A runs in its own PID namespace, so the kernel shows it only its own process tree. B isn't "unreachable". It just isn't part of A's view of the system.</p></details>
+          <details class="quiz"><summary>Q2. You started the API with <code class="inl">-m 512m</code>. A memory leak pushes it towards 10 GB. What stops it, and what do you see?</summary>
+            <p class="ans">The cgroup memory limit. Once usage passes 512 MiB, the kernel's OOM killer kills the process. The container shows <code class="inl">Exited (137)</code>, and <code class="inl">docker inspect</code> reports <code class="inl">OOMKilled: true</code>.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: containers share the ________, but use ________ for isolation and ________ for resource control.</summary>
+            <p class="ans">Kernel · namespaces · cgroups.</p></details>
+          <details class="quiz"><summary>Q4. Predict: a container started with <code class="inl">--cpus 0.5</code> runs a CPU-heavy loop. Is it killed or slowed?</summary>
+            <p class="ans">Slowed. It is throttled to 50 ms of CPU per 100 ms. Only going over a <em>memory</em> limit gets a process killed.</p></details>
+          <details class="quiz"><summary>Q5. Inside a container your app is PID 1. Is it PID 1 on the host too?</summary>
+            <p class="ans">No. The PID namespace gives the container its own numbering. On the host it's an ordinary process with a normal PID such as 12345 (<code class="inl">docker top</code> or <code class="inl">docker inspect -f '{{.State.Pid}}'</code>). It's one process seen from two views.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 3. ARCHITECTURE ===================== -->
+      <section id="architecture">
+        <h2><span class="sec-num">3</span> Docker architecture</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>On a fresh Ubuntu server where the Docker service isn't running, type the command you'll use most:</p>
+<pre><span class="pr">$</span> docker ps
+<span class="out">Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?</span></pre>
+        <p>The <code class="inl">docker</code> command is installed and works, yet it can't do anything on its own. The opposite surprise also happens: start a container in the background, close your terminal, and the container keeps running. Both facts point the same way. The program you type is not the program that runs containers.</p>
+
+        <h3>The idea</h3>
+        <p>Docker is <strong>client–server</strong>. The <code class="inl">docker</code> command is a <span class="term">client</span> that only sends requests. A background service, the <span class="term">Docker daemon</span> (<code class="inl">dockerd</code>), does the work: it pulls images, creates and starts containers, and manages networks and volumes. When the daemon needs an image it doesn't have, it downloads it from a <span class="term">registry</span>, which is Docker Hub by default.</p>
+<pre> You
+  │  docker run nginx
+  ▼
+ Docker CLI (client) ── REST API over /var/run/docker.sock ──▶ Docker daemon (dockerd)
+                                                                  │ 1. is "nginx" here?
+                         Registry (Docker Hub) ◀── 2. no → pull ──┤
+                                                                  │ 3. create container
+                                                                  ▼ 4. start it
+                                                            nginx container</pre>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A restaurant. <strong>You</strong> are the customer. The <strong>CLI is the waiter</strong>: it takes your order to the kitchen and brings back the result, but it cooks nothing. The <strong>daemon is the kitchen</strong>, where all the work happens. The <strong>registry is the supermarket</strong> the kitchen buys ingredients (images) from when the fridge is empty. If the kitchen is closed, all the waiter can say is "Cannot connect".</p>
+        </div>
+
+        <h3>See it: hello-world</h3>
+        <p>Docker's own test image prints this exact architecture:</p>
 <pre><span class="pr">$</span> docker run hello-world
 <span class="out">Unable to find image 'hello-world:latest' locally
 latest: Pulling from library/hello-world
@@ -200,8 +309,7 @@ Digest: sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8
 Status: Downloaded newer image for hello-world:latest
 
 Hello from Docker!
-This message shows that your installation appears to be working correctly.
-
+…
 To generate this message, Docker took the following steps:
  1. The Docker client contacted the Docker daemon.
  2. The Docker daemon pulled the "hello-world" image from the Docker Hub.
@@ -210,126 +318,226 @@ To generate this message, Docker took the following steps:
     executable that produces the output you are currently reading.
  4. The Docker daemon streamed that output to the Docker client, which sent it
     to your terminal.</span></pre>
+        <p>Read it against the diagram. <code class="inl">Unable to find image … locally</code> is step 1: the daemon checked its own image store, and because you gave no tag it assumed <code class="inl">:latest</code>. <code class="inl">Pulling from library/hello-world</code> is step 2. The four numbered lines are steps 1–4 in Docker's own words.</p>
+        <p><strong>What it does <em>not</em> do:</strong> the CLI downloaded nothing and ran nothing. Also, the container didn't keep running: it printed its message and exited. It now sits there stopped, and you'll clean it up in section 8.</p>
 
-        <h3>Check the installation</h3>
-<pre><span class="pr">$</span> docker version                 <span class="cm"># client AND server versions — if "Server" is missing, the daemon isn't reachable</span>
+        <h3>Build it up: look inside</h3>
+        <h4>Two programs, two versions</h4>
+<pre><span class="pr">$</span> docker version                 <span class="cm"># trimmed</span>
 <span class="out">Client: Docker Engine - Community
  Version:           29.7.2
  API version:       1.55
- OS/Arch:           linux/amd64
- Context:           default
 
 Server: Docker Engine - Community
  Engine:
   Version:          29.7.2
-  API version:      1.55 (minimum version 1.40)
-  OS/Arch:          linux/amd64
  containerd:
   Version:          v2.3.3
  runc:
-  Version:          1.4.3
- docker-init:
-  Version:          0.19.0</span>
-<span class="pr">$</span> docker info                    <span class="cm"># daemon-wide details (trimmed)</span>
-<span class="out">Server:
- Containers: 3
-  Running: 2
-  Paused: 0
-  Stopped: 1
- Images: 4
- Server Version: 29.7.2
- Storage Driver: overlayfs
-  driver-type: io.containerd.snapshotter.v1
- Logging Driver: json-file
- Cgroup Driver: systemd
- Cgroup Version: 2
- Default Runtime: runc
- Kernel Version: 6.8.0-85-generic
- Operating System: Ubuntu 24.04.3 LTS
- CPUs: 2
- Total Memory: 3.82GiB
- Docker Root Dir: /var/lib/docker</span></pre>
-        <p>Read <code class="inl">docker info</code> for: container counts, <strong>Storage Driver</strong> (how image layers are stacked), <strong>Logging Driver</strong> (<code class="inl">json-file</code> → where <code class="inl">docker logs</code> reads from), <strong>Cgroup Version</strong>, and <strong>Docker Root Dir</strong> (where images/volumes live on disk).</p>
+  Version:          1.4.3</span></pre>
+        <p>The output has a <strong>Client</strong> block and a <strong>Server</strong> block because they are two separate programs. If the Server block is missing and you get "Cannot connect", the daemon isn't running or you can't reach its socket. <code class="inl">docker info</code> adds daemon-wide details: container and image counts, storage driver, cgroup version, and the Docker Root Dir (<code class="inl">/var/lib/docker</code>, where images and volumes live).</p>
 
-        <h3>The CLI is just an HTTP client</h3>
+        <h4>The CLI is just an HTTP client</h4>
 <pre><span class="pr">$</span> ls -l /var/run/docker.sock
 <span class="out">srw-rw---- 1 root docker 0 Oct  9 09:58 /var/run/docker.sock</span>      <span class="cm"># s = socket; root + group "docker" may use it</span>
-<span class="pr">$</span> curl -s --unix-socket /var/run/docker.sock http://localhost/version
-<span class="out">{"Platform":{"Name":"Docker Engine - Community"},"Version":"29.7.2","ApiVersion":"1.55","MinAPIVersion":"1.40","Os":"linux","Arch":"amd64",…}</span>
 <span class="pr">$</span> curl -s --unix-socket /var/run/docker.sock http://localhost/containers/json | jq -r '.[].Names[0]'
 <span class="out">/web
-/taskflow-db</span>                       <span class="cm"># same data "docker ps" shows</span></pre>
+/taskflow-db</span>                       <span class="cm"># the same data "docker ps" shows</span></pre>
+        <p><code class="inl">curl</code> talked to the daemon directly and got the container list. All <code class="inl">docker ps</code> does is send that same request and format the reply as a table.</p>
+
+        <h4>Under the hood: the daemon delegates too</h4>
+<pre> docker CLI ── REST API over /var/run/docker.sock ──▶ dockerd  (Docker daemon / "Docker Engine")
+ (client: docker run, ps, build…)                       │  manages images, containers, networks, volumes, builds
+                                                         │  gRPC
+                                                         ▼
+                                                    containerd  (pulls &amp; stores images, supervises containers)
+                                                         │
+                                               containerd-shim-runc-v2  (one per container; lets it outlive
+                                                         │                a containerd restart)
+                                                         ▼
+                                                       runc  (OCI runtime: sets up namespaces + cgroups, execs PID 1, exits)
+                                                         ▼
+                                              your process, e.g. nginx  (PID 1 inside the container)
+
+ dockerd ◀────── pull / push over HTTPS ──────▶ Registry (Docker Hub docker.io, ghcr.io, ECR …)</pre>
+        <p>You only ever talk to dockerd, and each layer below it does one job. The shim is why a container survives a containerd restart. With <code class="inl">"live-restore": true</code> in the daemon config, containers also keep running while dockerd restarts or is upgraded. dockerd manages four kinds of objects: <strong>images</strong> and <strong>containers</strong> (this session), plus <strong>volumes</strong> and <strong>networks</strong> (Session 8). Images and runtimes follow the <span class="term">OCI</span> (Open Container Initiative) specs, so an image built by Docker runs unchanged on containerd, Podman or Kubernetes.</p>
 
         <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
+          <span class="c-title">The two errors everyone hits</span>
 <pre><span class="out">Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?</span>
-<span class="pr">$</span> sudo systemctl enable --now docker            <span class="cm"># start it (and on every boot)</span>
+<span class="pr">$</span> sudo systemctl enable --now docker            <span class="cm"># start it now and on every boot</span>
 
 <span class="out">permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock</span>
-<span class="pr">$</span> sudo usermod -aG docker $USER &amp;&amp; newgrp docker <span class="cm"># add yourself to the docker group (or log out/in)</span></pre>
-          <p>The <code class="inl">docker</code> group is root-equivalent (<code class="inl">docker run -v /:/host …</code> can read any file). Only add trusted users; never expose <code class="inl">docker.sock</code> to the internet or mount it into untrusted containers.</p>
+<span class="pr">$</span> sudo usermod -aG docker $USER &amp;&amp; newgrp docker <span class="cm"># join the docker group (or log out and in)</span></pre>
+          <p>The <code class="inl">docker</code> group is equivalent to root: <code class="inl">docker run -v /:/host …</code> can read any file on the machine. Add only trusted users, and never expose <code class="inl">docker.sock</code> to the internet or mount it into untrusted containers.</p>
         </div>
 
-        <h3>Docker objects</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Object</th><th>What it is</th><th>List with</th><th>Session</th></tr></thead>
-            <tbody>
-              <tr><td>Image</td><td>Read-only template (layers + metadata)</td><td><code class="inl">docker images</code></td><td>6, 7</td></tr>
-              <tr><td>Container</td><td>A running (or stopped) instance of an image</td><td><code class="inl">docker ps -a</code></td><td>6</td></tr>
-              <tr><td>Volume</td><td>Persistent data managed by Docker</td><td><code class="inl">docker volume ls</code></td><td>8</td></tr>
-              <tr><td>Network</td><td>Virtual network connecting containers</td><td><code class="inl">docker network ls</code></td><td>8</td></tr>
-            </tbody>
-          </table>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"The <code class="inl">docker</code> command creates and runs containers." <strong>✗</strong> The CLI only sends API requests. dockerd creates and runs containers, through containerd and runc. That split is why one CLI can control a daemon on another machine.</p>
+          <p>"Kubernetes removed Docker in v1.24, so Docker images don't run on Kubernetes." <strong>✗</strong> Kubernetes removed <em>dockershim</em> (its built-in Docker Engine integration). It now runs containers through containerd or CRI-O, and Docker-built images are standard OCI images that run fine.</p>
         </div>
-        <p>Images and runtimes follow the <strong>OCI</strong> (Open Container Initiative) specs, so an image built by Docker runs unchanged on containerd, Podman or Kubernetes (which dropped Docker itself in v1.24 but still runs Docker-built images).</p>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          CLI → REST over <code class="inl">docker.sock</code> → dockerd → containerd → shim → runc → your process; images come from a registry. <code class="inl">docker version</code> must show both Client and Server.
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Client = asks · Daemon = does · Registry = stores</strong><br /><strong>CLI → dockerd → containerd → shim → runc → your process</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You type <code class="inl">docker run nginx</code>. Which component receives it first, and which one actually creates the container?</summary>
+            <p class="ans">You type into the Docker CLI (the client), which sends a REST request to dockerd over <code class="inl">/var/run/docker.sock</code>. dockerd creates the container, delegating to containerd and runc. If the image is missing, the <em>daemon</em> pulls it from the registry. The CLI only shows the progress.</p></details>
+          <details class="quiz"><summary>Q2. <code class="inl">docker version</code> prints the Client block, then "Cannot connect to the Docker daemon…". What's wrong, and what do you try first on Ubuntu?</summary>
+            <p class="ans">The client works but can't reach a daemon, so the daemon isn't running. Check with <code class="inl">sudo systemctl status docker</code> and start it with <code class="inl">sudo systemctl enable --now docker</code>. If the error says "permission denied" instead, add yourself to the <code class="inl">docker</code> group.</p></details>
+          <details class="quiz"><summary>Q3. Match <code class="inl">dockerd</code>, <code class="inl">containerd</code>, <code class="inl">runc</code>: (a) serves the API the CLI calls; (b) sets up namespaces/cgroups, execs PID 1, then exits; (c) stores images and supervises containers, and is used by Kubernetes too.</summary>
+            <p class="ans">(a) dockerd · (b) runc · (c) containerd.</p></details>
+          <details class="quiz"><summary>Q4. Why does <code class="inl">curl --unix-socket /var/run/docker.sock http://localhost/containers/json</code> return the same data as <code class="inl">docker ps</code>?</summary>
+            <p class="ans">The CLI is just an HTTP client for the daemon's REST API on that socket. Both send the same request. The CLI only formats the JSON reply as a table.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 3. IMAGES ===================== -->
+      <!-- ===================== 4. IMAGES: LAYERS ===================== -->
       <section id="images">
-        <h2><span class="sec-num">3</span> Docker images</h2>
+        <h2><span class="sec-num">4</span> Docker images: layers</h2>
         <hr class="section-rule" />
 
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>An image is a cake mould; containers are the cakes. One mould, many identical cakes — and the mould never changes.</p>
-        </div>
+        <h3>The problem</h3>
+        <p>To run TaskFlow's API you need all of this, in exactly these versions:</p>
+<pre>Alpine Linux userland  (/bin, /lib, /etc)
+Node.js 20 + npm
+node_modules           (express, pg, prom-client …)
+server.js, package.json
+"start it with: node server.js, port 3000"</pre>
+        <p>Installing that by hand on every machine is the "works on my machine" problem all over again. And when you want three copies of the API, they should all start from identical files, without three separate installs, and without one copy's changes leaking into the others.</p>
 
+        <h3>The idea</h3>
+        <p>An <span class="term">image</span> is a <strong>read-only template</strong>: a stack of filesystem <span class="term">layers</span> plus a little config (default command, environment variables, working directory, ports). A container is created <em>from</em> an image, and Docker adds one thin <strong>writable layer</strong> on top for that container alone.</p>
+<pre>   container 1        container 2        container 3
+  ┌───────────┐      ┌───────────┐      ┌───────────┐
+  │ writable  │      │ writable  │      │ writable  │   ← one per container, deleted with it
+  └─────┬─────┘      └─────┬─────┘      └─────┬─────┘
+        └──────────────────┼──────────────────┘
+  ┌────────────────────────┴─────────────────────────┐
+  │ COPY . .           your code                     │ ← layer 4
+  │ RUN npm ci         node_modules                  │ ← layer 3    IMAGE: read-only,
+  │ COPY package*.json                               │ ← layer 2    stored once, shared
+  │ FROM node:20-alpine   Alpine + Node 20           │ ← layer 1 (really a few)
+  └──────────────────────────────────────────────────┘
+    + config: CMD ["node","server.js"]  WORKDIR /app  ENV PORT=3000</pre>
+        <p>Each layer holds the files that one build step added or changed. You'll write those steps in a Dockerfile in Session 7. Three things follow from this design:</p>
         <ul>
-          <li>An <span class="term">image</span> = a stack of read-only <span class="term">layers</span> (filesystem diffs) + config (default command, env vars, exposed ports, working dir).</li>
-          <li>Image vs container ≈ class vs object: <code class="inl">docker run</code> adds a thin <strong>writable layer</strong> on top; deleting the container deletes that layer (data inside is lost — use volumes, Session 8).</li>
-          <li>Layers are shared and cached: 10 containers from <code class="inl">nginx:1.27-alpine</code> store the image once; images with the same base share those layers.</li>
+          <li><strong>Layers are shared.</strong> Three containers from one image store it once. Two images built on the same base share the base layers, on disk and over the network.</li>
+          <li><strong>Layers are cached.</strong> Change only <code class="inl">server.js</code> and rebuild: Docker reuses the unchanged layers below it (Session 7).</li>
+          <li><strong>Read-only means safe.</strong> A container can't damage its image or its siblings. Anything it writes goes into its own writable layer. If it edits a file that came from the image, Docker first copies that file up into the writable layer (<span class="term">copy-on-write</span>).</li>
         </ul>
 
-<pre> ┌──────────────────────────────────────────┐  ← container layer: read-write, one per container (copy-on-write)
- ╞══════════════════════════════════════════╡
- │ CMD ["nginx","-g","daemon off;"]   0 B   │  ← metadata-only layers
- │ COPY docker-entrypoint.sh …       8 kB   │
- │ RUN apk add nginx …              39.7 MB │  ← image layers: read-only, shared
- │ alpine base (minirootfs)          ~8 MB  │
- └──────────────────────────────────────────┘</pre>
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p><strong>Image = class, container = object.</strong> The class is a definition and doesn't change when you use it. <code class="inl">docker run</code> is <code class="inl">new</code>: it gives you a fresh instance. The writable layer is that object's own fields. You can make many objects from one class, and deleting an object doesn't touch the class.</p>
+        </div>
 
-        <h3>Naming: <code class="inl">[registry/][namespace/]repository[:tag | @digest]</code></h3>
+        <h3>See it: the writable layer</h3>
+        <p>Start two containers from the same image, write a file in one of them, and look for it in the other:</p>
+<pre><span class="pr">$</span> docker run -d --name a alpine:3.20 sleep 600
+<span class="pr">$</span> docker run -d --name b alpine:3.20 sleep 600
+<span class="pr">$</span> docker exec a sh -c 'echo "remember milk" &gt; /note.txt'
+<span class="pr">$</span> docker exec a cat /note.txt
+<span class="out">remember milk</span>
+<span class="pr">$</span> docker exec b cat /note.txt
+<span class="out">cat: can't open '/note.txt': No such file or directory</span>
+<span class="pr">$</span> docker diff a
+<span class="out">A /note.txt</span>
+<span class="pr">$</span> docker diff b                  <span class="cm"># prints nothing: b hasn't changed anything</span></pre>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>You type</th><th>Docker reads it as</th></tr></thead>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">nginx</code></td><td><code class="inl">docker.io/library/nginx:latest</code> (Docker Hub, official image, tag latest)</td></tr>
-              <tr><td><code class="inl">postgres:16</code></td><td><code class="inl">docker.io/library/postgres:16</code></td></tr>
-              <tr><td><code class="inl">shauryav/taskflow-api:1.0</code></td><td><code class="inl">docker.io/shauryav/taskflow-api:1.0</code> (user namespace)</td></tr>
-              <tr><td><code class="inl">ghcr.io/shauryav/taskflow-api:sha-3f2a9c1</code></td><td>GitHub Container Registry</td></tr>
-              <tr><td><code class="inl">123456789012.dkr.ecr.ap-south-1.amazonaws.com/taskflow-api:1.0</code></td><td>AWS ECR (Mumbai)</td></tr>
-              <tr><td><code class="inl">nginx@sha256:65645c7b…2a10</code></td><td>Exact immutable image by digest</td></tr>
+              <tr><td><code class="inl">-d</code></td><td>Run in the background (detached)</td></tr>
+              <tr><td><code class="inl">--name a</code></td><td>Call the container <code class="inl">a</code> so you can refer to it</td></tr>
+              <tr><td><code class="inl">sleep 600</code></td><td>The container's process: sleep for 10 minutes, which keeps it alive long enough to poke at</td></tr>
+              <tr><td><code class="inl">docker exec a …</code></td><td>Run an extra command inside the running container <code class="inl">a</code> (more in section 7)</td></tr>
+              <tr><td><code class="inl">docker diff a</code></td><td>List what changed in <code class="inl">a</code>'s writable layer compared with the image: <code class="inl">A</code> added · <code class="inl">C</code> changed · <code class="inl">D</code> deleted</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Now delete <code class="inl">a</code> and start a fresh container from the same image:</p>
+<pre><span class="pr">$</span> docker rm -f a
+<span class="out">a</span>
+<span class="pr">$</span> docker run --rm alpine:3.20 cat /note.txt
+<span class="out">cat: can't open '/note.txt': No such file or directory</span></pre>
+        <p>The note was deleted along with <code class="inl">a</code>'s writable layer. The image never had it.</p>
+        <p><strong>What it does <em>not</em> do:</strong> writing inside a container never changes the image. The writable layer also isn't storage you can rely on, because <code class="inl">docker rm</code> deletes it. Data that must survive, like Postgres's tables, goes in a <strong>volume</strong> (Session 8).</p>
+
+        <h3>Build it up: what's actually in an image</h3>
+<pre><span class="pr">$</span> docker image inspect -f 'cmd={{json .Config.Cmd}} layers={{len .RootFS.Layers}}' alpine:3.20
+<span class="out">cmd=["/bin/sh"] layers=1</span></pre>
+        <p><code class="inl">alpine</code> is one layer of files plus config that says "by default, run <code class="inl">/bin/sh</code>". That config is why <code class="inl">docker run -it alpine:3.20</code> drops you into a shell. Real application images have more layers. In section 5 you'll list nginx's layers and prove that two images share some.</p>
+
+        <h3>The exam table</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Image</th><th>Container</th></tr></thead>
+            <tbody>
+              <tr><td>Blueprint / template</td><td>An instance created from an image</td></tr>
+              <tr><td>Read-only layers + config</td><td>Image layers + its own writable layer</td></tr>
+              <tr><td>Doesn't run</td><td>Runs a process (or is stopped)</td></tr>
+              <tr><td>One image → many containers</td><td>Each container comes from exactly one image</td></tr>
+              <tr><td>Removed with <code class="inl">docker rmi</code></td><td>Removed with <code class="inl">docker rm</code></td></tr>
             </tbody>
           </table>
         </div>
 
-        <h3>Pull and list</h3>
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"Running a container modifies its image." <strong>✗</strong> Writes go into the container's writable layer. The image is read-only.</p>
+          <p>"Each container gets its own full copy of the image." <strong>✗</strong> Image layers are stored once and shared. Each container adds only its thin writable layer (copy-on-write).</p>
+          <p>"Data written inside a container survives <code class="inl">docker rm</code>." <strong>✗</strong> It survives stop and start, but <code class="inl">rm</code> deletes the writable layer. Use volumes.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>Image = class (read-only layers + config) · Container = object (image + its own writable layer)</strong><br /><strong>One image → many containers.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Give two advantages of building images out of layers. ("You can make many containers" doesn't count: that's true of any image.)</summary>
+            <p class="ans"><strong>Storage and transfer efficiency</strong>: images with a common base share those layers, so they're stored and downloaded once. <strong>Build caching</strong>: unchanged layers are reused on rebuild, so builds are fast.</p></details>
+          <details class="quiz"><summary>Q2. An image holds Ubuntu + Python + your app. You start 3 containers, and container 1 edits <code class="inl">/app/config.py</code>. Does that change the image? Container 2?</summary>
+            <p class="ans">Neither. Copy-on-write copies <code class="inl">config.py</code> into container 1's writable layer and edits it there. The image layers stay read-only, and container 2 still sees the original file.</p></details>
+          <details class="quiz"><summary>Q3. Fill in: the writable layer belongs to the ________ and is deleted by <code class="inl">docker ________</code>.</summary>
+            <p class="ans">Container · <code class="inl">rm</code>. <code class="inl">stop</code> keeps it, so the files are still there after <code class="inl">start</code>.</p></details>
+          <details class="quiz"><summary>Q4. Spot the misconception: "I'll <code class="inl">docker exec</code> into the container and <code class="inl">apk add curl</code>, so every future container from this image has curl."</summary>
+            <p class="ans">The install lands in that one container's writable layer. New containers start from the unchanged image without curl. To change the image you build a new one (a <code class="inl">RUN</code> line in a Dockerfile, Session 7).</p></details>
+          <details class="quiz"><summary>Q5. Predict <code class="inl">docker diff</code> after a container runs <code class="inl">rm /etc/motd; mkdir /app; echo x &gt; /app/out.log</code>.</summary>
+            <p class="ans"><code class="inl">A /app</code>, <code class="inl">A /app/out.log</code>, <code class="inl">C /etc</code>, <code class="inl">D /etc/motd</code>. The deleted file is still in the image. The writable layer only records "deleted here" and hides it.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 5. GETTING IMAGES ===================== -->
+      <section id="getting-images">
+        <h2><span class="sec-num">5</span> Getting images: pull, tags, build</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>You type <code class="inl">postgres</code>. Which Postgres: 16 or 17? Built for amd64 or arm64? Downloaded from where? And if you pulled <code class="inl">latest</code> in July and your teammate pulled <code class="inl">latest</code> today, are you running the same thing? (Not necessarily.)</p>
+
+        <h3>The idea</h3>
+        <p>Every image has a full name that answers four questions: from where, whose, what, and which version. You usually type the short form and Docker fills in the rest:</p>
+<pre>  docker.io  /  shauryav  /  taskflow-api  :  1.0
+  └registry┘   └namespace┘   └repository┘     └tag┘
+   default:     default: library                default:
+   docker.io    (= official images)             latest
+
+  nginx   ⇒   docker.io/library/nginx:latest</pre>
+        <p>A <span class="term">tag</span> is a human-readable label that the publisher can move to a newer build. A <span class="term">digest</span> (<code class="inl">@sha256:…</code>) is a hash of the image's content, so it can never change. <code class="inl">docker pull</code> downloads an image's layers from the registry into the daemon's local image store.</p>
+
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>It's Git again (Session 5). A <strong>tag is like a branch name</strong>: a movable pointer, so <code class="inl">main</code> today isn't <code class="inl">main</code> next week. A <strong>digest is like a commit SHA</strong>: it names one exact content forever. And <code class="inl">docker pull</code> is like <code class="inl">git fetch</code>: it downloads, but doesn't change anything that's running.</p>
+        </div>
+
+        <h3>See it: pull one image</h3>
 <pre><span class="pr">$</span> docker pull nginx:1.27-alpine
 <span class="out">1.27-alpine: Pulling from library/nginx
 9994ea1088e3: Pull complete
@@ -339,337 +547,212 @@ c60e446e49a0: Pull complete
 e6557c42ebea: Pull complete
 Digest: sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
 Status: Downloaded newer image for nginx:1.27-alpine
-docker.io/library/nginx:1.27-alpine</span>
-<span class="pr">$</span> docker pull shauryav/taskflow-api:1.1        <span class="cm"># shares base layers with 1.0 already on disk</span>
+docker.io/library/nginx:1.27-alpine</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token / line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">pull</code></td><td>Download an image. That is all it does.</td></tr>
+              <tr><td><code class="inl">nginx</code></td><td>Repository. No namespace was given, so it's the official <code class="inl">library/nginx</code> on <code class="inl">docker.io</code>.</td></tr>
+              <tr><td><code class="inl">:1.27-alpine</code></td><td>Tag: nginx 1.27 built on Alpine</td></tr>
+              <tr><td><code class="inl">9994ea1088e3: Pull complete</code></td><td>One line per layer, downloaded and unpacked</td></tr>
+              <tr><td><code class="inl">Digest: sha256:…</code></td><td>The image's true identity (hash of its manifest)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">pull</code> creates no container and starts nothing, so <code class="inl">docker ps</code> is still empty. <code class="inl">docker run</code> is the command that pulls only if the image is missing, then creates and starts a container.</p>
+        <p>To see what you have locally:</p>
+<pre><span class="pr">$</span> docker images                  <span class="cm"># = docker image ls (Docker 29 layout)</span>
+<span class="out">IMAGE                       ID             DISK USAGE   CONTENT SIZE   EXTRA
+nginx:1.27-alpine           65645c7bb6a0       76.8MB         22.7MB   U
+node:20-alpine              cae454a4b1be        182MB         45.1MB
+postgres:16                 7f1fb36e9729        640MB          159MB   U
+shauryav/taskflow-api:1.1   98908197a86b        205MB         50.3MB</span></pre>
+        <p><code class="inl">ID</code> is the first 12 hex characters of the image ID, and any unique prefix works in commands. <code class="inl">CONTENT SIZE</code> is what was downloaded (compressed). <code class="inl">DISK USAGE</code> is the total space it takes locally (the download plus the unpacked files). <code class="inl">U</code> means at least one container uses the image.</p>
+        <p>Older Docker versions and most tutorials show the classic columns <code class="inl">REPOSITORY  TAG  IMAGE ID  CREATED  SIZE</code>. The information is the same.</p>
+
+        <h3>Build it up</h3>
+        <h4>Layers are shared: proof #1</h4>
+<pre><span class="pr">$</span> docker pull shauryav/taskflow-api:1.1        <span class="cm"># 1.0 is already on disk</span>
 <span class="out">1.1: Pulling from shauryav/taskflow-api
 6e771e15690e: Already exists
 c60e446e49a0: Already exists
 4ba50d8bb2c6: Pull complete
 Digest: sha256:2c4b1dbfe35aa5118ebb1115fa9fec84b423060c7d50feca5e6e705b7e55a683
 Status: Downloaded newer image for shauryav/taskflow-api:1.1</span></pre>
-        <p>Each hex line = one layer. <strong>Digest</strong> = SHA-256 of the image manifest (its true identity). <code class="inl">Already exists</code> = layer reused, not downloaded.</p>
+        <p><code class="inl">Already exists</code> means that layer is already stored locally, so Docker skips the download. Only the layer that changed between 1.0 and 1.1 crossed the network.</p>
 
-<pre><span class="pr">$</span> docker images                  <span class="cm"># = docker image ls (Docker 29 view)</span>
-<span class="out">IMAGE                       ID             DISK USAGE   CONTENT SIZE   EXTRA
-nginx:1.27-alpine           65645c7bb6a0       76.8MB         22.7MB   U
-node:20-alpine              cae454a4b1be        182MB         45.1MB
-postgres:16                 7f1fb36e9729        640MB          159MB   U
-shauryav/taskflow-api:1.1   98908197a86b        205MB         50.3MB</span>
-<span class="pr">$</span> docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'    <span class="cm"># pick columns</span>
-<span class="pr">$</span> docker images -q                                                       <span class="cm"># IDs only (for scripting)</span></pre>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">IMAGE</code></td><td><code class="inl">repository:tag</code></td></tr>
-              <tr><td><code class="inl">ID</code></td><td>Short image ID (first 12 hex chars of its sha256 ID) — any unique prefix works in commands</td></tr>
-              <tr><td><code class="inl">DISK USAGE</code> / <code class="inl">CONTENT SIZE</code></td><td>Space used locally (compressed + unpacked) / compressed size pulled from the registry</td></tr>
-              <tr><td><code class="inl">EXTRA</code> = <code class="inl">U</code></td><td>In use by at least one container</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Older Docker versions and most tutorials show the classic columns <code class="inl">REPOSITORY  TAG  IMAGE ID  CREATED  SIZE</code> — same information.</p>
+        <h4>See every layer and the step that made it</h4>
+<pre><span class="pr">$</span> docker history nginx:1.27-alpine        <span class="cm"># newest layer first (trimmed)</span>
+<span class="out">IMAGE          CREATED         CREATED BY                                      SIZE      COMMENT
+65645c7bb6a0   18 months ago   RUN /bin/sh -c set -x     &amp;&amp; apkArch="$(cat …   39.7MB    buildkit.dockerfile.v0
+&lt;missing&gt;      18 months ago   CMD ["nginx" "-g" "daemon off;"]                0B        buildkit.dockerfile.v0
+&lt;missing&gt;      18 months ago   EXPOSE map[80/tcp:{}]                           0B        buildkit.dockerfile.v0
+&lt;missing&gt;      18 months ago   COPY docker-entrypoint.sh / # buildkit          8.19kB    buildkit.dockerfile.v0
+&lt;missing&gt;      18 months ago   RUN /bin/sh -c set -x     &amp;&amp; addgroup -g 101…   5.43MB    buildkit.dockerfile.v0</span></pre>
+        <ul>
+          <li>Each row is one build instruction. Rows with a size added files (a layer). <code class="inl">0B</code> rows (CMD, EXPOSE, ENTRYPOINT) only set config.</li>
+          <li><code class="inl">&lt;missing&gt;</code> is normal. Those layers were built on another machine, so they have no local image ID.</li>
+          <li>Anyone with the image can read this list, so a secret passed in a build step leaks here (Session 7).</li>
+        </ul>
 
-        <h3>Tags vs digests</h3>
+        <h4>Tags vs digests</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th>Tag (<code class="inl">:1.27-alpine</code>)</th><th>Digest (<code class="inl">@sha256:…</code>)</th></tr></thead>
             <tbody>
-              <tr><td>Mutable?</td><td>Yes — the publisher can move it to a new build</td><td>No — content-addressed, always the same bytes</td></tr>
+              <tr><td>Can change?</td><td>Yes: the publisher can move it to a new build</td><td>No: it's content-addressed, always the same bytes</td></tr>
               <tr><td>Readable?</td><td>Yes</td><td>No</td></tr>
-              <tr><td>Use for</td><td>Day-to-day, pinned versions (<code class="inl">postgres:16</code>, never bare <code class="inl">latest</code>)</td><td>Reproducible builds / production pinning</td></tr>
+              <tr><td>Use for</td><td>Day-to-day, pinned versions (<code class="inl">postgres:16</code>, never bare <code class="inl">latest</code>)</td><td>Reproducible builds and production pinning</td></tr>
             </tbody>
           </table>
         </div>
 <pre><span class="pr">$</span> docker image inspect -f '{{json .RepoDigests}}' nginx:1.27-alpine
 <span class="out">["nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"]</span>
-<span class="pr">$</span> docker pull nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10</pre>
+<span class="pr">$</span> docker pull nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10   <span class="cm"># exact bytes, forever</span></pre>
 
-        <h3>Inspect, history, remove</h3>
-<pre><span class="pr">$</span> docker image inspect -f '{{.Os}}/{{.Architecture}} cmd={{json .Config.Cmd}} entrypoint={{json .Config.Entrypoint}} ports={{.Config.ExposedPorts}}' nginx:1.27-alpine
-<span class="out">linux/amd64 cmd=["nginx","-g","daemon off;"] entrypoint=["/docker-entrypoint.sh"] ports=map[80/tcp:{}]</span>
-<span class="pr">$</span> docker image inspect -f '{{len .RootFS.Layers}}' nginx:1.27-alpine    <span class="cm"># number of filesystem layers</span>
-<span class="out">8</span>
+        <h4>Beyond Docker Hub</h4>
+        <p>Other registries just put their hostname first: <code class="inl">ghcr.io/shauryav/taskflow-api:sha-3f2a9c1</code> (GitHub Container Registry, Session 19) or <code class="inl">123456789012.dkr.ecr.ap-south-1.amazonaws.com/taskflow-api:1.0</code> (AWS ECR, Mumbai). If no hostname comes first, the registry is Docker Hub.</p>
 
-<span class="pr">$</span> docker history nginx:1.27-alpine        <span class="cm"># how the image was built, newest layer first (trimmed)</span>
-<span class="out">IMAGE          CREATED         CREATED BY                                      SIZE      COMMENT
-65645c7bb6a0   18 months ago   RUN /bin/sh -c set -x     &amp;&amp; apkArch="$(cat …   39.7MB    buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   CMD ["nginx" "-g" "daemon off;"]                0B        buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   STOPSIGNAL SIGQUIT                              0B        buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   EXPOSE map[80/tcp:{}]                           0B        buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   ENTRYPOINT ["/docker-entrypoint.sh"]            0B        buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   COPY docker-entrypoint.sh / # buildkit          8.19kB    buildkit.dockerfile.v0
-&lt;missing&gt;      18 months ago   RUN /bin/sh -c set -x     &amp;&amp; addgroup -g 101…   5.43MB    buildkit.dockerfile.v0</span></pre>
+        <h4>The other way to get an image: build it</h4>
+        <p>Pulling gets someone else's image. To package <em>your</em> code you build one from a <code class="inl">Dockerfile</code>, a text file of build steps. Here's the smallest possible one: a folder <code class="inl">taskflow-hello/</code> with two files (Session 7 covers every instruction).</p>
+        <div class="fname">taskflow-hello/hello.js</div>
+<pre>console.log(<span class="st">"Hello from TaskFlow, running in a container!"</span>);</pre>
+        <div class="fname">taskflow-hello/Dockerfile</div>
+<pre><span class="kw">FROM</span> node:20-alpine
+<span class="kw">WORKDIR</span> /app
+<span class="kw">COPY</span> hello.js .
+<span class="kw">CMD</span> ["node", "hello.js"]</pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">FROM node:20-alpine</code></td><td>Start from the official Node 20 image. Its layers become the bottom of yours.</td></tr>
+              <tr><td><code class="inl">WORKDIR /app</code></td><td>Create <code class="inl">/app</code> and work there for the next steps, and in the container later. New layer.</td></tr>
+              <tr><td><code class="inl">COPY hello.js .</code></td><td>Copy <code class="inl">hello.js</code> from your folder into <code class="inl">/app</code>. New layer.</td></tr>
+              <tr><td><code class="inl">CMD ["node", "hello.js"]</code></td><td>Config, not a layer: the default command for when a container <em>starts</em>. Nothing runs during the build.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="pr">$</span> cd taskflow-hello
+<span class="pr">$</span> docker build -t taskflow-hello:v1 .
+<span class="out">[+] Building 0.1s (8/8) FINISHED                                docker:default
+ =&gt; [internal] load build definition from Dockerfile                       0.0s
+ =&gt; [internal] load metadata for docker.io/library/node:20-alpine          0.0s
+ =&gt; [1/3] FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f  0.0s
+ =&gt; [internal] load build context                                          0.0s
+ =&gt; CACHED [2/3] WORKDIR /app                                              0.0s
+ =&gt; [3/3] COPY hello.js .                                                  0.0s
+ =&gt; exporting to image                                                     0.1s
+ =&gt; =&gt; naming to docker.io/library/taskflow-hello:v1                       0.0s</span>
+<span class="pr">$</span> docker run --name hello taskflow-hello:v1
+<span class="out">Hello from TaskFlow, running in a container!</span>
+<span class="pr">$</span> docker ps -a --filter name=hello --format '{{.Names}}\t{{.Status}}'
+<span class="out">hello	Exited (0) Less than a second ago</span></pre>
         <ul>
-          <li><code class="inl">&lt;missing&gt;</code> is normal: those layers were built on another machine, so they have no local image ID.</li>
-          <li><code class="inl">0B</code> rows are metadata-only instructions (CMD, EXPOSE, ENV…). Each row maps to a Dockerfile line (Session 7) — and anyone can read them, so secrets passed in a build step leak here.</li>
+          <li><code class="inl">docker build</code> builds an image from the <code class="inl">Dockerfile</code> in the given folder. <code class="inl">-t taskflow-hello:v1</code> names (tags) the result.</li>
+          <li><code class="inl">.</code> is the <strong>build context</strong>: the folder sent to the daemon, and the only place <code class="inl">COPY</code> can read from.</li>
         </ul>
+        <p><code class="inl">[1/3]</code>, <code class="inl">[2/3]</code> and <code class="inl">[3/3]</code> are the three steps that produce files. CMD isn't listed because it creates none. This output comes from a rebuild after editing <code class="inl">hello.js</code>, so the unchanged WORKDIR step shows <code class="inl">CACHED</code>: that's the layer cache at work. Notice also that the container exited as soon as it printed. Node finished the script, so the container finished too. Hold that thought until section 8.</p>
 
-<pre><span class="pr">$</span> docker rmi hello-world
-<span class="out">Error response from daemon: conflict: unable to delete hello-world:latest (must be forced) - container 1fb97f7b7b08 is using its referenced image 5e2309035332</span>
-<span class="pr">$</span> docker rm 1fb97f7b7b08 &amp;&amp; docker rmi hello-world     <span class="cm"># remove the (stopped) container first</span>
-<span class="out">1fb97f7b7b08
-Untagged: hello-world:latest
-Deleted: sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8</span>
-<span class="pr">$</span> docker image prune              <span class="cm"># remove dangling (untagged) images; -a = every image not used by a container</span></pre>
+        <h4>Layers are shared: proof #2</h4>
+<pre><span class="pr">$</span> docker image inspect -f '{{range .RootFS.Layers}}{{slice . 7 19}} {{end}}' node:20-alpine taskflow-hello:v1
+<span class="out">a8d26d037006 21e4f00ae03f d71b9385f08f 624111e2a83c
+a8d26d037006 21e4f00ae03f d71b9385f08f 624111e2a83c d44b4203edb3 8abd926c4040</span></pre>
+        <p>The template prints the first 12 hex characters of each layer hash. Your image's first four layers are <em>identical</em> to <code class="inl">node:20-alpine</code>'s. Your image is node:20-alpine plus two new layers (WORKDIR and COPY), and those four shared layers are stored on disk only once.</p>
 
         <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li>Using <code class="inl">:latest</code> everywhere — "latest" is just a default tag name, not "newest". Two servers pulling <code class="inl">latest</code> a week apart can run different code. Pin versions.</li>
-            <li>Apple Silicon (arm64) Mac running an amd64-only image → <code class="inl">exec format error</code> or a platform warning. Use multi-arch images or <code class="inl">docker run --platform linux/amd64 …</code> (emulated, slower).</li>
-          </ul>
+          <span class="c-title">Common mistake: wrong CPU architecture</span>
+          <p>An Apple Silicon (arm64) Mac running an amd64-only image gets <code class="inl">exec format error</code> or a platform warning. Use multi-arch images (most official ones are), or force emulation with <code class="inl">docker run --platform linux/amd64 …</code>, which works but is slower.</p>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Image = read-only layers + config; container adds a writable layer. Name = <code class="inl">registry/namespace/repo:tag</code>; tags move, digests don't. <code class="inl">pull</code>, <code class="inl">images</code>, <code class="inl">image inspect</code>, <code class="inl">history</code>, <code class="inl">rmi</code>.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">latest</code> means the newest version." <strong>✗</strong> It's only the default tag <em>name</em>, and the publisher points it wherever they like. Two servers that pull <code class="inl">latest</code> a week apart can run different code, so pin versions (<code class="inl">postgres:16</code>) or digests.</p>
+          <p>"<code class="inl">docker pull</code> starts the application." <strong>✗</strong> It only downloads.</p>
+          <p>"Same tag on two machines = same image." <strong>✗</strong> Only the same <em>digest</em> guarantees the same bytes.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>pull = download only · run = pull-if-missing + create + start</strong><br /><strong>Tags move, digests don't.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. What is the difference between <code class="inl">docker pull nginx</code> and <code class="inl">docker run nginx</code>?</summary>
+            <p class="ans"><code class="inl">pull</code> only downloads the image. <code class="inl">run</code> pulls it if it's missing, then creates a container from it and starts it.</p></details>
+          <details class="quiz"><summary>Q2. Expand to full names: <code class="inl">redis</code> · <code class="inl">shauryav/taskflow-api:1.1</code> · <code class="inl">ghcr.io/shauryav/taskflow-api:sha-3f2a9c1</code>.</summary>
+            <p class="ans"><code class="inl">docker.io/library/redis:latest</code> · <code class="inl">docker.io/shauryav/taskflow-api:1.1</code> · already complete: registry <code class="inl">ghcr.io</code>, namespace <code class="inl">shauryav</code>, repository <code class="inl">taskflow-api</code>, tag <code class="inl">sha-3f2a9c1</code>.</p></details>
+          <details class="quiz"><summary>Q3. Two servers both run <code class="inl">myapp:latest</code> but behave differently. How is that possible, how do you prove it, and how do you prevent it?</summary>
+            <p class="ans"><code class="inl">latest</code> was moved between the two pulls. Prove it by comparing <code class="inl">docker image inspect -f '{{json .RepoDigests}}' myapp:latest</code> on both: different digests mean different images. Prevent it by deploying an explicit version tag (<code class="inl">myapp:1.4.2</code>) or a digest.</p></details>
+          <details class="quiz"><summary>Q4. A pull shows <code class="inl">6e771e15690e: Already exists</code>. What did Docker skip, and why could it?</summary>
+            <p class="ans">It skipped downloading that layer. Layers are content-addressed, and an identical layer from another image (here, the base layers from taskflow-api:1.0) was already in the local store.</p></details>
+          <details class="quiz"><summary>Q5. In the 4-line Dockerfile, when does <code class="inl">CMD ["node", "hello.js"]</code> run: during <code class="inl">docker build</code>, or later?</summary>
+            <p class="ans">Later. CMD only records the default command in the image's config. It runs each time a container starts, unless you override it (<code class="inl">docker run taskflow-hello:v1 node -v</code>).</p></details>
         </div>
       </section>
 
-      <!-- ===================== 4. CONTAINERS ===================== -->
-      <section id="containers">
-        <h2><span class="sec-num">4</span> Docker containers</h2>
-        <hr class="section-rule" />
-
-        <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p><code class="inl">docker run</code> bakes a cake from the mould and serves it. <code class="inl">exec</code> lets you poke inside the cake; <code class="inl">logs</code> lets you hear what it's saying.</p>
-        </div>
-
-        <h3><code class="inl">docker run [OPTIONS] IMAGE [COMMAND] [ARG...]</code></h3>
-        <p>Options go <strong>before</strong> the image; anything <strong>after</strong> the image replaces the image's default command.</p>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Flag</th><th>Meaning</th><th>Example</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">-d</code></td><td>Detached: run in background, print container ID</td><td><code class="inl">docker run -d nginx:1.27-alpine</code></td></tr>
-              <tr><td><code class="inl">-it</code></td><td>Interactive + TTY: for shells</td><td><code class="inl">docker run -it --rm ubuntu:24.04 bash</code></td></tr>
-              <tr><td><code class="inl">-p HOST:CONTAINER</code></td><td>Publish a port (Session 4: app must listen on 0.0.0.0)</td><td><code class="inl">-p 8080:80</code>, <code class="inl">-p 127.0.0.1:5432:5432</code></td></tr>
-              <tr><td><code class="inl">-e KEY=value</code> / <code class="inl">--env-file .env</code></td><td>Environment variables</td><td><code class="inl">-e POSTGRES_PASSWORD=devpass</code></td></tr>
-              <tr><td><code class="inl">--name</code></td><td>Fixed name instead of a random one (<code class="inl">quirky_turing</code>)</td><td><code class="inl">--name taskflow-db</code></td></tr>
-              <tr><td><code class="inl">--rm</code></td><td>Delete the container when it exits</td><td>One-off commands</td></tr>
-              <tr><td><code class="inl">-v SRC:DEST</code></td><td>Mount a named volume or host folder (Session 8)</td><td><code class="inl">-v taskflow-pgdata:/var/lib/postgresql/data</code></td></tr>
-              <tr><td><code class="inl">--restart</code></td><td>Restart policy (section 6)</td><td><code class="inl">--restart unless-stopped</code></td></tr>
-              <tr><td><code class="inl">-w</code></td><td>Working directory inside the container</td><td><code class="inl">-w /app</code></td></tr>
-              <tr><td><code class="inl">-m</code> / <code class="inl">--cpus</code></td><td>Memory / CPU limits (cgroups)</td><td><code class="inl">-m 256m --cpus 0.5</code></td></tr>
-              <tr><td><code class="inl">--init</code></td><td>Tiny init as PID 1 that forwards signals and reaps zombies</td><td>Apps that ignore SIGTERM</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="callout example">
-          <span class="c-title">Example: TaskFlow's database, web server and API — no Dockerfile needed yet</span>
-<pre><span class="cm"># PostgreSQL 16 for TaskFlow (the image creates the user/db from these env vars on first start)</span>
-<span class="pr">$</span> docker run -d --name taskflow-db \
-    -e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=taskflow \
-    -p 5432:5432 \
-    -v taskflow-pgdata:/var/lib/postgresql/data \
-    --restart unless-stopped \
-    postgres:16
-<span class="out">3b5f0e8d1a27c94e0b6d2f8a1c3e5b7d9f0a2c4e6b8d0f1a3c5e7b9d1f3a5c7e</span>
-<span class="pr">$</span> docker exec -it taskflow-db psql -U taskflow -c '\conninfo'
-<span class="out">You are connected to database "taskflow" as user "taskflow" via socket in "/var/run/postgresql" at port "5432".</span>
-
-<span class="cm"># nginx (future taskflow-web): host port 8080 → container port 80</span>
-<span class="pr">$</span> docker run -d --name web -p 8080:80 nginx:1.27-alpine
-<span class="pr">$</span> curl -sI localhost:8080 | head -2
-<span class="out">HTTP/1.1 200 OK
-Server: nginx/1.27.5</span>
-
-<span class="cm"># the API straight from source: mount the code, run it with the official Node image (Session 7 replaces this with a Dockerfile)</span>
-<span class="pr">$</span> cd ~/taskflow
-<span class="pr">$</span> docker run -d --name api -p 3000:3000 -e PORT=3000 \
-    -v "$(pwd)":/app -w /app node:20-alpine sh -c "npm ci &amp;&amp; node server.js"
-<span class="pr">$</span> docker logs api | tail -2
-<span class="out">found 0 vulnerabilities
-taskflow-api listening on 0.0.0.0:3000</span>
-<span class="pr">$</span> curl -s localhost:3000/health
-<span class="out">{"status":"ok"}</span></pre>
-          <p>Downside: <code class="inl">npm ci</code> runs inside the container but writes a root-owned <code class="inl">node_modules/</code> into your project folder, and every start reinstalls. Session 7 bakes dependencies into a proper image instead.</p>
-        </div>
-
-        <h3>List containers</h3>
-<pre><span class="pr">$</span> docker ps                      <span class="cm"># running only; -a = include stopped; -q = IDs only</span>
-<span class="out">CONTAINER ID   IMAGE               COMMAND                  CREATED          STATUS          PORTS                                         NAMES
-7c1e9a2b4d3f   node:20-alpine      "docker-entrypoint.s…"   12 seconds ago   Up 11 seconds   0.0.0.0:3000-&gt;3000/tcp, [::]:3000-&gt;3000/tcp   api
-c849a4166138   nginx:1.27-alpine   "/docker-entrypoint.…"   3 minutes ago    Up 3 minutes    0.0.0.0:8080-&gt;80/tcp, [::]:8080-&gt;80/tcp       web
-3b5f0e8d1a27   postgres:16         "docker-entrypoint.s…"   5 minutes ago    Up 5 minutes    0.0.0.0:5432-&gt;5432/tcp, [::]:5432-&gt;5432/tcp   taskflow-db</span>
-<span class="pr">$</span> docker ps -a --filter status=exited --format 'table {{.Names}}\t{{.Status}}'
-<span class="out">NAMES           STATUS
-elated_hopper   Exited (0) 30 seconds ago</span>          <span class="cm"># the hello-world run: no --name → random name</span></pre>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">CONTAINER ID</code></td><td>First 12 hex chars of the 64-char ID. Any unique prefix works: <code class="inl">docker logs c84</code>.</td></tr>
-              <tr><td><code class="inl">COMMAND</code></td><td>Entrypoint + command running as PID 1 (truncated with …).</td></tr>
-              <tr><td><code class="inl">STATUS</code></td><td><code class="inl">Up 5 minutes</code>, <code class="inl">Up … (healthy)</code>, <code class="inl">Exited (137) 2 minutes ago</code> (exit code in brackets), <code class="inl">Restarting (1)</code>, <code class="inl">Created</code>, <code class="inl">(Paused)</code>.</td></tr>
-              <tr><td><code class="inl">PORTS</code></td><td><code class="inl">0.0.0.0:8080-&gt;80/tcp</code> = host 8080 on all IPv4 interfaces → container 80. <code class="inl">[::]</code> = same for IPv6.</td></tr>
-              <tr><td><code class="inl">NAMES</code></td><td>Use names instead of IDs in every command.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>Logs, exec, inspect</h3>
-<pre><span class="pr">$</span> docker logs -f --tail 3 web      <span class="cm"># follow last 3 lines (also: --since 10m, -t timestamps); Ctrl+C stops following only</span>
-<span class="out">2026/10/09 05:02:11 [notice] 1#1: start worker process 31
-2026/10/09 05:02:11 [notice] 1#1: start worker process 32
-172.17.0.1 - - [09/Oct/2026:05:03:40 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.5.0" "-"</span>
-
-<span class="pr">$</span> docker exec -it web sh          <span class="cm"># shell inside the RUNNING container (alpine has sh, not bash)</span>
-<span class="pr">/ #</span> ps
-<span class="out">PID   USER     TIME  COMMAND
-    1 root      0:00 nginx: master process nginx -g daemon off;
-   30 nginx     0:00 nginx: worker process
-   31 nginx     0:00 nginx: worker process
-   45 root      0:00 ps</span>
-<span class="pr">/ #</span> exit
-<span class="pr">$</span> docker exec web nginx -t        <span class="cm"># one-off command, no shell</span>
-<span class="out">nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
-nginx: configuration file /etc/nginx/nginx.conf test is successful</span>
-<span class="pr">$</span> docker exec api env | grep PORT
-<span class="out">PORT=3000</span></pre>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th><code class="inl">docker run -it IMAGE sh</code></th><th><code class="inl">docker exec -it CONTAINER sh</code></th></tr></thead>
-            <tbody>
-              <tr><td>Creates a <strong>new</strong> container</td><td>Enters an <strong>existing, running</strong> container</td></tr>
-              <tr><td><code class="inl">sh</code> becomes PID 1; exiting it stops the container</td><td>Extra process; exiting leaves the app running</td></tr>
-              <tr><td>Explore an image</td><td>Debug a live app (env, files, connectivity)</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-<pre><span class="pr">$</span> docker inspect web              <span class="cm"># full JSON (trimmed to the useful parts)</span>
-<span class="out">[
-    {
-        "Id": "c849a4166138149c13be354467f01c9a793ef83a66d3887b72ad9c3febe9b7be",
-        "Created": "2026-10-09T05:02:10.176370542Z",
-        "Path": "/docker-entrypoint.sh",
-        "Args": ["nginx", "-g", "daemon off;"],
-        "State": {
-            "Status": "running",
-            "Running": true,
-            "Paused": false,
-            "Restarting": false,
-            "OOMKilled": false,
-            "Pid": 12345,
-            "ExitCode": 0,
-            "StartedAt": "2026-10-09T05:02:11.278963500Z"
-        },
-        "Name": "/web",
-        "RestartCount": 0,
-        "HostConfig": {
-            "PortBindings": { "80/tcp": [ { "HostIp": "", "HostPort": "8080" } ] },
-            "RestartPolicy": { "Name": "no", "MaximumRetryCount": 0 },
-            "Memory": 0
-        },
-        "Config": {
-            "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "NGINX_VERSION=1.27.5"],
-            "Image": "nginx:1.27-alpine"
-        },
-        "NetworkSettings": {
-            "Networks": { "bridge": { "Gateway": "172.17.0.1", "IPAddress": "172.17.0.3", "IPPrefixLen": 16 } }
-        }
-    }
-]</span>
-<span class="pr">$</span> docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}' web
-<span class="out">running exit=0 restarts=0</span>
-<span class="pr">$</span> docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' web
-<span class="out">172.17.0.3</span></pre>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Field</th><th>Why you look at it</th></tr></thead>
-            <tbody>
-              <tr><td><code class="inl">State.Status / ExitCode / OOMKilled</code></td><td>Did it crash? With what code? Killed for using too much memory?</td></tr>
-              <tr><td><code class="inl">State.Pid</code></td><td>The container's PID 1 <em>as seen by the host</em> (it's just a process).</td></tr>
-              <tr><td><code class="inl">RestartCount</code></td><td>Climbing number = crash loop.</td></tr>
-              <tr><td><code class="inl">HostConfig.PortBindings / RestartPolicy / Memory</code></td><td>What you passed with <code class="inl">-p</code>, <code class="inl">--restart</code>, <code class="inl">-m</code> (0 = no limit).</td></tr>
-              <tr><td><code class="inl">Config.Env</code></td><td>Env vars actually set (secrets show up here in plain text!).</td></tr>
-              <tr><td><code class="inl">NetworkSettings.Networks</code></td><td>Container IP on each network (default bridge <code class="inl">172.17.0.0/16</code>).</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <h3>stats, top, cp</h3>
-<pre><span class="pr">$</span> docker stats --no-stream        <span class="cm"># live resource usage (omit --no-stream for a refreshing view)</span>
-<span class="out">CONTAINER ID   NAME          CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O         PIDS
-7c1e9a2b4d3f   api           0.02%     41.3MiB / 3.82GiB     1.06%     2.9kB / 1.4kB     0B / 0B           7
-c849a4166138   web           0.00%     9.1MiB / 3.82GiB      0.23%     1.4kB / 678B      0B / 8.19kB       3
-3b5f0e8d1a27   taskflow-db   0.01%     38.6MiB / 3.82GiB     0.99%     1.1kB / 0B        12.1MB / 49.5MB   6</span>
-<span class="pr">$</span> docker top web                  <span class="cm"># processes, with HOST PIDs</span>
-<span class="out">UID        PID      PPID     C    STIME   TTY   TIME       CMD
-root       12345    12322    0    05:02   ?     00:00:00   nginx: master process nginx -g daemon off;
-101        12401    12345    0    05:02   ?     00:00:00   nginx: worker process</span>
-<span class="pr">$</span> docker cp web:/etc/nginx/nginx.conf ./nginx.conf         <span class="cm"># container → host</span>
-<span class="out">Successfully copied 2.56kB to /home/shaurya/nginx.conf</span>
-<span class="pr">$</span> docker cp ./index.html web:/usr/share/nginx/html/       <span class="cm"># host → container (lost when the container is removed)</span>
-<span class="out">Successfully copied 2.05kB to web:/usr/share/nginx/html/</span></pre>
-
-        <div class="callout warn">
-          <span class="c-title">Common mistakes</span>
-          <ul>
-            <li><code class="inl">docker run nginx -p 8080:80</code> — <code class="inl">-p</code> after the image is passed to nginx as an argument. Flags go before the image.</li>
-            <li><code class="inl">docker run -d ubuntu:24.04</code> → <code class="inl">Exited (0)</code> instantly. A container lives only as long as its PID 1; <code class="inl">bash</code> with no terminal exits at once. Run a long-lived process (a server), or <code class="inl">-it</code> for a shell.</li>
-            <li>Second container on the same host port:
-              <code class="inl">Bind for 0.0.0.0:8080 failed: port is already allocated</code> → pick another host port (<code class="inl">-p 8081:80</code>) or stop the first one.</li>
-            <li><code class="inl">docker rm web</code> on a running container → <code class="inl">cannot remove container "web": container is running: stop the container before removing or force remove</code>. Use <code class="inl">docker stop</code> first, or <code class="inl">docker rm -f</code>.</li>
-          </ul>
-        </div>
-
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          <code class="inl">run</code> (with <code class="inl">-d -p -e --name -v --restart</code>) → <code class="inl">ps</code> → <code class="inl">logs -f</code> → <code class="inl">exec -it … sh</code> → <code class="inl">inspect -f</code>/<code class="inl">stats</code>/<code class="inl">top</code>/<code class="inl">cp</code>. Debug order: <code class="inl">ps -a</code> (status + exit code) → <code class="inl">logs</code> → <code class="inl">inspect</code>.
-        </div>
-      </section>
-
-      <!-- ===================== 5. DOCKER HUB ===================== -->
+      <!-- ===================== 6. DOCKER HUB ===================== -->
       <section id="docker-hub">
-        <h2><span class="sec-num">5</span> Docker Hub</h2>
+        <h2><span class="sec-num">6</span> Docker Hub</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p><code class="inl">taskflow-api:1.0</code> exists only in your laptop's image store. The EC2 server, your teammate and the CI runner all need it. You could <code class="inl">docker save</code> it into a 200 MB tarball and <code class="inl">scp</code> it around, for every version, forever. Code has GitHub to solve this. Images need the same thing.</p>
+
+        <h3>The idea</h3>
+        <p>A <span class="term">registry</span> is a server that stores images and serves them over HTTPS. <span class="term">Docker Hub</span> (<code class="inl">docker.io</code>) is Docker's default public registry. It holds <strong>repositories</strong>, one per image (<code class="inl">shauryav/taskflow-api</code>), and each repository holds <strong>tags</strong> (<code class="inl">1.0</code>, <code class="inl">1.1</code>, <code class="inl">latest</code>). You push once, and anyone with access can pull anywhere.</p>
+<pre> your laptop                    Docker Hub (docker.io)
+ taskflow-api:1.0              ┌──────────────────────────────┐
+     │ docker tag              │ library/   nginx  postgres   │ ← Official images
+     ▼                         │            node   redis …    │
+ shauryav/taskflow-api:1.0 ───▶│ shauryav/  taskflow-api      │───▶ docker pull on the EC2 server
+            docker push        │             ├─ 1.0           │───▶ … on a teammate's laptop
+                               │             └─ 1.1           │───▶ … on the CI runner
+                               └──────────────────────────────┘</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>Docker Hub is GitHub for images: download other people's images, upload your own so any machine can pull them.</p>
+          <span class="c-title">Think of it like this</span>
+          <p><strong>Docker Hub is GitHub for images.</strong> Your account (<code class="inl">shauryav</code>) is the namespace. A Hub repository is like a GitHub repository, and its tags are like release tags. <code class="inl">docker push</code> is <code class="inl">git push</code>, and <code class="inl">docker pull</code> is <code class="inl">git clone</code>. "Official Image" and "Verified Publisher" badges are like a verified organisation: they tell you whom to trust.</p>
         </div>
 
-        <ul>
-          <li><span class="term">Docker Hub</span> (<code class="inl">docker.io</code>) is Docker's default public <span class="term">registry</span>. A registry holds <strong>repositories</strong>; a repository holds tags of one image (<code class="inl">shauryav/taskflow-api</code> → <code class="inl">1.0</code>, <code class="inl">1.1</code>…).</li>
-          <li>Repos can be public or private. Other registries: GHCR (<code class="inl">ghcr.io</code>), AWS ECR, Google Artifact Registry, Azure ACR (Session 19).</li>
-        </ul>
-
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Badge</th><th>Who publishes</th><th>Name format</th><th>Trust</th></tr></thead>
-            <tbody>
-              <tr><td><strong>Docker Official Image</strong></td><td>Curated by Docker with upstream maintainers; security-scanned, documented</td><td>No namespace: <code class="inl">nginx</code>, <code class="inl">postgres</code>, <code class="inl">node</code>, <code class="inl">redis</code> (really <code class="inl">library/…</code>)</td><td>Highest — default choice for base images</td></tr>
-              <tr><td><strong>Verified Publisher</strong></td><td>Commercial vendors verified by Docker</td><td><code class="inl">vendor/image</code>, e.g. <code class="inl">grafana/grafana</code></td><td>High</td></tr>
-              <tr><td><strong>Sponsored OSS</strong></td><td>Open-source projects in Docker's sponsored programme</td><td><code class="inl">project/image</code></td><td>Good</td></tr>
-              <tr><td><strong>Community / user</strong></td><td>Anyone</td><td><code class="inl">user/image</code>, e.g. <code class="inl">shauryav/taskflow-api</code></td><td>Unknown — check source, stars, last update</td></tr>
-            </tbody>
-          </table>
-        </div>
-
+        <h3>See it: find a trustworthy image</h3>
 <pre><span class="pr">$</span> docker search --limit 3 postgres
 <span class="out">NAME                DESCRIPTION                                     STARS     OFFICIAL
 postgres            The PostgreSQL object-relational database sy…   15029     [OK]
 cimg/postgres                                                       9
-circleci/postgres   The PostgreSQL object-relational database sy…   35</span>
-<span class="pr">$</span> docker search --filter is-official=true --limit 3 node
-<span class="out">NAME      DESCRIPTION                                     STARS     OFFICIAL
-node      Node.js is a JavaScript-based platform for s…   14206     [OK]</span></pre>
+circleci/postgres   The PostgreSQL object-relational database sy…   35</span></pre>
+        <p><code class="inl">search</code> queries Docker Hub. <code class="inl">--limit 3</code> caps the results. Add <code class="inl">--filter is-official=true</code> to keep only Official Images (the <code class="inl">[OK]</code> column). Notice that the official one has no namespace: <code class="inl">postgres</code>, not <code class="inl">someone/postgres</code>.</p>
+        <p><strong>What it does <em>not</em> do:</strong> download anything, or list an image's tags. For tags, use the Hub website.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Badge</th><th>Who publishes</th><th>Name format</th><th>Trust</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Docker Official Image</strong></td><td>Curated by Docker with upstream maintainers; security-scanned, documented</td><td>No namespace: <code class="inl">nginx</code>, <code class="inl">postgres</code>, <code class="inl">node</code>, <code class="inl">redis</code> (really <code class="inl">library/…</code>)</td><td>Highest; the default choice for base images</td></tr>
+              <tr><td><strong>Verified Publisher</strong></td><td>Commercial vendors verified by Docker</td><td><code class="inl">vendor/image</code>, e.g. <code class="inl">grafana/grafana</code></td><td>High</td></tr>
+              <tr><td><strong>Community / user</strong></td><td>Anyone</td><td><code class="inl">user/image</code>, e.g. <code class="inl">shauryav/taskflow-api</code></td><td>Unknown: check the source, stars and last update</td></tr>
+            </tbody>
+          </table>
+        </div>
 
-        <h3>Log in, tag, push</h3>
-        <p>Create a <strong>Personal Access Token</strong> on Docker Hub (Account settings → Personal access tokens) and use it as the password.</p>
+        <h3>Build it up: ship TaskFlow's image</h3>
+        <h4>Step 1: a name is just a pointer</h4>
+        <p>To push, an image needs a name in <em>your</em> namespace. <code class="inl">docker tag SOURCE TARGET</code> adds that second name. Try it on the image from section 5:</p>
+<pre><span class="pr">$</span> docker tag taskflow-hello:v1 shauryav/taskflow-hello:v1
+<span class="pr">$</span> docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}' | grep taskflow-hello
+<span class="out">taskflow-hello:v1            eb8d669deb62
+shauryav/taskflow-hello:v1   eb8d669deb62</span></pre>
+        <p>The two names share one ID, so it's one image. <strong>What <code class="inl">docker tag</code> does <em>not</em> do:</strong> copy anything, build anything, or upload anything.</p>
+
+        <h4>Step 2: log in, tag, push the real API</h4>
+        <p><code class="inl">taskflow-api:1.0</code> is the real API image (you'll write its Dockerfile in Session 7). Create a <strong>Personal Access Token</strong> on Docker Hub (Account settings → Personal access tokens) and use it as the password.</p>
 <pre><span class="pr">$</span> docker login -u shauryav
 <span class="out">Password:
 Login Succeeded</span>
 <span class="pr">$</span> echo "$DOCKERHUB_TOKEN" | docker login -u shauryav --password-stdin    <span class="cm"># non-interactive (CI); keeps the token out of shell history</span>
 
-<span class="cm"># the image was built locally as "taskflow-api:1.0" (Dockerfile = Session 7). Give it your namespace:</span>
-<span class="pr">$</span> docker tag taskflow-api:1.0 shauryav/taskflow-api:1.0      <span class="cm"># new name → SAME image ID, no copy</span>
+<span class="pr">$</span> docker tag taskflow-api:1.0 shauryav/taskflow-api:1.0
 <span class="pr">$</span> docker tag taskflow-api:1.0 shauryav/taskflow-api:latest
 <span class="pr">$</span> docker push shauryav/taskflow-api:1.0
 <span class="out">The push refers to repository [docker.io/shauryav/taskflow-api]
@@ -678,55 +761,252 @@ Login Succeeded</span>
 6e771e15690e: Mounted from library/node
 c60e446e49a0: Mounted from library/node
 1.0: digest: sha256:66bb801f51d268a2e1ce5f78e120932d079cba91f5e7db7ce5e7b92c862d98ef size: 1786</span>
-<span class="pr">$</span> docker push shauryav/taskflow-api:latest     <span class="cm"># layers already there → "Layer already exists", nearly instant</span>
+<span class="pr">$</span> docker push shauryav/taskflow-api:latest     <span class="cm"># every layer is already there → "Layer already exists", nearly instant</span>
 
-<span class="cm"># on any other machine (EC2, a teammate's laptop):</span>
+<span class="cm"># on any other machine (EC2, a teammate's laptop): pulls, then runs (flags in section 7)</span>
 <span class="pr">$</span> docker run -d -p 3000:3000 shauryav/taskflow-api:1.0
 <span class="pr">$</span> docker logout
 <span class="out">Removing login credentials for https://index.docker.io/v1/</span></pre>
         <ul>
-          <li><code class="inl">Mounted from library/node</code> = the registry already has that base layer, so it's linked, not re-uploaded.</li>
-          <li>Credentials are saved in <code class="inl">~/.docker/config.json</code> (base64, i.e. plain text, unless a credential helper is configured — Docker warns you).</li>
+          <li><code class="inl">Pushed</code> = uploaded: your two layers (dependencies and code).</li>
+          <li><code class="inl">Mounted from library/node</code> = Docker Hub already has that base layer, so it's linked rather than uploaded again. This is layer sharing (section 4), on the registry side.</li>
+          <li>The last line gives the digest of what you pushed. That's the exact identity to deploy.</li>
+          <li>Credentials are saved in <code class="inl">~/.docker/config.json</code>. Without a credential helper they're stored base64-encoded, which is effectively plain text, and Docker warns you about it.</li>
         </ul>
 
-        <h3>Pull rate limits</h3>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Who</th><th>Pull limit (per Docker docs)</th></tr></thead>
-            <tbody>
-              <tr><td>Unauthenticated</td><td>100 pulls / 6 hours per IPv4 address (or IPv6 /64)</td></tr>
-              <tr><td>Personal (free account, logged in)</td><td>200 pulls / 6 hours</td></tr>
-              <tr><td>Pro / Team / Business</td><td>Unlimited</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p>Docker has changed these numbers before — check the "Usage and limits" page. Hitting the limit gives <code class="inl">toomanyrequests: You have reached your pull rate limit…</code>. Shared IPs (college Wi-Fi, CI runners, a NAT gateway) hit it fast → always <code class="inl">docker login</code> in CI, or pull from a mirror / GHCR / ECR.</p>
+        <h4>Pull rate limits</h4>
+        <p>Per Docker's docs, over a 6-hour window: <strong>100 pulls</strong> per IPv4 address (or IPv6 /64) when you're not logged in, <strong>200 pulls</strong> on a free Personal account, and unlimited on Pro, Team and Business. Docker has changed these numbers before, so check the "Usage and limits" page. Hitting the limit gives <code class="inl">toomanyrequests: You have reached your pull rate limit…</code>. Shared IPs such as college Wi-Fi, CI runners and NAT gateways hit it fast. Always <code class="inl">docker login</code> in CI, or pull from a mirror, GHCR or ECR.</p>
 
         <div class="callout warn">
           <span class="c-title">Common mistakes</span>
           <ul>
-            <li><code class="inl">docker push taskflow-api:1.0</code> → <code class="inl">denied: requested access to the resource is denied</code>. Without a namespace Docker tries <code class="inl">library/taskflow-api</code> (official images only). Tag as <code class="inl">shauryav/…</code>, and make sure you're logged in as <code class="inl">shauryav</code>.</li>
+            <li><code class="inl">docker push taskflow-api:1.0</code> → <code class="inl">denied: requested access to the resource is denied</code>. With no namespace, Docker tries <code class="inl">library/taskflow-api</code>, which is reserved for official images. Tag it as <code class="inl">shauryav/…</code> and log in as <code class="inl">shauryav</code>.</li>
             <li><code class="inl">An image does not exist locally with the tag: shauryav/taskflow-api</code> → you forgot <code class="inl">docker tag</code>, or typed a different tag.</li>
-            <li>Pulling random community images for production — prefer Official / Verified images and pin versions.</li>
           </ul>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          Docker Hub = default registry. Prefer Official/Verified images. <code class="inl">login</code> (with a token) → <code class="inl">tag</code> into <code class="inl">user/repo:tag</code> → <code class="inl">push</code>; mind the pull rate limits.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">docker tag</code> makes a copy of the image." <strong>✗</strong> It adds another name for the same image ID. No bytes are copied.</p>
+          <p>"<code class="inl">docker push</code> uploads the whole image every time." <strong>✗</strong> It uploads only the layers the registry lacks. The rest show <code class="inl">Layer already exists</code> or <code class="inl">Mounted from …</code>.</p>
+          <p>"<code class="inl">nginx</code> and <code class="inl">someuser/nginx</code> are the same image." <strong>✗</strong> <code class="inl">nginx</code> is <code class="inl">docker.io/library/nginx</code>, the curated Official Image. <code class="inl">someuser/nginx</code> could have been built by anyone.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>login → tag (into user/repo:tag) → push</strong><br /><strong>No namespace = library/ = Official Images, and you can't push there.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. <code class="inl">docker push taskflow-api:1.0</code> fails with "requested access to the resource is denied". Why, and which three commands fix it?</summary>
+            <p class="ans">With no namespace the target is <code class="inl">docker.io/library/taskflow-api</code>, and only Docker can write there. Fix: <code class="inl">docker login -u shauryav</code> → <code class="inl">docker tag taskflow-api:1.0 shauryav/taskflow-api:1.0</code> → <code class="inl">docker push shauryav/taskflow-api:1.0</code>.</p></details>
+          <details class="quiz"><summary>Q2. Push output says <code class="inl">c60e446e49a0: Mounted from library/node</code>. What happened?</summary>
+            <p class="ans">Docker Hub already stores that layer (it belongs to the official <code class="inl">node</code> image), so it linked the layer into your repository instead of you uploading it. Same content means same layer, which is shared.</p></details>
+          <details class="quiz"><summary>Q3. A CI pipeline on shared runners fails with <code class="inl">toomanyrequests</code>, but pulls on your laptop are fine. Why, and give two fixes.</summary>
+            <p class="ans">Anonymous pulls are limited per IP, and many jobs share the runner's IP, so CI uses up 100 pulls in 6 hours fast. Fixes: <code class="inl">docker login</code> in the pipeline (200 per 6 hours per account, or unlimited on paid plans), or pull from a mirror, GHCR or ECR.</p></details>
+          <details class="quiz"><summary>Q4. Base image for TaskFlow: <code class="inl">node:20-alpine</code> or <code class="inl">coolguy/node20-fast</code>? Why?</summary>
+            <p class="ans"><code class="inl">node:20-alpine</code>. It's an Official Image: curated, security-scanned, documented and regularly updated. A random community image could contain anything and may never get patched.</p></details>
         </div>
       </section>
 
-      <!-- ===================== 6. LIFECYCLE ===================== -->
-      <section id="lifecycle">
-        <h2><span class="sec-num">6</span> Container lifecycle</h2>
+      <!-- ===================== 7. CONTAINERS ===================== -->
+      <section id="containers">
+        <h2><span class="sec-num">7</span> Docker containers</h2>
         <hr class="section-rule" />
 
+        <h3>The problem</h3>
+        <p>You have the <code class="inl">postgres:16</code> image. TaskFlow needs a database that is actually <em>running</em>: in the background, with a user and password, reachable on port 5432, with a name you can type, and with logs you can read when it misbehaves. The image does none of that. All of it is configuration on the <em>container</em>.</p>
+
+        <h3>The idea</h3>
+        <p><code class="inl">docker run</code> = create a container from an image + start it. Everything <strong>between</strong> <code class="inl">run</code> and the image configures that container. Anything <strong>after</strong> the image replaces the image's default command:</p>
+<pre>docker run  -d --name web -p 8080:80   nginx:1.27-alpine   [COMMAND] [ARG…]
+            └─────── OPTIONS ──────┘   └───── IMAGE ─────┘   └─ replaces CMD ─┘
+              "how to run it"           "what to run"        "run this instead"</pre>
+        <p>A container has its own network namespace (section 2), so its port 80 is invisible from outside until you <strong>publish</strong> it:</p>
+<pre> browser ──▶ localhost:8080 ──── -p 8080:80 ────▶ container 172.17.0.3:80 ──▶ nginx
+             └ HOST port ─┘                       └── CONTAINER port ───┘</pre>
+
         <div class="callout eli5">
-          <span class="c-title">Explain like I'm 5</span>
-          <p>A container is born (created), lives (running), naps (paused), goes to sleep (exited) and can wake up again — until you throw it away (removed).</p>
+          <span class="c-title">Think of it like this</span>
+          <p>Back at the hotel, each room has its own phone extension (the container's port 80), but outsiders can only dial the hotel's main number. <code class="inl">-p 8080:80</code> tells reception: "calls to 8080 go to that room's extension 80." <code class="inl">docker run</code> checks a new guest into a new room. <code class="inl">docker exec</code> knocks on a room that's already occupied and lets you in.</p>
         </div>
 
+        <h3>See it: one web server</h3>
+<pre><span class="pr">$</span> docker run -d --name web -p 8080:80 nginx:1.27-alpine
+<span class="out">c849a4166138149c13be354467f01c9a793ef83a66d3887b72ad9c3febe9b7be</span>
+<span class="pr">$</span> curl -sI localhost:8080 | head -2
+<span class="out">HTTP/1.1 200 OK
+Server: nginx/1.27.5</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-d</code></td><td>Detached: run in the background and print the new container's 64-character ID</td></tr>
+              <tr><td><code class="inl">--name web</code></td><td>A fixed name instead of a random one like <code class="inl">quirky_turing</code></td></tr>
+              <tr><td><code class="inl">-p 8080:80</code></td><td>Publish a port: <strong>HOST:CONTAINER</strong>, outside first. The app inside must listen on <code class="inl">0.0.0.0</code>, not <code class="inl">127.0.0.1</code> (Session 4).</td></tr>
+              <tr><td><code class="inl">nginx:1.27-alpine</code></td><td>The image. No command follows it, so the image's CMD runs (<code class="inl">nginx -g 'daemon off;'</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">-d</code> doesn't keep a container alive. Only its process does that (section 8). <code class="inl">-p</code> doesn't change the port nginx listens on: inside the container it still listens on 80. An image's <code class="inl">EXPOSE</code> line only documents the port. Publishing it is <code class="inl">-p</code>'s job.</p>
+
+        <h3>Build it up: TaskFlow's database, web server and API</h3>
+        <p>No Dockerfile needed yet. Official images plus the right flags get you all three:</p>
+<pre><span class="cm"># PostgreSQL 16 (the image creates the user/db from these env vars on first start)</span>
+<span class="pr">$</span> docker run -d --name taskflow-db \
+    -e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=taskflow \
+    -p 5432:5432 \
+    -v taskflow-pgdata:/var/lib/postgresql/data \
+    --restart unless-stopped \
+    postgres:16
+<span class="out">3b5f0e8d1a27c94e0b6d2f8a1c3e5b7d9f0a2c4e6b8d0f1a3c5e7b9d1f3a5c7e</span>
+<span class="pr">$</span> docker exec -it taskflow-db psql -U taskflow -c '\conninfo'
+<span class="out">You are connected to database "taskflow" as user "taskflow" via socket in "/var/run/postgresql" at port "5432".</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>New token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">-e KEY=value</code></td><td>Set an environment variable inside the container. The postgres image reads these three on first start.</td></tr>
+              <tr><td><code class="inl">-v taskflow-pgdata:/var/lib/postgresql/data</code></td><td>Keep Postgres's data in a named volume <em>outside</em> the writable layer, so it survives <code class="inl">docker rm</code> (Session 8)</td></tr>
+              <tr><td><code class="inl">--restart unless-stopped</code></td><td>Bring it back after crashes and reboots (section 8)</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><span class="cm"># the API straight from source: mount the code, run it with the official Node image (Session 7 replaces this with a Dockerfile)</span>
+<span class="pr">$</span> cd ~/taskflow
+<span class="pr">$</span> docker run -d --name api -p 3000:3000 -e PORT=3000 \
+    -v "$(pwd)":/app -w /app node:20-alpine sh -c "npm ci &amp;&amp; node server.js"
+<span class="pr">$</span> curl -s localhost:3000/health
+<span class="out">{"status":"ok"}</span></pre>
+        <p>This time a command comes <em>after</em> the image (<code class="inl">sh -c "npm ci &amp;&amp; node server.js"</code>), and it replaces node's default CMD. <code class="inl">-v "$(pwd)":/app</code> mounts your project folder into the container, and <code class="inl">-w /app</code> sets the working directory. The downside is that every start reinstalls dependencies and writes a root-owned <code class="inl">node_modules/</code> into your folder. Session 7 bakes them into a proper image instead.</p>
+
+        <h4>Is it running? <code class="inl">docker ps</code></h4>
+<pre><span class="pr">$</span> docker ps                      <span class="cm"># running only; -a = include stopped; -q = IDs only</span>
+<span class="out">CONTAINER ID   IMAGE               COMMAND                  CREATED          STATUS          PORTS                                         NAMES
+7c1e9a2b4d3f   node:20-alpine      "docker-entrypoint.s…"   12 seconds ago   Up 11 seconds   0.0.0.0:3000-&gt;3000/tcp, [::]:3000-&gt;3000/tcp   api
+c849a4166138   nginx:1.27-alpine   "/docker-entrypoint.…"   3 minutes ago    Up 3 minutes    0.0.0.0:8080-&gt;80/tcp, [::]:8080-&gt;80/tcp       web
+3b5f0e8d1a27   postgres:16         "docker-entrypoint.s…"   5 minutes ago    Up 5 minutes    0.0.0.0:5432-&gt;5432/tcp, [::]:5432-&gt;5432/tcp   taskflow-db</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">CONTAINER ID</code></td><td>First 12 hex characters of the 64-character ID. Any unique prefix works: <code class="inl">docker logs c84</code>.</td></tr>
+              <tr><td><code class="inl">COMMAND</code></td><td>Entrypoint + command running as PID 1 (truncated with …)</td></tr>
+              <tr><td><code class="inl">STATUS</code></td><td><code class="inl">Up 5 minutes</code>, <code class="inl">Up … (healthy)</code>, <code class="inl">Exited (137) 2 minutes ago</code> (exit code in brackets), <code class="inl">Restarting (1)</code>, <code class="inl">Created</code>, <code class="inl">(Paused)</code></td></tr>
+              <tr><td><code class="inl">PORTS</code></td><td><code class="inl">0.0.0.0:8080-&gt;80/tcp</code> = host port 8080 on all IPv4 interfaces → container port 80. <code class="inl">[::]</code> = the same for IPv6.</td></tr>
+              <tr><td><code class="inl">NAMES</code></td><td>Use names instead of IDs in every command</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>What is it saying? <code class="inl">docker logs</code></h4>
+<pre><span class="pr">$</span> docker logs -f --tail 3 web      <span class="cm"># follow the last 3 lines; Ctrl+C stops following, not the container</span>
+<span class="out">2026/10/09 05:02:11 [notice] 1#1: start worker process 31
+2026/10/09 05:02:11 [notice] 1#1: start worker process 32
+172.17.0.1 - - [09/Oct/2026:05:03:40 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.5.0" "-"</span></pre>
+        <p><code class="inl">logs</code> shows whatever the main process writes to stdout and stderr. <code class="inl">-f</code> means follow, <code class="inl">--tail 3</code> means start from the last 3 lines, and there's also <code class="inl">--since 10m</code> and <code class="inl">-t</code> for timestamps.</p>
+
+        <h4>Go inside: <code class="inl">docker exec</code></h4>
+<pre><span class="pr">$</span> docker exec -it web sh          <span class="cm"># a shell inside the RUNNING container (alpine has sh, not bash)</span>
+<span class="pr">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 nginx: master process nginx -g daemon off;
+   30 nginx     0:00 nginx: worker process
+   31 nginx     0:00 nginx: worker process
+   45 root      0:00 ps</span>
+<span class="pr">/ #</span> exit
+<span class="pr">$</span> docker exec api env | grep PORT     <span class="cm"># one-off command, no shell needed</span>
+<span class="out">PORT=3000</span></pre>
+        <p><code class="inl">-i</code> keeps input open and <code class="inl">-t</code> gives you a terminal. Use both together for a shell. nginx is PID 1 here, which is the PID namespace from section 2.</p>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th><code class="inl">docker run -it IMAGE sh</code></th><th><code class="inl">docker exec -it CONTAINER sh</code></th></tr></thead>
+            <tbody>
+              <tr><td>Creates a <strong>new</strong> container</td><td>Enters an <strong>existing, running</strong> container</td></tr>
+              <tr><td><code class="inl">sh</code> becomes PID 1, so exiting it stops the container</td><td><code class="inl">sh</code> is an extra process, so exiting leaves the app running</td></tr>
+              <tr><td>Explore an image</td><td>Debug a live app (env, files, connectivity)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Every detail: <code class="inl">docker inspect</code></h4>
+        <p><code class="inl">docker inspect web</code> prints the container's whole configuration and state as JSON, which runs to hundreds of lines. You almost always want one field, so pick it with <code class="inl">-f</code> and a Go template:</p>
+<pre><span class="pr">$</span> docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}' web
+<span class="out">running exit=0 restarts=0</span>
+<span class="pr">$</span> docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' web
+<span class="out">172.17.0.3</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>Why you look at it</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">State.Status / ExitCode / OOMKilled</code>, <code class="inl">RestartCount</code></td><td>Did it crash? With what code? Was it killed for using too much memory? A climbing restart count means a crash loop.</td></tr>
+              <tr><td><code class="inl">State.Pid</code></td><td>The container's PID 1 <em>as the host sees it</em>, because it's just a process</td></tr>
+              <tr><td><code class="inl">HostConfig.*</code> / <code class="inl">NetworkSettings.Networks</code></td><td>What you passed with <code class="inl">-p</code>, <code class="inl">--restart</code> and <code class="inl">-m</code> (Memory 0 = no limit) / the container's IP (default bridge <code class="inl">172.17.0.0/16</code>)</td></tr>
+              <tr><td><code class="inl">Config.Env</code></td><td>The env vars actually set. Secrets show up here in plain text.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4>Resources and host PIDs: <code class="inl">stats</code>, <code class="inl">top</code></h4>
+<pre><span class="pr">$</span> docker stats --no-stream        <span class="cm"># live usage vs cgroup limits (omit --no-stream for a refreshing view)</span>
+<span class="out">CONTAINER ID   NAME          CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O         PIDS
+7c1e9a2b4d3f   api           0.02%     41.3MiB / 3.82GiB     1.06%     2.9kB / 1.4kB     0B / 0B           7
+c849a4166138   web           0.00%     9.1MiB / 3.82GiB      0.23%     1.4kB / 678B      0B / 8.19kB       3
+3b5f0e8d1a27   taskflow-db   0.01%     38.6MiB / 3.82GiB     0.99%     1.1kB / 0B        12.1MB / 49.5MB   6</span>
+<span class="pr">$</span> docker top web                  <span class="cm"># the same nginx processes, with HOST PIDs</span>
+<span class="out">UID        PID      PPID     C    STIME   TTY   TIME       CMD
+root       12345    12322    0    05:02   ?     00:00:00   nginx: master process nginx -g daemon off;
+101        12401    12345    0    05:02   ?     00:00:00   nginx: worker process</span></pre>
+        <p>Compare <code class="inl">top</code> with the <code class="inl">ps</code> inside: the nginx master is PID 1 inside the container and PID 12345 on the host. One process, two views. The <code class="inl">LIMIT</code> column in <code class="inl">stats</code> is the whole host's RAM, because no <code class="inl">-m</code> was given.</p>
+
+        <div class="callout warn">
+          <span class="c-title">Common mistakes</span>
+          <ul>
+            <li>A second container on the same host port fails with <code class="inl">Bind for 0.0.0.0:8080 failed: port is already allocated</code>. Pick another host port (<code class="inl">-p 8081:80</code>) or stop the first container.</li>
+            <li><code class="inl">curl localhost:8080</code> works on the server but not from your laptop. <code class="inl">-p</code> did its job, but the server's firewall or security group must also allow port 8080 (Session 21). The reverse also applies: <code class="inl">-p 127.0.0.1:8080:80</code> deliberately limits access to the server itself.</li>
+          </ul>
+        </div>
+
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">docker run nginx -p 8080:80</code> publishes port 8080." <strong>✗</strong> Everything after the image goes to the container's command, so nginx receives <code class="inl">-p 8080:80</code> as arguments. Flags go before the image.</p>
+          <p>"In <code class="inl">-p 8080:80</code>, 8080 is the container's port." <strong>✗</strong> The format is HOST:CONTAINER, so 8080 is on the host and 80 is inside.</p>
+          <p>"<code class="inl">docker exec</code> starts a new container." <strong>✗</strong> It runs an extra process inside an existing, running container.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>docker run [OPTIONS] IMAGE [COMMAND]: options before, command after.</strong><br /><strong>-p HOST:CONTAINER = outside:inside.</strong><br /><strong>Debug order: ps -a → logs → exec → inspect.</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. Spot the bug: <code class="inl">docker run nginx:1.27-alpine -d --name web -p 8080:80</code></summary>
+            <p class="ans">The flags come after the image, so Docker passes them to nginx as its command. The container runs in the foreground with no name and no published port, and nginx probably fails on the unknown arguments. Fix: <code class="inl">docker run -d --name web -p 8080:80 nginx:1.27-alpine</code>.</p></details>
+          <details class="quiz"><summary>Q2. The API listens on 3000 inside the container. You run it with <code class="inl">-p 8080:3000</code>. Which URL works from your laptop, and what does <code class="inl">curl localhost:3000</code> give?</summary>
+            <p class="ans"><code class="inl">http://localhost:8080</code> works, because host port 8080 forwards to container port 3000. <code class="inl">localhost:3000</code> gives "connection refused": nothing on the host is listening on 3000.</p></details>
+          <details class="quiz"><summary>Q3. You <code class="inl">exit</code> the shell from <code class="inl">docker exec -it web sh</code>. Does nginx stop? What if you exit from <code class="inl">docker run -it ubuntu:24.04 bash</code> instead?</summary>
+            <p class="ans">With exec, nginx keeps running: your shell was an extra process, and nginx is still PID 1. With run, bash <em>was</em> PID 1, so the container stops.</p></details>
+          <details class="quiz"><summary>Q4. Predict: the API already holds host port 3000, and you run <code class="inl">docker run -d -p 3000:80 nginx:1.27-alpine</code>. What happens?</summary>
+            <p class="ans">It fails with <code class="inl">Bind for 0.0.0.0:3000 failed: port is already allocated</code>, and <code class="inl">docker</code> exits 125 (Docker's own error, section 8). Only one container can hold host port 3000, even though nginx uses port 80 inside. (The new container is still created and left in the <code class="inl">Created</code> state.) Use another host port, such as <code class="inl">-p 3001:80</code>.</p></details>
+        </div>
+      </section>
+
+      <!-- ===================== 8. LIFECYCLE ===================== -->
+      <section id="lifecycle">
+        <h2><span class="sec-num">8</span> Container lifecycle</h2>
+        <hr class="section-rule" />
+
+        <h3>The problem</h3>
+        <p>Three puzzles you'll hit in your first week:</p>
+<pre><span class="pr">$</span> docker run -d ubuntu:24.04    <span class="cm"># a second later it's gone from docker ps. Crash?</span>
+<span class="pr">$</span> docker stop api               <span class="cm"># takes exactly 10 seconds, every time. Why 10?</span>
+<span class="pr">$</span> sudo reboot                   <span class="cm"># afterwards taskflow-db is up but web isn't. Who decided?</span></pre>
+        <p>All three are lifecycle questions: what state a container is in, what moves it from one state to another, and what happened to its main process.</p>
+
+        <h3>The idea</h3>
+        <p>A container is always in one state: <strong>created → running ⇄ paused → exited → removed</strong>. Behind most surprises is one rule: <strong>a container runs exactly as long as its main process (PID 1) runs.</strong> When PID 1 exits, the container has exited.</p>
 <pre>                docker create                  docker start
    IMAGE ─────────────────────▶ CREATED ───────────────────────▶ RUNNING ◀──────────┐
                 (docker run = create + start)                      │  ▲    │          │
@@ -740,13 +1020,43 @@ c60e446e49a0: Mounted from library/node
                                                                docker rm ▼
                                                                       REMOVED</pre>
 
+        <div class="callout eli5">
+          <span class="c-title">Think of it like this</span>
+          <p>A laptop. <strong>create</strong> = unboxed but switched off. <strong>start</strong> = power on. <strong>pause</strong> = sleep mode: everything frozen, memory kept. <strong>stop</strong> = shut down: it asks programs to save and quit (SIGTERM) and pulls the plug if they don't (SIGKILL), but the disk (the writable layer) is kept. <strong>rm</strong> = throw it away: the disk is gone, but the factory (the image) can make another one.</p>
+        </div>
+
+        <h3>See it: create is not start</h3>
 <pre><span class="pr">$</span> docker create --name demo alpine:3.20 sleep 300
 <span class="out">3c37b2bd07038bbe52352086458a7a93125ad73ffd12a78f2dc2baca2c764a4f</span>
 <span class="pr">$</span> docker ps -a --filter name=demo --format '{{.Names}}\t{{.Status}}'
 <span class="out">demo	Created</span>
-<span class="pr">$</span> docker start demo &amp;&amp; docker pause demo
-<span class="out">demo
-demo</span>
+<span class="pr">$</span> docker start demo
+<span class="out">demo</span>
+<span class="pr">$</span> docker start demo              <span class="cm"># again, while it's running</span>
+<span class="out">demo</span></pre>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Token</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td><code class="inl">create</code></td><td>Build the container (writable layer + config) without starting it</td></tr>
+              <tr><td><code class="inl">sleep 300</code></td><td>The main process: sleep for 5 minutes, long enough to watch it</td></tr>
+              <tr><td><code class="inl">--filter name=demo</code></td><td>Show only containers whose name matches <code class="inl">demo</code></td></tr>
+              <tr><td><code class="inl">--format '{{.Names}}\t{{.Status}}'</code></td><td>Print just these two columns</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>What it does <em>not</em> do:</strong> <code class="inl">create</code> starts nothing, so plain <code class="inl">docker ps</code> wouldn't list <code class="inl">demo</code> at all. The second <code class="inl">start</code> doesn't make a second copy or raise an error. The container is already running, so Docker prints its name and exits with status 0.</p>
+
+        <h3>Build it up</h3>
+        <h4>The main-process rule</h4>
+<pre><span class="pr">$</span> docker run -d --name ubu ubuntu:24.04
+<span class="pr">$</span> docker ps -a --filter name=ubu --format '{{.Names}}\t{{.Command}}\t{{.Status}}'
+<span class="out">ubu	"/bin/bash"	Exited (0) 2 seconds ago</span></pre>
+        <p>That solves puzzle 1. The ubuntu image's default command is <code class="inl">bash</code>. With no terminal attached, bash reads end-of-input and exits straight away. PID 1 is gone, so the container has exited. Exit code 0 means this is not a crash. The <code class="inl">hello</code> container from section 5 did the same thing: node finished the script. nginx keeps running because <code class="inl">nginx -g 'daemon off;'</code> stays in the foreground forever. That's also why each container runs <strong>one main process</strong>: SSH plus five services inside one container is treating it like a VM.</p>
+
+        <h4>Pause, stop, and the 10-second mystery</h4>
+<pre><span class="pr">$</span> docker pause demo
+<span class="out">demo</span>
 <span class="pr">$</span> docker ps -a --filter name=demo --format '{{.Names}}\t{{.Status}}'
 <span class="out">demo	Up 4 seconds (Paused)</span>                 <span class="cm"># processes frozen (cgroup freezer), memory kept</span>
 <span class="pr">$</span> docker unpause demo
@@ -755,24 +1065,20 @@ demo</span>
 <span class="out">demo
 real	0m10.31s</span>                              <span class="cm"># waited the full 10 s grace period…</span>
 <span class="pr">$</span> docker ps -a --filter name=demo --format '{{.Names}}\t{{.Status}}'
-<span class="out">demo	Exited (137) 3 seconds ago</span>          <span class="cm"># …then SIGKILL (128 + 9 = 137)</span>
-<span class="pr">$</span> docker rm demo
-<span class="out">demo</span></pre>
-
+<span class="out">demo	Exited (137) 3 seconds ago</span>          <span class="cm"># …then SIGKILL (128 + 9 = 137)</span></pre>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th></th><th><code class="inl">docker stop</code></th><th><code class="inl">docker kill</code></th></tr></thead>
             <tbody>
               <tr><td>Signal</td><td><code class="inl">SIGTERM</code> (or the image's <code class="inl">STOPSIGNAL</code>), then <code class="inl">SIGKILL</code> after the grace period</td><td><code class="inl">SIGKILL</code> immediately (or <code class="inl">-s SIGHUP</code> etc.)</td></tr>
-              <tr><td>Grace period</td><td>10 s default for Linux containers; <code class="inl">docker stop -t 30</code></td><td>None</td></tr>
-              <tr><td>App can clean up?</td><td>Yes — close DB connections, finish requests</td><td>No</td></tr>
+              <tr><td>Grace period</td><td>10 s by default; <code class="inl">docker stop -t 30</code> to change it</td><td>None</td></tr>
+              <tr><td>App can clean up?</td><td>Yes: close DB connections, finish requests</td><td>No</td></tr>
             </tbody>
           </table>
         </div>
-
         <div class="callout key">
-          <span class="c-title">Why did stop take 10 s and exit 137?</span>
-          <p>The process is <strong>PID 1</strong> in its namespace, and the kernel doesn't apply default signal actions to PID 1 — a process that hasn't installed a SIGTERM handler (like <code class="inl">sleep</code>, or a Node app without one) ignores it. Docker waits out the grace period and SIGKILLs it. Fix: handle SIGTERM in the app, or run with <code class="inl">--init</code>.</p>
+          <span class="c-title">Why did stop take 10 s and exit 137? (puzzle 2)</span>
+          <p>The process is <strong>PID 1</strong> in its namespace, and the kernel doesn't apply default signal actions to PID 1. A process that hasn't installed a SIGTERM handler (like <code class="inl">sleep</code>, or a Node app without one) simply ignores the signal. Docker waits out the grace period, then sends SIGKILL. Fix it by handling SIGTERM in the app, or by running with <code class="inl">--init</code>.</p>
         </div>
         <div class="fname">server.js (excerpt — graceful shutdown)</div>
 <pre>const server = app.listen(PORT, HOST);
@@ -781,16 +1087,16 @@ process.on(<span class="st">'SIGTERM'</span>, () =&gt; {                 <span c
   console.log(<span class="st">'SIGTERM received, closing HTTP server'</span>);
   server.close(() =&gt; process.exit(<span class="nm">0</span>));      <span class="cm">// finish in-flight requests, then exit 0</span>
 });</pre>
-        <p>With this, <code class="inl">docker stop api</code> returns in under a second and the status is <code class="inl">Exited (0)</code>.</p>
+        <p>Installing a handler means SIGTERM is no longer ignored, even though Node is PID 1. <code class="inl">server.close()</code> lets in-flight requests finish, then the process exits 0. With this handler, <code class="inl">docker stop api</code> returns in under a second with <code class="inl">Exited (0)</code> instead of 137.</p>
 
-        <h3>Restart policies</h3>
+        <h4>Restart policies (puzzle 3)</h4>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Policy</th><th>Restarts on non-zero exit</th><th>On zero exit</th><th>After daemon / host reboot</th><th>After manual <code class="inl">docker stop</code></th></tr></thead>
             <tbody>
               <tr><td><code class="inl">no</code> (default)</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
               <tr><td><code class="inl">on-failure[:N]</code></td><td>✅ (max N tries)</td><td>❌</td><td>❌</td><td>❌</td></tr>
-              <tr><td><code class="inl">always</code></td><td>✅</td><td>✅</td><td>✅ (even if you had stopped it)</td><td>❌ until daemon restarts</td></tr>
+              <tr><td><code class="inl">always</code></td><td>✅</td><td>✅</td><td>✅ (even if you had stopped it)</td><td>❌ until the daemon restarts</td></tr>
               <tr><td><code class="inl">unless-stopped</code></td><td>✅</td><td>✅</td><td>✅ unless you stopped it</td><td>❌ stays stopped</td></tr>
             </tbody>
           </table>
@@ -800,40 +1106,44 @@ process.on(<span class="st">'SIGTERM'</span>, () =&gt; {                 <span c
 <span class="out">3 on-failure 1</span>                       <span class="cm"># tried 3 times, gave up, last exit code 1</span>
 <span class="pr">$</span> docker update --restart unless-stopped web     <span class="cm"># change the policy of an existing container</span>
 <span class="out">web</span></pre>
-        <p>Use <code class="inl">unless-stopped</code> for long-running services on a single server (TaskFlow DB/API). In Kubernetes, the platform restarts containers instead (Session 10).</p>
+        <p><code class="inl">taskflow-db</code> came back after the reboot because it had <code class="inl">--restart unless-stopped</code>. <code class="inl">web</code> still had the default <code class="inl">no</code> (the <code class="inl">docker update</code> above fixes that). Use <code class="inl">unless-stopped</code> for long-running services on a single server. In Kubernetes, the platform does the restarting instead (Session 10).</p>
 
-        <h3>Exit codes</h3>
+        <h4>Exit codes: why did it die?</h4>
+        <p>Learn three codes first: <strong>0</strong> = finished fine, <strong>1</strong> = the app reported an error, <strong>137</strong> = killed. Everything above 128 means "killed by signal (code − 128)". Here's the full set:</p>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>Code</th><th>Meaning</th><th>Typical cause</th></tr></thead>
             <tbody>
-              <tr><td>0</td><td>Success</td><td>Task finished, or graceful stop</td></tr>
-              <tr><td>1 (or another code the app picks)</td><td>Application error</td><td>Uncaught exception, missing env var, can't reach DB</td></tr>
+              <tr><td>0</td><td>Success</td><td>Task finished, or a graceful stop</td></tr>
+              <tr><td>1 (or another code the app picks)</td><td>Application error</td><td>Uncaught exception, missing env var, can't reach the DB</td></tr>
               <tr><td>125</td><td>Docker itself failed</td><td>Bad <code class="inl">docker run</code> flag, daemon error</td></tr>
               <tr><td>126</td><td>Command found but not executable</td><td>Missing <code class="inl">chmod +x</code>, running a non-executable file</td></tr>
-              <tr><td>127</td><td>Command not found</td><td>Typo in CMD, binary not in the image / <code class="inl">$PATH</code></td></tr>
-              <tr><td>137</td><td>128 + 9 = <strong>SIGKILL</strong></td><td>OOM-killed (memory limit), <code class="inl">docker kill</code>, or stop timeout expired</td></tr>
-              <tr><td>143</td><td>128 + 15 = <strong>SIGTERM</strong></td><td>Terminated by stop and died from the signal (no handler) — e.g. under <code class="inl">--init</code></td></tr>
+              <tr><td>127</td><td>Command not found</td><td>Typo in CMD, binary not in the image or <code class="inl">$PATH</code></td></tr>
+              <tr><td>137</td><td>128 + 9 = <strong>SIGKILL</strong></td><td>OOM-killed (memory limit), <code class="inl">docker kill</code>, or the stop timeout expired</td></tr>
+              <tr><td>143</td><td>128 + 15 = <strong>SIGTERM</strong></td><td>Stopped, and the process died from the signal (no handler), e.g. under <code class="inl">--init</code></td></tr>
             </tbody>
           </table>
         </div>
-<pre><span class="pr">$</span> docker run --rm alpine:3.20 sh -c 'exit 3'; echo "exit=$?"
-<span class="out">exit=3</span>
-<span class="pr">$</span> docker run --rm --foo alpine:3.20; echo "exit=$?"
-<span class="out">unknown flag: --foo
-exit=125</span>
-<span class="pr">$</span> docker run --rm alpine:3.20 /etc/hosts; echo "exit=$?"
-<span class="out">docker: Error response from daemon: … exec: "/etc/hosts": permission denied
-exit=126</span>
-<span class="pr">$</span> docker run --rm alpine:3.20 notacommand; echo "exit=$?"
+<pre><span class="pr">$</span> docker run --rm alpine:3.20 notacommand; echo "exit=$?"
 <span class="out">docker: Error response from daemon: … exec: "notacommand": executable file not found in $PATH
 exit=127</span>
 <span class="pr">$</span> docker run --name hog -m 20m alpine:3.20 sh -c 'x=a; while true; do x=$x$x; done'; echo "exit=$?"
 <span class="out">exit=137</span>
 <span class="pr">$</span> docker inspect -f 'OOMKilled={{.State.OOMKilled}}' hog
-<span class="out">OOMKilled=true</span></pre>
+<span class="out">OOMKilled=true</span>                      <span class="cm"># the cgroup memory limit from section 2, enforced</span></pre>
 
-        <h3>Disk usage &amp; cleanup</h3>
+        <h4>Removed: cleaning up</h4>
+<pre><span class="pr">$</span> docker rm demo
+<span class="out">demo</span>
+<span class="pr">$</span> docker rm web
+<span class="out">Error response from daemon: cannot remove container "web": container is running: stop the container before removing or force remove</span>
+<span class="pr">$</span> docker rmi hello-world          <span class="cm"># remove the IMAGE from section 3</span>
+<span class="out">Error response from daemon: conflict: unable to delete hello-world:latest (must be forced) - container 1fb97f7b7b08 is using its referenced image 5e2309035332</span>
+<span class="pr">$</span> docker rm 1fb97f7b7b08 &amp;&amp; docker rmi hello-world     <span class="cm"># remove the stopped container first</span>
+<span class="out">1fb97f7b7b08
+Untagged: hello-world:latest
+Deleted: sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8</span></pre>
+        <p>Removing a container (<code class="inl">rm</code>) and removing an image (<code class="inl">rmi</code>) are separate jobs. Docker refuses to delete an image while any container, even a stopped one, still uses it. <code class="inl">docker rm -f</code> stops and removes a container in one go. For a bulk clean-up, check what's using space first:</p>
 <pre><span class="pr">$</span> docker system df
 <span class="out">TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
 Images          5         3         1.12GB    384.6MB (34%)
@@ -851,19 +1161,40 @@ Build Cache     12        0         210.4MB   210.4MB</span>
 Are you sure you want to continue? [y/N] y
 …
 Total reclaimed space: 213.6MB</span></pre>
-
         <div class="callout warn">
           <span class="c-title">Careful with prune</span>
           <ul>
-            <li><code class="inl">docker system prune -a</code> also deletes every image not used by a container → long re-downloads.</li>
-            <li><code class="inl">docker system prune --volumes</code> (or <code class="inl">docker volume prune</code>) can delete data volumes — e.g. TaskFlow's Postgres data if its container was removed. Never run it on a server without checking <code class="inl">docker volume ls</code> first.</li>
-            <li><code class="inl">-f</code> skips the confirmation prompt — don't put it in scripts you haven't tested.</li>
+            <li><code class="inl">docker system prune -a</code> also deletes every image not used by a container, which means long re-downloads.</li>
+            <li><code class="inl">docker system prune --volumes</code> (or <code class="inl">docker volume prune</code>) can delete data volumes, e.g. TaskFlow's Postgres data if its container was removed. Never run it on a server without checking <code class="inl">docker volume ls</code> first.</li>
+            <li><code class="inl">-f</code> skips the confirmation prompt. Don't put it in scripts you haven't tested.</li>
           </ul>
         </div>
 
-        <div class="recap">
-          <span class="c-title">Recap</span>
-          created → running ⇄ paused → exited → removed. stop = SIGTERM + grace + SIGKILL; handle SIGTERM in the app. Pick a restart policy (<code class="inl">unless-stopped</code> for services). Read exit codes: 125/126/127 = can't start, 137 = killed (often OOM), 143 = SIGTERM.
+        <div class="callout trap">
+          <span class="c-title">Exam trap</span>
+          <p>"<code class="inl">docker stop</code> deletes the container." <strong>✗</strong> The container is now Exited. <code class="inl">docker start</code> brings it back with its writable layer intact. Only <code class="inl">rm</code> deletes it.</p>
+          <p>"Removing a container also removes its image." <strong>✗</strong> Those are separate commands (<code class="inl">rm</code> vs <code class="inl">rmi</code>), and an image outlives all its containers.</p>
+          <p>"<code class="inl">Exited (0)</code> means it crashed." <strong>✗</strong> 0 means success: the main process finished.</p>
+          <p>"<code class="inl">--restart always</code> means the container can't be stopped." <strong>✗</strong> A manual stop works. The container only comes back when the daemon restarts.</p>
+        </div>
+
+        <div class="callout hook">
+          <span class="c-title">Remember</span>
+          <p><strong>A container lives exactly as long as its PID 1.</strong><br /><strong>stop = SIGTERM → 10 s → SIGKILL · kill = SIGKILL now.</strong><br /><strong>137 = 128 + 9 (killed) · 143 = 128 + 15 (terminated).</strong></p>
+        </div>
+
+        <div class="mastery">
+          <span class="c-title">Mastery check</span>
+          <details class="quiz"><summary>Q1. You run <code class="inl">docker create --name web nginx</code>. Is nginx running? What do <code class="inl">docker ps</code> and <code class="inl">docker ps -a</code> show?</summary>
+            <p class="ans">No. The container exists in the <code class="inl">Created</code> state, but no process has started. <code class="inl">docker ps</code> (running only) doesn't list it. <code class="inl">docker ps -a</code> shows it with STATUS <code class="inl">Created</code>. Run <code class="inl">docker start web</code> to start it.</p></details>
+          <details class="quiz"><summary>Q2. You run <code class="inl">docker start web</code> twice. What happens the second time?</summary>
+            <p class="ans">Effectively nothing. The container is already running, so Docker prints <code class="inl">web</code> and exits 0. It doesn't start a second copy and doesn't raise an error. <code class="inl">start</code> acts on an existing container. It never creates one.</p></details>
+          <details class="quiz"><summary>Q3. You write a file inside a container, then <code class="inl">docker stop</code> and <code class="inl">docker start</code> it. Is the file still there? What about after <code class="inl">docker rm</code> + a new <code class="inl">docker run</code>?</summary>
+            <p class="ans">After stop and start, yes: it's the same container with the same writable layer. After rm and a new run, no: <code class="inl">rm</code> deleted that writable layer, and the new container starts fresh from the image. Use a volume for anything that must last.</p></details>
+          <details class="quiz"><summary>Q4. Your <code class="inl">console.log("Hello")</code> container exits immediately, but an nginx container keeps running. Why?</summary>
+            <p class="ans">A container runs only while its main process runs. <code class="inl">node hello.js</code> prints and finishes, so the container exits with code 0. nginx (started with <code class="inl">daemon off;</code>) stays in the foreground serving requests, so PID 1 never ends.</p></details>
+          <details class="quiz"><summary>Q5. <code class="inl">docker ps -a</code> shows <code class="inl">Exited (137)</code> and inspect says <code class="inl">OOMKilled=true</code>. What happened, and what are two fixes?</summary>
+            <p class="ans">The process went over its cgroup memory limit (<code class="inl">-m</code>), so the kernel's OOM killer sent SIGKILL (128 + 9 = 137). Fixes: raise the limit (<code class="inl">-m 512m</code>), or find and fix the memory leak or usage spike in the app.</p></details>
         </div>
       </section>
 
@@ -875,28 +1206,33 @@ Total reclaimed space: 213.6MB</span></pre>
           <table>
             <thead><tr><th>Command</th><th>What it does</th></tr></thead>
             <tbody>
-              <tr><td><code class="inl">docker version</code> / <code class="inl">docker info</code></td><td>Client + server versions / daemon details.</td></tr>
-              <tr><td><code class="inl">docker pull image:tag</code></td><td>Download an image from a registry.</td></tr>
-              <tr><td><code class="inl">docker images</code> / <code class="inl">docker image ls -q</code></td><td>List local images / IDs only.</td></tr>
-              <tr><td><code class="inl">docker image inspect -f '{{…}}' image</code></td><td>Image metadata (CMD, ports, digests, arch).</td></tr>
-              <tr><td><code class="inl">docker history image</code></td><td>Layers and the instructions that made them.</td></tr>
-              <tr><td><code class="inl">docker rmi image</code> / <code class="inl">docker image prune [-a]</code></td><td>Delete an image / dangling (or unused) images.</td></tr>
-              <tr><td><code class="inl">docker run -d --name n -p 8080:80 -e K=V -v vol:/path --restart unless-stopped image</code></td><td>Create + start a container.</td></tr>
-              <tr><td><code class="inl">docker run -it --rm image sh</code></td><td>Throwaway interactive container.</td></tr>
-              <tr><td><code class="inl">docker ps</code> / <code class="inl">docker ps -a</code></td><td>Running / all containers (status + exit code).</td></tr>
-              <tr><td><code class="inl">docker logs -f --tail 50 name</code></td><td>Follow a container's stdout/stderr.</td></tr>
-              <tr><td><code class="inl">docker exec -it name sh</code></td><td>Shell inside a running container.</td></tr>
-              <tr><td><code class="inl">docker stop</code> / <code class="inl">start</code> / <code class="inl">restart</code> / <code class="inl">kill name</code></td><td>Lifecycle control.</td></tr>
-              <tr><td><code class="inl">docker pause</code> / <code class="inl">unpause name</code></td><td>Freeze / resume processes.</td></tr>
-              <tr><td><code class="inl">docker rm [-f] name</code> / <code class="inl">docker container prune</code></td><td>Remove a container / all stopped ones.</td></tr>
-              <tr><td><code class="inl">docker inspect -f '{{.State.ExitCode}}' name</code></td><td>Any field from the container's JSON.</td></tr>
-              <tr><td><code class="inl">docker stats --no-stream</code> / <code class="inl">docker top name</code></td><td>Resource usage / processes.</td></tr>
-              <tr><td><code class="inl">docker cp name:/path ./local</code></td><td>Copy files out of / into a container.</td></tr>
-              <tr><td><code class="inl">docker update --restart unless-stopped name</code></td><td>Change restart policy (or limits) in place.</td></tr>
-              <tr><td><code class="inl">docker login -u user</code> / <code class="inl">docker logout</code></td><td>Authenticate to a registry.</td></tr>
-              <tr><td><code class="inl">docker tag src user/repo:tag</code> / <code class="inl">docker push user/repo:tag</code></td><td>Name an image for a registry / upload it.</td></tr>
-              <tr><td><code class="inl">docker search --filter is-official=true term</code></td><td>Search Docker Hub.</td></tr>
-              <tr><td><code class="inl">docker system df</code> / <code class="inl">docker system prune</code></td><td>Disk usage / clean up (read the warning!).</td></tr>
+              <tr><td><code class="inl">docker version</code> / <code class="inl">docker info</code></td><td>Client + server versions / daemon details</td></tr>
+              <tr><td><code class="inl">docker pull image:tag</code></td><td>Download an image from a registry (starts nothing)</td></tr>
+              <tr><td><code class="inl">docker images</code> / <code class="inl">docker image ls -q</code></td><td>List local images / IDs only</td></tr>
+              <tr><td><code class="inl">docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'</code></td><td>Pick your own columns</td></tr>
+              <tr><td><code class="inl">docker image inspect -f '{{…}}' image</code></td><td>Image metadata (CMD, layers, digests, arch)</td></tr>
+              <tr><td><code class="inl">docker history image</code></td><td>Layers and the instructions that made them</td></tr>
+              <tr><td><code class="inl">docker build -t name:tag .</code></td><td>Build an image from the Dockerfile in <code class="inl">.</code> (Session 7)</td></tr>
+              <tr><td><code class="inl">docker rmi image</code> / <code class="inl">docker image prune [-a]</code></td><td>Delete an image / dangling (or all unused) images</td></tr>
+              <tr><td><code class="inl">docker login -u user</code> / <code class="inl">docker logout</code></td><td>Authenticate to a registry</td></tr>
+              <tr><td><code class="inl">docker tag src user/repo:tag</code> / <code class="inl">docker push user/repo:tag</code></td><td>Add a registry name to an image (no copy) / upload missing layers</td></tr>
+              <tr><td><code class="inl">docker search --filter is-official=true term</code></td><td>Search Docker Hub</td></tr>
+              <tr><td><code class="inl">docker run -d --name n -p 8080:80 -e K=V -v vol:/path --restart unless-stopped image</code></td><td>Create + start a container</td></tr>
+              <tr><td><code class="inl">docker run -it --rm image sh</code></td><td>Throwaway interactive container</td></tr>
+              <tr><td>run flags: <code class="inl">-d -it --rm --name -p -e/--env-file -v -w -m/--cpus --restart --init</code></td><td>Background · shell · auto-delete · name · ports · env · mounts · workdir · limits · restart policy · signal-forwarding init</td></tr>
+              <tr><td><code class="inl">docker create --name n image [cmd]</code></td><td>Create without starting (state: Created)</td></tr>
+              <tr><td><code class="inl">docker ps</code> / <code class="inl">docker ps -a</code></td><td>Running / all containers (status + exit code)</td></tr>
+              <tr><td><code class="inl">docker logs -f --tail 50 name</code></td><td>Follow a container's stdout/stderr</td></tr>
+              <tr><td><code class="inl">docker exec -it name sh</code></td><td>Shell inside a running container</td></tr>
+              <tr><td><code class="inl">docker diff name</code></td><td>What changed in the writable layer (A / C / D)</td></tr>
+              <tr><td><code class="inl">docker inspect -f '{{.State.ExitCode}}' name</code></td><td>Any field from the container's JSON</td></tr>
+              <tr><td><code class="inl">docker stats --no-stream</code> / <code class="inl">docker top name</code></td><td>Resource usage / processes with host PIDs</td></tr>
+              <tr><td><code class="inl">docker cp name:/path ./local</code></td><td>Copy files out of / into a container</td></tr>
+              <tr><td><code class="inl">docker start</code> / <code class="inl">stop</code> / <code class="inl">restart</code> / <code class="inl">kill name</code></td><td>Lifecycle control</td></tr>
+              <tr><td><code class="inl">docker pause</code> / <code class="inl">unpause name</code></td><td>Freeze / resume processes</td></tr>
+              <tr><td><code class="inl">docker update --restart unless-stopped name</code></td><td>Change the restart policy (or limits) in place</td></tr>
+              <tr><td><code class="inl">docker rm [-f] name</code> / <code class="inl">docker container prune</code></td><td>Remove a container / all stopped ones</td></tr>
+              <tr><td><code class="inl">docker system df</code> / <code class="inl">docker system prune</code></td><td>Disk usage / clean up (read the warning!)</td></tr>
             </tbody>
           </table>
         </div>
@@ -908,38 +1244,24 @@ Total reclaimed space: 213.6MB</span></pre>
         <hr class="section-rule" />
         <div class="bigidea">
           <span class="c-title">The big idea</span>
-          <p>A container is just a Linux process that namespaces isolate and cgroups limit, started from a layered, read-only image — which is why it's tiny and fast compared to a VM. When you run <code class="inl">docker run -d -p 5432:5432 postgres:16</code>, the CLI calls dockerd over its socket, dockerd pulls the image from Docker Hub if needed, and containerd + runc start Postgres as PID 1. From there you drive it through its lifecycle with <code class="inl">ps</code>, <code class="inl">logs</code>, <code class="inl">exec</code>, <code class="inl">stop</code> and <code class="inl">rm</code>, read its exit code when it dies, and share your own images by tagging and pushing them — Session 7 shows how to build the TaskFlow image properly.</p>
+          <p>A container is just a Linux process that namespaces isolate and cgroups limit, started from a layered, read-only image. That's why it's tiny and fast compared with a VM. When you run <code class="inl">docker run -d -p 5432:5432 postgres:16</code>, the CLI calls dockerd over its socket, and dockerd pulls the image from Docker Hub if it's missing. Then containerd and runc start Postgres as PID 1 with a fresh writable layer on top. From there you drive the container through its lifecycle with <code class="inl">ps</code>, <code class="inl">logs</code>, <code class="inl">exec</code>, <code class="inl">stop</code> and <code class="inl">rm</code>, read its exit code when it dies, and share your own images by tagging and pushing them. Session 7 shows how to build the TaskFlow image properly.</p>
         </div>
 
-        <h3>Quick self-check</h3>
-        <details class="quiz">
-          <summary>Give four differences between a container and a VM.</summary>
-          <p class="ans">Containers share the host kernel (VMs run their own guest kernel on a hypervisor); containers are MBs vs GBs; start in milliseconds/seconds vs minutes; isolation is process-level (weaker) vs hardware-level (stronger); higher density per host; Linux containers need a Linux kernel while VMs can run any OS.</p>
-        </details>
-        <details class="quiz">
-          <summary>What are namespaces and cgroups? One line each.</summary>
-          <p class="ans">Namespaces control what a process can <em>see</em> (its own PIDs, network, mounts, hostname…). cgroups control how much it can <em>use</em> (memory, CPU, PIDs, I/O).</p>
-        </details>
-        <details class="quiz">
-          <summary>Trace <code class="inl">docker run nginx</code> through Docker's architecture.</summary>
-          <p class="ans">The docker CLI sends a REST call to dockerd over <code class="inl">/var/run/docker.sock</code>; dockerd finds no local image, so it pulls <code class="inl">docker.io/library/nginx:latest</code> from Docker Hub; it asks containerd to create the container; containerd starts a shim, which uses runc to set up namespaces/cgroups and exec nginx as PID 1; output streams back to the CLI.</p>
-        </details>
-        <details class="quiz">
-          <summary>What does <code class="inl">0.0.0.0:8080-&gt;80/tcp</code> in <code class="inl">docker ps</code> mean?</summary>
-          <p class="ans">Port 8080 on every IPv4 interface of the host is forwarded to port 80 inside the container (TCP). It came from <code class="inl">-p 8080:80</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>A container shows <code class="inl">Exited (137)</code>. List the likely causes and how to confirm.</summary>
-          <p class="ans">137 = killed by SIGKILL: memory limit exceeded (check <code class="inl">docker inspect -f '{{.State.OOMKilled}}'</code> → true), someone ran <code class="inl">docker kill</code>, or <code class="inl">docker stop</code>'s grace period expired because PID 1 ignored SIGTERM.</p>
-        </details>
-        <details class="quiz">
-          <summary><code class="inl">docker push taskflow-api:1.0</code> fails with "requested access to the resource is denied". Fix?</summary>
-          <p class="ans">The image has no namespace, so Docker targets <code class="inl">docker.io/library/taskflow-api</code>, which you can't write to. <code class="inl">docker login -u shauryav</code>, <code class="inl">docker tag taskflow-api:1.0 shauryav/taskflow-api:1.0</code>, then <code class="inl">docker push shauryav/taskflow-api:1.0</code>.</p>
-        </details>
-        <details class="quiz">
-          <summary>Difference between <code class="inl">--restart always</code> and <code class="inl">--restart unless-stopped</code>?</summary>
-          <p class="ans">Both restart the container whenever it exits. After you manually stop it and then the daemon/host restarts, <code class="inl">always</code> brings it back up, while <code class="inl">unless-stopped</code> leaves it stopped.</p>
-        </details>
+        <div class="mastery">
+          <span class="c-title">Final mastery check — combine everything</span>
+          <details class="quiz"><summary>Q1. Fresh Ubuntu server. You run <code class="inl">docker run -d --name taskflow-db -e POSTGRES_PASSWORD=devpass -p 5432:5432 postgres:16</code>. List what happens, component by component, and the state the container ends in.</summary>
+            <p class="ans">The CLI turns the command into REST calls to dockerd over <code class="inl">/var/run/docker.sock</code>. dockerd finds no <code class="inl">postgres:16</code> locally, so it pulls <code class="inl">docker.io/library/postgres:16</code> layer by layer from Docker Hub. It then creates the container (a writable layer on the read-only image layers, plus the env var and port binding) and hands it to containerd. containerd's shim calls runc, which sets up namespaces (own PIDs, own network with a 172.17.x IP, own mounts) and cgroups (no limits, since none were given), execs Postgres as PID 1 and exits. Host port 5432 now forwards to the container's 5432, and <code class="inl">-d</code> makes the CLI print the ID and return. The final state is <strong>running</strong> (<code class="inl">Up</code>), for as long as Postgres runs.</p></details>
+          <details class="quiz"><summary>Q2. Your teammate pulled <code class="inl">shauryav/taskflow-api:latest</code> and <code class="inl">/tasks</code> returns 500. It works on your laptop "with the same image". Give two likely causes and the commands that prove each.</summary>
+            <p class="ans">(1) <strong>It's not the same image.</strong> <code class="inl">latest</code> moved between your pulls. Compare <code class="inl">docker image inspect -f '{{json .RepoDigests}}' shauryav/taskflow-api:latest</code> on both machines. Fix it by deploying <code class="inl">:1.1</code> or a digest. (2) <strong>The environment outside the image differs</strong>, for example a missing <code class="inl">DATABASE_URL</code> or no database reachable. Check <code class="inl">docker logs api</code> and <code class="inl">docker exec api env</code>. (A third possibility is a CPU architecture mismatch, which shows up as <code class="inl">exec format error</code> in the logs.)</p></details>
+          <details class="quiz"><summary>Q3. The API runs with <code class="inl">-m 256m --restart unless-stopped</code>. Its STATUS keeps flipping to <code class="inl">Restarting (137)</code> and <code class="inl">RestartCount</code> climbs. Which two features are interacting? How do you confirm, and how do you fix it?</summary>
+            <p class="ans">The cgroup memory limit and the restart policy. The app goes over 256 MiB, the OOM killer sends SIGKILL (137), the restart policy starts it again, and the cycle repeats: a crash loop. Confirm with <code class="inl">docker inspect -f '{{.State.OOMKilled}} {{.RestartCount}}' api</code> → <code class="inl">true 7</code>, and watch <code class="inl">docker stats</code>. Fix it by giving the app more memory (recreate with a bigger <code class="inl">-m</code>) or fixing the leak.</p></details>
+          <details class="quiz"><summary>Q4. You run <code class="inl">docker rm -f taskflow-db</code>, then the exact same <code class="inl">docker run</code> command from section 7 (the one with <code class="inl">-v taskflow-pgdata:…</code>). Are your tasks still there? What if the original command had no <code class="inl">-v</code>?</summary>
+            <p class="ans">With <code class="inl">-v</code>: yes. The data lived in the named volume, not in the container's writable layer, and <code class="inl">rm</code> only deletes the container. Without <code class="inl">-v</code>: the new container starts with an empty database, because nothing connects the old data to it. (The postgres image actually puts its data in an anonymous volume, which is left orphaned. More in Session 8.)</p></details>
+          <details class="quiz"><summary>Q5. Correct every error: "The docker CLI boots a small VM for each image. Changes are saved into the image, and <code class="inl">docker stop</code> deletes the container."</summary>
+            <p class="ans">(1) The <strong>daemon</strong> does the work (via containerd and runc), not the CLI. (2) It's not a VM. It's an isolated <strong>process</strong> on the shared host kernel, and it runs per <strong>container</strong>, not per image. (3) Changes go into the container's <strong>writable layer</strong>, because images are read-only. (4) <code class="inl">stop</code> only moves the container to Exited and keeps its writable layer. <code class="inl">rm</code> deletes it.</p></details>
+          <details class="quiz"><summary>Q6. You built <code class="inl">taskflow-api:1.1</code> on your laptop. Write the commands, in order, to get it running on a fresh EC2 server so that it survives reboots, then check that it's healthy.</summary>
+            <p class="ans">Laptop: <code class="inl">docker login -u shauryav</code> → <code class="inl">docker tag taskflow-api:1.1 shauryav/taskflow-api:1.1</code> → <code class="inl">docker push shauryav/taskflow-api:1.1</code>. Server: <code class="inl">docker run -d --name api -p 3000:3000 -e PORT=3000 --restart unless-stopped shauryav/taskflow-api:1.1</code> (it pulls automatically). Check with <code class="inl">docker ps</code> (<code class="inl">Up</code>), <code class="inl">docker logs api</code>, then <code class="inl">curl localhost:3000/health</code> → <code class="inl">{"status":"ok"}</code>. In real use you'd also pass <code class="inl">DATABASE_URL</code>.</p></details>
+        </div>
       </section>
 
       <!-- ===================== REFERENCES ===================== -->
@@ -972,6 +1294,6 @@ Total reclaimed space: 213.6MB</span></pre>
 
   <footer class="foot wrap">DevOps &amp; Cloud · Session 6 — Docker Fundamentals</footer>
 
-  <script src="../../../assets/js/app.js?v=20261009a"></script>
+  <script src="../../../assets/js/app.js?v=20261010a"></script>
 </body>
 </html>
