@@ -160,6 +160,7 @@
     .cmdsheet ul.cl > li { padding-left: 14px; margin: 1px 0; }
     .cmdsheet .c { white-space: normal; }
     .cmdsheet .tk { white-space: nowrap; }
+    .cmdsheet .tk.brk { white-space: normal; word-break: break-all; }   /* very long URLs may wrap mid-word */
 
     /* small ruled tables */
     table.t { width: 100%; border-collapse: collapse; margin: 2px 0; }
@@ -245,6 +246,8 @@
     <a href="#tf-cmds">Terraform cmds</a>
     <a href="#net">Networking notes</a>
     <a href="#net-cmds">Networking cmds</a>
+    <a href="#mon">Monitoring notes</a>
+    <a href="#mon-cmds">Monitoring cmds</a>
     <button type="button" onclick="window.print()">🖨 Print / Save PDF</button>
     <span class="tip">print tip: A4 · margins none · background graphics ON</span>
   </nav>
@@ -3478,6 +3481,340 @@ nameserver 8.8.8.8</pre>
             <tr><td>D · E</td><td>224 – 239 · 240 – 255</td><td>—</td><td>multicast · experimental</td></tr>
           </table>
           <p>127.x = loopback (not A) · today = <span class="k">CIDR</span>, any prefix → classes just history</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot">next page → Monitoring &amp; GitOps 📈</div>
+  </section>
+
+  <!-- ===================== PAGE 19 · MONITORING, OBSERVABILITY & GITOPS ===================== -->
+  <section class="sheet" id="mon">
+    <header class="head">
+      <div class="ttl">
+        <h1><span class="hlg">Monitoring &amp; GitOps</span> <span class="os">— One Shot 📈</span></h1>
+        <div class="sub">Ch-9 · DevOps · observability → Prometheus → Grafana → GitOps → Argo CD</div>
+      </div>
+      <div class="reg">Date: <b>19/10/26</b><br />Page No. <b>19</b></div>
+    </header>
+    <div class="rule2"></div>
+
+    <div class="cols">
+      <!-- left column -->
+      <div class="col">
+
+        <div class="b tl">
+          <span class="m">PYQ ★</span>
+          <h2><span class="no">1</span>Monitoring vs observability</h2>
+          <table class="t">
+            <tr><th></th><th>monitoring</th><th>observability</th></tr>
+            <tr><td>does</td><td><span class="hl">detects</span> known problems</td><td>helps find <span class="hl">WHY</span></td></tr>
+            <tr><td>how</td><td>fixed checks + thresholds → alerts</td><td>explore metrics + logs + traces</td></tr>
+            <tr><td>eg</td><td>alert: latency &gt; 2 s · CPU &gt; 90%</td><td>slow API → trace → slow DB query → log error</td></tr>
+          </table>
+        </div>
+
+        <div class="b ink">
+          <span class="m">IMP!!</span>
+          <h2><span class="no">2</span>Metrics · logs · traces</h2>
+          <table class="t">
+            <tr><td>metrics</td><td>WHAT is happening</td><td>numbers over time: CPU, req/s, error rate 4%, latency</td></tr>
+            <tr><td>logs</td><td>WHAT happened</td><td>timestamped event lines</td></tr>
+            <tr><td>traces</td><td>WHERE time went</td><td>1 request across services · each step = <span class="k">span</span></td></tr>
+          </table>
+<pre>10:01:05 INFO  Request received: /api/users
+10:01:06 ERROR Database connection timeout</pre>
+<pre>API Gateway        200 ms  <span class="o">← whole request</span>
+ └─ User Service    30 ms
+ └─ DB query       150 ms  <span class="o">← culprit</span></pre>
+          <p class="p">metrics spot it → traces locate it → logs explain it · <span class="k">trace ID</span> links logs to 1 request</p>
+        </div>
+
+        <div class="b grn tr">
+          <span class="m">★★★</span>
+          <h2><span class="no">3</span>Prometheus</h2>
+          <div class="flow">
+            <span class="bx">app / exporter /metrics</span><span class="ar"><small>scrape (PULL)</small>◀──</span>
+            <span class="bx">Prometheus TSDB</span><span class="ar"><small>PromQL</small>──▶</span>
+            <span class="bx">Grafana</span>
+          </div>
+          <div class="flow">
+            <span class="bx">alert rules</span><span class="ar">──▶</span>
+            <span class="bx">Alertmanager</span><span class="ar"><small>group · route</small>──▶</span>
+            <span class="bx">Slack / email</span>
+          </div>
+          <p class="c" style="text-align:center">http_requests_total{status="500"}  25</p>
+          <p class="p" style="text-align:center;margin-top:-1px">metric name · labels {…} · current value</p>
+          <table class="t">
+            <tr><td>target</td><td>thing being scraped</td><td>exporter</td><td>exposes metrics (Node Exporter = Linux host)</td></tr>
+            <tr><td>time series</td><td>1 metric + 1 label set over time</td><td>Alertmanager</td><td>groups, routes, sends alerts</td></tr>
+          </table>
+        </div>
+
+        <div class="b dash">
+          <h2><span class="no">4</span>Metric types + must-know PromQL</h2>
+          <table class="t">
+            <tr><td>counter</td><td>only goes up (requests_total) → use <span class="c">rate()</span></td></tr>
+            <tr><td>gauge</td><td>up / down (memory, queue size)</td></tr>
+            <tr><td>histogram</td><td>buckets (latency) → percentiles</td></tr>
+          </table>
+<pre>rate(http_requests_total[5m])   <span class="o">← req/s, over last 5 min</span>
+sum by (status) (rate(http_requests_total[5m]))
+up == 0                          <span class="o">← targets that are DOWN</span></pre>
+          <p class="r">⚠ never graph a raw counter → it only grows · wrap it in <span class="c">rate()</span></p>
+        </div>
+
+        <div class="b ink tl">
+          <h2><span class="no">5</span>Grafana</h2>
+          <ul class="l">
+            <li><span class="k">data source</span> (Prometheus) → <span class="k">dashboard</span> → <span class="k">panels</span> (1 graph = 1 query) → <span class="k">alert rules</span></li>
+            <li><span class="hl">Prometheus collects + stores · Grafana only shows</span> · can also show logs / traces (Loki, Tempo)</li>
+          </ul>
+        </div>
+
+
+        <div class="b grn">
+          <h2><span class="no">6</span>What to watch + tools</h2>
+          <table class="t">
+            <tr><td>golden signals</td><td><span class="k">latency</span> · <span class="k">traffic</span> (req/s) · <span class="k">errors</span> · <span class="k">saturation</span> (how full: CPU, queue)</td></tr>
+            <tr><td>SLI → SLO → SLA</td><td>measured number (99.2% ok) → target (99.9%) → contract with penalty</td></tr>
+          </table>
+          <p>metrics → <span class="k">Prometheus</span> · logs → <span class="k">Loki</span> / ELK · traces → <span class="k">Jaeger</span> / Tempo · all 3 collected via <span class="k">OpenTelemetry</span> · shown in <span class="k">Grafana</span></p>
+        </div>
+
+      </div>
+
+      <!-- right column -->
+      <div class="col">
+
+        <div class="b tl">
+          <span class="m" style="left:auto;right:-4px;top:-9px;transform:rotate(6deg)">★★★</span>
+          <h2><span class="no">7</span>GitOps</h2>
+          <ul class="l">
+            <li>desired state (YAML) lives in <span class="k">Git</span> → a <span class="k">controller in the cluster</span> keeps making reality match</li>
+          </ul>
+          <div class="flow">
+            <span class="bx">edit YAML</span><span class="ar">▶</span><span class="bx">PR + review</span><span class="ar">▶</span><span class="bx">merge to Git</span><span class="ar"><small>controller PULLS</small>▶</span><span class="bx">cluster updated</span>
+          </div>
+          <table class="t">
+            <tr><th></th><th>push CD (old)</th><th>pull CD (GitOps)</th></tr>
+            <tr><td>who applies</td><td>CI runs kubectl/helm</td><td>Argo CD inside cluster</td></tr>
+            <tr><td>cluster creds</td><td>stored in CI</td><td>stay in cluster</td></tr>
+            <tr><td>drift</td><td>not noticed</td><td>detected (+ fixed)</td></tr>
+          </table>
+          <p><span class="k">4 rules</span>: declarative · versioned in Git · pulled automatically · continuously reconciled</p>
+          <p class="r">⚠ Git doesn't deploy anything itself → the controller does</p>
+          <p><span class="k">drift</span> = cluster ≠ Git (someone ran <span class="c">kubectl scale</span> by hand)</p>
+        </div>
+
+        <div class="b ink">
+          <span class="m" style="left:auto;right:-4px;top:-9px;transform:rotate(6deg)">PYQ ★</span>
+          <h2><span class="no">8</span>Git = source of truth</h2>
+          <table class="t">
+            <tr><td>Git (desired)</td><td>replicas: 3 · image: myapp:v2</td></tr>
+            <tr><td>cluster (actual)</td><td class="r">replicas: 1 · image: myapp:v1 → MISMATCH</td></tr>
+          </table>
+          <p>why: history (who / when) · PR review before prod · <span class="hl">rollback = <span class="c">git revert</span></span> · same config every env · audit trail</p>
+          <p class="r">⚠ change prod via Git, not by hand → else Git goes stale</p>
+        </div>
+
+        <div class="b grn tr">
+          <h2><span class="no">9</span>Argo CD</h2>
+          <ul class="l">
+            <li>GitOps CD tool for K8s · compares Git (desired) vs cluster (live)</li>
+            <li><span class="k">Application</span> = which repo + path + branch → which cluster + namespace</li>
+          </ul>
+          <table class="t">
+            <tr><td>Sync</td><td>apply Git's config to the cluster</td></tr>
+            <tr><td>Synced / OutOfSync</td><td>live matches Git / differs</td></tr>
+            <tr><td>Healthy / Degraded</td><td>are the resources actually working</td></tr>
+            <tr><td>auto-sync</td><td>apply every Git change automatically</td></tr>
+            <tr><td>prune</td><td>delete things removed from Git</td></tr>
+            <tr><td>self-heal</td><td>undo manual changes in the cluster</td></tr>
+          </table>
+          <p>eg Git says 3 → someone scales to 1 → <span class="c">OutOfSync</span> → self-heal puts back <span class="hl">3</span></p>
+          <p class="r">⚠ auto-sync / self-heal are OFF by default · Synced ≠ Healthy</p>
+        </div>
+
+        <div class="b dash">
+          <h2><span class="no">10</span>CD with GitOps</h2>
+          <div class="flow">
+            <span class="bx">code</span><span class="ar"><small>CI</small>▶</span><span class="bx">build + test + push myapp:v2</span><span class="ar">▶</span><span class="bx">bump tag in Git</span><span class="ar"><small>Argo CD</small>▶</span><span class="bx">K8s rollout</span>
+          </div>
+<pre>containers:
+  - name: app
+    image: myapp:v2      <span class="o">← the only line CI changes</span></pre>
+          <p><span class="k">CI</span> builds the image · <span class="k">Argo CD</span> deploys config → <span class="r">Argo CD does NOT build images</span></p>
+          <p>pin exact tags (no <span class="c">latest</span>) · review prod changes · watch rollout health after sync</p>
+          <table class="t">
+            <tr><td>app repo</td><td>code + Dockerfile + CI → builds image</td></tr>
+            <tr><td>config repo</td><td>K8s YAML / Helm values per env ← Argo CD watches</td></tr>
+          </table>
+          <p>Argo CD checks Git ~every 3 min (or instantly via webhook)</p>
+        </div>
+
+        <div class="sticky">
+          <h2>⚠ Exam traps</h2>
+          <ol>
+            <li>monitoring detects · observability explains</li>
+            <li>Prometheus PULLS</li>
+            <li>rate() on counters</li>
+            <li>Grafana shows, doesn't store</li>
+            <li>Git doesn't deploy</li>
+            <li>Synced ≠ Healthy</li>
+            <li>rollback = git revert</li>
+            <li>Argo CD ≠ CI</li>
+          </ol>
+        </div>
+
+      </div>
+    </div>
+    <div class="foot">next page → PromQL, configs + cmds 📈</div>
+  </section>
+
+  <!-- ===================== PAGE 20 · MONITORING & GITOPS CONFIGS + COMMANDS ===================== -->
+  <section class="sheet cmdsheet" id="mon-cmds">
+    <header class="head">
+      <div class="ttl">
+        <h1><span class="hlg">Monitoring &amp; GitOps</span> <span class="os">— PromQL, Configs + Cmds 📈</span></h1>
+        <div class="sub">Ch-9 · PromQL · prometheus.yml · alert rule · install + access · Argo CD app + CLI</div>
+      </div>
+      <div class="reg">Date: <b>19/10/26</b><br />Page No. <b>20</b></div>
+    </header>
+    <div class="rule2"></div>
+
+    <div class="cols">
+      <div class="col">
+
+        <div class="b tl">
+          <span class="m">IMP!!</span>
+          <h2><span class="no">A</span>PromQL cheats</h2>
+          <table class="t">
+            <tr><td>up</td><td>1 = target scraped ok, 0 = down</td></tr>
+            <tr><td>rate(x_total[5m])</td><td>per-second rate of a counter</td></tr>
+            <tr><td>increase(x_total[1h])</td><td>how many in the last hour</td></tr>
+            <tr><td>sum by (status) (…)</td><td>add up series, 1 line per status</td></tr>
+            <tr><td>x{status=~"5.."}</td><td>label regex: any 5xx</td></tr>
+            <tr><td>avg · max · topk(3, …)</td><td>aggregate / top 3</td></tr>
+          </table>
+<pre class="sm"><span class="cm"># error ratio (5xx ÷ all)</span>
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+<span class="cm"># p95 latency from a histogram</span>
+histogram_quantile(0.95,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</pre>
+        </div>
+        <div class="b ink">
+          <h2><span class="no">B</span>prometheus.yml</h2>
+<pre class="sm">global:
+  scrape_interval: 15s         <span class="o">← how often every target is pulled</span>
+  evaluation_interval: 15s     <span class="o">← how often alert rules run</span>
+rule_files:
+  - /etc/prometheus/alerts.yml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+scrape_configs:
+  - job_name: taskflow-api       <span class="o">← becomes label job="…"</span>
+    metrics_path: /metrics       <span class="o">← default</span>
+    static_configs:
+      - targets: ["api:3000"]    <span class="o">← host:port to scrape</span>
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]</pre>
+          <p><span class="c">curl -X POST localhost:9090/-/reload</span> → reload config (needs <span class="c">--web.enable-lifecycle</span>)</p>
+        </div>
+        <div class="b grn tr">
+          <span class="m">PYQ</span>
+          <h2><span class="no">C</span>Alert rule</h2>
+<pre class="sm">groups:
+  - name: taskflow
+    rules:
+      - alert: TaskflowApiDown
+        expr: up{job="taskflow-api"} == 0
+        for: 1m                    <span class="o">← must stay true 1 min</span>
+        labels: { severity: critical }
+        annotations:
+          summary: "API {{ $labels.instance }} is down"</pre>
+          <div class="flow">
+            <span class="bx">inactive</span><span class="ar"><small>expr true</small>▶</span>
+            <span class="bx">pending</span><span class="ar"><small>still true after for</small>▶</span>
+            <span class="bx">firing → Alertmanager</span>
+          </div>
+        </div>
+        <div class="b dash">
+          <h2><span class="no">D</span>Alertmanager routing</h2>
+<pre class="sm">route:
+  receiver: slack-dev              <span class="o">← default destination</span>
+  group_by: ["alertname", "job"]   <span class="o">← 1 message per group</span>
+  repeat_interval: 4h              <span class="o">← re-send if still firing</span>
+  routes:
+    - matchers: [severity="critical"]
+      receiver: slack-oncall       <span class="o">← critical → on-call</span>
+receivers:
+  - name: slack-dev
+    slack_configs:
+      - channel: "#alerts"
+        send_resolved: true</pre>
+          <p>Prometheus decides WHEN it fires · Alertmanager decides WHO hears it (group, dedupe, silence)</p>
+        </div>
+      </div>
+
+      <div class="col">
+
+        <div class="b tl">
+          <span class="m" style="left:auto;right:-4px;top:-9px;transform:rotate(6deg)">★★</span>
+          <h2><span class="no">E</span>Install on K8s (kube-prometheus-stack)</h2>
+          <ul class="l cl">
+            <li><span class="c"><span class="tk">helm</span> <span class="tk">repo</span> <span class="tk">add</span> <span class="tk">prometheus-community</span> <span class="tk brk">https://prometheus-community.github.io/helm-charts</span></span> <span class="x">→</span> add chart repo</li>
+            <li><span class="c"><span class="tk">helm</span> <span class="tk">upgrade</span> <span class="tk">--install</span> <span class="tk">monitoring</span> <span class="tk">prometheus-community/kube-prometheus-stack</span> <span class="tk">-n</span> <span class="tk">monitoring</span> <span class="tk">--create-namespace</span></span> <span class="x">→</span> Prometheus + Grafana + Alertmanager + exporters</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">get</span> <span class="tk">pods</span> <span class="tk">-n</span> <span class="tk">monitoring</span></span> <span class="x">→</span> all Running?</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">port-forward</span> <span class="tk">-n</span> <span class="tk">monitoring</span> <span class="tk">svc/monitoring-kube-prometheus-prometheus</span> <span class="tk">9090:9090</span></span> <span class="x">→</span> Prometheus UI</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">port-forward</span> <span class="tk">-n</span> <span class="tk">monitoring</span> <span class="tk">svc/monitoring-grafana</span> <span class="tk">3000:80</span></span> <span class="x">→</span> Grafana UI</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">get</span> <span class="tk">secret</span> <span class="tk">-n</span> <span class="tk">monitoring</span> <span class="tk">monitoring-grafana</span> <span class="tk">-o</span> <span class="tk">jsonpath=&quot;{.data.admin-password}&quot;</span> <span class="tk">|</span> <span class="tk">base64</span> <span class="tk">-d</span></span> <span class="x">→</span> Grafana admin password</li>
+          </ul>
+        </div>
+        <div class="b ink">
+          <h2><span class="no">F</span>Install Argo CD &amp; log in</h2>
+          <ul class="l cl">
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">create</span> <span class="tk">namespace</span> <span class="tk">argocd</span></span> <span class="x">→</span> its own namespace</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">apply</span> <span class="tk">-n</span> <span class="tk">argocd</span> <span class="tk">--server-side</span> <span class="tk">-f</span> <span class="tk brk">https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml</span></span> <span class="x">→</span> install</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">admin</span> <span class="tk">initial-password</span> <span class="tk">-n</span> <span class="tk">argocd</span></span> <span class="x">→</span> first admin password</li>
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">port-forward</span> <span class="tk">svc/argocd-server</span> <span class="tk">-n</span> <span class="tk">argocd</span> <span class="tk">8080:443</span></span> <span class="x">→</span> UI at https://localhost:8080</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">login</span> <span class="tk">localhost:8080</span> <span class="tk">--username</span> <span class="tk">admin</span> <span class="tk">--insecure</span></span> <span class="x">→</span> CLI login (self-signed cert)</li>
+          </ul>
+        </div>
+        <div class="b grn tl">
+          <span class="m" style="left:auto;right:-4px;top:-9px;transform:rotate(6deg)">★★★</span>
+          <h2><span class="no">G</span>Argo CD Application</h2>
+<pre class="sm">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: { name: taskflow, namespace: argocd }
+spec:
+  project: default
+  source:                                  <span class="o">← WHERE desired state is</span>
+    repoURL: https://github.com/shauryav/taskflow.git
+    targetRevision: main                   <span class="o">← branch / tag / SHA</span>
+    path: charts/taskflow                  <span class="o">← folder in repo</span>
+  destination:                             <span class="o">← WHERE to deploy</span>
+    server: https://kubernetes.default.svc <span class="o">← this cluster</span>
+    namespace: taskflow
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }   <span class="o">← auto-sync ON</span>
+    syncOptions: [CreateNamespace=true]</pre>
+        </div>
+        <div class="b dash">
+          <h2><span class="no">H</span>argocd app cmds</h2>
+          <ul class="l cl">
+            <li><span class="c"><span class="tk">kubectl</span> <span class="tk">apply</span> <span class="tk">-f</span> <span class="tk">argocd/taskflow.yaml</span></span> <span class="x">→</span> create the Application</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">list</span></span> <span class="x">→</span> all apps + sync / health</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">get</span> <span class="tk">taskflow</span></span> <span class="x">→</span> status + every resource</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">diff</span> <span class="tk">taskflow</span></span> <span class="x">→</span> Git vs live, what would change</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">sync</span> <span class="tk">taskflow</span></span> <span class="x">→</span> sync now (don't wait for poll)</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">history</span> <span class="tk">taskflow</span></span> <span class="x">→</span> past syncs with IDs</li>
+            <li><span class="c"><span class="tk">argocd</span> <span class="tk">app</span> <span class="tk">rollback</span> <span class="tk">taskflow</span> <span class="tk">0</span></span> <span class="x">→</span> <span class="r">fails while auto-sync is ON</span></li>
+            <li><span class="c"><span class="tk">git</span> <span class="tk">revert</span> <span class="tk">--no-edit</span> <span class="tk">&lt;sha&gt;</span> <span class="tk">&amp;&amp;</span> <span class="tk">git</span> <span class="tk">push</span></span> <span class="x">→</span> <span class="hl">GitOps rollback ✓</span></li>
+          </ul>
         </div>
       </div>
     </div>
